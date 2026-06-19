@@ -1,0 +1,13 @@
+FROM golang:1.24-bookworm AS build
+
+WORKDIR /src
+COPY go.mod ./
+COPY test/mock-upstream ./test/mock-upstream
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w' -o /out/mock-upstream ./test/mock-upstream
+
+FROM alpine:3.21
+
+COPY --from=build /out/mock-upstream /usr/local/bin/mock-upstream
+EXPOSE 4010
+ENTRYPOINT ["/usr/local/bin/mock-upstream"]

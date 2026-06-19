@@ -1,0 +1,8 @@
+model = "gpt-test"
+model_provider = "codex-pool"
+
+[model_providers.codex-pool]
+name = "Codex Pool integration test"
+base_url = "http://codex-pool:8317/v1"
+env_key = "CODEX_POOL_API_KEY"
+wire_api = "responses"
