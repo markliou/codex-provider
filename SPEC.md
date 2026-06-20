@@ -8,6 +8,13 @@ Do not install software, runtimes, package managers, libraries, build tools, tes
 
 Portability is the first priority for every design and implementation decision. The service must be reproducible from a clean Docker host using only version-controlled source, the Docker build context, Docker runtime options, and the mounted `/data` volume. Do not rely on host-specific paths, host-installed commands, host configuration, or manually provisioned host dependencies.
 
+Before release or deployment testing, verify the implementation with Docker-only commands:
+
+1. Run the Go test suite in a Go Docker image.
+2. Build the production image from the repository Dockerfile.
+3. Run the Codex CLI/provider integration script against a mock upstream and prove Codex can use `config.toml` with `base_url`, `env_key`, and `wire_api = "responses"`.
+4. Run the staged security audit and manually inspect staged changes before committing.
+
 ## 0. Purpose
 
 Build a Dockerized, single-user Codex account-pool service inspired by Cockpit Tools' Codex API Service / `cockpit-cliproxy` sidecar.
@@ -139,6 +146,7 @@ docker run -d \
 | `CODEX_POOL_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error`. |
 | `CODEX_POOL_REDACT_LOGS` | no | `true` | Redact tokens, auth headers, API keys, refresh tokens. |
 | `CODEX_POOL_DEFAULT_MODEL` | no | implementation-defined | Default model when request omits model. |
+| `CODEX_POOL_CODEX_BASE_URL` | no | `https://chatgpt.com/backend-api` | Codex/ChatGPT backend base URL used for device-auth accounts. |
 | `CODEX_POOL_ROUTING_STRATEGY` | no | `sticky_failover` | Routing strategy. |
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session TTL. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `3` | Max account failover attempts per request. |

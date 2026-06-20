@@ -1,6 +1,6 @@
 # Codex Pool Provider
 
-Dockerized, single-user OpenAI-compatible provider gateway for Codex. The service exposes `/v1` endpoints and routes requests to a configured provider API with sticky session affinity.
+Dockerized, single-user Codex/ChatGPT account-pool service. The service exposes one OpenAI-compatible `/v1` endpoint to Codex clients, while internally routing requests across Codex accounts authenticated with ChatGPT device auth.
 
 No runtime, package manager, test tool, or service dependency is installed on the host. Build, password hashing, testing, and execution all occur in Docker.
 
@@ -31,8 +31,6 @@ docker run -d \
   -v codex-pool-data:/data \
   -e CODEX_POOL_API_KEY='replace-with-a-long-random-client-key' \
   -e CODEX_POOL_ADMIN_PASSWORD_HASH='pbkdf2-sha256:...' \
-  -e CODEX_POOL_UPSTREAM_BASE_URL='https://api.openai.com/v1' \
-  -e CODEX_POOL_UPSTREAM_API_KEY='upstream-provider-key' \
   -e CODEX_POOL_DEFAULT_MODEL='gpt-5.4' \
   -e CODEX_POOL_ADMIN_ADDR='0.0.0.0:8318' \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
@@ -42,6 +40,33 @@ docker run -d \
 `CODEX_POOL_ALLOW_REMOTE_ADMIN=true` is required because Docker port forwarding reaches the container over its network interface. The published admin port remains loopback-only on the host through `-p 127.0.0.1:8318:8318`; do not publish that port to a public interface without TLS and additional access controls.
 
 All persistent configuration, sticky sessions, cooldowns, and account data are stored in the `codex-pool-data` Docker volume at `/data`.
+
+Open these paths after startup:
+
+```text
+Public API: http://<server-host>:8317/v1
+Admin UI:   http://<server-host>:8318/admin
+Health:     http://<server-host>:8317/healthz
+```
+
+The admin root `http://<server-host>:8318/` redirects to `/admin`. The public API root `http://<server-host>:8317/` returns a small service-info JSON response, so router health checks and manual browser visits do not look like a broken 404.
+
+Docker port mapping is always `host:container`. To expose the service externally as `<api-port>` for API and `<admin-port>` for admin while keeping the container defaults, use:
+
+```bash
+-p <api-port>:8317 \
+-p <admin-port>:8318
+```
+
+### Add Codex Accounts
+
+Open `/admin`, sign in, add a Codex account, then select `Login` for that account. The container runs Codex CLI device auth with:
+
+```text
+CODEX_HOME=/data/accounts/<account-id>/.codex
+```
+
+The admin page shows the verification URL and user code. After you complete the browser login, Codex stores `auth.json` under the account's `/data/accounts/<account-id>/.codex` directory. Those credentials never belong in the Git repository or Docker image.
 
 ### Remote Admin Through A Router
 
@@ -95,9 +120,9 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - `POST /v1/chat/completions`, including translation to a Responses upstream.
 - Model aliases and `(thinking-tier)` suffix translation.
 - Sticky failover routing, per-model cooldowns, and JSON persistence in `/data`.
-- Authenticated admin dashboard at `/admin`, HttpOnly session cookie, CSRF checks, account CRUD/actions, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Disabled`, or `Standby`.
+- Authenticated admin dashboard at `/admin`, HttpOnly session cookie, CSRF checks, account CRUD/actions, device-auth login jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Disabled`, or `Standby`.
 
-Provider accounts can be initialized through `CODEX_POOL_UPSTREAM_*` environment variables or created through the admin API. API keys are redacted from all admin responses.
+Codex accounts are created through the admin UI/API and authenticated with device auth. A legacy provider API-key gateway path remains for testing and advanced OpenAI-compatible providers, but it is not the default runtime path.
 
 ## Verification
 
@@ -105,10 +130,25 @@ The implementation is tested only with Docker:
 
 ```bash
 docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm \
-  go test -v -p 1 -buildvcs=false ./...
+  /usr/local/go/bin/go test -v -p 1 -buildvcs=false ./...
 ```
 
-The integration test performed during implementation built the service and mock upstream images, exercised model discovery, Responses forwarding, thinking-tier translation, Chat Completions translation, admin login/CSRF/account actions, persistence after restart, and a real `codex exec` call through `test/codex-config.toml`.
+Run the Codex CLI/provider integration test with Docker as well:
+
+```bash
+sh scripts/test/integration-codex-config.sh
+```
+
+That script builds the service and mock upstream images, starts them on an isolated Docker network, verifies public dashboard access, verifies protected management APIs, checks public API-key enforcement, then runs a real `codex exec` inside the service image with an ephemeral `CODEX_HOME/config.toml`. The test proves Codex can use:
+
+```toml
+[model_providers.codex-pool]
+base_url = "http://codex-pool:8317/v1"
+env_key = "CODEX_POOL_API_KEY"
+wire_api = "responses"
+```
+
+The checked-in [test config](test/codex-config.toml) uses the same provider contract.
 
 ## Commit Security
 
@@ -122,7 +162,8 @@ Before each commit, run the Docker-only test suite and the staged-change audit:
 
 ```bash
 docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm \
-  go test -v -p 1 -buildvcs=false ./...
+  /usr/local/go/bin/go test -v -p 1 -buildvcs=false ./...
+sh scripts/test/integration-codex-config.sh
 sh scripts/security/precommit-security-audit.sh --check
 ```
 

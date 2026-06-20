@@ -51,12 +51,13 @@ input:focus, select:focus { border-color: #2d7660; box-shadow: 0 0 0 3px rgba(45
 .full { width: 100%; margin-top: 21px; }
 .page-heading, .section-heading, .dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .page-heading { margin-bottom: 24px; }
-.summary-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 26px; }
+.summary-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 26px; }
 .summary-item { min-height: 95px; padding: 16px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
 .summary-value { display: block; margin-top: 8px; font-size: 27px; font-weight: 760; line-height: 1; }
 .summary-item.error .summary-value { color: var(--red); }
 .summary-item.low .summary-value { color: var(--amber); }
 .summary-item.cooldown .summary-value { color: var(--orange); }
+.summary-item.missing_auth .summary-value { color: var(--gray); }
 .section-block { border-top: 1px solid #cbd3d8; padding-top: 16px; }
 .section-block.compact { min-width: 0; }
 .section-heading { margin-bottom: 12px; align-items: center; }
@@ -72,7 +73,7 @@ tbody tr:hover { background: #fafcfc; }
 .account-name { display: grid; gap: 3px; font-weight: 720; }.account-id { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
 .status-stack { display: grid; gap: 5px; }.status-reason { max-width: 205px; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .badge { display: inline-flex; width: fit-content; align-items: center; min-height: 22px; padding: 3px 7px; border-radius: 4px; font-size: 11px; font-weight: 760; letter-spacing: .04em; text-transform: uppercase; }
-.badge.ready { color: var(--green); background: var(--green-bg); }.badge.low { color: var(--amber); background: var(--amber-bg); }.badge.error { color: var(--red); background: var(--red-bg); }.badge.cooldown { color: var(--orange); background: var(--orange-bg); }.badge.disabled, .badge.standby { color: var(--gray); background: var(--gray-bg); }
+.badge.ready { color: var(--green); background: var(--green-bg); }.badge.low { color: var(--amber); background: var(--amber-bg); }.badge.error { color: var(--red); background: var(--red-bg); }.badge.cooldown { color: var(--orange); background: var(--orange-bg); }.badge.disabled, .badge.standby, .badge.missing_auth { color: var(--gray); background: var(--gray-bg); }
 .quota { display: grid; min-width: 118px; gap: 6px; }.quota-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #4d5d69; font-size: 11px; }.quota-track { height: 6px; overflow: hidden; border-radius: 3px; background: #e6eaec; }.quota-fill { height: 100%; background: var(--green); }.quota-fill.low { background: var(--amber); }.quota-fill.empty { background: var(--red); }.quota-unknown { color: var(--muted); font-size: 12px; }
 .route { color: #465664; font-size: 12px; line-height: 1.45; }.route strong { color: var(--ink); font-weight: 680; }.activity { color: var(--muted); font-size: 12px; line-height: 1.45; }
 .row-actions { display: flex; flex-wrap: wrap; gap: 5px; min-width: 160px; }.row-actions .button { min-height: 28px; padding: 5px 8px; font-size: 11px; }.button.danger { color: var(--red); background: #fff; border-color: #f0bbb6; }.button.warn { color: var(--amber); background: #fff; border-color: #ebce97; }

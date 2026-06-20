@@ -73,16 +73,13 @@
 
   <dialog id="account-dialog" class="account-dialog">
     <form id="account-form" method="dialog">
-      <div class="dialog-heading"><div><div class="eyebrow">PROVIDER ACCOUNT</div><h2>Add account</h2></div><button id="close-dialog-button" class="button quiet" type="button">Close</button></div>
+      <div class="dialog-heading"><div><div class="eyebrow">CODEX ACCOUNT</div><h2>Add account</h2></div><button id="close-dialog-button" class="button quiet" type="button">Close</button></div>
       <div class="form-grid">
         <label>Account ID<input name="id" pattern="[A-Za-z0-9_-]+" required></label>
         <label>Label<input name="label" required></label>
-        <label>Provider URL<input name="upstreamBaseUrl" type="url" placeholder="https://provider.example/v1" required></label>
-        <label>Provider API key<input name="upstreamApiKey" type="password" autocomplete="off"></label>
         <label>Models<input name="allowedModels" placeholder="gpt-5.4, gpt-5.4-mini"></label>
         <label>Quota hint (%)<input name="remainingQuota" type="number" min="0" max="100" placeholder="Unknown"></label>
         <label>Priority<input name="priority" type="number" min="0" value="100" required></label>
-        <label>Wire API<select name="wireApi"><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option></select></label>
       </div>
       <label class="checkbox"><input name="enabled" type="checkbox" checked>Enabled</label>
       <label class="checkbox"><input name="inPool" type="checkbox" checked>Include in pool</label>

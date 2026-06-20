@@ -12,7 +12,7 @@
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? "No activity" : date.toLocaleString();
   };
-  const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Standby" }[status] || "Unknown");
+  const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Standby", missing_auth: "Login needed" }[status] || "Unknown");
 
   function notify(message, error = false) {
     toast.textContent = message;
@@ -75,6 +75,7 @@
       ["Low quota", summary.low || 0, "low"],
       ["Cooling down", summary.cooldown || 0, "cooldown"],
       ["Errors", summary.error || 0, "error"],
+      ["Need login", summary.missing_auth || 0, "missing_auth"],
     ];
     $("#summary-grid").innerHTML = items.map(([label, value, tone]) => `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${value}</span></div>`).join("");
   }
@@ -103,6 +104,7 @@
       const activity = health.status === "error" ? health.lastFailureAt : health.lastSuccessAt;
       const route = `${account.inPool ? "In pool" : "Out of pool"} · priority ${account.priority}`;
       const actions = [
+        account.authType === "codex_device_auth" ? actionButton("login", account.id, "Login") : "",
         account.enabled ? actionButton("disable", account.id, "Disable", "warn") : actionButton("enable", account.id, "Enable"),
         account.inPool ? actionButton("pool-remove", account.id, "Remove pool") : actionButton("pool-add", account.id, "Add pool"),
         actionButton("quota", account.id, "Quota"),
@@ -113,7 +115,7 @@
         <td><div class="account-name">${escapeHTML(account.label || account.id)}<span class="account-id">${escapeHTML(account.id)}</span></div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span><span class="status-reason" title="${escapeHTML(reason)}">${escapeHTML(reason)}</span></div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota)}</td>
-        <td><div class="route"><strong>${escapeHTML(account.wireApi || "responses")}</strong><br>${escapeHTML(route)}</div></td>
+        <td><div class="route"><strong>${escapeHTML(account.authType || "codex_device_auth")}</strong><br>${escapeHTML(route)}</div></td>
         <td><div class="activity">${displayTime(activity)}${health.consecutiveFailure ? `<br>${health.consecutiveFailure} consecutive failure${health.consecutiveFailure === 1 ? "" : "s"}` : ""}</div></td>
         <td><div class="row-actions">${actions}</div></td>
       </tr>`;
@@ -182,6 +184,10 @@
       if (action === "delete") {
         if (!window.confirm(`Remove account ${id}?`)) return;
         await api(`/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
+      } else if (action === "login") {
+        const response = await api(`/accounts/${encodeURIComponent(id)}/login`, { method: "POST" });
+        notify("Device login started");
+        watchLoginJob(response.job.jobId);
       } else if (action === "quota") {
         const current = state.data.healthByID.get(id)?.remainingQuota;
         const value = window.prompt("Remaining quota percentage (0-100)", current ?? "");
@@ -195,6 +201,37 @@
       notify("Account updated");
       refresh(true);
     } catch (error) { notify(error.message, true); }
+  }
+
+  async function watchLoginJob(jobId) {
+    let attempts = 0;
+    const tick = async () => {
+      attempts += 1;
+      try {
+        const response = await api(`/jobs/${encodeURIComponent(jobId)}`);
+        const job = response.job;
+        if (job.status === "waiting_for_user") {
+          const parts = [job.message || "Open the verification URL and enter the code."];
+          if (job.verificationUrl) parts.push(job.verificationUrl);
+          if (job.userCode) parts.push(`Code: ${job.userCode}`);
+          notify(parts.join("  "));
+        }
+        if (job.status === "completed") {
+          notify("Device login completed");
+          refresh(true);
+          return;
+        }
+        if (job.status === "failed") {
+          notify(job.error || job.message || "Device login failed", true);
+          refresh(true);
+          return;
+        }
+        if (attempts < 180) window.setTimeout(tick, 5000);
+      } catch (error) {
+        notify(error.message, true);
+      }
+    };
+    tick();
   }
 
   $("#login-form").addEventListener("submit", async (event) => {
@@ -221,7 +258,7 @@
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const quota = String(form.get("remainingQuota") || "").trim();
-    const payload = { id: String(form.get("id")).trim(), label: String(form.get("label")).trim(), upstreamBaseUrl: String(form.get("upstreamBaseUrl")).trim(), upstreamApiKey: String(form.get("upstreamApiKey")).trim(), allowedModels: String(form.get("allowedModels")).split(",").map((value) => value.trim()).filter(Boolean), priority: Number(form.get("priority")), wireApi: form.get("wireApi"), enabled: form.get("enabled") === "on", inPool: form.get("inPool") === "on" };
+    const payload = { id: String(form.get("id")).trim(), label: String(form.get("label")).trim(), authType: "codex_device_auth", allowedModels: String(form.get("allowedModels")).split(",").map((value) => value.trim()).filter(Boolean), priority: Number(form.get("priority")), enabled: form.get("enabled") === "on", inPool: form.get("inPool") === "on" };
     if (quota) payload.remainingQuota = Number(quota);
     try {
       await api("/accounts", { method: "POST", body: JSON.stringify(payload) });

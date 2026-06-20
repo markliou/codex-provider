@@ -63,6 +63,10 @@ func (s *mockServer) handleResponse(w http.ResponseWriter, r *http.Request) {
 	writeEvent(w, flusher, "response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": "msg_mock", "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": responseText, "annotations": []any{}}})
 	writeEvent(w, flusher, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": response["output"].([]any)[0]})
 	writeEvent(w, flusher, "response.completed", map[string]any{"type": "response.completed", "response": response})
+	_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	if flusher != nil {
+		flusher.Flush()
+	}
 }
 
 func inProgressResponse(model string) map[string]any {

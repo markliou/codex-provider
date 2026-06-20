@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -15,7 +16,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,10 +27,16 @@ import (
 )
 
 const (
-	publicAddressDefault = ":8317"
-	adminAddressDefault  = "127.0.0.1:8318"
-	maxRequestBody       = 16 << 20
-	sessionLifetime      = 12 * time.Hour
+	publicAddressDefault      = ":8317"
+	adminAddressDefault       = "127.0.0.1:8318"
+	codexBaseURLDefault       = "https://chatgpt.com/backend-api"
+	codexRefreshURLDefault    = "https://auth.openai.com/oauth/token"
+	codexOAuthClientIDDefault = "app_EMoamEEZ73f0CkXaXp7hrann"
+	codexTokenRefreshWindow   = 5 * time.Minute
+	adminLoginMaxFailures     = 5
+	adminLoginLockout         = 15 * time.Minute
+	maxRequestBody            = 16 << 20
+	sessionLifetime           = 12 * time.Hour
 )
 
 type config struct {
@@ -42,7 +51,9 @@ type account struct {
 	ID              string    `json:"id"`
 	Label           string    `json:"label"`
 	Email           string    `json:"email,omitempty"`
+	AccountID       string    `json:"accountId,omitempty"`
 	AuthType        string    `json:"authType"`
+	CodexHome       string    `json:"codexHome,omitempty"`
 	Enabled         bool      `json:"enabled"`
 	InPool          bool      `json:"inPool"`
 	Priority        int       `json:"priority"`
@@ -54,6 +65,7 @@ type account struct {
 	WireAPI         string    `json:"wireApi,omitempty"`
 	CreatedAt       time.Time `json:"createdAt"`
 	UpdatedAt       time.Time `json:"updatedAt"`
+	LastLoginAt     time.Time `json:"lastLoginAt,omitempty"`
 }
 
 type cooldown struct {
@@ -78,6 +90,26 @@ type accountHealth struct {
 	ConsecutiveFailure int       `json:"consecutiveFailure"`
 }
 
+type loginJob struct {
+	ID              string    `json:"jobId"`
+	Type            string    `json:"type"`
+	Status          string    `json:"status"`
+	AccountID       string    `json:"accountId"`
+	VerificationURL string    `json:"verificationUrl,omitempty"`
+	UserCode        string    `json:"userCode,omitempty"`
+	Message         string    `json:"message,omitempty"`
+	Error           string    `json:"error,omitempty"`
+	StartedAt       time.Time `json:"startedAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+	CompletedAt     time.Time `json:"completedAt,omitempty"`
+}
+
+type loginFailure struct {
+	Count       int
+	LockedOutAt time.Time
+	LastFailure time.Time
+}
+
 type state struct {
 	StickySessions map[string]stickySession `json:"stickySessions"`
 	Cooldowns      map[string][]cooldown    `json:"cooldowns"`
@@ -100,6 +132,9 @@ type app struct {
 	publicAddress    string
 	adminAddress     string
 	allowRemoteAdmin bool
+	codexBaseURL     string
+	jobs             map[string]*loginJob
+	loginFailures    map[string]loginFailure
 	client           *http.Client
 	logger           *log.Logger
 }
@@ -159,6 +194,9 @@ func newAppFromEnv() (*app, error) {
 		publicAddress:    publicAddress,
 		adminAddress:     adminAddress,
 		allowRemoteAdmin: allowRemote,
+		codexBaseURL:     strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
+		jobs:             map[string]*loginJob{},
+		loginFailures:    map[string]loginFailure{},
 		client:           &http.Client{Timeout: 5 * time.Minute},
 		logger:           log.New(os.Stdout, "codex-pool ", log.LstdFlags|log.LUTC),
 	}
@@ -191,6 +229,13 @@ func (a *app) load() error {
 	}
 	if a.state.Health == nil {
 		a.state.Health = map[string]accountHealth{}
+	}
+	for i := range a.config.Accounts {
+		if isCodexDeviceAuth(a.config.Accounts[i]) {
+			a.config.Accounts[i].CodexHome = a.accountCodexHome(a.config.Accounts[i].ID)
+			a.config.Accounts[i].UpstreamBaseURL = ""
+			a.config.Accounts[i].UpstreamAPIKey = ""
+		}
 	}
 	if len(a.config.Accounts) == 0 && os.Getenv("CODEX_POOL_UPSTREAM_BASE_URL") != "" {
 		now := time.Now().UTC()
@@ -240,6 +285,7 @@ func (a *app) serve() error {
 
 func (a *app) publicMux() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", a.handlePublicRoot)
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
 	mux.HandleFunc("GET /v1/models", a.requireAPIKey(a.handleModels))
 	mux.HandleFunc("POST /v1/responses", a.requireAPIKey(a.handleResponses))
@@ -250,6 +296,7 @@ func (a *app) publicMux() http.Handler {
 
 func (a *app) adminMux() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", a.handleAdminRoot)
 	mux.HandleFunc("GET /admin", a.handleAdminPage)
 	mux.HandleFunc("GET /admin/assets/app.css", handleAdminCSS)
 	mux.HandleFunc("GET /admin/assets/app.js", handleAdminJS)
@@ -261,11 +308,28 @@ func (a *app) adminMux() http.Handler {
 	mux.HandleFunc("POST /admin/api/accounts", a.requireAdmin(a.handleAccounts))
 	mux.HandleFunc("GET /admin/api/accounts/health", a.requireAdmin(a.handleAccountHealth))
 	mux.HandleFunc("POST /admin/api/accounts/quota/refresh-all", a.requireAdmin(a.handleRefreshAllQuota))
+	mux.HandleFunc("GET /admin/api/jobs/", a.requireAdmin(a.handleJob))
 	mux.HandleFunc("GET /admin/api/sticky-sessions", a.requireAdmin(a.handleStickySessions))
 	mux.HandleFunc("DELETE /admin/api/sticky-sessions/", a.requireAdmin(a.handleStickySessionDelete))
 	mux.HandleFunc("POST /admin/api/accounts/", a.requireAdmin(a.handleAccountAction))
 	mux.HandleFunc("DELETE /admin/api/accounts/", a.requireAdmin(a.handleAccountDelete))
 	return recovery(mux)
+}
+
+func (a *app) handlePublicRoot(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"service":   "codex-pool",
+		"api":       "/v1",
+		"health":    "/healthz",
+		"admin":     "/admin on the configured admin port",
+		"message":   "Use /v1 for Codex/OpenAI-compatible API requests. Use /admin on the admin port for the dashboard.",
+		"adminPort": "container 8318 by default",
+	})
+}
+
+func (a *app) handleAdminRoot(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/admin", http.StatusFound)
 }
 
 func (a *app) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -340,7 +404,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			writeOpenAIError(w, http.StatusServiceUnavailable, "all_accounts_cooling_down", err.Error())
 			return
 		}
-		endpoint, outBody, convertResponse, err := prepareUpstreamRequest(candidate, updatedBody, chat)
+		endpoint, outBody, convertResponse, err := a.prepareUpstreamRequest(candidate, updatedBody, chat)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", err.Error())
 			return
@@ -374,8 +438,11 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", "all eligible upstream accounts failed")
 }
 
-func prepareUpstreamRequest(candidate account, body []byte, chat bool) (string, []byte, bool, error) {
+func (a *app) prepareUpstreamRequest(candidate account, body []byte, chat bool) (string, []byte, bool, error) {
 	base := strings.TrimRight(candidate.UpstreamBaseURL, "/")
+	if base == "" && isCodexDeviceAuth(candidate) {
+		base = a.codexBaseURL
+	}
 	if base == "" {
 		return "", nil, false, errors.New("selected account has no upstreamBaseUrl")
 	}
@@ -416,6 +483,21 @@ func (a *app) forward(ctx context.Context, candidate account, endpoint string, b
 	}
 	if candidate.UpstreamAPIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+candidate.UpstreamAPIKey)
+	} else if isCodexDeviceAuth(candidate) {
+		if err := a.refreshCodexAuthIfNeeded(candidate); err != nil {
+			return nil, err
+		}
+		auth, err := a.codexAuth(candidate)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+auth.AccessToken)
+		if auth.AccountID != "" {
+			req.Header.Set("ChatGPT-Account-ID", auth.AccountID)
+		}
+		if auth.FedRAMP {
+			req.Header.Set("X-OpenAI-Fedramp", "true")
+		}
 	}
 	return a.client.Do(req)
 }
@@ -470,25 +552,35 @@ func (a *app) handleAdminPage(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *app) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	key := adminLoginKey(r)
+	if retryAt, locked := a.adminLoginLockedOut(key); locked {
+		w.Header().Set("Retry-After", strconv.Itoa(int(time.Until(retryAt).Seconds())))
+		writeOpenAIError(w, http.StatusTooManyRequests, "admin_rate_limited", "too many failed login attempts")
+		return
+	}
 	var request struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&request); err != nil || request.Username != a.adminUser || !verifyPasswordHash(string(a.adminHash), request.Password) {
+		a.recordAdminLoginFailure(key)
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid_admin_credentials", "invalid username or password")
 		return
 	}
+	a.clearAdminLoginFailures(key)
 	expires := time.Now().UTC().Add(sessionLifetime)
 	token := a.signSession(a.adminUser, expires)
 	csrf := randomID()
-	http.SetCookie(w, &http.Cookie{Name: "codex_pool_session", Value: token, Path: "/admin", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil, Expires: expires})
-	http.SetCookie(w, &http.Cookie{Name: "codex_pool_csrf", Value: csrf, Path: "/admin", HttpOnly: false, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil, Expires: expires})
+	secureCookie := a.cookieSecure(r)
+	http.SetCookie(w, &http.Cookie{Name: "codex_pool_session", Value: token, Path: "/admin", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: secureCookie, Expires: expires})
+	http.SetCookie(w, &http.Cookie{Name: "codex_pool_csrf", Value: csrf, Path: "/admin", HttpOnly: false, SameSite: http.SameSiteStrictMode, Secure: secureCookie, Expires: expires})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "csrfToken": csrf})
 }
 
-func (a *app) handleAdminLogout(w http.ResponseWriter, _ *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: "codex_pool_session", Value: "", Path: "/admin", MaxAge: -1, HttpOnly: true})
-	http.SetCookie(w, &http.Cookie{Name: "codex_pool_csrf", Value: "", Path: "/admin", MaxAge: -1})
+func (a *app) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	secureCookie := a.cookieSecure(r)
+	http.SetCookie(w, &http.Cookie{Name: "codex_pool_session", Value: "", Path: "/admin", MaxAge: -1, HttpOnly: true, Secure: secureCookie})
+	http.SetCookie(w, &http.Cookie{Name: "codex_pool_csrf", Value: "", Path: "/admin", MaxAge: -1, Secure: secureCookie})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -526,14 +618,26 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid account JSON")
 		return
 	}
-	if !validAccountID(input.ID) || strings.TrimSpace(input.UpstreamBaseURL) == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "id and upstreamBaseUrl are required")
+	if !validAccountID(input.ID) {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "id is required")
 		return
 	}
 	input.UpstreamBaseURL = strings.TrimRight(input.UpstreamBaseURL, "/")
 	input.WireAPI = normalWireAPI(input.WireAPI)
 	if input.AuthType == "" {
-		input.AuthType = "provider_api_key"
+		if input.UpstreamBaseURL != "" || input.UpstreamAPIKey != "" {
+			input.AuthType = "provider_api_key"
+		} else {
+			input.AuthType = "codex_device_auth"
+		}
+	}
+	if isCodexDeviceAuth(input) {
+		input.UpstreamBaseURL = ""
+		input.UpstreamAPIKey = ""
+		input.CodexHome = a.accountCodexHome(input.ID)
+	} else if strings.TrimSpace(input.UpstreamBaseURL) == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "upstreamBaseUrl is required for provider API key accounts")
+		return
 	}
 	now := time.Now().UTC()
 	input.CreatedAt = now
@@ -571,6 +675,18 @@ func (a *app) handleRefreshAllQuota(w http.ResponseWriter, _ *http.Request) {
 		results = append(results, map[string]any{"accountId": account.ID, "ok": true, "quota": nil, "message": "provider API accounts do not expose a common quota endpoint"})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
+}
+
+func (a *app) handleJob(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/admin/api/jobs/")
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	job := a.jobs[id]
+	if job == nil {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "job not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "job": *job})
 }
 
 func (a *app) handleStickySessions(w http.ResponseWriter, _ *http.Request) {
@@ -615,6 +731,14 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch action {
+	case "login":
+		if !isCodexDeviceAuth(*item) {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "device auth login is only available for Codex accounts")
+			return
+		}
+		job := a.startLoginJobLocked(*item)
+		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "job": job})
+		return
 	case "enable":
 		item.Enabled = true
 	case "disable":
@@ -658,6 +782,12 @@ func (a *app) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 	defer a.mu.Unlock()
 	for i, account := range a.config.Accounts {
 		if account.ID == id {
+			if isCodexDeviceAuth(account) {
+				if err := os.RemoveAll(a.accountRoot(id)); err != nil {
+					writeOpenAIError(w, 500, "storage_error", "unable to purge account credentials")
+					return
+				}
+			}
 			a.config.Accounts = append(a.config.Accounts[:i], a.config.Accounts[i+1:]...)
 			delete(a.state.Cooldowns, id)
 			a.clearStickyForAccountLocked(id)
@@ -698,6 +828,70 @@ func (a *app) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+func (a *app) cookieSecure(r *http.Request) bool {
+	if os.Getenv("CODEX_POOL_COOKIE_SECURE") == "true" {
+		return true
+	}
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+func (a *app) adminLoginLockedOut(key string) (time.Time, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.loginFailures == nil {
+		a.loginFailures = map[string]loginFailure{}
+	}
+	failure := a.loginFailures[key]
+	if failure.LockedOutAt.IsZero() {
+		return time.Time{}, false
+	}
+	until := failure.LockedOutAt.Add(adminLoginLockout)
+	if time.Now().UTC().Before(until) {
+		return until, true
+	}
+	delete(a.loginFailures, key)
+	return time.Time{}, false
+}
+
+func (a *app) recordAdminLoginFailure(key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.loginFailures == nil {
+		a.loginFailures = map[string]loginFailure{}
+	}
+	now := time.Now().UTC()
+	failure := a.loginFailures[key]
+	if !failure.LastFailure.IsZero() && now.Sub(failure.LastFailure) > adminLoginLockout {
+		failure = loginFailure{}
+	}
+	failure.Count++
+	failure.LastFailure = now
+	if failure.Count >= adminLoginMaxFailures && failure.LockedOutAt.IsZero() {
+		failure.LockedOutAt = now
+	}
+	a.loginFailures[key] = failure
+}
+
+func (a *app) clearAdminLoginFailures(key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.loginFailures, key)
+}
+
+func adminLoginKey(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return host
+	}
+	if r.RemoteAddr != "" {
+		return r.RemoteAddr
+	}
+	return "unknown"
 }
 
 func (a *app) validAPIKey(value string) bool {
@@ -796,7 +990,14 @@ func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (
 }
 
 func (a *app) usableLocked(item account, model string, now time.Time) bool {
-	if !item.Enabled || !item.InPool || item.UpstreamBaseURL == "" || !allowedModel(item, model) {
+	if !item.Enabled || !item.InPool || !allowedModel(item, model) {
+		return false
+	}
+	if isCodexDeviceAuth(item) {
+		if _, err := a.codexAuth(item); err != nil {
+			return false
+		}
+	} else if item.UpstreamBaseURL == "" {
 		return false
 	}
 	for _, cd := range a.state.Cooldowns[item.ID] {
@@ -856,6 +1057,14 @@ func (a *app) clearStickyForAccountLocked(id string) {
 			delete(a.state.StickySessions, key)
 		}
 	}
+}
+
+func (a *app) accountRoot(id string) string {
+	return filepath.Join(a.dataDir, "accounts", id)
+}
+
+func (a *app) accountCodexHome(id string) string {
+	return filepath.Join(a.accountRoot(id), ".codex")
 }
 
 func (a *app) saveLocked() error {
@@ -938,6 +1147,393 @@ func normalWireAPI(value string) string {
 		return "responses"
 	}
 }
+func isCodexDeviceAuth(item account) bool {
+	return item.AuthType == "codex_device_auth"
+}
+
+type codexAuthInfo struct {
+	AccessToken string
+	AccountID   string
+	Email       string
+	PlanType    string
+	FedRAMP     bool
+}
+
+type codexAuthFile struct {
+	AuthMode    string     `json:"auth_mode"`
+	LastRefresh *time.Time `json:"last_refresh,omitempty"`
+	Tokens      *struct {
+		IDToken      string  `json:"id_token"`
+		AccessToken  string  `json:"access_token"`
+		RefreshToken string  `json:"refresh_token"`
+		AccountID    *string `json:"account_id"`
+	} `json:"tokens"`
+}
+
+type codexRefreshResponse struct {
+	IDToken      string `json:"id_token"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+func (a *app) codexAuth(item account) (codexAuthInfo, error) {
+	home := a.accountCodexHome(item.ID)
+	data, err := os.ReadFile(filepath.Join(home, "auth.json"))
+	if err != nil {
+		return codexAuthInfo{}, fmt.Errorf("codex auth is missing for account %s", item.ID)
+	}
+	var auth codexAuthFile
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return codexAuthInfo{}, fmt.Errorf("codex auth is invalid for account %s", item.ID)
+	}
+	if auth.Tokens == nil || strings.TrimSpace(auth.Tokens.AccessToken) == "" {
+		return codexAuthInfo{}, fmt.Errorf("codex access token is missing for account %s", item.ID)
+	}
+	info := codexAuthInfo{AccessToken: strings.TrimSpace(auth.Tokens.AccessToken)}
+	if auth.Tokens.AccountID != nil {
+		info.AccountID = strings.TrimSpace(*auth.Tokens.AccountID)
+	}
+	if claims := jwtPayload(auth.Tokens.IDToken); claims != nil {
+		info.Email = claimString(claims, "email")
+		if profile, _ := claims["https://api.openai.com/profile"].(map[string]any); info.Email == "" && profile != nil {
+			info.Email = claimString(profile, "email")
+		}
+		if authClaims, _ := claims["https://api.openai.com/auth"].(map[string]any); authClaims != nil {
+			if info.AccountID == "" {
+				info.AccountID = claimString(authClaims, "chatgpt_account_id")
+			}
+			info.PlanType = claimString(authClaims, "chatgpt_plan_type")
+			if fedramp, ok := authClaims["chatgpt_account_is_fedramp"].(bool); ok {
+				info.FedRAMP = fedramp
+			}
+		}
+	}
+	return info, nil
+}
+
+func (a *app) refreshCodexAuthIfNeeded(item account) error {
+	home := a.accountCodexHome(item.ID)
+	path := filepath.Join(home, "auth.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("codex auth is missing for account %s", item.ID)
+	}
+	var auth codexAuthFile
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return fmt.Errorf("codex auth is invalid for account %s", item.ID)
+	}
+	if auth.Tokens == nil || auth.Tokens.AccessToken == "" || auth.Tokens.RefreshToken == "" {
+		return nil
+	}
+	expiry, ok := jwtExpiry(auth.Tokens.AccessToken)
+	if !ok || time.Until(expiry) > codexTokenRefreshWindow {
+		return nil
+	}
+	refreshed, err := a.requestCodexTokenRefresh(auth.Tokens.RefreshToken)
+	if err != nil {
+		return err
+	}
+	if refreshed.IDToken != "" {
+		auth.Tokens.IDToken = refreshed.IDToken
+	}
+	if refreshed.AccessToken != "" {
+		auth.Tokens.AccessToken = refreshed.AccessToken
+	}
+	if refreshed.RefreshToken != "" {
+		auth.Tokens.RefreshToken = refreshed.RefreshToken
+	}
+	now := time.Now().UTC()
+	auth.LastRefresh = &now
+	if err := writeJSONAtomic(path, auth); err != nil {
+		return fmt.Errorf("persist refreshed codex auth: %w", err)
+	}
+	return nil
+}
+
+func (a *app) requestCodexTokenRefresh(refreshToken string) (codexRefreshResponse, error) {
+	request := map[string]string{
+		"client_id":     envOr("CODEX_APP_SERVER_LOGIN_CLIENT_ID", codexOAuthClientIDDefault),
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshToken,
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return codexRefreshResponse{}, err
+	}
+	endpoint := envOr("CODEX_REFRESH_TOKEN_URL_OVERRIDE", codexRefreshURLDefault)
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return codexRefreshResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	response, err := a.client.Do(req)
+	if err != nil {
+		return codexRefreshResponse{}, fmt.Errorf("refresh codex token: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return codexRefreshResponse{}, fmt.Errorf("refresh codex token failed with status %d", response.StatusCode)
+	}
+	var refreshed codexRefreshResponse
+	if err := json.NewDecoder(io.LimitReader(response.Body, maxRequestBody)).Decode(&refreshed); err != nil {
+		return codexRefreshResponse{}, fmt.Errorf("decode refreshed codex token: %w", err)
+	}
+	return refreshed, nil
+}
+
+func jwtPayload(token string) map[string]any {
+	parts := strings.Split(token, ".")
+	if len(parts) < 3 || parts[1] == "" {
+		return nil
+	}
+	data, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(data, &claims); err != nil {
+		return nil
+	}
+	return claims
+}
+
+func jwtExpiry(token string) (time.Time, bool) {
+	claims := jwtPayload(token)
+	if claims == nil {
+		return time.Time{}, false
+	}
+	switch exp := claims["exp"].(type) {
+	case float64:
+		return time.Unix(int64(exp), 0), true
+	case int64:
+		return time.Unix(exp, 0), true
+	case json.Number:
+		value, err := exp.Int64()
+		if err == nil {
+			return time.Unix(value, 0), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func claimString(claims map[string]any, name string) string {
+	if value, ok := claims[name].(string); ok {
+		return value
+	}
+	return ""
+}
+
+func (a *app) startLoginJobLocked(item account) loginJob {
+	if a.jobs == nil {
+		a.jobs = map[string]*loginJob{}
+	}
+	home := a.accountCodexHome(item.ID)
+	jobID := fmt.Sprintf("job-login-%s-%d-%s", item.ID, time.Now().Unix(), randomID())
+	now := time.Now().UTC()
+	job := &loginJob{
+		ID:        jobID,
+		Type:      "account_login",
+		Status:    "running",
+		AccountID: item.ID,
+		Message:   "Starting Codex device auth login",
+		StartedAt: now,
+		UpdatedAt: now,
+	}
+	a.jobs[jobID] = job
+	go a.runLoginJob(jobID, item.ID, home)
+	return *job
+}
+
+func (a *app) runLoginJob(jobID, accountID, codexHome string) {
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		a.finishLoginJob(jobID, "failed", "", "", fmt.Sprintf("create CODEX_HOME: %v", err))
+		return
+	}
+	cmd := exec.Command("codex", "-c", "cli_auth_credentials_store=\"file\"", "login", "--device-auth")
+	cmd.Env = codexLoginEnv(codexHome)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		a.finishLoginJob(jobID, "failed", "", "", fmt.Sprintf("capture stdout: %v", err))
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		a.finishLoginJob(jobID, "failed", "", "", fmt.Sprintf("capture stderr: %v", err))
+		return
+	}
+	var output strings.Builder
+	var outputMu sync.Mutex
+	consume := func(reader io.Reader, done chan<- struct{}) {
+		defer close(done)
+		scanner := bufio.NewScanner(reader)
+		scanner.Buffer(make([]byte, 1024), 256*1024)
+		for scanner.Scan() {
+			line := stripANSI(scanner.Text())
+			outputMu.Lock()
+			output.WriteString(line)
+			output.WriteByte('\n')
+			text := output.String()
+			outputMu.Unlock()
+			verificationURL, userCode := parseDeviceAuthPrompt(text)
+			if verificationURL != "" || userCode != "" {
+				a.updateLoginJob(jobID, "waiting_for_user", verificationURL, userCode, "Open the verification URL and enter the code.")
+			}
+		}
+	}
+	if err := cmd.Start(); err != nil {
+		a.finishLoginJob(jobID, "failed", "", "", fmt.Sprintf("start Codex CLI: %v", err))
+		return
+	}
+	stdoutDone := make(chan struct{})
+	stderrDone := make(chan struct{})
+	go consume(stdout, stdoutDone)
+	go consume(stderr, stderrDone)
+	err = cmd.Wait()
+	<-stdoutDone
+	<-stderrDone
+	outputMu.Lock()
+	text := output.String()
+	outputMu.Unlock()
+	verificationURL, userCode := parseDeviceAuthPrompt(text)
+	if err != nil {
+		message := strings.TrimSpace(text)
+		if message == "" {
+			message = err.Error()
+		}
+		a.finishLoginJob(jobID, "failed", verificationURL, userCode, redactLoginOutput(message))
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if job := a.jobs[jobID]; job != nil {
+		now := time.Now().UTC()
+		job.Status = "completed"
+		job.Message = "Codex device auth login completed"
+		job.Error = ""
+		job.VerificationURL = verificationURL
+		job.UserCode = userCode
+		job.CompletedAt = now
+		job.UpdatedAt = now
+	}
+	if item := a.accountLocked(accountID); item != nil {
+		if auth, err := a.codexAuth(*item); err == nil {
+			if auth.Email != "" {
+				item.Email = auth.Email
+			}
+			if auth.AccountID != "" {
+				item.AccountID = auth.AccountID
+			}
+			item.LastLoginAt = time.Now().UTC()
+			item.UpdatedAt = item.LastLoginAt
+			_ = a.saveLocked()
+		}
+	}
+}
+
+func (a *app) updateLoginJob(jobID, status, verificationURL, userCode, message string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	job := a.jobs[jobID]
+	if job == nil {
+		return
+	}
+	job.Status = status
+	if verificationURL != "" {
+		job.VerificationURL = verificationURL
+	}
+	if userCode != "" {
+		job.UserCode = userCode
+	}
+	job.Message = message
+	job.UpdatedAt = time.Now().UTC()
+}
+
+func (a *app) finishLoginJob(jobID, status, verificationURL, userCode, message string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	job := a.jobs[jobID]
+	if job == nil {
+		return
+	}
+	now := time.Now().UTC()
+	job.Status = status
+	job.Message = message
+	if status == "failed" {
+		job.Error = message
+	}
+	if verificationURL != "" {
+		job.VerificationURL = verificationURL
+	}
+	if userCode != "" {
+		job.UserCode = userCode
+	}
+	job.CompletedAt = now
+	job.UpdatedAt = now
+}
+
+func codexLoginEnv(codexHome string) []string {
+	accountHome := filepath.Dir(codexHome)
+	env := []string{
+		"CODEX_HOME=" + codexHome,
+		"HOME=" + accountHome,
+		"PATH=" + envOr("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+	}
+	for _, name := range []string{
+		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "no_proxy",
+		"SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_CA_CERTIFICATE",
+		"CODEX_REFRESH_TOKEN_URL_OVERRIDE", "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+	} {
+		if value := os.Getenv(name); value != "" {
+			env = append(env, name+"="+value)
+		}
+	}
+	return env
+}
+
+var (
+	ansiPattern       = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+	deviceURLPattern  = regexp.MustCompile(`https?://[^\s]+`)
+	deviceCodePattern = regexp.MustCompile(`[A-Z0-9]{4,}(-[A-Z0-9]{4,})+`)
+	secretishPattern  = regexp.MustCompile(`(?i)(access[_ -]?token|refresh[_ -]?token|id[_ -]?token|authorization|bearer|api[_ -]?key|cookie|session[_ -]?cookie|CODEX_POOL_[A-Z0-9_]+)`)
+	jwtLikePattern    = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`)
+)
+
+func stripANSI(value string) string {
+	return ansiPattern.ReplaceAllString(value, "")
+}
+
+func parseDeviceAuthPrompt(output string) (string, string) {
+	var verificationURL, userCode string
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if verificationURL == "" {
+			if match := deviceURLPattern.FindString(line); match != "" {
+				verificationURL = strings.TrimRight(match, ".,)")
+			}
+		}
+		if userCode == "" {
+			userCode = deviceCodePattern.FindString(line)
+		}
+	}
+	return verificationURL, userCode
+}
+
+func redactLoginOutput(value string) string {
+	lines := strings.Split(value, "\n")
+	for i, line := range lines {
+		if secretishPattern.MatchString(line) || jwtLikePattern.MatchString(line) {
+			lines[i] = "[REDACTED]"
+		}
+	}
+	const max = 1200
+	result := strings.TrimSpace(strings.Join(lines, "\n"))
+	if len(result) > max {
+		return result[:max] + "..."
+	}
+	return result
+}
+
 func retryAfter(value string) time.Duration {
 	seconds, err := strconv.Atoi(value)
 	if err == nil && seconds > 0 {
@@ -955,7 +1551,7 @@ func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 	return result
 }
 func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
-	summary := map[string]int{"total": len(a.config.Accounts), "ready": 0, "low": 0, "cooldown": 0, "error": 0}
+	summary := map[string]int{"total": len(a.config.Accounts), "ready": 0, "low": 0, "cooldown": 0, "error": 0, "missing_auth": 0}
 	for _, item := range a.config.Accounts {
 		status, _ := a.accountStatusLocked(item, now)
 		if _, ok := summary[status]; ok {
@@ -973,6 +1569,11 @@ func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]an
 func (a *app) accountStatusLocked(item account, now time.Time) (string, string) {
 	if !item.Enabled {
 		return "disabled", "Account is disabled"
+	}
+	if isCodexDeviceAuth(item) {
+		if _, err := a.codexAuth(item); err != nil {
+			return "missing_auth", "Device auth login is required"
+		}
 	}
 	if !item.InPool {
 		return "standby", "Account is not in the pool"
@@ -996,7 +1597,7 @@ func publicAccounts(values []account) []map[string]any {
 	return result
 }
 func publicAccount(item account) map[string]any {
-	return map[string]any{"id": item.ID, "label": item.Label, "email": item.Email, "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "upstreamBaseUrl": item.UpstreamBaseURL, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != ""}
+	return map[string]any{"id": item.ID, "label": item.Label, "email": item.Email, "accountId": item.AccountID, "authType": item.AuthType, "codexHome": item.CodexHome, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "upstreamBaseUrl": item.UpstreamBaseURL, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
 }
 func validAccountID(id string) bool {
 	if id == "" || len(id) > 80 {
