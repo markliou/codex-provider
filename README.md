@@ -49,7 +49,7 @@ Admin UI:   http://<server-host>:8318/admin
 Health:     http://<server-host>:8317/healthz
 ```
 
-The admin root `http://<server-host>:8318/` redirects to `/admin`. The public API root `http://<server-host>:8317/` returns a small service-info JSON response, so router health checks and manual browser visits do not look like a broken 404.
+The admin root `http://<server-host>:8318/` redirects to `/admin`. Public API paths, including `/` and `/healthz`, require the configured API key; unauthenticated requests receive `401`, while authenticated root requests receive a small service-info JSON response.
 
 Docker port mapping is always `host:container`. To expose the service externally as `<api-port>` for API and `<admin-port>` for admin while keeping the container defaults, use:
 
@@ -93,7 +93,7 @@ Do not forward TCP `8318` directly from the Internet: the admin service does not
 
 `GET /admin` is a public, read-only pool status page. It shows only account labels, status, quota hints, configured models, and aggregate counts. It never returns account IDs, email addresses, upstream URLs, API keys, sticky sessions, traffic details, or upstream error bodies.
 
-Select `Admin sign in` on the same page to authenticate. Only a signed-in admin can add, remove, enable, disable, add to pool, remove from pool, change quota hints, clear cooldowns, or inspect sticky sessions. Both views use the same admin port `8318`; no additional port is required.
+Select `Console` on the same page to authenticate with the admin password. Only an authenticated owner can add, remove, enable, disable, add to pool, remove from pool, change quota hints, clear cooldowns, or inspect sticky sessions. Both views use the same admin port `8318`; no additional port is required.
 
 ## Codex CLI
 

@@ -196,6 +196,19 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("GET %s did not include %q", path, expected)
 		}
 	}
+	request := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	for _, forbidden := range []string{"Admin sign in", "Username"} {
+		if strings.Contains(recorder.Body.String(), forbidden) {
+			t.Fatalf("admin page still includes %q", forbidden)
+		}
+	}
+	for _, expected := range []string{"Console", "Access", "Passphrase"} {
+		if !strings.Contains(recorder.Body.String(), expected) {
+			t.Fatalf("admin page does not include low-key label %q", expected)
+		}
+	}
 }
 
 func TestRootEndpointsAreHelpful(t *testing.T) {
@@ -204,11 +217,34 @@ func TestRootEndpointsAreHelpful(t *testing.T) {
 	publicRequest := httptest.NewRequest(http.MethodGet, "/", nil)
 	publicRecorder := httptest.NewRecorder()
 	a.publicMux().ServeHTTP(publicRecorder, publicRequest)
+	if publicRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("public root without key returned %d", publicRecorder.Code)
+	}
+
+	publicRequest = httptest.NewRequest(http.MethodGet, "/", nil)
+	publicRequest.Header.Set("Authorization", "Bearer client-key")
+	publicRecorder = httptest.NewRecorder()
+	a.publicMux().ServeHTTP(publicRecorder, publicRequest)
 	if publicRecorder.Code != http.StatusOK {
-		t.Fatalf("public root returned %d", publicRecorder.Code)
+		t.Fatalf("public root with key returned %d", publicRecorder.Code)
 	}
 	if body := publicRecorder.Body.String(); !strings.Contains(body, "codex-pool") || !strings.Contains(body, "/v1") {
 		t.Fatalf("public root did not describe service endpoints: %s", body)
+	}
+
+	healthRequest := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	healthRecorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(healthRecorder, healthRequest)
+	if healthRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("public health without key returned %d", healthRecorder.Code)
+	}
+
+	healthRequest = httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	healthRequest.Header.Set("Authorization", "Bearer client-key")
+	healthRecorder = httptest.NewRecorder()
+	a.publicMux().ServeHTTP(healthRecorder, healthRequest)
+	if healthRecorder.Code != http.StatusOK {
+		t.Fatalf("public health with key returned %d", healthRecorder.Code)
 	}
 
 	adminRequest := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -235,6 +271,19 @@ func TestAdminCookieSecureBehindForwardedHTTPS(t *testing.T) {
 		if strings.HasPrefix(cookie.Name, "codex_pool_") && !cookie.Secure {
 			t.Fatalf("cookie %s was not Secure behind forwarded HTTPS", cookie.Name)
 		}
+	}
+}
+
+func TestAdminLoginAcceptsPasswordOnly(t *testing.T) {
+	a := testApp(t, nil)
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/login", strings.NewReader(`{"password":"admin-password"}`))
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("password-only login returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "csrfToken") {
+		t.Fatalf("password-only login did not return csrf token: %s", recorder.Body.String())
 	}
 }
 

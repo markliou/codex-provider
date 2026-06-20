@@ -238,7 +238,7 @@
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     try {
-      const response = await fetch("/admin/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: form.get("username"), password: form.get("password") }) });
+      const response = await fetch("/admin/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: form.get("password") }) });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error?.message || "Unable to sign in");
       state.csrfToken = body.csrfToken;

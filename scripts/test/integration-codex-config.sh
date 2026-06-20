@@ -42,16 +42,22 @@ docker run --rm --network "$NETWORK" --entrypoint node codex-pool:local -e '
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 for (let i = 0; i < 60; i += 1) {
   try {
-    const health = await fetch("http://codex-pool:8317/healthz");
+    const health = await fetch("http://codex-pool:8317/healthz", { headers: { Authorization: "Bearer '"$CLIENT_KEY"'" } });
     if (health.ok) break;
   } catch (_) {}
   await wait(500);
 }
 const fail = (message) => { throw new Error(message); };
-const apiRoot = await fetch("http://codex-pool:8317/");
-if (apiRoot.status !== 200) fail(`public API root status ${apiRoot.status}`);
+const apiRootNoKey = await fetch("http://codex-pool:8317/");
+if (apiRootNoKey.status !== 401) fail(`public API root without key status ${apiRootNoKey.status}`);
+const apiRoot = await fetch("http://codex-pool:8317/", { headers: { Authorization: "Bearer '"$CLIENT_KEY"'" } });
+if (apiRoot.status !== 200) fail(`public API root with key status ${apiRoot.status}`);
 const apiRootBody = await apiRoot.text();
 if (!apiRootBody.includes("codex-pool") || !apiRootBody.includes("/v1")) fail(`public API root body ${apiRootBody}`);
+const healthNoKey = await fetch("http://codex-pool:8317/healthz");
+if (healthNoKey.status !== 401) fail(`public health without key status ${healthNoKey.status}`);
+const health = await fetch("http://codex-pool:8317/healthz", { headers: { Authorization: "Bearer '"$CLIENT_KEY"'" } });
+if (health.status !== 200) fail(`public health with key status ${health.status}`);
 const adminRoot = await fetch("http://codex-pool:8318/", { redirect: "manual" });
 if (adminRoot.status !== 302) fail(`admin root status ${adminRoot.status}`);
 if (adminRoot.headers.get("location") !== "/admin") fail(`admin root location ${adminRoot.headers.get("location")}`);

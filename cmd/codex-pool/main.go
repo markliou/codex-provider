@@ -285,8 +285,8 @@ func (a *app) serve() error {
 
 func (a *app) publicMux() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", a.handlePublicRoot)
-	mux.HandleFunc("GET /healthz", a.handleHealthz)
+	mux.HandleFunc("GET /{$}", a.requireAPIKey(a.handlePublicRoot))
+	mux.HandleFunc("GET /healthz", a.requireAPIKey(a.handleHealthz))
 	mux.HandleFunc("GET /v1/models", a.requireAPIKey(a.handleModels))
 	mux.HandleFunc("POST /v1/responses", a.requireAPIKey(a.handleResponses))
 	mux.HandleFunc("POST /v1/responses/compact", a.requireAPIKey(a.handleResponses))
@@ -562,7 +562,16 @@ func (a *app) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&request); err != nil || request.Username != a.adminUser || !verifyPasswordHash(string(a.adminHash), request.Password) {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&request); err != nil {
+		a.recordAdminLoginFailure(key)
+		writeOpenAIError(w, http.StatusUnauthorized, "invalid_admin_credentials", "invalid username or password")
+		return
+	}
+	username := strings.TrimSpace(request.Username)
+	if username == "" {
+		username = a.adminUser
+	}
+	if username != a.adminUser || !verifyPasswordHash(string(a.adminHash), request.Password) {
 		a.recordAdminLoginFailure(key)
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid_admin_credentials", "invalid username or password")
 		return

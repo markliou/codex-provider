@@ -137,7 +137,7 @@ docker run -d \
 | `CODEX_POOL_API_KEY` | yes, unless `CODEX_POOL_API_KEYS` set | none | Single bearer key for public `/v1` access. |
 | `CODEX_POOL_API_KEYS` | no | none | Comma-separated public API keys. |
 | `CODEX_POOL_API_KEYS_FILE` | no | none | Path to file containing one public API key per line. |
-| `CODEX_POOL_ADMIN_USERNAME` | no | `admin` | Admin UI username. |
+| `CODEX_POOL_ADMIN_USERNAME` | no | `admin` | Internal admin session subject and legacy login API username. The UI uses password-only login. |
 | `CODEX_POOL_ADMIN_PASSWORD_HASH` | yes | none | PBKDF2-HMAC-SHA256 hash emitted by the container's `hash-password` command. Do not require plaintext password. |
 | `CODEX_POOL_DATA_DIR` | no | `/data` | Persistent runtime data root. |
 | `CODEX_POOL_PUBLIC_ADDR` | no | `0.0.0.0:8317` | Public API bind address. |
