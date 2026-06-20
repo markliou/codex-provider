@@ -1,5 +1,5 @@
 (() => {
-  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null };
+  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, mode: "public" };
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => document.querySelectorAll(selector);
   const loginView = $("#login-view");
@@ -27,7 +27,7 @@
     if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     if (options.method && options.method !== "GET") headers.set("X-CSRF-Token", state.csrfToken);
     const response = await fetch(`/admin/api${path}`, { credentials: "same-origin", ...options, headers });
-    if (response.status === 401) { showLogin(); throw new Error("Your session has expired"); }
+    if (response.status === 401) { showPublicDashboard(); throw new Error("Your session has expired"); }
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
     return body;
@@ -36,19 +36,36 @@
   function showLogin(message = "") {
     dashboardView.hidden = true;
     loginView.hidden = false;
-    $$(".dashboard-only").forEach((element) => { element.hidden = true; });
+    $$(".management-only, .public-only").forEach((element) => { element.hidden = true; });
     $("#login-error").textContent = message;
     $("#login-error").hidden = !message;
     window.clearInterval(state.refreshTimer);
   }
 
   function showDashboard() {
+    state.mode = "management";
     loginView.hidden = true;
     dashboardView.hidden = false;
-    $$(".dashboard-only").forEach((element) => { element.hidden = false; });
+    $$(".management-only").forEach((element) => { element.hidden = false; });
+    $$(".public-only").forEach((element) => { element.hidden = true; });
+    $("#dashboard-eyebrow").textContent = "OPERATIONAL OVERVIEW";
+    $("#dashboard-title").textContent = "Account pool";
     refresh();
     window.clearInterval(state.refreshTimer);
     state.refreshTimer = window.setInterval(() => refresh(true), 30000);
+  }
+
+  function showPublicDashboard() {
+    state.mode = "public";
+    loginView.hidden = true;
+    dashboardView.hidden = false;
+    $$(".management-only").forEach((element) => { element.hidden = true; });
+    $$(".public-only").forEach((element) => { element.hidden = false; });
+    $("#dashboard-eyebrow").textContent = "PUBLIC STATUS";
+    $("#dashboard-title").textContent = "Pool status";
+    refreshPublic();
+    window.clearInterval(state.refreshTimer);
+    state.refreshTimer = window.setInterval(() => refreshPublic(true), 30000);
   }
 
   function renderSummary(summary) {
@@ -73,6 +90,7 @@
   }
 
   function renderAccounts(accounts, healthByID) {
+    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th>Last activity</th><th>Action</th></tr>";
     $("#account-count").textContent = `${accounts.length} configured`;
     const body = $("#accounts-body");
     if (!accounts.length) {
@@ -102,6 +120,22 @@
     }).join("");
   }
 
+  function renderPublicAccounts(accounts) {
+    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Models</th></tr>";
+    $("#account-count").textContent = `${accounts.length} visible`;
+    const body = $("#accounts-body");
+    if (!accounts.length) {
+      body.innerHTML = '<tr><td colspan="4"><div class="empty-state">No accounts available</div></td></tr>';
+      return;
+    }
+    body.innerHTML = accounts.map((account) => `<tr>
+      <td><div class="account-name">${escapeHTML(account.label)}</div></td>
+      <td><span class="badge ${escapeHTML(account.status)}">${statusLabel(account.status)}</span></td>
+      <td>${quotaMarkup(account.remainingQuota)}</td>
+      <td><div class="route">${escapeHTML((account.allowedModels || []).join(", ") || "All configured models")}</div></td>
+    </tr>`).join("");
+  }
+
   function renderSticky(sessions) {
     $("#sticky-count").textContent = `${sessions.length} active`;
     $("#sticky-list").innerHTML = sessions.length ? sessions.map((session) => `<div class="sticky-item"><div><div class="sticky-key" title="${escapeHTML(session.key)}">${escapeHTML(session.key)}</div><div class="sticky-meta">${escapeHTML(session.accountId)} · ${displayTime(session.lastSuccessAt)}</div></div><button class="button secondary" type="button" data-sticky-key="${escapeHTML(session.key)}">Clear</button></div>`).join("") : '<div class="empty-state">No active sticky sessions</div>';
@@ -126,6 +160,18 @@
     } catch (error) {
       if (!silent) notify(error.message, true);
       $("#service-status").textContent = "Service unavailable";
+    }
+  }
+
+  async function refreshPublic(silent = false) {
+    try {
+      const response = await fetch("/admin/api/public-dashboard", { credentials: "same-origin" });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
+      renderSummary(body.dashboard.summary || {});
+      renderPublicAccounts(body.dashboard.accounts || []);
+    } catch (error) {
+      if (!silent) notify(error.message, true);
     }
   }
 
@@ -166,7 +212,8 @@
   });
 
   $("#refresh-button").addEventListener("click", () => refresh());
-  $("#logout-button").addEventListener("click", async () => { try { await api("/logout", { method: "POST" }); } catch (_) {} sessionStorage.removeItem("codexPoolCsrf"); state.csrfToken = ""; showLogin(); });
+  $("#sign-in-button").addEventListener("click", () => showLogin());
+  $("#logout-button").addEventListener("click", async () => { try { await api("/logout", { method: "POST" }); } catch (_) {} sessionStorage.removeItem("codexPoolCsrf"); state.csrfToken = ""; showPublicDashboard(); });
   $("#add-account-button").addEventListener("click", () => { $("#account-form").reset(); $("#account-form-error").hidden = true; $("#account-dialog").showModal(); });
   $("#close-dialog-button").addEventListener("click", () => $("#account-dialog").close());
   $("#cancel-account-button").addEventListener("click", () => $("#account-dialog").close());
@@ -184,5 +231,5 @@
   $("#accounts-body").addEventListener("click", (event) => { const button = event.target.closest("[data-account-action]"); if (button) handleAccountAction(button); });
   $("#sticky-list").addEventListener("click", async (event) => { const button = event.target.closest("[data-sticky-key]"); if (!button) return; try { await api(`/sticky-sessions/${encodeURIComponent(button.dataset.stickyKey)}`, { method: "DELETE" }); notify("Sticky session cleared"); refresh(true); } catch (error) { notify(error.message, true); } });
 
-  if (state.csrfToken) showDashboard(); else showLogin();
+  showPublicDashboard();
 })();

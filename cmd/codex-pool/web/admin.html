@@ -11,10 +11,13 @@
   <div class="app-shell">
     <header class="topbar">
       <div class="brand"><span class="brand-mark">CP</span><span>Codex Pool</span></div>
-      <div class="topbar-actions dashboard-only">
+      <div class="topbar-actions management-only">
         <span id="service-status" class="service-status">Checking service</span>
         <button id="refresh-button" class="button secondary" type="button">Refresh</button>
         <button id="logout-button" class="button quiet" type="button">Sign out</button>
+      </div>
+      <div class="topbar-actions public-only">
+        <button id="sign-in-button" class="button quiet" type="button">Admin sign in</button>
       </div>
     </header>
 
@@ -33,10 +36,10 @@
       <section id="dashboard-view" class="dashboard-view" hidden>
         <div class="page-heading">
           <div>
-            <div class="eyebrow">OPERATIONAL OVERVIEW</div>
-            <h1>Account pool</h1>
+            <div id="dashboard-eyebrow" class="eyebrow">PUBLIC STATUS</div>
+            <h1 id="dashboard-title">Pool status</h1>
           </div>
-          <button id="add-account-button" class="button primary" type="button">Add account</button>
+          <button id="add-account-button" class="button primary management-only" type="button">Add account</button>
         </div>
 
         <section id="summary-grid" class="summary-grid" aria-label="Pool summary"></section>
@@ -48,13 +51,13 @@
           </div>
           <div class="table-wrap">
             <table class="account-table">
-              <thead><tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th>Last activity</th><th>Action</th></tr></thead>
+              <thead id="accounts-head"><tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th>Last activity</th><th>Action</th></tr></thead>
               <tbody id="accounts-body"></tbody>
             </table>
           </div>
         </section>
 
-        <div class="secondary-grid">
+        <div class="secondary-grid management-only">
           <section class="section-block compact" aria-labelledby="sticky-title">
             <div class="section-heading"><div><h2 id="sticky-title">Sticky sessions</h2><p id="sticky-count" class="muted"></p></div></div>
             <div id="sticky-list" class="sticky-list"></div>

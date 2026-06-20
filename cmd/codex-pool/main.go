@@ -253,6 +253,7 @@ func (a *app) adminMux() http.Handler {
 	mux.HandleFunc("GET /admin", a.handleAdminPage)
 	mux.HandleFunc("GET /admin/assets/app.css", handleAdminCSS)
 	mux.HandleFunc("GET /admin/assets/app.js", handleAdminJS)
+	mux.HandleFunc("GET /admin/api/public-dashboard", a.handlePublicDashboard)
 	mux.HandleFunc("POST /admin/api/login", a.handleAdminLogin)
 	mux.HandleFunc("POST /admin/api/logout", a.requireAdmin(a.handleAdminLogout))
 	mux.HandleFunc("GET /admin/api/state", a.requireAdmin(a.handleAdminState))
@@ -495,6 +496,22 @@ func (a *app) handleAdminState(w http.ResponseWriter, _ *http.Request) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(time.Now().UTC())}})
+}
+
+func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	now := time.Now().UTC()
+	accounts := make([]map[string]any, 0, len(a.config.Accounts))
+	for index, item := range a.config.Accounts {
+		status, _ := a.accountStatusLocked(item, now)
+		label := strings.TrimSpace(item.Label)
+		if label == "" {
+			label = fmt.Sprintf("Account %d", index+1)
+		}
+		accounts = append(accounts, map[string]any{"label": label, "status": status, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.dashboardSummaryLocked(now), "accounts": accounts}})
 }
 
 func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {

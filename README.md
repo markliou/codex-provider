@@ -64,6 +64,12 @@ Configure the router to forward an external TCP port only to the HTTPS reverse p
 
 Do not forward TCP `8318` directly from the Internet: the admin service does not terminate TLS itself. Use a reverse proxy with a valid TLS certificate, preserve the original `Host` header, and restrict the proxy to `/admin` and `/admin/api/` if the public API is served separately.
 
+### Public Status And Protected Management
+
+`GET /admin` is a public, read-only pool status page. It shows only account labels, status, quota hints, configured models, and aggregate counts. It never returns account IDs, email addresses, upstream URLs, API keys, sticky sessions, traffic details, or upstream error bodies.
+
+Select `Admin sign in` on the same page to authenticate. Only a signed-in admin can add, remove, enable, disable, add to pool, remove from pool, change quota hints, clear cooldowns, or inspect sticky sessions. Both views use the same admin port `8318`; no additional port is required.
+
 ## Codex CLI
 
 Create `~/.codex/config.toml` on the machine running Codex:
@@ -103,3 +109,27 @@ docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm \
 ```
 
 The integration test performed during implementation built the service and mock upstream images, exercised model discovery, Responses forwarding, thinking-tier translation, Chat Completions translation, admin login/CSRF/account actions, persistence after restart, and a real `codex exec` call through `test/codex-config.toml`.
+
+## Commit Security
+
+Install the repository hook once:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Before each commit, run the Docker-only test suite and the staged-change audit:
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm \
+  go test -v -p 1 -buildvcs=false ./...
+sh scripts/security/precommit-security-audit.sh --check
+```
+
+The hook blocks credential/runtime-data paths, high-confidence API keys, session tokens, JWTs, and OAuth token values. It also requires an explicit review acknowledgement for every commit:
+
+```bash
+CODEX_ACCOUNT_SECURITY_REVIEWED=yes git commit -m "your message"
+```
+
+Never stage `.codex/`, `auth.json`, `.env`, `/data`, account data, OAuth responses, provider keys, or generated config files. See [AGENTS.md](AGENTS.md) for the mandatory Codex account security review checklist.

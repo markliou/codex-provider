@@ -87,7 +87,7 @@ func TestDashboardStatusSeparatesQuotaAndErrors(t *testing.T) {
 func TestAdminDashboardAssets(t *testing.T) {
 	a := testApp(t, nil)
 	checks := map[string]string{
-		"/admin":                "Account pool",
+		"/admin":                "Pool status",
 		"/admin/assets/app.css": ".badge.error",
 		"/admin/assets/app.js":  "Low quota",
 	}
@@ -101,6 +101,37 @@ func TestAdminDashboardAssets(t *testing.T) {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("GET %s did not include %q", path, expected)
 		}
+	}
+}
+
+func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
+	quota := 12
+	a := testApp(t, []account{{
+		ID: "private-account-id", Label: "Public account", Email: "private@example.test", Enabled: true, InPool: true, RemainingQuota: &quota,
+		UpstreamBaseURL: "https://upstream.example.test/v1", UpstreamAPIKey: "upstream-secret-value", AllowedModels: []string{"gpt-test"},
+	}})
+
+	publicRequest := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
+	publicRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(publicRecorder, publicRequest)
+	if publicRecorder.Code != http.StatusOK {
+		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
+	}
+	publicBody := publicRecorder.Body.String()
+	for _, forbidden := range []string{"private-account-id", "private@example.test", "upstream.example.test", "upstream-secret-value"} {
+		if strings.Contains(publicBody, forbidden) {
+			t.Fatalf("public dashboard exposed %q", forbidden)
+		}
+	}
+	if !strings.Contains(publicBody, "Public account") || !strings.Contains(publicBody, `"status":"low"`) {
+		t.Fatalf("public dashboard omitted expected status data: %s", publicBody)
+	}
+
+	managementRequest := httptest.NewRequest(http.MethodGet, "/admin/api/accounts", nil)
+	managementRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(managementRecorder, managementRequest)
+	if managementRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated management API returned %d", managementRecorder.Code)
 	}
 }
 

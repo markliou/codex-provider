@@ -1,4 +1,17 @@
 .env
+.env.*
+!.env.example
+.codex/
 data/
+accounts/
+state/
+logs/
+auth.json
+config.json
+*.db
+*.sqlite
+*.key
+*.pem
+*.p12
 coverage.out
 *.log
