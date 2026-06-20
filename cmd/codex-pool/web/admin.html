@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Codex Pool</title>
+  <link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">CP</span><span>Codex Pool</span></div>
+      <div class="topbar-actions dashboard-only">
+        <span id="service-status" class="service-status">Checking service</span>
+        <button id="refresh-button" class="button secondary" type="button">Refresh</button>
+        <button id="logout-button" class="button quiet" type="button">Sign out</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="login-view" class="login-view" aria-labelledby="login-title">
+        <form id="login-form" class="login-panel">
+          <div class="eyebrow">ADMIN</div>
+          <h1 id="login-title">Sign in</h1>
+          <label>Username<input id="username" name="username" autocomplete="username" required value="admin"></label>
+          <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+          <p id="login-error" class="form-error" role="alert" hidden></p>
+          <button class="button primary full" type="submit">Sign in</button>
+        </form>
+      </section>
+
+      <section id="dashboard-view" class="dashboard-view" hidden>
+        <div class="page-heading">
+          <div>
+            <div class="eyebrow">OPERATIONAL OVERVIEW</div>
+            <h1>Account pool</h1>
+          </div>
+          <button id="add-account-button" class="button primary" type="button">Add account</button>
+        </div>
+
+        <section id="summary-grid" class="summary-grid" aria-label="Pool summary"></section>
+
+        <section class="section-block" aria-labelledby="accounts-title">
+          <div class="section-heading">
+            <div><h2 id="accounts-title">Accounts</h2><p id="account-count" class="muted"></p></div>
+            <span class="status-legend"><span class="legend-dot error"></span>Error <span class="legend-dot low"></span>Low quota</span>
+          </div>
+          <div class="table-wrap">
+            <table class="account-table">
+              <thead><tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th>Last activity</th><th>Action</th></tr></thead>
+              <tbody id="accounts-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <div class="secondary-grid">
+          <section class="section-block compact" aria-labelledby="sticky-title">
+            <div class="section-heading"><div><h2 id="sticky-title">Sticky sessions</h2><p id="sticky-count" class="muted"></p></div></div>
+            <div id="sticky-list" class="sticky-list"></div>
+          </section>
+          <section class="section-block compact" aria-labelledby="traffic-title">
+            <div class="section-heading"><div><h2 id="traffic-title">Traffic</h2><p class="muted">Since service start</p></div></div>
+            <dl id="traffic-stats" class="traffic-stats"></dl>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="account-dialog" class="account-dialog">
+    <form id="account-form" method="dialog">
+      <div class="dialog-heading"><div><div class="eyebrow">PROVIDER ACCOUNT</div><h2>Add account</h2></div><button id="close-dialog-button" class="button quiet" type="button">Close</button></div>
+      <div class="form-grid">
+        <label>Account ID<input name="id" pattern="[A-Za-z0-9_-]+" required></label>
+        <label>Label<input name="label" required></label>
+        <label>Provider URL<input name="upstreamBaseUrl" type="url" placeholder="https://provider.example/v1" required></label>
+        <label>Provider API key<input name="upstreamApiKey" type="password" autocomplete="off"></label>
+        <label>Models<input name="allowedModels" placeholder="gpt-5.4, gpt-5.4-mini"></label>
+        <label>Quota hint (%)<input name="remainingQuota" type="number" min="0" max="100" placeholder="Unknown"></label>
+        <label>Priority<input name="priority" type="number" min="0" value="100" required></label>
+        <label>Wire API<select name="wireApi"><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option></select></label>
+      </div>
+      <label class="checkbox"><input name="enabled" type="checkbox" checked>Enabled</label>
+      <label class="checkbox"><input name="inPool" type="checkbox" checked>Include in pool</label>
+      <p id="account-form-error" class="form-error" role="alert" hidden></p>
+      <div class="dialog-actions"><button id="cancel-account-button" class="button secondary" type="button">Cancel</button><button class="button primary" type="submit">Add account</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script src="/admin/assets/app.js" defer></script>
+</body>
+</html>

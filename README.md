@@ -43,6 +43,27 @@ docker run -d \
 
 All persistent configuration, sticky sessions, cooldowns, and account data are stored in the `codex-pool-data` Docker volume at `/data`.
 
+### Remote Admin Through A Router
+
+Set the container up once with remote admin enabled, then use the router's port-forward rule as the on/off switch. Toggling that router rule does not restart or otherwise alter the container.
+
+Replace the loopback admin mapping in the run command with the host's fixed LAN address:
+
+```bash
+-p <lan-host>:8318:8318
+```
+
+Keep these two environment variables in the container configuration:
+
+```bash
+-e CODEX_POOL_ADMIN_ADDR='0.0.0.0:8318' \
+-e CODEX_POOL_ALLOW_REMOTE_ADMIN=true
+```
+
+Configure the router to forward an external TCP port only to the HTTPS reverse proxy in front of `<lan-host>:8318`. When remote administration is not needed, disable that router forwarding rule. The service continues serving the public API and remains ready for the next time the rule is enabled.
+
+Do not forward TCP `8318` directly from the Internet: the admin service does not terminate TLS itself. Use a reverse proxy with a valid TLS certificate, preserve the original `Host` header, and restrict the proxy to `/admin` and `/admin/api/` if the public API is served separately.
+
 ## Codex CLI
 
 Create `~/.codex/config.toml` on the machine running Codex:
@@ -68,7 +89,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - `POST /v1/chat/completions`, including translation to a Responses upstream.
 - Model aliases and `(thinking-tier)` suffix translation.
 - Sticky failover routing, per-model cooldowns, and JSON persistence in `/data`.
-- Authenticated admin login, HttpOnly session cookie, CSRF checks, account CRUD/actions, and sticky-session inspection.
+- Authenticated admin dashboard at `/admin`, HttpOnly session cookie, CSRF checks, account CRUD/actions, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Disabled`, or `Standby`.
 
 Provider accounts can be initialized through `CODEX_POOL_UPSTREAM_*` environment variables or created through the admin API. API keys are redacted from all admin responses.
 

@@ -57,6 +57,53 @@ func TestIsLoopbackAddress(t *testing.T) {
 	}
 }
 
+func TestDashboardStatusSeparatesQuotaAndErrors(t *testing.T) {
+	quota := 20
+	a := testApp(t, []account{
+		{ID: "ready", Enabled: true, InPool: true},
+		{ID: "low", Enabled: true, InPool: true, RemainingQuota: &quota},
+		{ID: "error", Enabled: true, InPool: true},
+		{ID: "cooldown", Enabled: true, InPool: true},
+		{ID: "disabled", Enabled: false, InPool: true},
+	})
+	now := time.Now().UTC()
+	a.state.Health = map[string]accountHealth{"error": {ConsecutiveFailure: 2, LastFailureReason: "upstream_transport_error"}}
+	a.state.Cooldowns = map[string][]cooldown{"cooldown": {{ModelID: "gpt-test", NextRetryAt: now.Add(time.Minute), Reason: "rate_limited"}}}
+
+	expected := map[string]string{"ready": "ready", "low": "low", "error": "error", "cooldown": "cooldown", "disabled": "disabled"}
+	for _, item := range a.config.Accounts {
+		status, _ := a.accountStatusLocked(item, now)
+		if status != expected[item.ID] {
+			t.Fatalf("account %s status = %q, want %q", item.ID, status, expected[item.ID])
+		}
+	}
+
+	status, reason := a.accountStatusLocked(a.config.Accounts[2], now)
+	if status != "error" || reason != "upstream_transport_error" {
+		t.Fatalf("error status did not retain the upstream reason: %q, %q", status, reason)
+	}
+}
+
+func TestAdminDashboardAssets(t *testing.T) {
+	a := testApp(t, nil)
+	checks := map[string]string{
+		"/admin":                "Account pool",
+		"/admin/assets/app.css": ".badge.error",
+		"/admin/assets/app.js":  "Low quota",
+	}
+	for path, expected := range checks {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		recorder := httptest.NewRecorder()
+		a.adminMux().ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("GET %s returned %d", path, recorder.Code)
+		}
+		if !strings.Contains(recorder.Body.String(), expected) {
+			t.Fatalf("GET %s did not include %q", path, expected)
+		}
+	}
+}
+
 func TestResponsesProxyTranslatesModelAndUsesStickySession(t *testing.T) {
 	requests := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -129,6 +176,9 @@ func TestFailoverAfterRateLimit(t *testing.T) {
 	}
 	if len(a.state.Cooldowns["first"]) != 1 {
 		t.Fatalf("missing cooldown: %#v", a.state.Cooldowns)
+	}
+	if reason := a.state.Health["first"].LastFailureReason; reason != "rate_limited" {
+		t.Fatalf("rate limit reason = %q, want rate_limited", reason)
 	}
 }
 

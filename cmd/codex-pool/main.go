@@ -46,6 +46,7 @@ type account struct {
 	Enabled         bool      `json:"enabled"`
 	InPool          bool      `json:"inPool"`
 	Priority        int       `json:"priority"`
+	RemainingQuota  *int      `json:"remainingQuota,omitempty"`
 	AllowedModels   []string  `json:"allowedModels,omitempty"`
 	ExcludedModels  []string  `json:"excludedModels,omitempty"`
 	UpstreamBaseURL string    `json:"upstreamBaseUrl,omitempty"`
@@ -70,9 +71,17 @@ type stickySession struct {
 	FailoverFrom  string    `json:"failoverFrom,omitempty"`
 }
 
+type accountHealth struct {
+	LastSuccessAt      time.Time `json:"lastSuccessAt,omitempty"`
+	LastFailureAt      time.Time `json:"lastFailureAt,omitempty"`
+	LastFailureReason  string    `json:"lastFailureReason,omitempty"`
+	ConsecutiveFailure int       `json:"consecutiveFailure"`
+}
+
 type state struct {
 	StickySessions map[string]stickySession `json:"stickySessions"`
 	Cooldowns      map[string][]cooldown    `json:"cooldowns"`
+	Health         map[string]accountHealth `json:"health"`
 	RequestCount   uint64                   `json:"requestCount"`
 	SuccessCount   uint64                   `json:"successCount"`
 	FailureCount   uint64                   `json:"failureCount"`
@@ -164,7 +173,7 @@ func (a *app) load() error {
 		return fmt.Errorf("create data directory: %w", err)
 	}
 	a.config = config{DefaultModel: envOr("CODEX_POOL_DEFAULT_MODEL", "gpt-5.4"), ModelAliases: map[string]string{}}
-	a.state = state{StickySessions: map[string]stickySession{}, Cooldowns: map[string][]cooldown{}}
+	a.state = state{StickySessions: map[string]stickySession{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}}
 	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &a.config); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read config: %w", err)
 	}
@@ -179,6 +188,9 @@ func (a *app) load() error {
 	}
 	if a.state.Cooldowns == nil {
 		a.state.Cooldowns = map[string][]cooldown{}
+	}
+	if a.state.Health == nil {
+		a.state.Health = map[string]accountHealth{}
 	}
 	if len(a.config.Accounts) == 0 && os.Getenv("CODEX_POOL_UPSTREAM_BASE_URL") != "" {
 		now := time.Now().UTC()
@@ -239,6 +251,8 @@ func (a *app) publicMux() http.Handler {
 func (a *app) adminMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /admin", a.handleAdminPage)
+	mux.HandleFunc("GET /admin/assets/app.css", handleAdminCSS)
+	mux.HandleFunc("GET /admin/assets/app.js", handleAdminJS)
 	mux.HandleFunc("POST /admin/api/login", a.handleAdminLogin)
 	mux.HandleFunc("POST /admin/api/logout", a.requireAdmin(a.handleAdminLogout))
 	mux.HandleFunc("GET /admin/api/state", a.requireAdmin(a.handleAdminState))
@@ -340,7 +354,11 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			_ = response.Body.Close()
 			excluded[candidate.ID] = true
 			wait := retryAfter(response.Header.Get("Retry-After"))
-			a.markFailure(candidate.ID, model, "upstream_unavailable", wait)
+			reason := "upstream_5xx"
+			if response.StatusCode == http.StatusTooManyRequests {
+				reason = "rate_limited"
+			}
+			a.markFailure(candidate.ID, model, reason, wait)
 			continue
 		}
 		defer response.Body.Close()
@@ -446,7 +464,8 @@ func copyProxyResponse(w http.ResponseWriter, response *http.Response) {
 
 func (a *app) handleAdminPage(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, "<!doctype html><html><head><title>Codex Pool</title></head><body><main><h1>Codex Pool</h1><p>Use the authenticated admin API at /admin/api.</p></main></body></html>")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+	_, _ = io.WriteString(w, adminPageHTML)
 }
 
 func (a *app) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
@@ -475,7 +494,7 @@ func (a *app) handleAdminLogout(w http.ResponseWriter, _ *http.Request) {
 func (a *app) handleAdminState(w http.ResponseWriter, _ *http.Request) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(time.Now().UTC())}})
 }
 
 func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
@@ -522,8 +541,7 @@ func (a *app) handleAccountHealth(w http.ResponseWriter, _ *http.Request) {
 	items := make([]map[string]any, 0, len(a.config.Accounts))
 	now := time.Now().UTC()
 	for _, account := range a.config.Accounts {
-		cooldowns := activeCooldowns(a.state.Cooldowns[account.ID], now)
-		items = append(items, map[string]any{"accountId": account.ID, "available": account.Enabled && account.InPool && len(cooldowns) == 0, "cooldowns": cooldowns})
+		items = append(items, a.accountHealthItemLocked(account, now))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items})
 }
@@ -593,6 +611,15 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 		a.clearStickyForAccountLocked(id)
 	case "cooldowns/clear":
 		delete(a.state.Cooldowns, id)
+	case "quota/set":
+		var request struct {
+			RemainingQuota *int `json:"remainingQuota"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&request); err != nil || request.RemainingQuota == nil || *request.RemainingQuota < 0 || *request.RemainingQuota > 100 {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "remainingQuota must be an integer from 0 to 100")
+			return
+		}
+		item.RemainingQuota = request.RemainingQuota
 	case "quota/refresh":
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "quota": nil, "message": "provider API accounts do not expose a common quota endpoint"})
 		return
@@ -766,8 +793,17 @@ func (a *app) usableLocked(item account, model string, now time.Time) bool {
 func (a *app) markFailure(accountID, model, reason string, duration time.Duration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.state.Health == nil {
+		a.state.Health = map[string]accountHealth{}
+	}
+	now := time.Now().UTC()
+	health := a.state.Health[accountID]
+	health.LastFailureAt = now
+	health.LastFailureReason = reason
+	health.ConsecutiveFailure++
+	a.state.Health[accountID] = health
 	a.state.FailureCount++
-	a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: time.Now().UTC().Add(duration), Reason: reason})
+	a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
 	_ = a.saveLocked()
 }
 
@@ -775,6 +811,13 @@ func (a *app) markSuccess(key, model, accountID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
+	if a.state.Health == nil {
+		a.state.Health = map[string]accountHealth{}
+	}
+	health := a.state.Health[accountID]
+	health.LastSuccessAt = now
+	health.ConsecutiveFailure = 0
+	a.state.Health[accountID] = health
 	prior := a.state.StickySessions[key]
 	a.state.StickySessions[key] = stickySession{Key: key, ModelID: model, AccountID: accountID, CreatedAt: chooseTime(prior.CreatedAt, now), LastSuccessAt: now, FailoverFrom: prior.AccountID}
 	a.state.RequestCount++
@@ -894,6 +937,40 @@ func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 	}
 	return result
 }
+func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
+	summary := map[string]int{"total": len(a.config.Accounts), "ready": 0, "low": 0, "cooldown": 0, "error": 0}
+	for _, item := range a.config.Accounts {
+		status, _ := a.accountStatusLocked(item, now)
+		if _, ok := summary[status]; ok {
+			summary[status]++
+		}
+	}
+	return summary
+}
+func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]any {
+	cooldowns := activeCooldowns(a.state.Cooldowns[item.ID], now)
+	status, reason := a.accountStatusLocked(item, now)
+	health := a.state.Health[item.ID]
+	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "remainingQuota": item.RemainingQuota}
+}
+func (a *app) accountStatusLocked(item account, now time.Time) (string, string) {
+	if !item.Enabled {
+		return "disabled", "Account is disabled"
+	}
+	if !item.InPool {
+		return "standby", "Account is not in the pool"
+	}
+	if cooldowns := activeCooldowns(a.state.Cooldowns[item.ID], now); len(cooldowns) > 0 {
+		return "cooldown", cooldowns[0].Reason
+	}
+	if health := a.state.Health[item.ID]; health.ConsecutiveFailure > 0 {
+		return "error", health.LastFailureReason
+	}
+	if item.RemainingQuota != nil && *item.RemainingQuota <= 20 {
+		return "low", "Remaining quota is at or below 20%"
+	}
+	return "ready", "Ready"
+}
 func publicAccounts(values []account) []map[string]any {
 	result := make([]map[string]any, 0, len(values))
 	for _, item := range values {
@@ -902,7 +979,7 @@ func publicAccounts(values []account) []map[string]any {
 	return result
 }
 func publicAccount(item account) map[string]any {
-	return map[string]any{"id": item.ID, "label": item.Label, "email": item.Email, "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "upstreamBaseUrl": item.UpstreamBaseURL, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != ""}
+	return map[string]any{"id": item.ID, "label": item.Label, "email": item.Email, "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "upstreamBaseUrl": item.UpstreamBaseURL, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != ""}
 }
 func validAccountID(id string) bool {
 	if id == "" || len(id) > 80 {
