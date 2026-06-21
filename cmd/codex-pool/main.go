@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -30,6 +31,7 @@ const (
 	publicAddressDefault      = ":8317"
 	adminAddressDefault       = "127.0.0.1:8318"
 	codexBaseURLDefault       = "https://chatgpt.com/backend-api"
+	cliproxyBaseURLDefault    = "http://127.0.0.1:8319/v1"
 	codexRefreshURLDefault    = "https://auth.openai.com/oauth/token"
 	codexOAuthClientIDDefault = "app_EMoamEEZ73f0CkXaXp7hrann"
 	codexTokenRefreshWindow   = 5 * time.Minute
@@ -37,6 +39,9 @@ const (
 	adminLoginLockout         = 15 * time.Minute
 	maxRequestBody            = 16 << 20
 	sessionLifetime           = 12 * time.Hour
+	sessionAffinityTTLDefault = 24 * time.Hour
+	quotaRefreshInterval      = 5 * time.Minute
+	quotaRefreshTimeout       = 30 * time.Second
 )
 
 type config struct {
@@ -52,6 +57,8 @@ type account struct {
 	Label           string    `json:"label"`
 	Email           string    `json:"email,omitempty"`
 	AccountID       string    `json:"accountId,omitempty"`
+	PlanType        string    `json:"planType,omitempty"`
+	PlanRank        int       `json:"planRank,omitempty"`
 	AuthType        string    `json:"authType"`
 	CodexHome       string    `json:"codexHome,omitempty"`
 	Enabled         bool      `json:"enabled"`
@@ -74,12 +81,39 @@ type cooldown struct {
 	Reason      string    `json:"reason"`
 }
 
+type quotaWindow struct {
+	Percentage    int    `json:"percentage"`
+	ResetAt       *int64 `json:"resetAt,omitempty"`
+	WindowMinutes *int64 `json:"windowMinutes,omitempty"`
+	Present       bool   `json:"present"`
+}
+
+type accountQuota struct {
+	Hourly quotaWindow `json:"hourly"`
+	Weekly quotaWindow `json:"weekly"`
+}
+
+type quotaErrorInfo struct {
+	Code      string    `json:"code,omitempty"`
+	Message   string    `json:"message"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+type quotaSnapshot struct {
+	AccountID      string          `json:"accountId"`
+	PlanType       string          `json:"planType,omitempty"`
+	Quota          *accountQuota   `json:"quota,omitempty"`
+	UsageUpdatedAt time.Time       `json:"usageUpdatedAt,omitempty"`
+	QuotaError     *quotaErrorInfo `json:"quotaError,omitempty"`
+}
+
 type stickySession struct {
 	Key           string    `json:"key"`
 	ModelID       string    `json:"modelId"`
 	AccountID     string    `json:"accountId"`
 	CreatedAt     time.Time `json:"createdAt"`
 	LastSuccessAt time.Time `json:"lastSuccessAt"`
+	ExpiresAt     time.Time `json:"expiresAt,omitempty"`
 	FailoverFrom  string    `json:"failoverFrom,omitempty"`
 }
 
@@ -97,6 +131,7 @@ type loginJob struct {
 	AccountID       string    `json:"accountId"`
 	VerificationURL string    `json:"verificationUrl,omitempty"`
 	UserCode        string    `json:"userCode,omitempty"`
+	CodeExpiresAt   time.Time `json:"codeExpiresAt,omitempty"`
 	Message         string    `json:"message,omitempty"`
 	Error           string    `json:"error,omitempty"`
 	StartedAt       time.Time `json:"startedAt"`
@@ -114,6 +149,7 @@ type state struct {
 	StickySessions map[string]stickySession `json:"stickySessions"`
 	Cooldowns      map[string][]cooldown    `json:"cooldowns"`
 	Health         map[string]accountHealth `json:"health"`
+	Quotas         map[string]quotaSnapshot `json:"quotas,omitempty"`
 	RequestCount   uint64                   `json:"requestCount"`
 	SuccessCount   uint64                   `json:"successCount"`
 	FailureCount   uint64                   `json:"failureCount"`
@@ -121,22 +157,30 @@ type state struct {
 }
 
 type app struct {
-	mu               sync.RWMutex
-	config           config
-	state            state
-	dataDir          string
-	apiKeys          [][]byte
-	adminUser        string
-	adminHash        []byte
-	sessionKey       []byte
-	publicAddress    string
-	adminAddress     string
-	allowRemoteAdmin bool
-	codexBaseURL     string
-	jobs             map[string]*loginJob
-	loginFailures    map[string]loginFailure
-	client           *http.Client
-	logger           *log.Logger
+	mu                 sync.RWMutex
+	authLockMu         sync.Mutex
+	config             config
+	state              state
+	dataDir            string
+	apiKeys            [][]byte
+	adminUser          string
+	adminHash          []byte
+	sessionKey         []byte
+	sessionAffinityTTL time.Duration
+	maxRetryAccounts   int
+	publicAddress      string
+	adminAddress       string
+	allowRemoteAdmin   bool
+	codexBaseURL       string
+	codexGatewayMode   string
+	cliproxyBaseURL    string
+	cliproxyAPIKey     string
+	jobs               map[string]*loginJob
+	loginCancels       map[string]context.CancelFunc
+	loginFailures      map[string]loginFailure
+	authLocks          map[string]*sync.Mutex
+	client             *http.Client
+	logger             *log.Logger
 }
 
 func main() {
@@ -180,25 +224,44 @@ func newAppFromEnv() (*app, error) {
 	if !allowRemote && !isLoopbackAddress(adminAddress) {
 		return nil, errors.New("admin address must be loopback unless CODEX_POOL_ALLOW_REMOTE_ADMIN=true")
 	}
+	sessionAffinityTTL, err := sessionAffinityTTLFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	maxRetryAccounts, err := maxRetryAccountsFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	codexGatewayMode, err := codexGatewayModeFromEnv()
+	if err != nil {
+		return nil, err
+	}
 
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("generate session key: %w", err)
 	}
 	a := &app{
-		dataDir:          envOr("CODEX_POOL_DATA_DIR", "/data"),
-		apiKeys:          keys,
-		adminUser:        envOr("CODEX_POOL_ADMIN_USERNAME", "admin"),
-		adminHash:        []byte(adminHash),
-		sessionKey:       key,
-		publicAddress:    publicAddress,
-		adminAddress:     adminAddress,
-		allowRemoteAdmin: allowRemote,
-		codexBaseURL:     strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
-		jobs:             map[string]*loginJob{},
-		loginFailures:    map[string]loginFailure{},
-		client:           &http.Client{Timeout: 5 * time.Minute},
-		logger:           log.New(os.Stdout, "codex-pool ", log.LstdFlags|log.LUTC),
+		dataDir:            envOr("CODEX_POOL_DATA_DIR", "/data"),
+		apiKeys:            keys,
+		adminUser:          envOr("CODEX_POOL_ADMIN_USERNAME", "admin"),
+		adminHash:          []byte(adminHash),
+		sessionKey:         key,
+		sessionAffinityTTL: sessionAffinityTTL,
+		maxRetryAccounts:   maxRetryAccounts,
+		publicAddress:      publicAddress,
+		adminAddress:       adminAddress,
+		allowRemoteAdmin:   allowRemote,
+		codexBaseURL:       strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
+		codexGatewayMode:   codexGatewayMode,
+		cliproxyBaseURL:    strings.TrimRight(envOr("CODEX_POOL_CLIPROXY_BASE_URL", cliproxyBaseURLDefault), "/"),
+		cliproxyAPIKey:     strings.TrimSpace(os.Getenv("CODEX_POOL_CLIPROXY_API_KEY")),
+		jobs:               map[string]*loginJob{},
+		loginCancels:       map[string]context.CancelFunc{},
+		loginFailures:      map[string]loginFailure{},
+		authLocks:          map[string]*sync.Mutex{},
+		client:             &http.Client{Timeout: 5 * time.Minute},
+		logger:             log.New(os.Stdout, "codex-pool ", log.LstdFlags|log.LUTC),
 	}
 	if err := a.load(); err != nil {
 		return nil, err
@@ -210,10 +273,16 @@ func (a *app) load() error {
 	if err := os.MkdirAll(filepath.Join(a.dataDir, "state"), 0o700); err != nil {
 		return fmt.Errorf("create data directory: %w", err)
 	}
-	a.config = config{DefaultModel: envOr("CODEX_POOL_DEFAULT_MODEL", "gpt-5.4"), ModelAliases: map[string]string{}}
-	a.state = state{StickySessions: map[string]stickySession{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}}
+	a.config = config{DefaultModel: envOr("CODEX_POOL_DEFAULT_MODEL", "gpt-5.5(xhigh)"), ModelAliases: map[string]string{}}
+	a.state = state{StickySessions: map[string]stickySession{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}}
 	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &a.config); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read config: %w", err)
+	}
+	if configuredDefault := strings.TrimSpace(os.Getenv("CODEX_POOL_DEFAULT_MODEL")); configuredDefault != "" {
+		a.config.DefaultModel = configuredDefault
+	}
+	if strings.TrimSpace(a.config.DefaultModel) == "" {
+		a.config.DefaultModel = "gpt-5.5(xhigh)"
 	}
 	if err := readJSON(filepath.Join(a.dataDir, "state", "runtime.json"), &a.state); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read runtime state: %w", err)
@@ -230,11 +299,30 @@ func (a *app) load() error {
 	if a.state.Health == nil {
 		a.state.Health = map[string]accountHealth{}
 	}
+	if a.state.Quotas == nil {
+		a.state.Quotas = map[string]quotaSnapshot{}
+	}
+	if a.pruneExpiredStickySessionsLocked(time.Now().UTC()) {
+		_ = a.saveLocked()
+	}
 	for i := range a.config.Accounts {
+		a.config.Accounts[i].Email = normalizeEmail(a.config.Accounts[i].Email)
+		a.config.Accounts[i].PlanType = normalizePlanType(a.config.Accounts[i].PlanType)
+		a.config.Accounts[i].PlanRank = planRank(a.config.Accounts[i].PlanType)
+		if strings.TrimSpace(a.config.Accounts[i].Label) == "" {
+			a.config.Accounts[i].Label = accountDisplayName(a.config.Accounts[i])
+		}
 		if isCodexDeviceAuth(a.config.Accounts[i]) {
 			a.config.Accounts[i].CodexHome = a.accountCodexHome(a.config.Accounts[i].ID)
 			a.config.Accounts[i].UpstreamBaseURL = ""
 			a.config.Accounts[i].UpstreamAPIKey = ""
+		}
+	}
+	if a.codexGatewayMode != "direct" {
+		for _, account := range a.config.Accounts {
+			if isCodexDeviceAuth(account) {
+				_ = a.syncCliproxyAuth(account, false)
+			}
 		}
 	}
 	if len(a.config.Accounts) == 0 && os.Getenv("CODEX_POOL_UPSTREAM_BASE_URL") != "" {
@@ -273,6 +361,7 @@ func (a *app) serve() error {
 		return fmt.Errorf("listen admin API: %w", err)
 	}
 	a.logger.Printf("public API listening on %s; admin listening on %s", a.publicAddress, a.adminAddress)
+	a.startQuotaRefresher(context.Background())
 	errCh := make(chan error, 2)
 	go func() { errCh <- public.Serve(publicListener) }()
 	go func() { errCh <- admin.Serve(adminListener) }()
@@ -281,6 +370,38 @@ func (a *app) serve() error {
 		return nil
 	}
 	return err
+}
+
+func (a *app) startQuotaRefresher(ctx context.Context) {
+	go func() {
+		a.refreshAllCodexQuotas(ctx)
+		ticker := time.NewTicker(quotaRefreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.refreshAllCodexQuotas(ctx)
+			}
+		}
+	}()
+}
+
+func (a *app) refreshAllCodexQuotas(ctx context.Context) {
+	a.mu.RLock()
+	accountIDs := make([]string, 0, len(a.config.Accounts))
+	for _, account := range a.config.Accounts {
+		if isCodexDeviceAuth(account) {
+			accountIDs = append(accountIDs, account.ID)
+		}
+	}
+	a.mu.RUnlock()
+	for _, accountID := range accountIDs {
+		if _, err := a.refreshAccountQuota(ctx, accountID); err != nil {
+			a.logger.Printf("quota refresh skipped for %s: %s", accountID, err)
+		}
+	}
 }
 
 func (a *app) publicMux() http.Handler {
@@ -301,6 +422,7 @@ func (a *app) adminMux() http.Handler {
 	mux.HandleFunc("GET /admin/assets/app.css", handleAdminCSS)
 	mux.HandleFunc("GET /admin/assets/app.js", handleAdminJS)
 	mux.HandleFunc("GET /admin/api/public-dashboard", a.handlePublicDashboard)
+	mux.HandleFunc("POST /admin/api/public-dashboard/accounts/", a.handlePublicAccountAction)
 	mux.HandleFunc("POST /admin/api/login", a.handleAdminLogin)
 	mux.HandleFunc("POST /admin/api/logout", a.requireAdmin(a.handleAdminLogout))
 	mux.HandleFunc("GET /admin/api/state", a.requireAdmin(a.handleAdminState))
@@ -309,6 +431,7 @@ func (a *app) adminMux() http.Handler {
 	mux.HandleFunc("GET /admin/api/accounts/health", a.requireAdmin(a.handleAccountHealth))
 	mux.HandleFunc("POST /admin/api/accounts/quota/refresh-all", a.requireAdmin(a.handleRefreshAllQuota))
 	mux.HandleFunc("GET /admin/api/jobs/", a.requireAdmin(a.handleJob))
+	mux.HandleFunc("POST /admin/api/jobs/", a.requireAdmin(a.handleJobCancel))
 	mux.HandleFunc("GET /admin/api/sticky-sessions", a.requireAdmin(a.handleStickySessions))
 	mux.HandleFunc("DELETE /admin/api/sticky-sessions/", a.requireAdmin(a.handleStickySessionDelete))
 	mux.HandleFunc("POST /admin/api/accounts/", a.requireAdmin(a.handleAccountAction))
@@ -398,7 +521,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	}
 	stickyKey := a.stickyKey(r, payload, model)
 	excluded := map[string]bool{}
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < a.proxyAttemptLimit(); attempt++ {
 		candidate, err := a.selectAccount(stickyKey, model, excluded)
 		if err != nil {
 			writeOpenAIError(w, http.StatusServiceUnavailable, "all_accounts_cooling_down", err.Error())
@@ -440,36 +563,56 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 
 func (a *app) prepareUpstreamRequest(candidate account, body []byte, chat bool) (string, []byte, bool, error) {
 	base := strings.TrimRight(candidate.UpstreamBaseURL, "/")
-	if base == "" && isCodexDeviceAuth(candidate) {
+	if a.usesCliproxySidecar(candidate) {
+		base = a.cliproxyBaseURL
+	} else if base == "" && isCodexDeviceAuth(candidate) {
 		base = a.codexBaseURL
 	}
 	if base == "" {
 		return "", nil, false, errors.New("selected account has no upstreamBaseUrl")
 	}
+	var endpoint string
+	var outbound []byte
+	convertResponse := false
 	if !chat || normalWireAPI(candidate.WireAPI) == "chat_completions" {
 		path := "/responses"
 		if chat {
 			path = "/chat/completions"
 		}
-		return base + path, body, false, nil
+		endpoint = base + path
+		outbound = body
+	} else {
+		var chatRequest map[string]any
+		if err := json.Unmarshal(body, &chatRequest); err != nil {
+			return "", nil, false, err
+		}
+		input := make([]map[string]any, 0)
+		if messages, ok := chatRequest["messages"].([]any); ok {
+			for _, raw := range messages {
+				message, _ := raw.(map[string]any)
+				input = append(input, map[string]any{"role": message["role"], "content": message["content"]})
+			}
+		}
+		responsesRequest := map[string]any{"model": chatRequest["model"], "input": input}
+		if stream, _ := chatRequest["stream"].(bool); stream {
+			responsesRequest["stream"] = true
+		}
+		converted, err := json.Marshal(responsesRequest)
+		if err != nil {
+			return "", nil, false, err
+		}
+		endpoint = base + "/responses"
+		outbound = converted
+		convertResponse = true
 	}
-	var chatRequest map[string]any
-	if err := json.Unmarshal(body, &chatRequest); err != nil {
-		return "", nil, false, err
-	}
-	input := make([]map[string]any, 0)
-	if messages, ok := chatRequest["messages"].([]any); ok {
-		for _, raw := range messages {
-			message, _ := raw.(map[string]any)
-			input = append(input, map[string]any{"role": message["role"], "content": message["content"]})
+	if a.usesCliproxySidecar(candidate) {
+		var err error
+		outbound, err = withCliproxyAccountModel(outbound, candidate.ID)
+		if err != nil {
+			return "", nil, false, err
 		}
 	}
-	responsesRequest := map[string]any{"model": chatRequest["model"], "input": input}
-	if stream, _ := chatRequest["stream"].(bool); stream {
-		responsesRequest["stream"] = true
-	}
-	converted, err := json.Marshal(responsesRequest)
-	return base + "/responses", converted, true, err
+	return endpoint, outbound, convertResponse, nil
 }
 
 func (a *app) forward(ctx context.Context, candidate account, endpoint string, body []byte, accept string) (*http.Response, error) {
@@ -481,15 +624,23 @@ func (a *app) forward(ctx context.Context, candidate account, endpoint string, b
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}
-	if candidate.UpstreamAPIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+candidate.UpstreamAPIKey)
-	} else if isCodexDeviceAuth(candidate) {
-		if err := a.refreshCodexAuthIfNeeded(candidate); err != nil {
+	if a.usesCliproxySidecar(candidate) {
+		if err := a.syncCliproxyAuth(candidate, false); err != nil {
 			return nil, err
 		}
-		auth, err := a.codexAuth(candidate)
+		if a.cliproxyAPIKey == "" {
+			return nil, errors.New("cliproxy sidecar API key is unavailable")
+		}
+		req.Header.Set("Authorization", "Bearer "+a.cliproxyAPIKey)
+	} else if candidate.UpstreamAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+candidate.UpstreamAPIKey)
+	} else if isCodexDeviceAuth(candidate) {
+		auth, err := a.refreshedCodexAuthContext(ctx, candidate)
 		if err != nil {
 			return nil, err
+		}
+		if auth.AccountID == "" {
+			auth.AccountID = candidate.AccountID
 		}
 		req.Header.Set("Authorization", "Bearer "+auth.AccessToken)
 		if auth.AccountID != "" {
@@ -500,6 +651,27 @@ func (a *app) forward(ctx context.Context, candidate account, endpoint string, b
 		}
 	}
 	return a.client.Do(req)
+}
+
+func (a *app) usesCliproxySidecar(item account) bool {
+	return isCodexDeviceAuth(item) && a.codexGatewayMode != "direct"
+}
+
+func cliproxyAccountPrefix(accountID string) string {
+	return "codex-pool-" + accountID
+}
+
+func withCliproxyAccountModel(body []byte, accountID string) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	model, _ := payload["model"].(string)
+	if strings.TrimSpace(model) == "" {
+		return nil, errors.New("request model is required for cliproxy sidecar")
+	}
+	payload["model"] = cliproxyAccountPrefix(accountID) + "/" + model
+	return json.Marshal(payload)
 }
 
 func (a *app) writeChatFromResponse(w http.ResponseWriter, response *http.Response, model string) {
@@ -605,14 +777,47 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 	now := time.Now().UTC()
 	accounts := make([]map[string]any, 0, len(a.config.Accounts))
 	for index, item := range a.config.Accounts {
-		status, _ := a.accountStatusLocked(item, now)
-		label := strings.TrimSpace(item.Label)
-		if label == "" {
-			label = fmt.Sprintf("Account %d", index+1)
-		}
-		accounts = append(accounts, map[string]any{"label": label, "status": status, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels})
+		accounts = append(accounts, a.publicDashboardAccountLocked(item, index, now))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.dashboardSummaryLocked(now), "accounts": accounts}})
+}
+
+func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/admin/api/public-dashboard/accounts/"), "/")
+	if len(parts) != 2 || parts[0] == "" {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "public account action not found")
+		return
+	}
+	ref, action := parts[0], parts[1]
+	if action != "pool-add" && action != "pool-remove" {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "public account action not found")
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now().UTC()
+	for index := range a.config.Accounts {
+		item := &a.config.Accounts[index]
+		if !a.publicAccountRefMatchesLocked(item.ID, ref) {
+			continue
+		}
+		switch action {
+		case "pool-add":
+			item.Enabled = true
+			item.InPool = true
+		case "pool-remove":
+			item.InPool = false
+			a.clearStickyForAccountLocked(item.ID)
+		}
+		item.UpdatedAt = now
+		if err := a.saveLocked(); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "storage_error", "unable to persist account")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": a.publicDashboardAccountLocked(*item, index, now)})
+		return
+	}
+	writeOpenAIError(w, http.StatusNotFound, "not_found", "account not found")
 }
 
 func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
@@ -627,10 +832,9 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid account JSON")
 		return
 	}
-	if !validAccountID(input.ID) {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "id is required")
-		return
-	}
+	input.ID = strings.TrimSpace(input.ID)
+	input.Email = normalizeEmail(input.Email)
+	input.Label = strings.TrimSpace(input.Label)
 	input.UpstreamBaseURL = strings.TrimRight(input.UpstreamBaseURL, "/")
 	input.WireAPI = normalWireAPI(input.WireAPI)
 	if input.AuthType == "" {
@@ -641,11 +845,16 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if isCodexDeviceAuth(input) {
-		input.UpstreamBaseURL = ""
-		input.UpstreamAPIKey = ""
-		input.CodexHome = a.accountCodexHome(input.ID)
-	} else if strings.TrimSpace(input.UpstreamBaseURL) == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "upstreamBaseUrl is required for provider API key accounts")
+		input.AccountID = ""
+		input.PlanType = ""
+		input.PlanRank = 0
+	} else {
+		input.PlanType = normalizePlanType(input.PlanType)
+		input.PlanRank = planRank(input.PlanType)
+	}
+	generateID := input.ID == ""
+	if !generateID && !validAccountID(input.ID) {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "id must contain only letters, numbers, underscores, or dashes")
 		return
 	}
 	now := time.Now().UTC()
@@ -653,6 +862,22 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	input.UpdatedAt = now
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if generateID {
+		input.ID = a.uniqueAccountIDLocked(accountIDBase(input.Email, input.PlanType))
+	}
+	if input.Label == "" {
+		input.Label = accountDisplayName(input)
+	}
+	if isCodexDeviceAuth(input) {
+		input.UpstreamBaseURL = ""
+		input.UpstreamAPIKey = ""
+		input.AllowedModels = nil
+		input.ExcludedModels = nil
+		input.CodexHome = a.accountCodexHome(input.ID)
+	} else if strings.TrimSpace(input.UpstreamBaseURL) == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "upstreamBaseUrl is required for provider API key accounts")
+		return
+	}
 	if a.accountLocked(input.ID) != nil {
 		writeOpenAIError(w, http.StatusConflict, "account_exists", "account id already exists")
 		return
@@ -676,12 +901,23 @@ func (a *app) handleAccountHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items})
 }
 
-func (a *app) handleRefreshAllQuota(w http.ResponseWriter, _ *http.Request) {
+func (a *app) handleRefreshAllQuota(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	results := make([]map[string]any, 0, len(a.config.Accounts))
+	accountIDs := make([]string, 0, len(a.config.Accounts))
 	for _, account := range a.config.Accounts {
-		results = append(results, map[string]any{"accountId": account.ID, "ok": true, "quota": nil, "message": "provider API accounts do not expose a common quota endpoint"})
+		if isCodexDeviceAuth(account) {
+			accountIDs = append(accountIDs, account.ID)
+		}
+	}
+	a.mu.RUnlock()
+	results := make([]map[string]any, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		snapshot, err := a.refreshAccountQuota(r.Context(), accountID)
+		if err != nil {
+			results = append(results, map[string]any{"accountId": accountID, "ok": false, "error": map[string]any{"code": "quota_refresh_failed", "message": err.Error()}})
+			continue
+		}
+		results = append(results, map[string]any{"accountId": accountID, "ok": true, "quota": snapshot.Quota, "planType": snapshot.PlanType, "usageUpdatedAt": snapshot.UsageUpdatedAt})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
 }
@@ -698,14 +934,39 @@ func (a *app) handleJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "job": *job})
 }
 
+func (a *app) handleJobCancel(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/admin/api/jobs/")
+	id := strings.TrimSuffix(path, "/cancel")
+	id = strings.TrimSuffix(id, "/")
+	if id == "" || id == path {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "job action not found")
+		return
+	}
+	cancel, job, err := a.cancelLoginJob(id)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", err.Error())
+		return
+	}
+	if cancel != nil {
+		cancel()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "job": job})
+}
+
 func (a *app) handleStickySessions(w http.ResponseWriter, _ *http.Request) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now().UTC()
+	pruned := a.pruneExpiredStickySessionsLocked(now)
 	items := make([]stickySession, 0, len(a.state.StickySessions))
 	for _, item := range a.state.StickySessions {
+		item.ExpiresAt = a.stickyExpiresAt(item)
 		items = append(items, item)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Key < items[j].Key })
+	if pruned {
+		_ = a.saveLocked()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "sessions": items})
 }
 
@@ -733,12 +994,24 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 	}
 	id, action := parts[0], strings.Join(parts[1:], "/")
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	item := a.accountLocked(id)
 	if item == nil {
+		a.mu.Unlock()
 		writeOpenAIError(w, 404, "not_found", "account not found")
 		return
 	}
+	if action == "quota/refresh" {
+		accountID := item.ID
+		a.mu.Unlock()
+		snapshot, err := a.refreshAccountQuota(r.Context(), accountID)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "quota_refresh_failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "quota": snapshot.Quota, "planType": snapshot.PlanType, "usageUpdatedAt": snapshot.UsageUpdatedAt})
+		return
+	}
+	defer a.mu.Unlock()
 	switch action {
 	case "login":
 		if !isCodexDeviceAuth(*item) {
@@ -770,9 +1043,6 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		item.RemainingQuota = request.RemainingQuota
-	case "quota/refresh":
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "quota": nil, "message": "provider API accounts do not expose a common quota endpoint"})
-		return
 	default:
 		writeOpenAIError(w, 404, "not_found", "account action not found")
 		return
@@ -791,14 +1061,21 @@ func (a *app) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 	defer a.mu.Unlock()
 	for i, account := range a.config.Accounts {
 		if account.ID == id {
+			a.cancelLoginJobsForAccountLocked(id)
 			if isCodexDeviceAuth(account) {
 				if err := os.RemoveAll(a.accountRoot(id)); err != nil {
 					writeOpenAIError(w, 500, "storage_error", "unable to purge account credentials")
 					return
 				}
+				if err := os.Remove(a.cliproxyAuthPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+					writeOpenAIError(w, 500, "storage_error", "unable to purge account gateway credentials")
+					return
+				}
 			}
 			a.config.Accounts = append(a.config.Accounts[:i], a.config.Accounts[i+1:]...)
 			delete(a.state.Cooldowns, id)
+			delete(a.state.Health, id)
+			delete(a.state.Quotas, id)
 			a.clearStickyForAccountLocked(id)
 			if err := a.saveLocked(); err != nil {
 				writeOpenAIError(w, 500, "storage_error", "unable to persist account")
@@ -953,6 +1230,12 @@ func (a *app) validSession(token string) bool {
 
 func (a *app) modelsLocked() []string {
 	set := map[string]bool{a.config.DefaultModel: true}
+	if base, _ := parseModel(a.config.DefaultModel); base != "" {
+		set[base] = true
+		for _, tier := range []string{"low", "medium", "high", "xhigh"} {
+			set[fmt.Sprintf("%s(%s)", base, tier)] = true
+		}
+	}
 	for _, account := range a.config.Accounts {
 		for _, model := range account.AllowedModels {
 			set[model] = true
@@ -976,7 +1259,10 @@ func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
 	if existing, ok := a.state.StickySessions[stickyKey]; ok && !excluded[existing.AccountID] {
-		if item := a.accountLocked(existing.AccountID); item != nil && a.usableLocked(*item, model, now) {
+		if a.stickySessionExpiredLocked(existing, now) {
+			delete(a.state.StickySessions, stickyKey)
+			_ = a.saveLocked()
+		} else if item := a.accountLocked(existing.AccountID); item != nil && a.usableLocked(*item, model, now) {
 			return *item, nil
 		}
 	}
@@ -998,8 +1284,24 @@ func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (
 	return eligible[0], nil
 }
 
+func (a *app) proxyAttemptLimit() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	accountCount := len(a.config.Accounts)
+	if accountCount <= 0 {
+		return 1
+	}
+	if a.maxRetryAccounts > 0 && a.maxRetryAccounts < accountCount {
+		return a.maxRetryAccounts
+	}
+	return accountCount
+}
+
 func (a *app) usableLocked(item account, model string, now time.Time) bool {
 	if !item.Enabled || !item.InPool || !allowedModel(item, model) {
+		return false
+	}
+	if item.RemainingQuota != nil && *item.RemainingQuota <= 0 {
 		return false
 	}
 	if isCodexDeviceAuth(item) {
@@ -1046,10 +1348,51 @@ func (a *app) markSuccess(key, model, accountID string) {
 	health.ConsecutiveFailure = 0
 	a.state.Health[accountID] = health
 	prior := a.state.StickySessions[key]
-	a.state.StickySessions[key] = stickySession{Key: key, ModelID: model, AccountID: accountID, CreatedAt: chooseTime(prior.CreatedAt, now), LastSuccessAt: now, FailoverFrom: prior.AccountID}
+	failoverFrom := prior.FailoverFrom
+	if prior.AccountID != "" && prior.AccountID != accountID {
+		failoverFrom = prior.AccountID
+	}
+	a.state.StickySessions[key] = stickySession{Key: key, ModelID: model, AccountID: accountID, CreatedAt: chooseTime(prior.CreatedAt, now), LastSuccessAt: now, ExpiresAt: now.Add(a.stickyTTL()), FailoverFrom: failoverFrom}
 	a.state.RequestCount++
 	a.state.SuccessCount++
 	_ = a.saveLocked()
+}
+
+func (a *app) stickyTTL() time.Duration {
+	if a.sessionAffinityTTL > 0 {
+		return a.sessionAffinityTTL
+	}
+	return sessionAffinityTTLDefault
+}
+
+func (a *app) stickyExpiresAt(item stickySession) time.Time {
+	if !item.ExpiresAt.IsZero() {
+		return item.ExpiresAt
+	}
+	base := item.LastSuccessAt
+	if base.IsZero() {
+		base = item.CreatedAt
+	}
+	if base.IsZero() {
+		return time.Time{}
+	}
+	return base.Add(a.stickyTTL())
+}
+
+func (a *app) stickySessionExpiredLocked(item stickySession, now time.Time) bool {
+	expiresAt := a.stickyExpiresAt(item)
+	return expiresAt.IsZero() || !expiresAt.After(now)
+}
+
+func (a *app) pruneExpiredStickySessionsLocked(now time.Time) bool {
+	changed := false
+	for key, item := range a.state.StickySessions {
+		if a.stickySessionExpiredLocked(item, now) {
+			delete(a.state.StickySessions, key)
+			changed = true
+		}
+	}
+	return changed
 }
 
 func (a *app) accountLocked(id string) *account {
@@ -1179,10 +1522,50 @@ type codexAuthFile struct {
 	} `json:"tokens"`
 }
 
+// cliproxyCodexAuthFile is CLIProxyAPI's file-backed Codex OAuth record. The
+// sidecar owns refreshes of this copy so Pool never races it for a refresh token.
+type cliproxyCodexAuthFile struct {
+	Type         string `json:"type"`
+	Email        string `json:"email,omitempty"`
+	IDToken      string `json:"id_token,omitempty"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	AccountID    string `json:"account_id,omitempty"`
+	LastRefresh  string `json:"last_refresh,omitempty"`
+	Expire       string `json:"expired,omitempty"`
+	Prefix       string `json:"prefix"`
+	PlanType     string `json:"plan_type,omitempty"`
+}
+
 type codexRefreshResponse struct {
 	IDToken      string `json:"id_token"`
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
+}
+
+type codexUsageResponse struct {
+	PlanType            string                `json:"plan_type"`
+	RateLimit           *codexRateLimitInfo   `json:"rate_limit"`
+	CodeReviewRateLimit *codexRateLimitInfo   `json:"code_review_rate_limit"`
+	ResetCredits        *codexResetCreditInfo `json:"rate_limit_reset_credits"`
+}
+
+type codexRateLimitInfo struct {
+	Allowed         *bool            `json:"allowed"`
+	LimitReached    *bool            `json:"limit_reached"`
+	PrimaryWindow   *codexWindowInfo `json:"primary_window"`
+	SecondaryWindow *codexWindowInfo `json:"secondary_window"`
+}
+
+type codexWindowInfo struct {
+	UsedPercent        *int   `json:"used_percent"`
+	LimitWindowSeconds *int64 `json:"limit_window_seconds"`
+	ResetAfterSeconds  *int64 `json:"reset_after_seconds"`
+	ResetAt            *int64 `json:"reset_at"`
+}
+
+type codexResetCreditInfo struct {
+	AvailableCount *int64 `json:"available_count"`
 }
 
 func (a *app) codexAuth(item account) (codexAuthInfo, error) {
@@ -1220,7 +1603,117 @@ func (a *app) codexAuth(item account) (codexAuthInfo, error) {
 	return info, nil
 }
 
+func (a *app) cliproxyAuthPath(accountID string) string {
+	return filepath.Join(a.dataDir, "cliproxy", "auths", accountID+".json")
+}
+
+func (a *app) syncCliproxyAuth(item account, force bool) error {
+	if !a.usesCliproxySidecar(item) {
+		return nil
+	}
+	lock := a.codexAuthLock(item.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	return a.syncCliproxyAuthLocked(item, force)
+}
+
+func (a *app) syncCliproxyAuthLocked(item account, force bool) error {
+	path := a.cliproxyAuthPath(item.ID)
+	if !force {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect cliproxy auth for account %s: %w", item.ID, err)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(a.accountCodexHome(item.ID), "auth.json"))
+	if err != nil {
+		return fmt.Errorf("codex auth is missing for account %s", item.ID)
+	}
+	var source codexAuthFile
+	if err := json.Unmarshal(data, &source); err != nil || source.Tokens == nil || strings.TrimSpace(source.Tokens.AccessToken) == "" {
+		return fmt.Errorf("codex auth is invalid for account %s", item.ID)
+	}
+	info, err := a.codexAuth(item)
+	if err != nil {
+		return err
+	}
+	accountID := info.AccountID
+	if accountID == "" {
+		accountID = item.AccountID
+	}
+	record := cliproxyCodexAuthFile{
+		Type:         "codex",
+		Email:        normalizeEmail(chooseString(info.Email, item.Email)),
+		IDToken:      source.Tokens.IDToken,
+		AccessToken:  source.Tokens.AccessToken,
+		RefreshToken: source.Tokens.RefreshToken,
+		AccountID:    accountID,
+		Prefix:       cliproxyAccountPrefix(item.ID),
+		PlanType:     normalizePlanType(chooseString(info.PlanType, item.PlanType)),
+	}
+	if source.LastRefresh != nil {
+		record.LastRefresh = source.LastRefresh.UTC().Format(time.RFC3339)
+	}
+	if expiry, ok := jwtExpiry(source.Tokens.AccessToken); ok {
+		record.Expire = expiry.UTC().Format(time.RFC3339)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create cliproxy auth directory: %w", err)
+	}
+	if err := writeJSONAtomic(path, record); err != nil {
+		return fmt.Errorf("write cliproxy auth for account %s: %w", item.ID, err)
+	}
+	return nil
+}
+
+func (a *app) cliproxyCodexAuth(item account) (codexAuthInfo, error) {
+	if err := a.syncCliproxyAuth(item, false); err != nil {
+		return codexAuthInfo{}, err
+	}
+	path := a.cliproxyAuthPath(item.ID)
+	var record cliproxyCodexAuthFile
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		data, readErr := os.ReadFile(path)
+		if readErr == nil {
+			err = json.Unmarshal(data, &record)
+		} else {
+			err = readErr
+		}
+		if err == nil && strings.TrimSpace(record.AccessToken) != "" {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if err != nil || strings.TrimSpace(record.AccessToken) == "" {
+		return codexAuthInfo{}, fmt.Errorf("cliproxy auth is unavailable for account %s", item.ID)
+	}
+	info := codexAuthInfo{AccessToken: strings.TrimSpace(record.AccessToken), AccountID: strings.TrimSpace(record.AccountID), Email: normalizeEmail(record.Email), PlanType: normalizePlanType(record.PlanType)}
+	if claims := jwtPayload(record.IDToken); claims != nil {
+		if info.Email == "" {
+			info.Email = normalizeEmail(claimString(claims, "email"))
+		}
+		if authClaims, _ := claims["https://api.openai.com/auth"].(map[string]any); authClaims != nil {
+			if info.AccountID == "" {
+				info.AccountID = claimString(authClaims, "chatgpt_account_id")
+			}
+			if info.PlanType == "" {
+				info.PlanType = normalizePlanType(claimString(authClaims, "chatgpt_plan_type"))
+			}
+			if fedramp, ok := authClaims["chatgpt_account_is_fedramp"].(bool); ok {
+				info.FedRAMP = fedramp
+			}
+		}
+	}
+	return info, nil
+}
+
 func (a *app) refreshCodexAuthIfNeeded(item account) error {
+	return a.refreshCodexAuthIfNeededContext(context.Background(), item)
+}
+
+func (a *app) refreshCodexAuthIfNeededContext(ctx context.Context, item account) error {
 	home := a.accountCodexHome(item.ID)
 	path := filepath.Join(home, "auth.json")
 	data, err := os.ReadFile(path)
@@ -1238,7 +1731,7 @@ func (a *app) refreshCodexAuthIfNeeded(item account) error {
 	if !ok || time.Until(expiry) > codexTokenRefreshWindow {
 		return nil
 	}
-	refreshed, err := a.requestCodexTokenRefresh(auth.Tokens.RefreshToken)
+	refreshed, err := a.requestCodexTokenRefreshContext(ctx, auth.Tokens.RefreshToken)
 	if err != nil {
 		return err
 	}
@@ -1259,7 +1752,46 @@ func (a *app) refreshCodexAuthIfNeeded(item account) error {
 	return nil
 }
 
+func (a *app) refreshedCodexAuth(item account) (codexAuthInfo, error) {
+	return a.refreshedCodexAuthContext(context.Background(), item)
+}
+
+func (a *app) refreshedCodexAuthContext(ctx context.Context, item account) (codexAuthInfo, error) {
+	lock := a.codexAuthLock(item.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := a.refreshCodexAuthIfNeededContext(ctx, item); err != nil {
+		return codexAuthInfo{}, err
+	}
+	return a.codexAuth(item)
+}
+
+func (a *app) activeCodexAuthContext(ctx context.Context, item account) (codexAuthInfo, error) {
+	if a.usesCliproxySidecar(item) {
+		return a.cliproxyCodexAuth(item)
+	}
+	return a.refreshedCodexAuthContext(ctx, item)
+}
+
+func (a *app) codexAuthLock(accountID string) *sync.Mutex {
+	a.authLockMu.Lock()
+	defer a.authLockMu.Unlock()
+	if a.authLocks == nil {
+		a.authLocks = map[string]*sync.Mutex{}
+	}
+	lock := a.authLocks[accountID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		a.authLocks[accountID] = lock
+	}
+	return lock
+}
+
 func (a *app) requestCodexTokenRefresh(refreshToken string) (codexRefreshResponse, error) {
+	return a.requestCodexTokenRefreshContext(context.Background(), refreshToken)
+}
+
+func (a *app) requestCodexTokenRefreshContext(ctx context.Context, refreshToken string) (codexRefreshResponse, error) {
 	request := map[string]string{
 		"client_id":     envOr("CODEX_APP_SERVER_LOGIN_CLIENT_ID", codexOAuthClientIDDefault),
 		"grant_type":    "refresh_token",
@@ -1270,7 +1802,7 @@ func (a *app) requestCodexTokenRefresh(refreshToken string) (codexRefreshRespons
 		return codexRefreshResponse{}, err
 	}
 	endpoint := envOr("CODEX_REFRESH_TOKEN_URL_OVERRIDE", codexRefreshURLDefault)
-	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
 	if err != nil {
 		return codexRefreshResponse{}, err
 	}
@@ -1288,6 +1820,271 @@ func (a *app) requestCodexTokenRefresh(refreshToken string) (codexRefreshRespons
 		return codexRefreshResponse{}, fmt.Errorf("decode refreshed codex token: %w", err)
 	}
 	return refreshed, nil
+}
+
+func (a *app) codexUsageURL() string {
+	if value := strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_USAGE_URL")); value != "" {
+		return value
+	}
+	return strings.TrimRight(a.codexBaseURL, "/") + "/wham/usage"
+}
+
+func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaSnapshot, error) {
+	ctx, cancel := context.WithTimeout(ctx, quotaRefreshTimeout)
+	defer cancel()
+
+	a.mu.RLock()
+	item := a.accountLocked(accountID)
+	if item == nil {
+		a.mu.RUnlock()
+		return quotaSnapshot{}, errors.New("account not found")
+	}
+	accountCopy := *item
+	a.mu.RUnlock()
+
+	if !isCodexDeviceAuth(accountCopy) {
+		return quotaSnapshot{AccountID: accountID}, errors.New("quota refresh is only available for Codex device-auth accounts")
+	}
+	auth, err := a.activeCodexAuthContext(ctx, accountCopy)
+	if err != nil {
+		if ctx.Err() != nil {
+			return quotaSnapshot{}, errors.New("quota refresh cancelled")
+		}
+		a.saveQuotaError(accountID, "token_refresh_failed", "refresh codex token failed")
+		return quotaSnapshot{}, errors.New("refresh codex token failed")
+	}
+	if auth.AccountID == "" {
+		auth.AccountID = accountCopy.AccountID
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, a.codexUsageURL(), nil)
+	if err != nil {
+		a.saveQuotaError(accountID, "request_invalid", "quota request could not be created")
+		return quotaSnapshot{}, errors.New("quota request could not be created")
+	}
+	request.Header.Set("Authorization", "Bearer "+auth.AccessToken)
+	request.Header.Set("Accept", "application/json")
+	if auth.AccountID != "" {
+		request.Header.Set("ChatGPT-Account-Id", auth.AccountID)
+	}
+	if auth.FedRAMP {
+		request.Header.Set("X-OpenAI-Fedramp", "true")
+	}
+	response, err := a.client.Do(request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return quotaSnapshot{}, errors.New("quota refresh cancelled")
+		}
+		a.saveQuotaError(accountID, "request_failed", "quota request failed")
+		return quotaSnapshot{}, errors.New("quota request failed")
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxRequestBody))
+	if err != nil {
+		if ctx.Err() != nil {
+			return quotaSnapshot{}, errors.New("quota refresh cancelled")
+		}
+		a.saveQuotaError(accountID, "read_failed", "quota response could not be read")
+		return quotaSnapshot{}, errors.New("quota response could not be read")
+	}
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		code := extractUpstreamErrorCode(body)
+		message := fmt.Sprintf("quota API returned status %d", response.StatusCode)
+		if code != "" {
+			message += " [" + code + "]"
+		}
+		a.saveQuotaError(accountID, codeOr(code, "upstream_status"), message)
+		return quotaSnapshot{}, errors.New(message)
+	}
+	var usage codexUsageResponse
+	if err := json.Unmarshal(body, &usage); err != nil {
+		a.saveQuotaError(accountID, "decode_failed", "quota response JSON could not be decoded")
+		return quotaSnapshot{}, errors.New("quota response JSON could not be decoded")
+	}
+	quota := quotaFromUsage(usage, time.Now().UTC())
+	remaining := remainingQuotaHint(quota)
+	hasQuotaWindow := quota.Hourly.Present || quota.Weekly.Present
+	now := time.Now().UTC()
+	plan := normalizePlanType(chooseString(usage.PlanType, accountCopy.PlanType))
+	snapshot := quotaSnapshot{AccountID: accountID, PlanType: plan, Quota: &quota, UsageUpdatedAt: now}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state.Quotas == nil {
+		a.state.Quotas = map[string]quotaSnapshot{}
+	}
+	item = a.accountLocked(accountID)
+	if item == nil {
+		return quotaSnapshot{}, errors.New("account no longer exists")
+	}
+	if usage.PlanType != "" {
+		item.PlanType = plan
+		item.PlanRank = planRank(plan)
+	}
+	if auth.Email != "" {
+		item.Email = normalizeEmail(auth.Email)
+	}
+	if auth.AccountID != "" {
+		item.AccountID = auth.AccountID
+	}
+	item.Label = accountDisplayName(*item)
+	if hasQuotaWindow {
+		item.RemainingQuota = &remaining
+	} else {
+		item.RemainingQuota = nil
+	}
+	item.UpdatedAt = now
+	a.state.Quotas[accountID] = snapshot
+	if err := a.saveLocked(); err != nil {
+		return quotaSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+func (a *app) saveQuotaError(accountID, code, message string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.accountLocked(accountID) == nil {
+		return
+	}
+	if a.state.Quotas == nil {
+		a.state.Quotas = map[string]quotaSnapshot{}
+	}
+	prior := a.state.Quotas[accountID]
+	prior.AccountID = accountID
+	prior.QuotaError = &quotaErrorInfo{Code: code, Message: message, Timestamp: time.Now().UTC()}
+	a.state.Quotas[accountID] = prior
+	_ = a.saveLocked()
+}
+
+func extractUpstreamErrorCode(body []byte) string {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	if code := nestedString(payload, "detail", "code"); code != "" {
+		return sanitizedErrorCode(code)
+	}
+	if code := nestedString(payload, "error", "code"); code != "" {
+		return sanitizedErrorCode(code)
+	}
+	if code, _ := payload["code"].(string); code != "" {
+		return sanitizedErrorCode(code)
+	}
+	return ""
+}
+
+func sanitizedErrorCode(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 64 {
+		return ""
+	}
+	for _, character := range value {
+		if !(character >= 'a' && character <= 'z') &&
+			!(character >= 'A' && character <= 'Z') &&
+			!(character >= '0' && character <= '9') &&
+			character != '_' && character != '-' && character != '.' {
+			return ""
+		}
+	}
+	return value
+}
+
+func nestedString(payload map[string]any, objectName, key string) string {
+	object, _ := payload[objectName].(map[string]any)
+	if object == nil {
+		return ""
+	}
+	value, _ := object[key].(string)
+	return value
+}
+
+func quotaFromUsage(usage codexUsageResponse, now time.Time) accountQuota {
+	var primary, secondary *codexWindowInfo
+	if usage.RateLimit != nil {
+		primary = usage.RateLimit.PrimaryWindow
+		secondary = usage.RateLimit.SecondaryWindow
+	}
+	quota := accountQuota{
+		Hourly: normalizeQuotaWindow(primary, now),
+		Weekly: normalizeQuotaWindow(secondary, now),
+	}
+	if usage.RateLimit != nil && !quota.Hourly.Present && !quota.Weekly.Present {
+		limitReached := usage.RateLimit.LimitReached != nil && *usage.RateLimit.LimitReached
+		notAllowed := usage.RateLimit.Allowed != nil && !*usage.RateLimit.Allowed
+		if limitReached || notAllowed {
+			quota.Hourly = quotaWindow{Percentage: 0, Present: true}
+		}
+	}
+	return quota
+}
+
+func normalizeQuotaWindow(window *codexWindowInfo, now time.Time) quotaWindow {
+	if window == nil {
+		return quotaWindow{Percentage: 100, Present: false}
+	}
+	used := 0
+	if window.UsedPercent != nil {
+		used = clampInt(*window.UsedPercent, 0, 100)
+	}
+	var resetAt *int64
+	if window.ResetAt != nil {
+		value := *window.ResetAt
+		resetAt = &value
+	} else if window.ResetAfterSeconds != nil && *window.ResetAfterSeconds >= 0 {
+		value := now.Add(time.Duration(*window.ResetAfterSeconds) * time.Second).Unix()
+		resetAt = &value
+	}
+	var windowMinutes *int64
+	if window.LimitWindowSeconds != nil && *window.LimitWindowSeconds > 0 {
+		value := (*window.LimitWindowSeconds + 59) / 60
+		windowMinutes = &value
+	}
+	return quotaWindow{Percentage: 100 - used, ResetAt: resetAt, WindowMinutes: windowMinutes, Present: true}
+}
+
+func remainingQuotaHint(quota accountQuota) int {
+	values := make([]int, 0, 2)
+	if quota.Hourly.Present {
+		values = append(values, quota.Hourly.Percentage)
+	}
+	if quota.Weekly.Present {
+		values = append(values, quota.Weekly.Percentage)
+	}
+	if len(values) == 0 {
+		return 100
+	}
+	result := values[0]
+	for _, value := range values[1:] {
+		if value < result {
+			result = value
+		}
+	}
+	return clampInt(result, 0, 100)
+}
+
+func clampInt(value, min, max int) int {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func codeOr(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func chooseString(value, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return fallback
 }
 
 func jwtPayload(token string) map[string]any {
@@ -1336,8 +2133,21 @@ func (a *app) startLoginJobLocked(item account) loginJob {
 	if a.jobs == nil {
 		a.jobs = map[string]*loginJob{}
 	}
+	if a.loginCancels == nil {
+		a.loginCancels = map[string]context.CancelFunc{}
+	}
+	for _, job := range a.jobs {
+		if job.AccountID != item.ID {
+			continue
+		}
+		switch job.Status {
+		case "running", "waiting_for_user", "finalizing":
+			return *job
+		}
+	}
 	home := a.accountCodexHome(item.ID)
 	jobID := fmt.Sprintf("job-login-%s-%d-%s", item.ID, time.Now().Unix(), randomID())
+	ctx, cancel := context.WithCancel(context.Background())
 	now := time.Now().UTC()
 	job := &loginJob{
 		ID:        jobID,
@@ -1349,16 +2159,29 @@ func (a *app) startLoginJobLocked(item account) loginJob {
 		UpdatedAt: now,
 	}
 	a.jobs[jobID] = job
-	go a.runLoginJob(jobID, item.ID, home)
+	a.loginCancels[jobID] = cancel
+	go a.runLoginJob(ctx, jobID, item.ID, home)
 	return *job
 }
 
-func (a *app) runLoginJob(jobID, accountID, codexHome string) {
+func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome string) {
 	if err := os.MkdirAll(codexHome, 0o700); err != nil {
 		a.finishLoginJob(jobID, "failed", "", "", fmt.Sprintf("create CODEX_HOME: %v", err))
 		return
 	}
-	cmd := exec.Command("codex", "-c", "cli_auth_credentials_store=\"file\"", "login", "--device-auth")
+	cmd := exec.CommandContext(ctx, "codex", "-c", "cli_auth_credentials_store=\"file\"", "login", "--device-auth")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			return nil
+		}
+		return err
+	}
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Env = codexLoginEnv(codexHome)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1404,6 +2227,10 @@ func (a *app) runLoginJob(jobID, accountID, codexHome string) {
 	text := output.String()
 	outputMu.Unlock()
 	verificationURL, userCode := parseDeviceAuthPrompt(text)
+	if ctx.Err() != nil || a.loginJobStatus(jobID) == "cancelled" {
+		a.finishLoginJob(jobID, "cancelled", verificationURL, userCode, "Codex device auth login cancelled")
+		return
+	}
 	if err != nil {
 		message := strings.TrimSpace(text)
 		if message == "" {
@@ -1412,30 +2239,116 @@ func (a *app) runLoginJob(jobID, accountID, codexHome string) {
 		a.finishLoginJob(jobID, "failed", verificationURL, userCode, redactLoginOutput(message))
 		return
 	}
+	refreshQuotaAccountID := ""
+	continueLogin := false
+	sidecarAccount := account{}
+	syncSidecar := false
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if job := a.jobs[jobID]; job != nil {
+	if job := a.jobs[jobID]; job != nil && job.Status != "cancelled" {
 		now := time.Now().UTC()
-		job.Status = "completed"
-		job.Message = "Codex device auth login completed"
+		job.Status = "finalizing"
+		job.Message = "Refreshing account quota"
 		job.Error = ""
 		job.VerificationURL = verificationURL
 		job.UserCode = userCode
+		job.UpdatedAt = now
+		continueLogin = true
+		if item := a.accountLocked(accountID); item != nil {
+			if auth, err := a.codexAuth(*item); err == nil {
+				if auth.Email != "" {
+					item.Email = auth.Email
+				}
+				if auth.AccountID != "" {
+					item.AccountID = auth.AccountID
+				}
+				if auth.PlanType != "" {
+					item.PlanType = normalizePlanType(auth.PlanType)
+					item.PlanRank = planRank(item.PlanType)
+				}
+				item.Label = accountDisplayName(*item)
+				item.LastLoginAt = time.Now().UTC()
+				item.UpdatedAt = item.LastLoginAt
+				_ = a.saveLocked()
+				refreshQuotaAccountID = accountID
+				if a.usesCliproxySidecar(*item) {
+					sidecarAccount = *item
+					syncSidecar = true
+				}
+			}
+		}
+	}
+	a.mu.Unlock()
+	if !continueLogin || a.loginJobStatus(jobID) == "cancelled" {
+		return
+	}
+	if syncSidecar {
+		if err := a.syncCliproxyAuth(sidecarAccount, true); err != nil {
+			a.finishLoginJob(jobID, "failed", verificationURL, userCode, "Unable to prepare the account gateway")
+			return
+		}
+	}
+	if refreshQuotaAccountID != "" {
+		if _, err := a.refreshAccountQuota(ctx, refreshQuotaAccountID); err != nil && ctx.Err() == nil {
+			a.logger.Printf("quota refresh after login skipped for %s: %s", refreshQuotaAccountID, err)
+		}
+	}
+	if ctx.Err() != nil || a.loginJobStatus(jobID) == "cancelled" {
+		a.finishLoginJob(jobID, "cancelled", verificationURL, userCode, "Codex device auth login cancelled")
+		return
+	}
+	a.finishLoginJob(jobID, "completed", verificationURL, userCode, "Codex device auth login completed")
+}
+
+func (a *app) loginJobStatus(jobID string) string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if job := a.jobs[jobID]; job != nil {
+		return job.Status
+	}
+	return ""
+}
+
+func (a *app) cancelLoginJob(jobID string) (context.CancelFunc, loginJob, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	job := a.jobs[jobID]
+	if job == nil {
+		return nil, loginJob{}, errors.New("job not found")
+	}
+	switch job.Status {
+	case "completed", "failed", "cancelled":
+		return nil, *job, nil
+	}
+	now := time.Now().UTC()
+	job.Status = "cancelled"
+	job.Message = "Codex device auth login cancelled"
+	job.Error = ""
+	job.CompletedAt = now
+	job.UpdatedAt = now
+	cancel := a.loginCancels[jobID]
+	delete(a.loginCancels, jobID)
+	return cancel, *job, nil
+}
+
+func (a *app) cancelLoginJobsForAccountLocked(accountID string) {
+	now := time.Now().UTC()
+	for jobID, job := range a.jobs {
+		if job.AccountID != accountID {
+			continue
+		}
+		switch job.Status {
+		case "completed", "failed", "cancelled":
+			continue
+		}
+		job.Status = "cancelled"
+		job.Message = "Codex device auth login cancelled because the account was removed"
+		job.Error = ""
 		job.CompletedAt = now
 		job.UpdatedAt = now
-	}
-	if item := a.accountLocked(accountID); item != nil {
-		if auth, err := a.codexAuth(*item); err == nil {
-			if auth.Email != "" {
-				item.Email = auth.Email
-			}
-			if auth.AccountID != "" {
-				item.AccountID = auth.AccountID
-			}
-			item.LastLoginAt = time.Now().UTC()
-			item.UpdatedAt = item.LastLoginAt
-			_ = a.saveLocked()
+		if cancel := a.loginCancels[jobID]; cancel != nil {
+			cancel()
 		}
+		delete(a.loginCancels, jobID)
 	}
 }
 
@@ -1446,15 +2359,22 @@ func (a *app) updateLoginJob(jobID, status, verificationURL, userCode, message s
 	if job == nil {
 		return
 	}
+	if job.Status == "cancelled" || job.Status == "completed" || job.Status == "failed" {
+		return
+	}
+	now := time.Now().UTC()
 	job.Status = status
 	if verificationURL != "" {
 		job.VerificationURL = verificationURL
 	}
 	if userCode != "" {
 		job.UserCode = userCode
+		if job.CodeExpiresAt.IsZero() {
+			job.CodeExpiresAt = now.Add(15 * time.Minute)
+		}
 	}
 	job.Message = message
-	job.UpdatedAt = time.Now().UTC()
+	job.UpdatedAt = now
 }
 
 func (a *app) finishLoginJob(jobID, status, verificationURL, userCode, message string) {
@@ -1464,20 +2384,29 @@ func (a *app) finishLoginJob(jobID, status, verificationURL, userCode, message s
 	if job == nil {
 		return
 	}
+	if job.Status == "cancelled" && status != "cancelled" {
+		return
+	}
 	now := time.Now().UTC()
 	job.Status = status
 	job.Message = message
 	if status == "failed" {
 		job.Error = message
+	} else {
+		job.Error = ""
 	}
 	if verificationURL != "" {
 		job.VerificationURL = verificationURL
 	}
 	if userCode != "" {
 		job.UserCode = userCode
+		if job.CodeExpiresAt.IsZero() {
+			job.CodeExpiresAt = now.Add(15 * time.Minute)
+		}
 	}
 	job.CompletedAt = now
 	job.UpdatedAt = now
+	delete(a.loginCancels, jobID)
 }
 
 func codexLoginEnv(codexHome string) []string {
@@ -1573,7 +2502,8 @@ func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]an
 	cooldowns := activeCooldowns(a.state.Cooldowns[item.ID], now)
 	status, reason := a.accountStatusLocked(item, now)
 	health := a.state.Health[item.ID]
-	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "remainingQuota": item.RemainingQuota}
+	quota := a.state.Quotas[item.ID]
+	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
 }
 func (a *app) accountStatusLocked(item account, now time.Time) (string, string) {
 	if !item.Enabled {
@@ -1593,6 +2523,20 @@ func (a *app) accountStatusLocked(item account, now time.Time) (string, string) 
 	if health := a.state.Health[item.ID]; health.ConsecutiveFailure > 0 {
 		return "error", health.LastFailureReason
 	}
+	quotaSnapshot := a.state.Quotas[item.ID]
+	if quotaSnapshot.QuotaError != nil {
+		reason := "Quota refresh failed"
+		if quotaSnapshot.QuotaError.Code != "" {
+			reason += ": " + quotaSnapshot.QuotaError.Code
+		}
+		return "error", reason
+	}
+	if quotaSnapshot.Quota != nil {
+		remaining := remainingQuotaHint(*quotaSnapshot.Quota)
+		if remaining <= 20 {
+			return "low", "Quota window is at or below 20%"
+		}
+	}
 	if item.RemainingQuota != nil && *item.RemainingQuota <= 20 {
 		return "low", "Remaining quota is at or below 20%"
 	}
@@ -1606,7 +2550,221 @@ func publicAccounts(values []account) []map[string]any {
 	return result
 }
 func publicAccount(item account) map[string]any {
-	return map[string]any{"id": item.ID, "label": item.Label, "email": item.Email, "accountId": item.AccountID, "authType": item.AuthType, "codexHome": item.CodexHome, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "upstreamBaseUrl": item.UpstreamBaseURL, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
+	displayName := maskedAccountDisplayName(item)
+	return map[string]any{"id": item.ID, "label": displayName, "displayName": displayName, "email": maskedPublicEmail(item.Email), "planType": item.PlanType, "planRank": item.PlanRank, "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
+}
+
+func (a *app) publicDashboardAccountLocked(item account, index int, now time.Time) map[string]any {
+	status, reason := a.accountStatusLocked(item, now)
+	label := publicDashboardAccountLabel(item, index)
+	quota := a.state.Quotas[item.ID]
+	if quota.QuotaError != nil {
+		reason = "Quota information is temporarily unavailable"
+	}
+	return map[string]any{
+		"label":          label,
+		"email":          maskedPublicEmail(item.Email),
+		"poolRef":        a.publicAccountRefLocked(item.ID),
+		"status":         status,
+		"statusReason":   reason,
+		"enabled":        item.Enabled,
+		"inPool":         item.InPool,
+		"remainingQuota": item.RemainingQuota,
+		"allowedModels":  item.AllowedModels,
+		"quota":          quota.Quota,
+		"usageUpdatedAt": quota.UsageUpdatedAt,
+	}
+}
+
+func maskedPublicEmail(value string) string {
+	value = normalizeEmail(value)
+	parts := strings.Split(value, "@")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	local := parts[0]
+	if len(local) <= 2 {
+		local = local[:1] + "***"
+	} else if len(local) <= 4 {
+		local = local[:2] + "***"
+	} else {
+		local = local[:2] + "***" + local[len(local)-2:]
+	}
+	return local + "@" + parts[1]
+}
+
+func maskedAccountDisplayName(item account) string {
+	maskedEmail := maskedPublicEmail(item.Email)
+	plan := normalizePlanType(item.PlanType)
+	if maskedEmail != "" && plan != "unknown" {
+		return fmt.Sprintf("%s · %s", maskedEmail, planDisplayName(plan))
+	}
+	if maskedEmail != "" {
+		return maskedEmail
+	}
+	label := strings.TrimSpace(item.Label)
+	if label != "" && !strings.Contains(label, "@") {
+		return label
+	}
+	if plan != "unknown" {
+		return planDisplayName(plan) + " account"
+	}
+	return item.ID
+}
+
+func (a *app) publicAccountRefLocked(accountID string) string {
+	key := a.sessionKey
+	if len(key) == 0 {
+		key = []byte("codex-pool-public-account-ref")
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte("public-account:" + accountID))
+	sum := mac.Sum(nil)
+	return base64.RawURLEncoding.EncodeToString(sum[:16])
+}
+
+func (a *app) publicAccountRefMatchesLocked(accountID, ref string) bool {
+	expected := a.publicAccountRefLocked(accountID)
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(ref)) == 1
+}
+
+func normalizeEmail(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizePlanType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, " ", "_")
+	switch value {
+	case "free", "plus", "pro", "team", "enterprise", "edu":
+		return value
+	case "chatgpt_plus":
+		return "plus"
+	case "chatgpt_pro":
+		return "pro"
+	default:
+		if value == "" {
+			return "unknown"
+		}
+		return value
+	}
+}
+
+func planRank(plan string) int {
+	switch normalizePlanType(plan) {
+	case "enterprise":
+		return 500
+	case "team":
+		return 400
+	case "pro":
+		return 300
+	case "plus":
+		return 200
+	case "edu":
+		return 150
+	case "free":
+		return 100
+	default:
+		return 0
+	}
+}
+
+func planDisplayName(plan string) string {
+	normalized := normalizePlanType(plan)
+	switch normalized {
+	case "free":
+		return "Free"
+	case "plus":
+		return "Plus"
+	case "pro":
+		return "Pro"
+	case "team":
+		return "Team"
+	case "enterprise":
+		return "Enterprise"
+	case "edu":
+		return "Edu"
+	case "unknown":
+		return "Unknown tier"
+	default:
+		return strings.ToUpper(normalized[:1]) + normalized[1:]
+	}
+}
+
+func accountDisplayName(item account) string {
+	plan := planDisplayName(item.PlanType)
+	email := strings.TrimSpace(item.Email)
+	if email != "" && normalizePlanType(item.PlanType) != "unknown" {
+		return fmt.Sprintf("%s · %s", email, plan)
+	}
+	if email != "" {
+		return email
+	}
+	if strings.TrimSpace(item.Label) != "" {
+		return item.Label
+	}
+	return item.ID
+}
+
+func publicDashboardAccountLabel(item account, index int) string {
+	plan := normalizePlanType(item.PlanType)
+	if plan != "unknown" {
+		return planDisplayName(plan) + " account"
+	}
+	if strings.TrimSpace(item.Label) != "" && !strings.Contains(item.Label, "@") {
+		return item.Label
+	}
+	return fmt.Sprintf("Account %d", index+1)
+}
+
+func accountIDBase(email, plan string) string {
+	seed := normalizeEmail(email)
+	if seed == "" {
+		seed = "account"
+	}
+	if plan := normalizePlanType(plan); plan != "unknown" {
+		seed += "-" + plan
+	}
+	var builder strings.Builder
+	builder.WriteString("acct-")
+	lastDash := false
+	for _, r := range seed {
+		valid := r >= 'a' && r <= 'z' || r >= '0' && r <= '9'
+		if valid {
+			builder.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+	}
+	id := strings.Trim(builder.String(), "-")
+	if len(id) > 64 {
+		id = strings.TrimRight(id[:64], "-")
+	}
+	if id == "" || id == "acct" {
+		return "acct-account"
+	}
+	return id
+}
+
+func (a *app) uniqueAccountIDLocked(base string) string {
+	base = strings.Trim(base, "-")
+	if !validAccountID(base) {
+		base = "acct-account"
+	}
+	id := base
+	for index := 2; a.accountLocked(id) != nil; index++ {
+		suffix := fmt.Sprintf("-%d", index)
+		prefix := base
+		if len(prefix)+len(suffix) > 80 {
+			prefix = strings.TrimRight(prefix[:80-len(suffix)], "-")
+		}
+		id = prefix + suffix
+	}
+	return id
 }
 func validAccountID(id string) bool {
 	if id == "" || len(id) > 80 {
@@ -1635,6 +2793,39 @@ func envOr(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func codexGatewayModeFromEnv() (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(envOr("CODEX_POOL_CODEX_GATEWAY_MODE", "sidecar")))
+	switch mode {
+	case "sidecar", "direct":
+		return mode, nil
+	default:
+		return "", errors.New("CODEX_POOL_CODEX_GATEWAY_MODE must be sidecar or direct")
+	}
+}
+
+func sessionAffinityTTLFromEnv() (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv("CODEX_POOL_SESSION_AFFINITY_TTL_MS"))
+	if raw == "" {
+		return sessionAffinityTTLDefault, nil
+	}
+	millis, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || millis <= 0 {
+		return 0, fmt.Errorf("CODEX_POOL_SESSION_AFFINITY_TTL_MS must be a positive integer number of milliseconds")
+	}
+	return time.Duration(millis) * time.Millisecond, nil
+}
+func maxRetryAccountsFromEnv() (int, error) {
+	raw := strings.TrimSpace(os.Getenv("CODEX_POOL_MAX_RETRY_ACCOUNTS"))
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("CODEX_POOL_MAX_RETRY_ACCOUNTS must be zero or a positive integer")
+	}
+	return value, nil
 }
 func chooseTime(value, fallback time.Time) time.Time {
 	if value.IsZero() {

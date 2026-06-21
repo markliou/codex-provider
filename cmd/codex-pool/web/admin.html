@@ -61,33 +61,21 @@
             <div class="section-heading"><div><h2 id="sticky-title">Sticky sessions</h2><p id="sticky-count" class="muted"></p></div></div>
             <div id="sticky-list" class="sticky-list"></div>
           </section>
-          <section class="section-block compact" aria-labelledby="traffic-title">
-            <div class="section-heading"><div><h2 id="traffic-title">Traffic</h2><p class="muted">Since service start</p></div></div>
-            <dl id="traffic-stats" class="traffic-stats"></dl>
-          </section>
         </div>
       </section>
     </main>
   </div>
 
-  <dialog id="account-dialog" class="account-dialog">
-    <form id="account-form" method="dialog">
-      <div class="dialog-heading"><div><div class="eyebrow">CODEX ACCOUNT</div><h2>Add account</h2></div><button id="close-dialog-button" class="button quiet" type="button">Close</button></div>
-      <div class="form-grid">
-        <label>Account ID<input name="id" pattern="[A-Za-z0-9_-]+" required></label>
-        <label>Label<input name="label" required></label>
-        <label>Models<input name="allowedModels" placeholder="gpt-5.4, gpt-5.4-mini"></label>
-        <label>Quota hint (%)<input name="remainingQuota" type="number" min="0" max="100" placeholder="Unknown"></label>
-        <label>Priority<input name="priority" type="number" min="0" value="100" required></label>
+  <dialog id="device-auth-dialog" class="device-dialog">
+    <div class="device-auth-panel">
+      <div class="dialog-heading"><div><div class="eyebrow">DEVICE AUTH</div><h2>Codex <span id="device-auth-countdown" class="device-auth-countdown">15:00</span></h2></div><button id="close-device-auth-button" class="button quiet" type="button">Close</button></div>
+      <div class="device-auth-grid">
+        <div class="device-auth-row"><span class="device-auth-label">URL</span><a id="device-auth-url" class="device-auth-value" target="_blank" rel="noreferrer"></a></div>
+        <div class="device-auth-row"><span class="device-auth-label">Code</span><code id="device-auth-code" class="device-auth-code"></code></div>
       </div>
-      <label class="checkbox"><input name="enabled" type="checkbox" checked>Enabled</label>
-      <label class="checkbox"><input name="inPool" type="checkbox" checked>Include in pool</label>
-      <p id="account-form-error" class="form-error" role="alert" hidden></p>
-      <div class="dialog-actions"><button id="cancel-account-button" class="button secondary" type="button">Cancel</button><button class="button primary" type="submit">Add account</button></div>
-    </form>
+    </div>
   </dialog>
 
-  <div id="toast" class="toast" role="status" hidden></div>
   <script src="/admin/assets/app.js" defer></script>
 </body>
 </html>

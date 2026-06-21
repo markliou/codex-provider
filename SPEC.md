@@ -145,11 +145,13 @@ docker run -d \
 | `CODEX_POOL_ALLOW_REMOTE_ADMIN` | no | `false` | Required if admin address is non-loopback. |
 | `CODEX_POOL_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error`. |
 | `CODEX_POOL_REDACT_LOGS` | no | `true` | Redact tokens, auth headers, API keys, refresh tokens. |
-| `CODEX_POOL_DEFAULT_MODEL` | no | implementation-defined | Default model when request omits model. |
-| `CODEX_POOL_CODEX_BASE_URL` | no | `https://chatgpt.com/backend-api` | Codex/ChatGPT backend base URL used for device-auth accounts. |
+| `CODEX_POOL_DEFAULT_MODEL` | no | `gpt-5.5(xhigh)` | Default model when request omits model. |
+| `CODEX_POOL_CODEX_BASE_URL` | no | `https://chatgpt.com/backend-api` | Codex/ChatGPT backend base URL used for quota reads and the legacy direct gateway. |
+| `CODEX_POOL_CODEX_USAGE_URL` | no | `CODEX_POOL_CODEX_BASE_URL + /wham/usage` | Optional quota endpoint override for tests or compatible backends. |
+| `CODEX_POOL_CODEX_GATEWAY_MODE` | no | `sidecar` | `sidecar` routes device-auth inference through the bundled loopback-only CLIProxyAPI executor. `direct` is a compatibility/test override. |
 | `CODEX_POOL_ROUTING_STRATEGY` | no | `sticky_failover` | Routing strategy. |
-| `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session TTL. |
-| `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `3` | Max account failover attempts per request. |
+| `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
+| `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
 
 ### 2.2 Startup safety checks
 
@@ -160,6 +162,14 @@ The service must refuse to start when:
 3. Public API key equals a known example value.
 4. Admin password hash equals a known example value.
 5. Admin binds to `0.0.0.0` or another non-loopback address while `CODEX_POOL_ALLOW_REMOTE_ADMIN` is not `true`.
+
+### 2.3 Bundled Codex sidecar
+
+The image must bundle a pinned CLIProxyAPI executable and run it in the same container on `127.0.0.1:8319`. Do not expose or publish that port. The pool remains the only public OpenAI-compatible API and the only management UI.
+
+For a device-auth account, Pool writes a separate CLIProxy auth record under `/data/cliproxy/auths/<account-id>.json` with a unique account prefix. Pool must include that prefix when relaying a selected account's request, so all account selection, sticky-session binding, quota exclusion, cooldown, and failover remain in Pool. Configure the sidecar with one retry credential and no independent cooling so a `429` or upstream server error returns to Pool for routing.
+
+The sidecar owns refreshes of its copied OAuth credential. Pool must read the sidecar copy for quota polling and must not concurrently refresh the original Codex CLI auth file. Sidecar auth records, its internal API key, and generated config are runtime `/data` content and must never be committed.
 
 The service should warn when:
 
@@ -409,6 +419,8 @@ Do not round-robin by default.
 
 Reason: prompt-cache locality is important. Requests for the same project/session/model should continue using the same account until that account becomes unavailable or enters cooldown.
 
+Sticky bindings have an idle TTL controlled by `CODEX_POOL_SESSION_AFFINITY_TTL_MS`. A successful request refreshes the binding expiry. Expired bindings are pruned and the next request selects a fresh account.
+
 ### 6.2 Sticky key derivation
 
 Use the first available source:
@@ -467,6 +479,8 @@ failback = new_session_only
 
 A session that failed over from `acct-a` to `acct-b` should remain on `acct-b` until it ends, unless `acct-b` also fails.
 
+On upstream quota exhaustion or rate limiting (`429`), mark the account/model in cooldown and retry the next eligible account in the same request. By default, the retry budget scales with the configured account count; `CODEX_POOL_MAX_RETRY_ACCOUNTS` can cap it.
+
 ### 6.5 Candidate account filter
 
 A selectable account must satisfy:
@@ -491,18 +505,17 @@ not in model-level cooldown for requested model
 ```json
 {
   "id": "acct-org-a",
-  "label": "Org A",
-  "email": "user@example.com",
-  "accountId": "chatgpt-account-id-if-known",
+  "label": "us***er@example.com · Plus",
+  "displayName": "us***er@example.com · Plus",
+  "email": "us***er@example.com",
   "authType": "codex_device_auth",
-  "codexHome": "/data/accounts/acct-org-a/.codex",
   "enabled": true,
   "inPool": true,
   "priority": 100,
-  "allowedModels": ["gpt-5.5"],
+  "allowedModels": [],
   "excludedModels": [],
   "planType": "plus",
-  "planRank": 100,
+  "planRank": 200,
   "remainingQuota": 82,
   "subscriptionExpiryMs": null,
   "createdAt": 1781930000000,
@@ -517,6 +530,7 @@ Notes:
 - `remainingQuota` is an integer routing hint. Treat it as a percentage or normalized score, not an exact token count.
 - Actual consumed tokens are tracked in usage stats.
 - Absolute remaining Codex token quota may not be available from upstream. Display both quota-window percentages and token usage counters.
+- Admin API account responses must not expose full email addresses, upstream account IDs, upstream URLs, API keys, `codexHome`, or auth file paths. The persisted config may keep those values for routing and credential isolation, but browser-facing account fields use masked display values.
 
 ### 7.2 Add account
 
@@ -528,15 +542,10 @@ Content-Type: application/json
 Request:
 
 ```json
-{
-  "id": "acct-org-a",
-  "label": "Org A",
-  "priority": 100,
-  "enabled": false,
-  "inPool": false,
-  "allowedModels": ["gpt-5.5"]
-}
+{}
 ```
+
+The admin UI sends no user-entered account fields. It creates an empty Codex device-auth slot, immediately starts device auth, and shows only the verification URL, user code, and a 15 minute countdown. `id`, `label`, `email`, `planType`, `planRank`, account ID, and model access are resolved after device auth from the authenticated Codex account; routing treats an empty `allowedModels` list as no per-account model restriction.
 
 Response:
 
@@ -545,9 +554,11 @@ Response:
   "ok": true,
   "account": {
     "id": "acct-org-a",
-    "label": "Org A",
-    "enabled": false,
-    "inPool": false,
+    "label": "acct-org-a",
+    "email": "",
+    "planType": "",
+    "enabled": true,
+    "inPool": true,
     "status": "missing_auth"
   }
 }
@@ -580,6 +591,7 @@ Response:
 
 ```http
 GET /admin/api/jobs/{jobId}
+POST /admin/api/jobs/{jobId}/cancel
 ```
 
 Waiting for user:
@@ -593,6 +605,7 @@ Waiting for user:
   "accountId": "acct-org-a",
   "verificationUrl": "https://auth.openai.com/activate",
   "userCode": "ABCD-EFGH",
+  "codeExpiresAt": "2026-06-20T16:15:00Z",
   "message": "Open the verification URL and enter the code."
 }
 ```
@@ -635,6 +648,17 @@ Disable must also remove the account from pool and clear sticky sessions bound t
 
 ### 7.6 Add/remove from pool
 
+Public trusted-user endpoints:
+
+```http
+POST /admin/api/public-dashboard/accounts/{poolRef}/pool-add
+POST /admin/api/public-dashboard/accounts/{poolRef}/pool-remove
+```
+
+`poolRef` is an opaque per-process account reference returned by the public dashboard. The public dashboard may return a partially masked email for account recognition, but must not expose full email addresses, account IDs, upstream URLs, API keys, sticky session keys, traffic details, quota error codes, or upstream error bodies.
+
+Legacy authenticated owner endpoints:
+
 ```http
 POST /admin/api/accounts/{accountId}/pool-add
 POST /admin/api/accounts/{accountId}/pool-remove
@@ -666,7 +690,7 @@ Purge permanently deletes trashed credential data.
 ```json
 {
   "accountId": "acct-org-a",
-  "email": "user@example.com",
+  "email": "us***er@example.com",
   "available": true,
   "consecutiveFailures": 0,
   "lastSuccessAt": 1781930500000,
@@ -705,7 +729,7 @@ Response:
   "accounts": [
     {
       "accountId": "acct-org-a",
-      "email": "user@example.com",
+      "email": "us***er@example.com",
       "available": false,
       "consecutiveFailures": 1,
       "lastSuccessAt": 1781930000000,
@@ -811,17 +835,20 @@ Response object:
   "accountId": "acct-org-a",
   "planType": "plus",
   "quota": {
-    "hourlyPercentage": 80,
-    "hourlyResetTime": 1781934000,
-    "hourlyWindowMinutes": 300,
-    "hourlyWindowPresent": true,
-    "weeklyPercentage": 50,
-    "weeklyResetTime": 1782016800,
-    "weeklyWindowMinutes": 10080,
-    "weeklyWindowPresent": true,
-    "rawData": {}
+    "hourly": {
+      "percentage": 80,
+      "resetAt": 1781934000,
+      "windowMinutes": 300,
+      "present": true
+    },
+    "weekly": {
+      "percentage": 50,
+      "resetAt": 1782016800,
+      "windowMinutes": 10080,
+      "present": true
+    }
   },
-  "usageUpdatedAt": 1781930500,
+  "usageUpdatedAt": "2026-06-21T12:30:00Z",
   "quotaError": null
 }
 ```
@@ -840,16 +867,20 @@ Response:
   "accountId": "acct-org-a",
   "planType": "plus",
   "quota": {
-    "hourlyPercentage": 80,
-    "hourlyResetTime": 1781934000,
-    "hourlyWindowMinutes": 300,
-    "hourlyWindowPresent": true,
-    "weeklyPercentage": 50,
-    "weeklyResetTime": 1782016800,
-    "weeklyWindowMinutes": 10080,
-    "weeklyWindowPresent": true,
-    "rawData": {}
-  }
+    "hourly": {
+      "percentage": 80,
+      "resetAt": 1781934000,
+      "windowMinutes": 300,
+      "present": true
+    },
+    "weekly": {
+      "percentage": 50,
+      "resetAt": 1782016800,
+      "windowMinutes": 10080,
+      "present": true
+    }
+  },
+  "usageUpdatedAt": "2026-06-21T12:30:00Z"
 }
 ```
 
@@ -882,7 +913,7 @@ Response:
 }
 ```
 
-Quota refresh must not block normal `/v1` request handling. Run refresh jobs in background with bounded concurrency.
+Quota refresh must not block normal `/v1` request handling. Run refresh jobs in background with bounded concurrency. The service refreshes Codex quotas once after a successful device-auth login, once during startup, and then every five minutes. `remainingQuota` is a routing hint derived from the lowest present quota window.
 
 ---
 
@@ -925,7 +956,7 @@ Expose all-time, daily, weekly, and monthly windows:
   "accounts": [
     {
       "accountId": "acct-org-a",
-      "email": "user@example.com",
+      "email": "us***er@example.com",
       "usage": {},
       "updatedAt": 1781930500000
     }
@@ -981,7 +1012,7 @@ Response:
   "timestamp": 1781930500000,
   "requestId": "req_xxx",
   "accountId": "acct-org-a",
-  "email": "user@example.com",
+  "email": "us***er@example.com",
   "apiKeyId": "default",
   "apiKeyLabel": "Default",
   "modelId": "gpt-5.5",
@@ -1219,7 +1250,7 @@ GET /admin/api/events
   "model": "gpt-5.5",
   "alias": "deep",
   "accountId": "acct-org-a",
-  "accountEmail": "user@example.com",
+  "accountEmail": "us***er@example.com",
   "authId": "acct-org-a",
   "apiKeyId": "default",
   "apiKeyLabel": "Default",
@@ -1307,7 +1338,7 @@ Internally support a Cockpit-like manifest shape for config export/import.
   "accounts": [
     {
       "id": "acct-org-a",
-      "email": "user@example.com",
+      "email": "us***er@example.com",
       "authId": "acct-org-a",
       "upstreamApiKey": null,
       "planRank": 100,
@@ -1338,41 +1369,30 @@ Internally support a Cockpit-like manifest shape for config export/import.
 
 ---
 
-## 16. Admin UI Requirements
+## 16. Dashboard And Admin UI Requirements
 
-Build a minimal web UI.
+Build a minimal web UI on the single admin port.
 
 ### 16.1 Pages
 
-Single-page admin dashboard is enough.
+Single-page dashboard is enough. Public mode is visible without admin login and may show pool status plus join/leave pool controls. Management mode is unlocked with the admin password and is reserved for account creation, deletion, device-auth repair, and sticky-session inspection.
 
 Sections:
 
 1. Service status
 2. Account pool
 3. Account health/cooldowns
-4. Quota windows
-5. Sticky sessions
-6. Usage stats
-7. Recent events
-8. Model aliases and model catalog
-9. Settings
+4. Quota hints
+5. Sticky sessions in management mode
 
 ### 16.2 Account table columns
 
 ```text
-ID
-Label
-Email
-Enabled
+Public label
 In Pool
 Status
-Priority
 Plan
 Remaining Quota
-Hourly Reset
-Weekly Reset
-Sticky Sessions
 Last Success
 Last Error
 Actions
@@ -1380,16 +1400,20 @@ Actions
 
 ### 16.3 Account actions
 
+Public mode:
+
 ```text
-Login / Re-login
-Enable
-Disable
 Add to pool
 Remove from pool
-Refresh quota
-Clear cooldown
-Soft delete
-Purge
+```
+
+Management mode:
+
+```text
+Add account
+Login / Re-login
+Delete account and purge credentials
+Clear sticky session
 ```
 
 ### 16.4 Sticky session table
@@ -1401,6 +1425,7 @@ Purge
   "accountId": "acct-org-a",
   "createdAt": 1781930000000,
   "lastSuccessAt": 1781930500000,
+  "expiresAt": 1782016900000,
   "failoverFrom": null
 }
 ```
@@ -1550,7 +1575,7 @@ The implementation is acceptable when:
 8. Accounts can be enabled, disabled, added to pool, removed from pool, soft-deleted, and purged.
 9. Sticky sessions keep using the same account across requests.
 10. Quota exhaustion triggers account/model cooldown and failover.
-11. Token expiration triggers refresh on the same account, not failover.
+11. Token expiration is refreshed by the account's sidecar credential on the same account, not treated as quota exhaustion or failover.
 12. Admin UI displays account health, cooldown until time, quota windows, token usage stats, and recent errors.
 13. Logs do not expose tokens, API keys, or auth files.
 14. Public `/v1` API is protected by configured API key.

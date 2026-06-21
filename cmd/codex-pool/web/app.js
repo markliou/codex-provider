@@ -1,10 +1,10 @@
 (() => {
-  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, mode: "public" };
+  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", mode: "public" };
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => document.querySelectorAll(selector);
   const loginView = $("#login-view");
   const dashboardView = $("#dashboard-view");
-  const toast = $("#toast");
+  const refreshIntervalMs = 5 * 60 * 1000;
 
   const escapeHTML = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
   const displayTime = (value) => {
@@ -15,11 +15,66 @@
   const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Standby", missing_auth: "Login needed" }[status] || "Unknown");
 
   function notify(message, error = false) {
-    toast.textContent = message;
-    toast.classList.toggle("error", error);
-    toast.hidden = false;
-    window.clearTimeout(notify.timer);
-    notify.timer = window.setTimeout(() => { toast.hidden = true; }, 4200);
+    if (!error) return;
+    const serviceStatus = $("#service-status");
+    if (serviceStatus) serviceStatus.textContent = message;
+  }
+
+  function formatRemaining(ms) {
+    const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+    const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
+    const seconds = String(totalSeconds % 60).padStart(2, "0");
+    return `${minutes}:${seconds}`;
+  }
+
+  function startDeviceAuthCountdown(expiresAt) {
+    const countdown = $("#device-auth-countdown");
+    const deadline = expiresAt ? new Date(expiresAt).getTime() : Date.now() + 15 * 60 * 1000;
+    const tick = () => {
+      const remaining = deadline - Date.now();
+      countdown.textContent = formatRemaining(remaining);
+      countdown.classList.toggle("expired", remaining <= 0);
+    };
+    window.clearInterval(state.deviceAuthTimer);
+    tick();
+    state.deviceAuthTimer = window.setInterval(tick, 1000);
+  }
+
+  function showDeviceAuth(job) {
+    const dialog = $("#device-auth-dialog");
+    const url = $("#device-auth-url");
+    const code = $("#device-auth-code");
+    if (job.verificationUrl) {
+      url.textContent = job.verificationUrl;
+      url.href = job.verificationUrl;
+    } else {
+      url.textContent = "";
+      url.removeAttribute("href");
+    }
+    code.textContent = job.userCode || "";
+    startDeviceAuthCountdown(job.codeExpiresAt);
+    if (!dialog.open) dialog.showModal();
+  }
+
+  async function cancelDeviceAuthJob(jobId) {
+    if (!jobId) return;
+    try {
+      await api(`/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+    } catch (error) {
+      notify(error.message, true);
+    }
+  }
+
+  function closeDeviceAuth(cancelJob = false) {
+    const dialog = $("#device-auth-dialog");
+    window.clearInterval(state.deviceAuthTimer);
+    window.clearTimeout(state.deviceAuthPollTimer);
+    state.deviceAuthTimer = null;
+    state.deviceAuthPollTimer = null;
+    const jobId = state.currentLoginJobId;
+    state.currentLoginJobId = "";
+    if (dialog.open) dialog.close();
+    if (cancelJob && jobId) cancelDeviceAuthJob(jobId);
   }
 
   async function api(path, options = {}) {
@@ -28,6 +83,14 @@
     if (options.method && options.method !== "GET") headers.set("X-CSRF-Token", state.csrfToken);
     const response = await fetch(`/admin/api${path}`, { credentials: "same-origin", ...options, headers });
     if (response.status === 401) { showPublicDashboard(); throw new Error("Your session has expired"); }
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
+    return body;
+  }
+
+  async function publicApi(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    const response = await fetch(`/admin/api/public-dashboard${path}`, { credentials: "same-origin", ...options, headers });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
     return body;
@@ -52,7 +115,7 @@
     $("#dashboard-title").textContent = "Account pool";
     refresh();
     window.clearInterval(state.refreshTimer);
-    state.refreshTimer = window.setInterval(() => refresh(true), 30000);
+    state.refreshTimer = window.setInterval(() => refresh(true), refreshIntervalMs);
   }
 
   function showPublicDashboard() {
@@ -65,7 +128,7 @@
     $("#dashboard-title").textContent = "Pool status";
     refreshPublic();
     window.clearInterval(state.refreshTimer);
-    state.refreshTimer = window.setInterval(() => refreshPublic(true), 30000);
+    state.refreshTimer = window.setInterval(() => refreshPublic(true), refreshIntervalMs);
   }
 
   function renderSummary(summary) {
@@ -80,10 +143,53 @@
     $("#summary-grid").innerHTML = items.map(([label, value, tone]) => `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${value}</span></div>`).join("");
   }
 
-  function quotaMarkup(value) {
+  function displayUnixTime(value) {
+    if (!value) return "";
+    const date = new Date(Number(value) * 1000);
+    return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
+  }
+
+  function displayResetCountdown(value) {
+    const seconds = Math.max(0, Math.ceil(Number(value) - Date.now() / 1000));
+    if (!Number.isFinite(seconds)) return "";
+    if (seconds === 0) return "now";
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (days) return `${days}d ${hours}h`;
+    if (hours) return `${hours}h ${minutes}m`;
+    return `${Math.max(1, minutes)}m`;
+  }
+
+  function quotaPercent(value) {
+    const percentage = Number(value ?? 100);
+    return Number.isFinite(percentage) ? Math.min(100, Math.max(0, percentage)) : 0;
+  }
+
+  function quotaTrackMarkup(value, label) {
+    const remaining = quotaPercent(value);
+    const tone = remaining <= 0 ? "empty" : remaining <= 20 ? "low" : "";
+    return `<progress class="quota-track ${tone}" value="${remaining}" max="100" aria-label="${escapeHTML(label)} quota remaining">${remaining}%</progress>`;
+  }
+
+  function quotaWindowMarkup(label, window) {
+    if (!window || !window.present) return "";
+    const value = quotaPercent(window.percentage);
+    const reset = displayUnixTime(window.resetAt);
+    const countdown = displayResetCountdown(window.resetAt);
+    return `<div class="quota-window"><div class="quota-line"><span>${label} quota</span><strong>${value}% left</strong></div>${quotaTrackMarkup(value, label)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}">Resets in ${escapeHTML(countdown || "soon")}</div>` : ""}</div>`;
+  }
+
+  function quotaMarkup(value, quota, quotaError, usageUpdatedAt) {
+    const refreshError = quotaError ? `<span class="quota-error" title="${escapeHTML(quotaError.message)}">Refresh failed${quotaError.code ? `: ${escapeHTML(quotaError.code)}` : ""}</span>` : "";
+    if (quota) {
+      const windows = [quotaWindowMarkup("5h", quota.hourly), quotaWindowMarkup("Week", quota.weekly)].filter(Boolean).join("");
+      const updated = usageUpdatedAt && usageUpdatedAt !== "0001-01-01T00:00:00Z" ? `<div class="quota-updated">Updated ${escapeHTML(displayTime(usageUpdatedAt))}</div>` : "";
+      return `<div class="quota quota-detailed">${windows || '<span class="quota-unknown">No quota window</span>'}${updated}${refreshError}</div>`;
+    }
+    if (quotaError) return refreshError;
     if (value === null || value === undefined) return '<span class="quota-unknown">Not reported</span>';
-    const tone = value <= 0 ? "empty" : value <= 20 ? "low" : "";
-    return `<div class="quota"><div class="quota-line"><span>Remaining</span><strong>${value}%</strong></div><div class="quota-track"><div class="quota-fill ${tone}" style="width:${value}%"></div></div></div>`;
+    return `<div class="quota"><div class="quota-line"><span>Quota</span><strong>${value}% left</strong></div>${quotaTrackMarkup(value, "Quota")}</div>`;
   }
 
   function actionButton(action, id, label, tone = "secondary") {
@@ -100,21 +206,18 @@
     }
     body.innerHTML = accounts.map((account) => {
       const health = healthByID.get(account.id) || { status: "standby", statusReason: "No health data" };
-      const reason = health.status === "error" ? health.lastFailureReason || health.statusReason : health.statusReason;
       const activity = health.status === "error" ? health.lastFailureAt : health.lastSuccessAt;
       const route = `${account.inPool ? "In pool" : "Out of pool"} · priority ${account.priority}`;
+      const displayName = account.displayName || account.email || account.label || account.id;
+      const tier = account.planType ? `${account.planType} · ` : "";
       const actions = [
         account.authType === "codex_device_auth" ? actionButton("login", account.id, "Login") : "",
-        account.enabled ? actionButton("disable", account.id, "Disable", "warn") : actionButton("enable", account.id, "Enable"),
-        account.inPool ? actionButton("pool-remove", account.id, "Remove pool") : actionButton("pool-add", account.id, "Add pool"),
-        actionButton("quota", account.id, "Quota"),
-        health.cooldowns?.length ? actionButton("cooldowns/clear", account.id, "Clear cooldown") : "",
         actionButton("delete", account.id, "Remove", "danger"),
       ].join("");
       return `<tr>
-        <td><div class="account-name">${escapeHTML(account.label || account.id)}<span class="account-id">${escapeHTML(account.id)}</span></div></td>
-        <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span><span class="status-reason" title="${escapeHTML(reason)}">${escapeHTML(reason)}</span></div></td>
-        <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota)}</td>
+        <td><div class="account-name">${escapeHTML(displayName)}<span class="account-id">${escapeHTML(tier + account.id)}</span></div></td>
+        <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span></div></td>
+        <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt)}</td>
         <td><div class="route"><strong>${escapeHTML(account.authType || "codex_device_auth")}</strong><br>${escapeHTML(route)}</div></td>
         <td><div class="activity">${displayTime(activity)}${health.consecutiveFailure ? `<br>${health.consecutiveFailure} consecutive failure${health.consecutiveFailure === 1 ? "" : "s"}` : ""}</div></td>
         <td><div class="row-actions">${actions}</div></td>
@@ -123,29 +226,32 @@
   }
 
   function renderPublicAccounts(accounts) {
-    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Models</th></tr>";
+    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th>Model access</th><th>Action</th></tr>";
     $("#account-count").textContent = `${accounts.length} visible`;
     const body = $("#accounts-body");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="4"><div class="empty-state">No accounts available</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="6"><div class="empty-state">No accounts available</div></td></tr>';
       return;
     }
-    body.innerHTML = accounts.map((account) => `<tr>
-      <td><div class="account-name">${escapeHTML(account.label)}</div></td>
-      <td><span class="badge ${escapeHTML(account.status)}">${statusLabel(account.status)}</span></td>
-      <td>${quotaMarkup(account.remainingQuota)}</td>
-      <td><div class="route">${escapeHTML((account.allowedModels || []).join(", ") || "All configured models")}</div></td>
-    </tr>`).join("");
+    body.innerHTML = accounts.map((account) => {
+      const action = account.inPool
+        ? `<button class="button warn" type="button" data-public-pool-action="pool-remove" data-pool-ref="${escapeHTML(account.poolRef)}">Leave pool</button>`
+        : `<button class="button secondary" type="button" data-public-pool-action="pool-add" data-pool-ref="${escapeHTML(account.poolRef)}">Join pool</button>`;
+      const poolLabel = account.inPool ? "In pool" : "Out of pool";
+      return `<tr>
+      <td><div class="account-name">${escapeHTML(account.displayName || account.label || account.email || "Account")}${account.email ? `<span class="account-id">${escapeHTML(account.email)}</span>` : ""}</div></td>
+      <td><div class="status-stack"><span class="badge ${escapeHTML(account.status)}">${statusLabel(account.status)}</span></div></td>
+      <td>${quotaMarkup(account.remainingQuota, account.quota, account.quotaError, account.usageUpdatedAt)}</td>
+      <td><div class="route"><strong>${escapeHTML(poolLabel)}</strong></div></td>
+      <td><div class="route">${escapeHTML((account.allowedModels || []).join(", ") || "Detected after login")}</div></td>
+      <td><div class="row-actions">${action}</div></td>
+    </tr>`;
+    }).join("");
   }
 
   function renderSticky(sessions) {
     $("#sticky-count").textContent = `${sessions.length} active`;
     $("#sticky-list").innerHTML = sessions.length ? sessions.map((session) => `<div class="sticky-item"><div><div class="sticky-key" title="${escapeHTML(session.key)}">${escapeHTML(session.key)}</div><div class="sticky-meta">${escapeHTML(session.accountId)} · ${displayTime(session.lastSuccessAt)}</div></div><button class="button secondary" type="button" data-sticky-key="${escapeHTML(session.key)}">Clear</button></div>`).join("") : '<div class="empty-state">No active sticky sessions</div>';
-  }
-
-  function renderTraffic(serviceState) {
-    const items = [["Requests", serviceState.requestCount || 0], ["Succeeded", serviceState.successCount || 0], ["Failed", serviceState.failureCount || 0], ["Default model", serviceState.defaultModel || "-" ]];
-    $("#traffic-stats").innerHTML = items.map(([label, value]) => `<div><dt>${label}</dt><dd>${escapeHTML(value)}</dd></div>`).join("");
   }
 
   async function refresh(silent = false) {
@@ -157,7 +263,6 @@
       renderSummary(serviceState.summary || {});
       renderAccounts(state.data.accounts, healthByID);
       renderSticky(state.data.sessions);
-      renderTraffic(serviceState);
       $("#service-status").textContent = "Service online";
     } catch (error) {
       if (!silent) notify(error.message, true);
@@ -185,16 +290,7 @@
         if (!window.confirm(`Remove account ${id}?`)) return;
         await api(`/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
       } else if (action === "login") {
-        const response = await api(`/accounts/${encodeURIComponent(id)}/login`, { method: "POST" });
-        notify("Device login started");
-        watchLoginJob(response.job.jobId);
-      } else if (action === "quota") {
-        const current = state.data.healthByID.get(id)?.remainingQuota;
-        const value = window.prompt("Remaining quota percentage (0-100)", current ?? "");
-        if (value === null) return;
-        const quota = Number(value);
-        if (!Number.isInteger(quota) || quota < 0 || quota > 100) throw new Error("Quota must be an integer from 0 to 100");
-        await api(`/accounts/${encodeURIComponent(id)}/quota/set`, { method: "POST", body: JSON.stringify({ remainingQuota: quota }) });
+        await startDeviceAuth(id);
       } else {
         await api(`/accounts/${encodeURIComponent(id)}/${action}`, { method: "POST" });
       }
@@ -203,30 +299,62 @@
     } catch (error) { notify(error.message, true); }
   }
 
+  async function handlePublicPoolAction(button) {
+    const action = button.dataset.publicPoolAction;
+    const ref = button.dataset.poolRef;
+    try {
+      await publicApi(`/accounts/${encodeURIComponent(ref)}/${action}`, { method: "POST" });
+      await refreshPublic(true);
+    } catch (error) {
+      notify(error.message, true);
+    }
+  }
+
+  async function startDeviceAuth(accountId) {
+    const response = await api(`/accounts/${encodeURIComponent(accountId)}/login`, { method: "POST" });
+    state.currentLoginJobId = response.job.jobId;
+    watchLoginJob(response.job.jobId);
+  }
+
+  async function createAccountAndStartLogin() {
+    try {
+      const response = await api("/accounts", { method: "POST", body: JSON.stringify({ authType: "codex_device_auth", priority: 100, enabled: true, inPool: true }) });
+      await refresh(true);
+      await startDeviceAuth(response.account.id);
+    } catch (error) {
+      notify(error.message, true);
+    }
+  }
+
   async function watchLoginJob(jobId) {
     let attempts = 0;
     const tick = async () => {
+      if (state.currentLoginJobId !== jobId) return;
       attempts += 1;
       try {
         const response = await api(`/jobs/${encodeURIComponent(jobId)}`);
         const job = response.job;
-        if (job.status === "waiting_for_user") {
-          const parts = [job.message || "Open the verification URL and enter the code."];
-          if (job.verificationUrl) parts.push(job.verificationUrl);
-          if (job.userCode) parts.push(`Code: ${job.userCode}`);
-          notify(parts.join("  "));
+        if (state.currentLoginJobId !== jobId) return;
+        if (job.status === "waiting_for_user" && (job.verificationUrl || job.userCode)) {
+          showDeviceAuth(job);
         }
         if (job.status === "completed") {
+          closeDeviceAuth(false);
           notify("Device login completed");
           refresh(true);
           return;
         }
-        if (job.status === "failed") {
+        if (job.status === "failed" || job.status === "cancelled") {
+          closeDeviceAuth(false);
+          if (job.status === "cancelled") {
+            refresh(true);
+            return;
+          }
           notify(job.error || job.message || "Device login failed", true);
           refresh(true);
           return;
         }
-        if (attempts < 180) window.setTimeout(tick, 5000);
+        if (attempts < 180) state.deviceAuthPollTimer = window.setTimeout(tick, 5000);
       } catch (error) {
         notify(error.message, true);
       }
@@ -251,21 +379,17 @@
   $("#refresh-button").addEventListener("click", () => refresh());
   $("#sign-in-button").addEventListener("click", () => showLogin());
   $("#logout-button").addEventListener("click", async () => { try { await api("/logout", { method: "POST" }); } catch (_) {} sessionStorage.removeItem("codexPoolCsrf"); state.csrfToken = ""; showPublicDashboard(); });
-  $("#add-account-button").addEventListener("click", () => { $("#account-form").reset(); $("#account-form-error").hidden = true; $("#account-dialog").showModal(); });
-  $("#close-dialog-button").addEventListener("click", () => $("#account-dialog").close());
-  $("#cancel-account-button").addEventListener("click", () => $("#account-dialog").close());
-  $("#account-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    const quota = String(form.get("remainingQuota") || "").trim();
-    const payload = { id: String(form.get("id")).trim(), label: String(form.get("label")).trim(), authType: "codex_device_auth", allowedModels: String(form.get("allowedModels")).split(",").map((value) => value.trim()).filter(Boolean), priority: Number(form.get("priority")), enabled: form.get("enabled") === "on", inPool: form.get("inPool") === "on" };
-    if (quota) payload.remainingQuota = Number(quota);
-    try {
-      await api("/accounts", { method: "POST", body: JSON.stringify(payload) });
-      $("#account-dialog").close(); notify("Account added"); refresh(true);
-    } catch (error) { $("#account-form-error").textContent = error.message; $("#account-form-error").hidden = false; }
+  $("#add-account-button").addEventListener("click", createAccountAndStartLogin);
+  $("#close-device-auth-button").addEventListener("click", () => closeDeviceAuth(true));
+  $("#accounts-body").addEventListener("click", (event) => {
+    const publicButton = event.target.closest("[data-public-pool-action]");
+    if (publicButton) {
+      handlePublicPoolAction(publicButton);
+      return;
+    }
+    const button = event.target.closest("[data-account-action]");
+    if (button) handleAccountAction(button);
   });
-  $("#accounts-body").addEventListener("click", (event) => { const button = event.target.closest("[data-account-action]"); if (button) handleAccountAction(button); });
   $("#sticky-list").addEventListener("click", async (event) => { const button = event.target.closest("[data-sticky-key]"); if (!button) return; try { await api(`/sticky-sessions/${encodeURIComponent(button.dataset.stickyKey)}`, { method: "DELETE" }); notify("Sticky session cleared"); refresh(true); } catch (error) { notify(error.message, true); } });
 
   showPublicDashboard();

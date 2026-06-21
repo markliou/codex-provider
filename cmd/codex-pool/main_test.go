@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -26,9 +28,9 @@ func testApp(t *testing.T, accounts []account) *app {
 	}
 	return &app{
 		config:  config{DefaultModel: "gpt-test", ModelAliases: map[string]string{"alias": "gpt-test"}, Accounts: accounts},
-		state:   state{StickySessions: map[string]stickySession{}, Cooldowns: map[string][]cooldown{}},
+		state:   state{StickySessions: map[string]stickySession{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}},
 		dataDir: dir, apiKeys: [][]byte{[]byte("client-key")}, adminUser: "admin", adminHash: []byte(hash),
-		sessionKey: []byte("01234567890123456789012345678901"), codexBaseURL: "https://chatgpt.example.test/backend-api", jobs: map[string]*loginJob{}, client: &http.Client{Timeout: time.Second},
+		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second},
 	}
 }
 
@@ -44,6 +46,35 @@ func TestParseModel(t *testing.T) {
 		if model != tc.model || tier != tc.tier {
 			t.Fatalf("parseModel(%q) = %q, %q", tc.input, model, tier)
 		}
+	}
+}
+
+func TestDefaultModelCatalogIncludesThinkingTiers(t *testing.T) {
+	a := testApp(t, nil)
+	a.config.DefaultModel = "gpt-5.5(xhigh)"
+	models := strings.Join(a.modelsLocked(), "\n")
+	for _, expected := range []string{"gpt-5.5", "gpt-5.5(low)", "gpt-5.5(medium)", "gpt-5.5(high)", "gpt-5.5(xhigh)"} {
+		if !strings.Contains(models, expected) {
+			t.Fatalf("modelsLocked missing %q in:\n%s", expected, models)
+		}
+	}
+}
+
+func TestDefaultModelEnvOverridesPersistedConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(dir, "config.json"), config{DefaultModel: "gpt-5.4", ModelAliases: map[string]string{}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_POOL_DEFAULT_MODEL", "gpt-5.5(xhigh)")
+	a := &app{dataDir: dir}
+	if err := a.load(); err != nil {
+		t.Fatal(err)
+	}
+	if a.config.DefaultModel != "gpt-5.5(xhigh)" {
+		t.Fatalf("default model = %q", a.config.DefaultModel)
 	}
 }
 
@@ -127,6 +158,15 @@ func TestCodexLoginEnvDoesNotInheritServiceSecrets(t *testing.T) {
 func TestDeviceAuthLoginJobLifecycle(t *testing.T) {
 	a := testApp(t, []account{{ID: "acct-login", Label: "Login", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
 	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct-login")
+	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/wham/usage" {
+			t.Fatalf("unexpected quota path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":60},"secondary_window":null}}`))
+	}))
+	defer usage.Close()
+	a.codexBaseURL = usage.URL + "/backend-api"
 	bin := t.TempDir()
 	script := `#!/bin/sh
 set -eu
@@ -156,8 +196,15 @@ EOF
 			if current.VerificationURL != "https://auth.openai.com/activate" || current.UserCode != "ABCD-EFGH" {
 				t.Fatalf("job did not capture device prompt: %#v", current)
 			}
+			if current.CodeExpiresAt.IsZero() || time.Until(current.CodeExpiresAt) < 14*time.Minute {
+				t.Fatalf("job did not set a 15 minute code expiry: %#v", current)
+			}
 			if a.config.Accounts[0].Email != "user@example.test" || a.config.Accounts[0].AccountID != "acct-chatgpt" {
 				t.Fatalf("account metadata not updated: %#v", a.config.Accounts[0])
+			}
+			quota := a.state.Quotas["acct-login"].Quota
+			if quota == nil || quota.Hourly.Percentage != 90 {
+				t.Fatalf("quota was not refreshed before job completion: %#v", quota)
 			}
 			envData, err := os.ReadFile(filepath.Join(a.accountCodexHome("acct-login"), "env.txt"))
 			if err != nil {
@@ -176,6 +223,77 @@ EOF
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	t.Fatalf("login job did not complete: %#v", a.jobs[job.ID])
+}
+
+func TestDeviceAuthLoginDoesNotStartDuplicateJob(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct-login", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
+	existing := &loginJob{ID: "job-existing", AccountID: "acct-login", Status: "waiting_for_user"}
+	a.mu.Lock()
+	a.jobs[existing.ID] = existing
+	job := a.startLoginJobLocked(a.config.Accounts[0])
+	a.mu.Unlock()
+	if job.ID != existing.ID {
+		t.Fatalf("duplicate login created job %q, want existing %q", job.ID, existing.ID)
+	}
+}
+
+func TestDeviceAuthLoginJobCancel(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct-cancel", Label: "Cancel", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
+	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct-cancel")
+	bin := t.TempDir()
+	script := `#!/bin/sh
+set -eu
+mkdir -p "$CODEX_HOME"
+printf '%s\n' 'Open https://auth.openai.com/activate' 'ABCD-EFGH'
+while true; do sleep 1; done
+`
+	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	a.mu.Lock()
+	job := a.startLoginJobLocked(a.config.Accounts[0])
+	a.mu.Unlock()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.RLock()
+		current := *a.jobs[job.ID]
+		a.mu.RUnlock()
+		if current.Status == "waiting_for_user" {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	cookies, csrf := adminSession(t, a)
+	cancelRequest := httptest.NewRequest(http.MethodPost, "/admin/api/jobs/"+job.ID+"/cancel", nil)
+	for _, cookie := range cookies {
+		cancelRequest.AddCookie(cookie)
+	}
+	cancelRequest.Header.Set("X-CSRF-Token", csrf)
+	cancelRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(cancelRecorder, cancelRequest)
+	if cancelRecorder.Code != http.StatusOK {
+		t.Fatalf("cancel returned %d: %s", cancelRecorder.Code, cancelRecorder.Body.String())
+	}
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.RLock()
+		current := *a.jobs[job.ID]
+		a.mu.RUnlock()
+		if current.Status == "cancelled" {
+			if current.Error != "" {
+				t.Fatalf("cancelled job retained error: %#v", current)
+			}
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	t.Fatalf("login job was not cancelled: %#v", a.jobs[job.ID])
 }
 
 func TestAdminDashboardAssets(t *testing.T) {
@@ -199,15 +317,44 @@ func TestAdminDashboardAssets(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/admin", nil)
 	recorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(recorder, request)
-	for _, forbidden := range []string{"Admin sign in", "Username"} {
+	for _, forbidden := range []string{"Admin sign in", "Username", "Account ID", "Label", "Models", "Subscription tier", "Email hint", "Quota hint", "account-form", "toast"} {
 		if strings.Contains(recorder.Body.String(), forbidden) {
 			t.Fatalf("admin page still includes %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"Console", "Access", "Passphrase"} {
+	for _, expected := range []string{"Console", "Access", "Passphrase", "Add account", "device-auth-url", "device-auth-code", "device-auth-countdown"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page does not include low-key label %q", expected)
 		}
+	}
+	jsRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
+	jsRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(jsRecorder, jsRequest)
+	if strings.Contains(jsRecorder.Body.String(), "Open the verification URL and enter the code") {
+		t.Fatal("admin JS still renders device-auth instruction text instead of URL/code only")
+	}
+	if strings.Contains(jsRecorder.Body.String(), "account-form") {
+		t.Fatal("admin JS still depends on add-account form inputs")
+	}
+	if !strings.Contains(jsRecorder.Body.String(), "codeExpiresAt") {
+		t.Fatal("admin JS does not render the device-auth expiry countdown")
+	}
+	if !strings.Contains(jsRecorder.Body.String(), "5 * 60 * 1000") {
+		t.Fatal("admin JS does not use the 5 minute dashboard refresh interval")
+	}
+	for _, expected := range []string{"displayResetCountdown", "quotaTrackMarkup", "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
+		if !strings.Contains(jsRecorder.Body.String(), expected) {
+			t.Fatalf("admin JS does not render clear quota state %q", expected)
+		}
+	}
+	if strings.Contains(jsRecorder.Body.String(), "toast") {
+		t.Fatal("admin JS still renders bottom-right toast notifications")
+	}
+	cssRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/app.css", nil)
+	cssRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(cssRecorder, cssRequest)
+	if !strings.Contains(cssRecorder.Body.String(), "::-webkit-progress-value") || !strings.Contains(cssRecorder.Body.String(), "background: #d7ded9") {
+		t.Fatal("admin CSS does not provide a visible unfilled quota track")
 	}
 }
 
@@ -310,7 +457,7 @@ func TestAdminLoginRateLimit(t *testing.T) {
 func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 	quota := 12
 	a := testApp(t, []account{{
-		ID: "private-account-id", Label: "Public account", Email: "private@example.test", Enabled: true, InPool: true, RemainingQuota: &quota,
+		ID: "private-account-id", Label: "private@example.test · Plus", Email: "private@example.test", AccountID: "chatgpt-private-id", PlanType: "plus", CodexHome: "/data/accounts/private-account-id/.codex", Enabled: true, InPool: true, RemainingQuota: &quota,
 		UpstreamBaseURL: "https://upstream.example.test/v1", UpstreamAPIKey: "upstream-secret-value", AllowedModels: []string{"gpt-test"},
 	}})
 
@@ -326,7 +473,10 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 			t.Fatalf("public dashboard exposed %q", forbidden)
 		}
 	}
-	if !strings.Contains(publicBody, "Public account") || !strings.Contains(publicBody, `"status":"low"`) {
+	if !strings.Contains(publicBody, "pr***te@example.test") {
+		t.Fatalf("public dashboard omitted masked email: %s", publicBody)
+	}
+	if !strings.Contains(publicBody, "Plus account") || !strings.Contains(publicBody, `"status":"low"`) {
 		t.Fatalf("public dashboard omitted expected status data: %s", publicBody)
 	}
 
@@ -335,6 +485,26 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 	a.adminMux().ServeHTTP(managementRecorder, managementRequest)
 	if managementRecorder.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated management API returned %d", managementRecorder.Code)
+	}
+
+	cookies, _ := adminSession(t, a)
+	authenticatedManagementRequest := httptest.NewRequest(http.MethodGet, "/admin/api/accounts", nil)
+	for _, cookie := range cookies {
+		authenticatedManagementRequest.AddCookie(cookie)
+	}
+	authenticatedManagementRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(authenticatedManagementRecorder, authenticatedManagementRequest)
+	if authenticatedManagementRecorder.Code != http.StatusOK {
+		t.Fatalf("authenticated management API returned %d", authenticatedManagementRecorder.Code)
+	}
+	managementBody := authenticatedManagementRecorder.Body.String()
+	for _, forbidden := range []string{"private@example.test", "chatgpt-private-id", "/data/accounts/private-account-id/.codex", "upstream.example.test", "upstream-secret-value"} {
+		if strings.Contains(managementBody, forbidden) {
+			t.Fatalf("management account list exposed %q", forbidden)
+		}
+	}
+	if !strings.Contains(managementBody, "pr***te@example.test") {
+		t.Fatalf("management account list omitted masked email: %s", managementBody)
 	}
 }
 
@@ -351,6 +521,7 @@ func TestManagementAPIsRequireAdminAndCSRF(t *testing.T) {
 		{http.MethodPost, "/admin/api/accounts/acct/enable", ""},
 		{http.MethodPost, "/admin/api/accounts/acct/login", ""},
 		{http.MethodPost, "/admin/api/accounts/quota/refresh-all", ""},
+		{http.MethodPost, "/admin/api/jobs/job-id/cancel", ""},
 		{http.MethodDelete, "/admin/api/accounts/acct", ""},
 		{http.MethodDelete, "/admin/api/sticky-sessions/key", ""},
 	}
@@ -377,9 +548,86 @@ func TestManagementAPIsRequireAdminAndCSRF(t *testing.T) {
 	}
 }
 
+func adminSession(t *testing.T, a *app) ([]*http.Cookie, string) {
+	t.Helper()
+	login := httptest.NewRequest(http.MethodPost, "/admin/api/login", strings.NewReader(`{"username":"admin","password":"admin-password"}`))
+	loginRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(loginRecorder, login)
+	if loginRecorder.Code != http.StatusOK {
+		t.Fatalf("login returned %d: %s", loginRecorder.Code, loginRecorder.Body.String())
+	}
+	var response struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	if err := json.Unmarshal(loginRecorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	return loginRecorder.Result().Cookies(), response.CSRFToken
+}
+
+func TestPublicPoolToggleDoesNotExposeAccountID(t *testing.T) {
+	a := testApp(t, []account{{
+		ID: "private-account-id", Label: "private@example.test · Plus", Email: "private@example.test", PlanType: "plus", Enabled: true, InPool: true, RemainingQuota: nil,
+		UpstreamBaseURL: "https://upstream.example.test/v1", UpstreamAPIKey: "upstream-secret-value",
+	}})
+	a.state.StickySessions["gpt-test:session"] = stickySession{Key: "gpt-test:session", ModelID: "gpt-test", AccountID: "private-account-id", CreatedAt: time.Now().UTC(), LastSuccessAt: time.Now().UTC()}
+
+	publicRequest := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
+	publicRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(publicRecorder, publicRequest)
+	if publicRecorder.Code != http.StatusOK {
+		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
+	}
+	publicBody := publicRecorder.Body.String()
+	for _, forbidden := range []string{"private-account-id", "private@example.test", "upstream.example.test", "upstream-secret-value"} {
+		if strings.Contains(publicBody, forbidden) {
+			t.Fatalf("public dashboard exposed %q", forbidden)
+		}
+	}
+	var parsed struct {
+		Dashboard struct {
+			Accounts []struct {
+				PoolRef string `json:"poolRef"`
+				InPool  bool   `json:"inPool"`
+			} `json:"accounts"`
+		} `json:"dashboard"`
+	}
+	if err := json.Unmarshal(publicRecorder.Body.Bytes(), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Dashboard.Accounts) != 1 || parsed.Dashboard.Accounts[0].PoolRef == "" || !parsed.Dashboard.Accounts[0].InPool {
+		t.Fatalf("public dashboard did not return expected pool ref: %s", publicBody)
+	}
+
+	removeRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/"+parsed.Dashboard.Accounts[0].PoolRef+"/pool-remove", nil)
+	removeRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(removeRecorder, removeRequest)
+	if removeRecorder.Code != http.StatusOK {
+		t.Fatalf("public pool-remove returned %d: %s", removeRecorder.Code, removeRecorder.Body.String())
+	}
+	if a.config.Accounts[0].InPool {
+		t.Fatal("public pool-remove did not remove account from pool")
+	}
+	if _, ok := a.state.StickySessions["gpt-test:session"]; ok {
+		t.Fatal("public pool-remove did not clear account sticky sessions")
+	}
+
+	addRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/"+parsed.Dashboard.Accounts[0].PoolRef+"/pool-add", nil)
+	addRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(addRecorder, addRequest)
+	if addRecorder.Code != http.StatusOK {
+		t.Fatalf("public pool-add returned %d: %s", addRecorder.Code, addRecorder.Body.String())
+	}
+	if !a.config.Accounts[0].Enabled || !a.config.Accounts[0].InPool {
+		t.Fatalf("public pool-add did not enable pool participation: %#v", a.config.Accounts[0])
+	}
+}
+
 func TestAccountDeletePurgesCodexCredentials(t *testing.T) {
 	a := testApp(t, []account{{ID: "acct-delete", Label: "Delete Me", AuthType: "codex_device_auth", CodexHome: filepath.Join(t.TempDir(), "ignored"), Enabled: true, InPool: true}})
 	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct-delete")
+	a.state.Health["acct-delete"] = accountHealth{LastFailureReason: "old failure"}
+	a.state.Quotas["acct-delete"] = quotaSnapshot{AccountID: "acct-delete", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 50, Present: true}}}
 	home := a.accountCodexHome("acct-delete")
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		t.Fatal(err)
@@ -408,6 +656,12 @@ func TestAccountDeletePurgesCodexCredentials(t *testing.T) {
 	}
 	if _, err := os.Stat(a.accountRoot("acct-delete")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("credential directory still exists or stat failed unexpectedly: %v", err)
+	}
+	if _, ok := a.state.Health["acct-delete"]; ok {
+		t.Fatal("deleted account health was retained")
+	}
+	if _, ok := a.state.Quotas["acct-delete"]; ok {
+		t.Fatal("deleted account quota was retained")
 	}
 }
 
@@ -453,6 +707,51 @@ func TestResponsesProxyTranslatesModelAndUsesStickySession(t *testing.T) {
 	if session := a.state.StickySessions["gpt-test:session-a"]; session.AccountID != "one" {
 		t.Fatalf("sticky session was not saved: %#v", session)
 	}
+	if session := a.state.StickySessions["gpt-test:session-a"]; session.ExpiresAt.IsZero() || time.Until(session.ExpiresAt) < 23*time.Hour {
+		t.Fatalf("sticky session expiry was not refreshed: %#v", session)
+	}
+}
+
+func TestStickySessionTTLExpiresAndReselects(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "old", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://old.example.test", UpstreamAPIKey: "old"},
+		{ID: "new", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://new.example.test", UpstreamAPIKey: "new"},
+	})
+	a.sessionAffinityTTL = time.Hour
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:session"] = stickySession{Key: "gpt-test:session", ModelID: "gpt-test", AccountID: "old", CreatedAt: now.Add(-2 * time.Hour), LastSuccessAt: now.Add(-2 * time.Hour), ExpiresAt: now.Add(-time.Minute)}
+
+	selected, err := a.selectAccount("gpt-test:session", "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "new" {
+		t.Fatalf("expired sticky session selected %q, want new", selected.ID)
+	}
+	if _, ok := a.state.StickySessions["gpt-test:session"]; ok {
+		t.Fatalf("expired sticky session was not pruned: %#v", a.state.StickySessions["gpt-test:session"])
+	}
+}
+
+func TestStickySessionTTLRefreshesOnSuccess(t *testing.T) {
+	a := testApp(t, []account{{ID: "one", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://one.example.test", UpstreamAPIKey: "one"}})
+	a.sessionAffinityTTL = time.Hour
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:session"] = stickySession{Key: "gpt-test:session", ModelID: "gpt-test", AccountID: "one", CreatedAt: now.Add(-30 * time.Minute), LastSuccessAt: now.Add(-30 * time.Minute), ExpiresAt: now.Add(30 * time.Minute)}
+	previousExpiry := a.state.StickySessions["gpt-test:session"].ExpiresAt
+
+	selected, err := a.selectAccount("gpt-test:session", "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "one" {
+		t.Fatalf("active sticky session selected %q, want one", selected.ID)
+	}
+	a.markSuccess("gpt-test:session", "gpt-test", "one")
+	refreshed := a.state.StickySessions["gpt-test:session"]
+	if !refreshed.ExpiresAt.After(previousExpiry) {
+		t.Fatalf("sticky session expiry was not refreshed: before=%s after=%s", previousExpiry, refreshed.ExpiresAt)
+	}
 }
 
 func TestResponsesProxyUsesCodexDeviceAuth(t *testing.T) {
@@ -493,8 +792,8 @@ func TestResponsesProxyAddsCodexMetadataHeaders(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer <access-token>" {
 			t.Fatalf("unexpected auth header %q", r.Header.Get("Authorization"))
 		}
-		if r.Header.Get("ChatGPT-Account-ID") != "acct-from-jwt" {
-			t.Fatalf("missing account id from id_token: %q", r.Header.Get("ChatGPT-Account-ID"))
+		if r.Header.Get("ChatGPT-Account-ID") != "acct-from-metadata" {
+			t.Fatalf("missing account id from account metadata: %q", r.Header.Get("ChatGPT-Account-ID"))
 		}
 		if r.Header.Get("X-OpenAI-Fedramp") != "true" {
 			t.Fatalf("missing fedramp header")
@@ -503,12 +802,12 @@ func TestResponsesProxyAddsCodexMetadataHeaders(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"resp_test","object":"response","output":[]}`))
 	}))
 	defer upstream.Close()
-	a := testApp(t, []account{{ID: "codex-meta", AuthType: "codex_device_auth", Enabled: true, InPool: true, UpstreamBaseURL: upstream.URL + "/backend-api", Priority: 100}})
+	a := testApp(t, []account{{ID: "codex-meta", AccountID: "acct-from-metadata", AuthType: "codex_device_auth", Enabled: true, InPool: true, UpstreamBaseURL: upstream.URL + "/backend-api", Priority: 100}})
 	home := a.accountCodexHome("codex-meta")
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	idToken := fakeJWTClaims(map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-from-jwt", "chatgpt_account_is_fedramp": true}})
+	idToken := fakeJWTClaims(map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_is_fedramp": true}})
 	authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"id_token":%q,"access_token":"<access-token>","refresh_token":"<refresh-token>"}}`, idToken)
 	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
 		t.Fatal(err)
@@ -519,6 +818,369 @@ func TestResponsesProxyAddsCodexMetadataHeaders(t *testing.T) {
 	a.publicMux().ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestDeviceAuthFailoverAfterRateLimit(t *testing.T) {
+	firstHits := 0
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstHits++
+		if r.Header.Get("Authorization") != "Bearer <first-access-token>" {
+			t.Fatalf("first account used unexpected authorization header %q", r.Header.Get("Authorization"))
+		}
+		if r.Header.Get("ChatGPT-Account-ID") != "acct-first" {
+			t.Fatalf("first account used unexpected ChatGPT account header %q", r.Header.Get("ChatGPT-Account-ID"))
+		}
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer first.Close()
+	secondHits := 0
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHits++
+		if r.Header.Get("Authorization") != "Bearer <second-access-token>" {
+			t.Fatalf("second account used unexpected authorization header %q", r.Header.Get("Authorization"))
+		}
+		if r.Header.Get("ChatGPT-Account-ID") != "acct-second" {
+			t.Fatalf("second account used unexpected ChatGPT account header %q", r.Header.Get("ChatGPT-Account-ID"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_device_failover","object":"response","output":[]}`))
+	}))
+	defer second.Close()
+
+	a := testApp(t, []account{
+		{ID: "device-first", AccountID: "acct-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL},
+		{ID: "device-second", AccountID: "acct-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: second.URL},
+	})
+	for _, item := range a.config.Accounts {
+		home := a.accountCodexHome(item.ID)
+		if err := os.MkdirAll(home, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		accessToken := "<first-access-token>"
+		if item.ID == "device-second" {
+			accessToken = "<second-access-token>"
+		}
+		authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q}}`, accessToken)
+		if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "device-failover")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("device-auth failover returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if firstHits != 1 || secondHits != 1 {
+		t.Fatalf("device-auth failover hits = first:%d second:%d, want 1 each", firstHits, secondHits)
+	}
+	if session := a.state.StickySessions["gpt-test:device-failover"]; session.AccountID != "device-second" {
+		t.Fatalf("device-auth sticky failover = %#v, want device-second", session)
+	}
+	if reason := a.state.Health["device-first"].LastFailureReason; reason != "rate_limited" {
+		t.Fatalf("first device-auth account failure reason = %q, want rate_limited", reason)
+	}
+}
+
+func TestCliproxyAuthAdapterUsesAnIsolatedRefreshOwner(t *testing.T) {
+	a := testApp(t, []account{{ID: "device-one", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.codexGatewayMode = "sidecar"
+	item := a.config.Accounts[0]
+	home := a.accountCodexHome(item.ID)
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	idToken := fakeJWTClaims(map[string]any{
+		"email":                       "pool-user@example.test",
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-one", "chatgpt_plan_type": "plus"},
+	})
+	authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"id_token":%q,"access_token":"<pool-access-token>","refresh_token":"<pool-refresh-token>"}}`, idToken)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.syncCliproxyAuth(item, true); err != nil {
+		t.Fatal(err)
+	}
+	var sidecar cliproxyCodexAuthFile
+	if err := readJSON(a.cliproxyAuthPath(item.ID), &sidecar); err != nil {
+		t.Fatal(err)
+	}
+	if sidecar.Type != "codex" || sidecar.Prefix != "codex-pool-device-one" || sidecar.AccountID != "acct-one" || sidecar.PlanType != "plus" {
+		t.Fatalf("unexpected cliproxy auth record: %#v", sidecar)
+	}
+	if sidecar.AccessToken != "<pool-access-token>" || sidecar.RefreshToken != "<pool-refresh-token>" {
+		t.Fatalf("cliproxy auth did not preserve token fields")
+	}
+
+	// Sidecar owns refreshes. Pool must use its current copy for quota reads and
+	// never refresh the original Codex CLI auth in parallel.
+	sidecar.AccessToken = "<sidecar-refreshed-access-token>"
+	if err := writeJSONAtomic(a.cliproxyAuthPath(item.ID), sidecar); err != nil {
+		t.Fatal(err)
+	}
+	active, err := a.activeCodexAuthContext(context.Background(), item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.AccessToken != "<sidecar-refreshed-access-token>" {
+		t.Fatalf("active sidecar auth token = %q", active.AccessToken)
+	}
+}
+
+func TestDeviceAuthFailoverThroughCliproxyAdapter(t *testing.T) {
+	seenModels := make([]string, 0, 2)
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected sidecar path %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer sidecar-test-key" {
+			t.Fatalf("unexpected sidecar authorization %q", r.Header.Get("Authorization"))
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		model, _ := payload["model"].(string)
+		seenModels = append(seenModels, model)
+		switch model {
+		case "codex-pool-device-first/gpt-test":
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+		case "codex-pool-device-second/gpt-test":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_sidecar_failover","object":"response","output":[]}`))
+		default:
+			t.Fatalf("unexpected sidecar model %q", model)
+		}
+	}))
+	defer sidecar.Close()
+
+	a := testApp(t, []account{
+		{ID: "device-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
+		{ID: "device-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10},
+	})
+	a.codexGatewayMode = "sidecar"
+	a.cliproxyBaseURL = sidecar.URL + "/v1"
+	a.cliproxyAPIKey = "sidecar-test-key"
+	for _, item := range a.config.Accounts {
+		home := a.accountCodexHome(item.ID)
+		if err := os.MkdirAll(home, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"<test-access-token>","refresh_token":"<test-refresh-token>"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "cliproxy-failover")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("cliproxy failover returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if got := strings.Join(seenModels, ","); got != "codex-pool-device-first/gpt-test,codex-pool-device-second/gpt-test" {
+		t.Fatalf("sidecar account sequence = %q", got)
+	}
+	if session := a.state.StickySessions["gpt-test:cliproxy-failover"]; session.AccountID != "device-second" {
+		t.Fatalf("cliproxy sticky failover = %#v", session)
+	}
+	if reason := a.state.Health["device-first"].LastFailureReason; reason != "rate_limited" {
+		t.Fatalf("cliproxy first account reason = %q", reason)
+	}
+}
+
+func TestDeviceAuthZeroQuotaAccountIsNotSelected(t *testing.T) {
+	zero := 0
+	emptyHits := 0
+	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		emptyHits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer empty.Close()
+	ready := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer <ready-access-token>" {
+			t.Fatalf("ready device-auth account used unexpected authorization header %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_device_ready","object":"response","output":[]}`))
+	}))
+	defer ready.Close()
+
+	a := testApp(t, []account{
+		{ID: "device-empty", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, RemainingQuota: &zero, UpstreamBaseURL: empty.URL},
+		{ID: "device-ready", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: ready.URL},
+	})
+	home := a.accountCodexHome("device-ready")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"<ready-access-token>"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("device-auth zero quota routing returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if emptyHits != 0 {
+		t.Fatalf("zero-quota device-auth account was called %d times", emptyHits)
+	}
+}
+
+func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
+	resetAt := time.Now().UTC().Add(7 * time.Hour).Unix()
+	var sawAccountHeader bool
+	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/wham/usage" {
+			t.Fatalf("unexpected usage path %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") == "" {
+			t.Fatal("missing authorization header")
+		}
+		if r.Header.Get("ChatGPT-Account-Id") == "acct-chatgpt" {
+			sawAccountHeader = true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{
+			"plan_type":"team",
+			"rate_limit":{
+				"allowed":true,
+				"limit_reached":false,
+				"primary_window":{"used_percent":30,"limit_window_seconds":18000,"reset_after_seconds":60},
+				"secondary_window":{"used_percent":80,"limit_window_seconds":604800,"reset_at":%d}
+			}
+		}`, resetAt)
+	}))
+	defer usage.Close()
+
+	a := testApp(t, []account{{ID: "codex-quota", AccountID: "acct-chatgpt", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.codexBaseURL = usage.URL + "/backend-api"
+	home := a.accountCodexHome("codex-quota")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"refresh_token":"<refresh-token>"}}`, fakeJWT(time.Now().Add(time.Hour)))
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := a.refreshAccountQuota(context.Background(), "codex-quota")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawAccountHeader {
+		t.Fatal("quota refresh did not send ChatGPT-Account-Id")
+	}
+	if snapshot.PlanType != "team" || snapshot.Quota == nil {
+		t.Fatalf("unexpected quota snapshot: %#v", snapshot)
+	}
+	if snapshot.Quota.Hourly.Percentage != 70 || snapshot.Quota.Hourly.WindowMinutes == nil || *snapshot.Quota.Hourly.WindowMinutes != 300 {
+		t.Fatalf("unexpected hourly quota: %#v", snapshot.Quota.Hourly)
+	}
+	if snapshot.Quota.Weekly.Percentage != 20 || snapshot.Quota.Weekly.ResetAt == nil || *snapshot.Quota.Weekly.ResetAt != resetAt {
+		t.Fatalf("unexpected weekly quota: %#v", snapshot.Quota.Weekly)
+	}
+	if a.config.Accounts[0].RemainingQuota == nil || *a.config.Accounts[0].RemainingQuota != 20 {
+		t.Fatalf("remaining quota hint not updated: %#v", a.config.Accounts[0].RemainingQuota)
+	}
+	status, reason := a.accountStatusLocked(a.config.Accounts[0], time.Now().UTC())
+	if status != "low" || !strings.Contains(reason, "Quota window") {
+		t.Fatalf("quota status = %q/%q, want low quota window", status, reason)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("public dashboard returned %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"hourly"`) || !strings.Contains(body, `"weekly"`) {
+		t.Fatalf("public dashboard did not include quota windows: %s", body)
+	}
+	if strings.Contains(body, "acct-chatgpt") || strings.Contains(body, "<refresh-token>") {
+		t.Fatalf("public dashboard exposed credential/account internals: %s", body)
+	}
+}
+
+func TestCodexQuotaErrorDoesNotPersistUpstreamBody(t *testing.T) {
+	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"invalid_token","message":"secret-body-token"}}`))
+	}))
+	defer usage.Close()
+
+	a := testApp(t, []account{{ID: "codex-quota-error", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.codexBaseURL = usage.URL + "/backend-api"
+	home := a.accountCodexHome("codex-quota-error")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"refresh_token":"<refresh-token>","account_id":"acct-chatgpt"}}`, fakeJWT(time.Now().Add(time.Hour)))
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := a.refreshAccountQuota(context.Background(), "codex-quota-error")
+	if err == nil {
+		t.Fatal("quota refresh with upstream 401 returned nil error")
+	}
+	if strings.Contains(err.Error(), "secret-body-token") {
+		t.Fatalf("quota error exposed upstream body: %s", err)
+	}
+	snapshot := a.state.Quotas["codex-quota-error"]
+	if snapshot.QuotaError == nil || snapshot.QuotaError.Code != "invalid_token" {
+		t.Fatalf("quota error was not persisted with code: %#v", snapshot)
+	}
+	if strings.Contains(snapshot.QuotaError.Message, "secret-body-token") {
+		t.Fatalf("persisted quota error exposed upstream body: %#v", snapshot.QuotaError)
+	}
+	status, reason := a.accountStatusLocked(a.config.Accounts[0], time.Now().UTC())
+	if status != "error" || !strings.Contains(reason, "invalid_token") {
+		t.Fatalf("quota refresh failure status = %q/%q, want error with sanitized code", status, reason)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("public dashboard returned %d", recorder.Code)
+	}
+	publicBody := recorder.Body.String()
+	if strings.Contains(publicBody, "invalid_token") || strings.Contains(publicBody, "secret-body-token") || strings.Contains(publicBody, "acct-chatgpt") {
+		t.Fatalf("public dashboard exposed quota failure internals: %s", publicBody)
+	}
+}
+
+func TestQuotaFromUsageTreatsReachedLimitWithoutWindowsAsExhausted(t *testing.T) {
+	reached := true
+	quota := quotaFromUsage(codexUsageResponse{
+		RateLimit: &codexRateLimitInfo{LimitReached: &reached},
+	}, time.Now().UTC())
+	if !quota.Hourly.Present || quota.Hourly.Percentage != 0 {
+		t.Fatalf("limit-reached usage was not normalized to exhausted quota: %#v", quota)
+	}
+	if remainingQuotaHint(quota) != 0 {
+		t.Fatalf("limit-reached quota remaining hint = %d, want 0", remainingQuotaHint(quota))
+	}
+}
+
+func TestExtractUpstreamErrorCodeRejectsUnsafeValues(t *testing.T) {
+	if code := extractUpstreamErrorCode([]byte(`{"error":{"code":"invalid_token"}}`)); code != "invalid_token" {
+		t.Fatalf("safe error code = %q, want invalid_token", code)
+	}
+	if code := extractUpstreamErrorCode([]byte(`{"error":{"code":"secret token value"}}`)); code != "" {
+		t.Fatalf("unsafe error code was retained: %q", code)
 	}
 }
 
@@ -573,6 +1235,61 @@ func TestResponsesProxyRefreshesExpiringCodexToken(t *testing.T) {
 	}
 	if persisted.Tokens == nil || persisted.Tokens.RefreshToken != "<new-refresh-token>" {
 		t.Fatalf("refreshed auth was not persisted: %s", updated)
+	}
+}
+
+func TestConcurrentCodexAuthRefreshUsesOneTokenRequest(t *testing.T) {
+	newAccess := fakeJWT(time.Now().Add(time.Hour))
+	var refreshMu sync.Mutex
+	refreshCalls := 0
+	refresh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshMu.Lock()
+		refreshCalls++
+		refreshMu.Unlock()
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"access_token":%q,"refresh_token":"<new-refresh-token>"}`, newAccess)
+	}))
+	defer refresh.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refresh.URL)
+
+	a := testApp(t, []account{{ID: "codex-lock", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
+	home := a.accountCodexHome("codex-lock")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"refresh_token":"<old-refresh-token>"}}`, fakeJWT(time.Now().Add(-time.Minute)))
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			auth, err := a.refreshedCodexAuth(a.config.Accounts[0])
+			if err == nil && auth.AccessToken != newAccess {
+				err = fmt.Errorf("unexpected access token %q", auth.AccessToken)
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	refreshMu.Lock()
+	defer refreshMu.Unlock()
+	if refreshCalls != 1 {
+		t.Fatalf("refresh endpoint was called %d times, want 1", refreshCalls)
 	}
 }
 
@@ -653,6 +1370,80 @@ func TestFailoverAfterRateLimit(t *testing.T) {
 	}
 }
 
+func TestFailoverTriesAllConfiguredAccounts(t *testing.T) {
+	hits := map[string]int{}
+	rateLimited := func(id string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits[id]++
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+	}
+	first := rateLimited("first")
+	defer first.Close()
+	second := rateLimited("second")
+	defer second.Close()
+	third := rateLimited("third")
+	defer third.Close()
+	fourth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits["fourth"]++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_ok","object":"response","output":[]}`))
+	}))
+	defer fourth.Close()
+	a := testApp(t, []account{
+		{ID: "first", Enabled: true, InPool: true, Priority: 400, UpstreamBaseURL: first.URL, UpstreamAPIKey: "one"},
+		{ID: "second", Enabled: true, InPool: true, Priority: 300, UpstreamBaseURL: second.URL, UpstreamAPIKey: "two"},
+		{ID: "third", Enabled: true, InPool: true, Priority: 200, UpstreamBaseURL: third.URL, UpstreamAPIKey: "three"},
+		{ID: "fourth", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: fourth.URL, UpstreamAPIKey: "four"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "all-accounts")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("failover returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	for _, id := range []string{"first", "second", "third", "fourth"} {
+		if hits[id] != 1 {
+			t.Fatalf("account %s hit count = %d, want 1 (all hits: %#v)", id, hits[id], hits)
+		}
+	}
+	if session := a.state.StickySessions["gpt-test:all-accounts"]; session.AccountID != "fourth" {
+		t.Fatalf("expected sticky failover to fourth, got %#v", session)
+	}
+}
+
+func TestZeroQuotaAccountIsNotSelected(t *testing.T) {
+	emptyQuota := 0
+	firstHits := 0
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstHits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_ok","object":"response","output":[]}`))
+	}))
+	defer second.Close()
+	a := testApp(t, []account{
+		{ID: "empty", Enabled: true, InPool: true, Priority: 100, RemainingQuota: &emptyQuota, UpstreamBaseURL: first.URL, UpstreamAPIKey: "empty"},
+		{ID: "ready", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: second.URL, UpstreamAPIKey: "ready"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if firstHits != 0 {
+		t.Fatalf("zero-quota account was selected %d times", firstHits)
+	}
+}
+
 func fakeJWT(exp time.Time) string {
 	return fakeJWTClaims(map[string]any{"exp": exp.Unix()})
 }
@@ -693,7 +1484,7 @@ func TestAdminLoginAndCSRFMiddleware(t *testing.T) {
 	if sessionCookie == nil || csrfCookie == nil || response.CSRFToken == "" {
 		t.Fatal("login did not establish expected cookies")
 	}
-	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts", strings.NewReader(`{"id":"codex-account","label":"Codex Account","codexHome":"/tmp/evil/.codex"}`))
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts", strings.NewReader(`{"email":"User@Example.Test","planType":"plus","allowedModels":["gpt-5.5"],"codexHome":"/tmp/evil/.codex"}`))
 	request.AddCookie(sessionCookie)
 	request.AddCookie(csrfCookie)
 	request.Header.Set("X-CSRF-Token", response.CSRFToken)
@@ -705,7 +1496,21 @@ func TestAdminLoginAndCSRFMiddleware(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), `"authType":"codex_device_auth"`) {
 		t.Fatalf("admin account create did not default to Codex device auth: %s", recorder.Body.String())
 	}
+	for _, expected := range []string{`"id":"acct-user-example-test"`, `"email":"us***@example.test"`, `"displayName":"us***@example.test"`} {
+		if !strings.Contains(recorder.Body.String(), expected) {
+			t.Fatalf("admin account create response missing %s: %s", expected, recorder.Body.String())
+		}
+	}
+	if strings.Contains(recorder.Body.String(), "user@example.test") {
+		t.Fatalf("admin account create response exposed full email: %s", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), `"planType":"plus"`) {
+		t.Fatalf("admin account create accepted caller-supplied plan type: %s", recorder.Body.String())
+	}
 	if strings.Contains(recorder.Body.String(), "/tmp/evil") {
 		t.Fatalf("admin account create accepted caller-supplied codexHome: %s", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), `"allowedModels":["`) {
+		t.Fatalf("admin account create unexpectedly stored user-selected models: %s", recorder.Body.String())
 	}
 }
