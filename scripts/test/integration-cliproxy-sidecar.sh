@@ -40,6 +40,8 @@ docker run -d --name "$POOL" --network "$NETWORK" --network-alias codex-pool -v 
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
   codex-pool:local >/dev/null
 
+docker exec "$POOL" sh -ceu 'test -s /etc/ssl/certs/ca-certificates.crt'
+
 docker run --rm --network "$NETWORK" --entrypoint node codex-pool:local -e '
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 for (let i = 0; i < 80; i += 1) {
