@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 const (
@@ -34,6 +36,8 @@ const (
 	cliproxyBaseURLDefault    = "http://127.0.0.1:8319/v1"
 	codexRefreshURLDefault    = "https://auth.openai.com/oauth/token"
 	codexOAuthClientIDDefault = "app_EMoamEEZ73f0CkXaXp7hrann"
+	chatGPTWebReferer         = "https://chatgpt.com/"
+	chatGPTWebUserAgent       = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 	codexTokenRefreshWindow   = 5 * time.Minute
 	adminLoginMaxFailures     = 5
 	adminLoginLockout         = 15 * time.Minute
@@ -53,26 +57,28 @@ type config struct {
 }
 
 type account struct {
-	ID              string    `json:"id"`
-	Label           string    `json:"label"`
-	Email           string    `json:"email,omitempty"`
-	AccountID       string    `json:"accountId,omitempty"`
-	PlanType        string    `json:"planType,omitempty"`
-	PlanRank        int       `json:"planRank,omitempty"`
-	AuthType        string    `json:"authType"`
-	CodexHome       string    `json:"codexHome,omitempty"`
-	Enabled         bool      `json:"enabled"`
-	InPool          bool      `json:"inPool"`
-	Priority        int       `json:"priority"`
-	RemainingQuota  *int      `json:"remainingQuota,omitempty"`
-	AllowedModels   []string  `json:"allowedModels,omitempty"`
-	ExcludedModels  []string  `json:"excludedModels,omitempty"`
-	UpstreamBaseURL string    `json:"upstreamBaseUrl,omitempty"`
-	UpstreamAPIKey  string    `json:"upstreamApiKey,omitempty"`
-	WireAPI         string    `json:"wireApi,omitempty"`
-	CreatedAt       time.Time `json:"createdAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
-	LastLoginAt     time.Time `json:"lastLoginAt,omitempty"`
+	ID               string    `json:"id"`
+	Label            string    `json:"label"`
+	Email            string    `json:"email,omitempty"`
+	AccountID        string    `json:"accountId,omitempty"`
+	OrganizationName string    `json:"organizationName,omitempty"`
+	PlanType         string    `json:"planType,omitempty"`
+	PlanLimit        string    `json:"planLimit,omitempty"`
+	PlanRank         int       `json:"planRank,omitempty"`
+	AuthType         string    `json:"authType"`
+	CodexHome        string    `json:"codexHome,omitempty"`
+	Enabled          bool      `json:"enabled"`
+	InPool           bool      `json:"inPool"`
+	Priority         int       `json:"priority"`
+	RemainingQuota   *int      `json:"remainingQuota,omitempty"`
+	AllowedModels    []string  `json:"allowedModels,omitempty"`
+	ExcludedModels   []string  `json:"excludedModels,omitempty"`
+	UpstreamBaseURL  string    `json:"upstreamBaseUrl,omitempty"`
+	UpstreamAPIKey   string    `json:"upstreamApiKey,omitempty"`
+	WireAPI          string    `json:"wireApi,omitempty"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+	LastLoginAt      time.Time `json:"lastLoginAt,omitempty"`
 }
 
 type cooldown struct {
@@ -100,11 +106,13 @@ type quotaErrorInfo struct {
 }
 
 type quotaSnapshot struct {
-	AccountID      string          `json:"accountId"`
-	PlanType       string          `json:"planType,omitempty"`
-	Quota          *accountQuota   `json:"quota,omitempty"`
-	UsageUpdatedAt time.Time       `json:"usageUpdatedAt,omitempty"`
-	QuotaError     *quotaErrorInfo `json:"quotaError,omitempty"`
+	AccountID        string          `json:"accountId"`
+	OrganizationName string          `json:"organizationName,omitempty"`
+	PlanType         string          `json:"planType,omitempty"`
+	PlanLimit        string          `json:"planLimit,omitempty"`
+	Quota            *accountQuota   `json:"quota,omitempty"`
+	UsageUpdatedAt   time.Time       `json:"usageUpdatedAt,omitempty"`
+	QuotaError       *quotaErrorInfo `json:"quotaError,omitempty"`
 }
 
 type stickySession struct {
@@ -307,7 +315,9 @@ func (a *app) load() error {
 	}
 	for i := range a.config.Accounts {
 		a.config.Accounts[i].Email = normalizeEmail(a.config.Accounts[i].Email)
+		a.config.Accounts[i].OrganizationName = cleanOrganizationName(a.config.Accounts[i].OrganizationName)
 		a.config.Accounts[i].PlanType = normalizePlanType(a.config.Accounts[i].PlanType)
+		a.config.Accounts[i].PlanLimit = cleanPlanLimit(a.config.Accounts[i].PlanLimit)
 		a.config.Accounts[i].PlanRank = planRank(a.config.Accounts[i].PlanType)
 		if strings.TrimSpace(a.config.Accounts[i].Label) == "" {
 			a.config.Accounts[i].Label = accountDisplayName(a.config.Accounts[i])
@@ -408,6 +418,7 @@ func (a *app) publicMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", a.requireAPIKey(a.handlePublicRoot))
 	mux.HandleFunc("GET /healthz", a.requireAPIKey(a.handleHealthz))
+	mux.HandleFunc("GET /v1/codex-pool/status", a.requireAPIKey(a.handleCurrentStatus))
 	mux.HandleFunc("GET /v1/models", a.requireAPIKey(a.handleModels))
 	mux.HandleFunc("POST /v1/responses", a.requireAPIKey(a.handleResponses))
 	mux.HandleFunc("POST /v1/responses/compact", a.requireAPIKey(a.handleResponses))
@@ -457,6 +468,54 @@ func (a *app) handleAdminRoot(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *app) handleCurrentStatus(w http.ResponseWriter, r *http.Request) {
+	model := a.resolveModel(r.URL.Query().Get("model"))
+	stickyKey, scope := currentStatusStickyKey(r, model)
+	now := time.Now().UTC()
+
+	a.mu.RLock()
+	var session stickySession
+	var found bool
+	if stickyKey != "" {
+		session, found = a.state.StickySessions[stickyKey]
+		if found && a.stickySessionExpiredLocked(session, now) {
+			found = false
+		}
+	} else {
+		session, found = a.latestStickySessionLocked(model, now)
+		scope = "latest"
+	}
+	if !found {
+		a.mu.RUnlock()
+		writeOpenAIError(w, http.StatusNotFound, "current_account_not_found", "no current account is bound to the requested model/session")
+		return
+	}
+	item, index := a.accountWithIndexLocked(session.AccountID)
+	if item == nil {
+		a.mu.RUnlock()
+		writeOpenAIError(w, http.StatusNotFound, "current_account_not_found", "current account is no longer configured")
+		return
+	}
+	expiresAt := a.stickyExpiresAt(session)
+	accountStatus := a.currentAccountStatusLocked(*item, index, now)
+	a.mu.RUnlock()
+
+	response := map[string]any{
+		"ok":    true,
+		"model": model,
+		"scope": map[string]any{
+			"type":          scope,
+			"lastSuccessAt": session.LastSuccessAt,
+			"expiresAt":     expiresAt,
+		},
+		"account": accountStatus,
+	}
+	if scope == "latest" {
+		response["warning"] = "No session or project was provided; returning the most recent active sticky session for this model."
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -550,6 +609,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			continue
 		}
 		defer response.Body.Close()
+		a.addCurrentAccountResponseHeaders(w, candidate.ID)
 		if convertResponse {
 			a.writeChatFromResponse(w, response, model)
 		} else {
@@ -707,6 +767,71 @@ func outputText(data map[string]any) string {
 	return ""
 }
 
+func (a *app) addCurrentAccountResponseHeaders(w http.ResponseWriter, accountID string) {
+	a.mu.RLock()
+	item, index := a.accountWithIndexLocked(accountID)
+	if item == nil {
+		a.mu.RUnlock()
+		return
+	}
+	quota := a.state.Quotas[item.ID]
+	displayItem := *item
+	if quota.OrganizationName != "" {
+		displayItem.OrganizationName = quota.OrganizationName
+	}
+	if quota.PlanType != "" {
+		displayItem.PlanType = quota.PlanType
+	}
+	if quota.PlanLimit != "" {
+		displayItem.PlanLimit = quota.PlanLimit
+	}
+	status, _ := a.accountStatusLocked(*item, time.Now().UTC())
+	displayName := currentAccountDisplayName(displayItem, index)
+	organizationName := publicOrganizationName(displayItem.OrganizationName)
+	planType := normalizePlanType(displayItem.PlanType)
+	planDisplay := accountPlanDisplayName(displayItem, false)
+	quotaValue := quota.Quota
+	updatedAt := quota.UsageUpdatedAt
+	a.mu.RUnlock()
+
+	if displayName != "" {
+		w.Header().Set("X-Codex-Pool-Account", safeHeaderValue(displayName))
+	}
+	if planType != "" && planType != "unknown" {
+		w.Header().Set("X-Codex-Pool-Plan", safeHeaderValue(planDisplay))
+	}
+	if organizationName != "" {
+		w.Header().Set("X-Codex-Pool-Organization", safeHeaderValue(organizationName))
+	}
+	if status != "" {
+		w.Header().Set("X-Codex-Pool-Account-Status", safeHeaderValue(status))
+	}
+	if quotaValue != nil {
+		w.Header().Set("X-Codex-Pool-Quota-Remaining", strconv.Itoa(remainingQuotaHint(*quotaValue)))
+		if quotaValue.Hourly.Present {
+			w.Header().Set("X-Codex-Pool-Quota-Hourly-Remaining", strconv.Itoa(quotaValue.Hourly.Percentage))
+		}
+		if quotaValue.Weekly.Present {
+			w.Header().Set("X-Codex-Pool-Quota-Weekly-Remaining", strconv.Itoa(quotaValue.Weekly.Percentage))
+		}
+	}
+	if !updatedAt.IsZero() {
+		w.Header().Set("X-Codex-Pool-Quota-Updated-At", updatedAt.Format(time.RFC3339))
+	}
+}
+
+func safeHeaderValue(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == 0 {
+			return -1
+		}
+		if r < 32 && r != '\t' {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(value))
+}
+
 func copyProxyResponse(w http.ResponseWriter, response *http.Response) {
 	for _, header := range []string{"Content-Type", "Cache-Control", "X-Request-Id"} {
 		if value := response.Header.Get(header); value != "" {
@@ -834,6 +959,7 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 	input.ID = strings.TrimSpace(input.ID)
 	input.Email = normalizeEmail(input.Email)
+	input.OrganizationName = cleanOrganizationName(input.OrganizationName)
 	input.Label = strings.TrimSpace(input.Label)
 	input.UpstreamBaseURL = strings.TrimRight(input.UpstreamBaseURL, "/")
 	input.WireAPI = normalWireAPI(input.WireAPI)
@@ -846,10 +972,13 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 	if isCodexDeviceAuth(input) {
 		input.AccountID = ""
+		input.OrganizationName = ""
 		input.PlanType = ""
+		input.PlanLimit = ""
 		input.PlanRank = 0
 	} else {
 		input.PlanType = normalizePlanType(input.PlanType)
+		input.PlanLimit = cleanPlanLimit(input.PlanLimit)
 		input.PlanRank = planRank(input.PlanType)
 	}
 	generateID := input.ID == ""
@@ -917,7 +1046,7 @@ func (a *app) handleRefreshAllQuota(w http.ResponseWriter, r *http.Request) {
 			results = append(results, map[string]any{"accountId": accountID, "ok": false, "error": map[string]any{"code": "quota_refresh_failed", "message": err.Error()}})
 			continue
 		}
-		results = append(results, map[string]any{"accountId": accountID, "ok": true, "quota": snapshot.Quota, "planType": snapshot.PlanType, "usageUpdatedAt": snapshot.UsageUpdatedAt})
+		results = append(results, map[string]any{"accountId": accountID, "ok": true, "quota": snapshot.Quota, "organizationName": publicOrganizationName(snapshot.OrganizationName), "planType": snapshot.PlanType, "planLimit": snapshot.PlanLimit, "usageUpdatedAt": snapshot.UsageUpdatedAt})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
 }
@@ -1008,7 +1137,7 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusBadGateway, "quota_refresh_failed", err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "quota": snapshot.Quota, "planType": snapshot.PlanType, "usageUpdatedAt": snapshot.UsageUpdatedAt})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "quota": snapshot.Quota, "organizationName": publicOrganizationName(snapshot.OrganizationName), "planType": snapshot.PlanType, "planLimit": snapshot.PlanLimit, "usageUpdatedAt": snapshot.UsageUpdatedAt})
 		return
 	}
 	defer a.mu.Unlock()
@@ -1258,13 +1387,20 @@ func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
+	stickyChanged := false
 	if existing, ok := a.state.StickySessions[stickyKey]; ok && !excluded[existing.AccountID] {
 		if a.stickySessionExpiredLocked(existing, now) {
 			delete(a.state.StickySessions, stickyKey)
-			_ = a.saveLocked()
+			stickyChanged = true
 		} else if item := a.accountLocked(existing.AccountID); item != nil && a.usableLocked(*item, model, now) {
 			return *item, nil
+		} else if item == nil {
+			delete(a.state.StickySessions, stickyKey)
+			stickyChanged = true
 		}
+	}
+	if stickyChanged {
+		_ = a.saveLocked()
 	}
 	eligible := make([]account, 0)
 	for _, item := range a.config.Accounts {
@@ -1301,7 +1437,7 @@ func (a *app) usableLocked(item account, model string, now time.Time) bool {
 	if !item.Enabled || !item.InPool || !allowedModel(item, model) {
 		return false
 	}
-	if item.RemainingQuota != nil && *item.RemainingQuota <= 0 {
+	if !a.quotaAvailableLocked(item) {
 		return false
 	}
 	if isCodexDeviceAuth(item) {
@@ -1315,6 +1451,20 @@ func (a *app) usableLocked(item account, model string, now time.Time) bool {
 		if cd.ModelID == model && cd.NextRetryAt.After(now) {
 			return false
 		}
+	}
+	return true
+}
+
+func (a *app) quotaAvailableLocked(item account) bool {
+	snapshot := a.state.Quotas[item.ID]
+	if snapshot.QuotaError != nil {
+		return false
+	}
+	if snapshot.Quota != nil {
+		return remainingQuotaHint(*snapshot.Quota) > 0
+	}
+	if item.RemainingQuota != nil {
+		return *item.RemainingQuota > 0
 	}
 	return true
 }
@@ -1358,6 +1508,26 @@ func (a *app) markSuccess(key, model, accountID string) {
 	_ = a.saveLocked()
 }
 
+func (a *app) clearAccountRuntimeStateLocked(accountID string) {
+	if a.state.Health != nil {
+		health := a.state.Health[accountID]
+		health.ConsecutiveFailure = 0
+		health.LastFailureReason = ""
+		a.state.Health[accountID] = health
+	}
+	if a.state.Cooldowns != nil {
+		delete(a.state.Cooldowns, accountID)
+	}
+	if a.state.Quotas != nil {
+		snapshot := a.state.Quotas[accountID]
+		if snapshot.AccountID != "" || snapshot.Quota != nil || snapshot.QuotaError != nil || !snapshot.UsageUpdatedAt.IsZero() {
+			snapshot.AccountID = accountID
+			snapshot.QuotaError = nil
+			a.state.Quotas[accountID] = snapshot
+		}
+	}
+}
+
 func (a *app) stickyTTL() time.Duration {
 	if a.sessionAffinityTTL > 0 {
 		return a.sessionAffinityTTL
@@ -1395,6 +1565,28 @@ func (a *app) pruneExpiredStickySessionsLocked(now time.Time) bool {
 	return changed
 }
 
+func (a *app) latestStickySessionLocked(model string, now time.Time) (stickySession, bool) {
+	var best stickySession
+	found := false
+	for _, item := range a.state.StickySessions {
+		if item.ModelID != model || a.stickySessionExpiredLocked(item, now) {
+			continue
+		}
+		if !found || stickyActivityTime(item).After(stickyActivityTime(best)) {
+			best = item
+			found = true
+		}
+	}
+	return best, found
+}
+
+func stickyActivityTime(item stickySession) time.Time {
+	if !item.LastSuccessAt.IsZero() {
+		return item.LastSuccessAt
+	}
+	return item.CreatedAt
+}
+
 func (a *app) accountLocked(id string) *account {
 	for i := range a.config.Accounts {
 		if a.config.Accounts[i].ID == id {
@@ -1402,6 +1594,15 @@ func (a *app) accountLocked(id string) *account {
 		}
 	}
 	return nil
+}
+
+func (a *app) accountWithIndexLocked(id string) (*account, int) {
+	for i := range a.config.Accounts {
+		if a.config.Accounts[i].ID == id {
+			return &a.config.Accounts[i], i
+		}
+	}
+	return nil, -1
 }
 func (a *app) clearStickyForAccountLocked(id string) {
 	for key, item := range a.state.StickySessions {
@@ -1458,6 +1659,41 @@ func parseModel(value string) (string, string) {
 	return value, ""
 }
 
+func (a *app) resolveModel(requestedModel string) string {
+	a.mu.RLock()
+	defaultModel := a.config.DefaultModel
+	a.mu.RUnlock()
+	if strings.TrimSpace(requestedModel) == "" {
+		requestedModel = defaultModel
+	}
+	model, _ := parseModel(requestedModel)
+	a.mu.RLock()
+	if alias, ok := a.config.ModelAliases[model]; ok {
+		model = alias
+	}
+	a.mu.RUnlock()
+	return model
+}
+
+func currentStatusStickyKey(r *http.Request, model string) (string, string) {
+	values := []struct {
+		value  string
+		source string
+	}{
+		{r.Header.Get("X-Codex-Pool-Session"), "session"},
+		{r.URL.Query().Get("session"), "session"},
+		{r.Header.Get("X-Codex-Pool-Project"), "project"},
+		{r.URL.Query().Get("project"), "project"},
+	}
+	for _, item := range values {
+		value := strings.TrimSpace(item.value)
+		if value != "" {
+			return model + ":" + value, item.source
+		}
+	}
+	return "", ""
+}
+
 func (a *app) stickyKey(r *http.Request, payload map[string]any, model string) string {
 	for _, value := range []string{r.Header.Get("X-Codex-Pool-Session"), r.Header.Get("X-Codex-Pool-Project")} {
 		if value != "" {
@@ -1504,11 +1740,13 @@ func isCodexDeviceAuth(item account) bool {
 }
 
 type codexAuthInfo struct {
-	AccessToken string
-	AccountID   string
-	Email       string
-	PlanType    string
-	FedRAMP     bool
+	AccessToken      string
+	AccountID        string
+	Email            string
+	OrganizationName string
+	PlanType         string
+	PlanLimit        string
+	FedRAMP          bool
 }
 
 type codexAuthFile struct {
@@ -1525,16 +1763,18 @@ type codexAuthFile struct {
 // cliproxyCodexAuthFile is CLIProxyAPI's file-backed Codex OAuth record. The
 // sidecar owns refreshes of this copy so Pool never races it for a refresh token.
 type cliproxyCodexAuthFile struct {
-	Type         string `json:"type"`
-	Email        string `json:"email,omitempty"`
-	IDToken      string `json:"id_token,omitempty"`
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	AccountID    string `json:"account_id,omitempty"`
-	LastRefresh  string `json:"last_refresh,omitempty"`
-	Expire       string `json:"expired,omitempty"`
-	Prefix       string `json:"prefix"`
-	PlanType     string `json:"plan_type,omitempty"`
+	Type             string `json:"type"`
+	Email            string `json:"email,omitempty"`
+	IDToken          string `json:"id_token,omitempty"`
+	AccessToken      string `json:"access_token"`
+	RefreshToken     string `json:"refresh_token,omitempty"`
+	AccountID        string `json:"account_id,omitempty"`
+	OrganizationName string `json:"organization_name,omitempty"`
+	LastRefresh      string `json:"last_refresh,omitempty"`
+	Expire           string `json:"expired,omitempty"`
+	Prefix           string `json:"prefix"`
+	PlanType         string `json:"plan_type,omitempty"`
+	PlanLimit        string `json:"plan_limit,omitempty"`
 }
 
 type codexRefreshResponse struct {
@@ -1545,9 +1785,17 @@ type codexRefreshResponse struct {
 
 type codexUsageResponse struct {
 	PlanType            string                `json:"plan_type"`
+	SubscriptionPlan    string                `json:"subscription_plan"`
 	RateLimit           *codexRateLimitInfo   `json:"rate_limit"`
 	CodeReviewRateLimit *codexRateLimitInfo   `json:"code_review_rate_limit"`
 	ResetCredits        *codexResetCreditInfo `json:"rate_limit_reset_credits"`
+}
+
+type codexSubscriptionMetadata struct {
+	AccountID        string
+	OrganizationName string
+	PlanType         string
+	PlanLimit        string
 }
 
 type codexRateLimitInfo struct {
@@ -1587,14 +1835,33 @@ func (a *app) codexAuth(item account) (codexAuthInfo, error) {
 	}
 	if claims := jwtPayload(auth.Tokens.IDToken); claims != nil {
 		info.Email = claimString(claims, "email")
-		if profile, _ := claims["https://api.openai.com/profile"].(map[string]any); info.Email == "" && profile != nil {
-			info.Email = claimString(profile, "email")
+		info.OrganizationName = organizationNameFromMap(claims)
+		info.PlanLimit = planLimitFromMap(claims)
+		if profile, _ := claims["https://api.openai.com/profile"].(map[string]any); profile != nil {
+			if info.Email == "" {
+				info.Email = claimString(profile, "email")
+			}
+			if info.OrganizationName == "" {
+				info.OrganizationName = organizationNameFromMap(profile)
+			}
+			if info.PlanLimit == "" {
+				info.PlanLimit = planLimitFromMap(profile)
+			}
 		}
 		if authClaims, _ := claims["https://api.openai.com/auth"].(map[string]any); authClaims != nil {
 			if info.AccountID == "" {
 				info.AccountID = claimString(authClaims, "chatgpt_account_id")
 			}
+			if info.OrganizationName == "" {
+				info.OrganizationName = organizationNameFromMap(authClaims)
+			}
 			info.PlanType = claimString(authClaims, "chatgpt_plan_type")
+			if info.PlanLimit == "" {
+				info.PlanLimit = cleanPlanLimit(info.PlanType)
+			}
+			if info.PlanLimit == "" {
+				info.PlanLimit = planLimitFromMap(authClaims)
+			}
 			if fedramp, ok := authClaims["chatgpt_account_is_fedramp"].(bool); ok {
 				info.FedRAMP = fedramp
 			}
@@ -1643,14 +1910,16 @@ func (a *app) syncCliproxyAuthLocked(item account, force bool) error {
 		accountID = item.AccountID
 	}
 	record := cliproxyCodexAuthFile{
-		Type:         "codex",
-		Email:        normalizeEmail(chooseString(info.Email, item.Email)),
-		IDToken:      source.Tokens.IDToken,
-		AccessToken:  source.Tokens.AccessToken,
-		RefreshToken: source.Tokens.RefreshToken,
-		AccountID:    accountID,
-		Prefix:       cliproxyAccountPrefix(item.ID),
-		PlanType:     normalizePlanType(chooseString(info.PlanType, item.PlanType)),
+		Type:             "codex",
+		Email:            normalizeEmail(chooseString(info.Email, item.Email)),
+		IDToken:          source.Tokens.IDToken,
+		AccessToken:      source.Tokens.AccessToken,
+		RefreshToken:     source.Tokens.RefreshToken,
+		AccountID:        accountID,
+		OrganizationName: cleanOrganizationName(chooseString(info.OrganizationName, item.OrganizationName)),
+		Prefix:           cliproxyAccountPrefix(item.ID),
+		PlanType:         normalizePlanType(chooseString(info.PlanType, item.PlanType)),
+		PlanLimit:        cleanPlanLimit(chooseString(info.PlanLimit, item.PlanLimit)),
 	}
 	if source.LastRefresh != nil {
 		record.LastRefresh = source.LastRefresh.UTC().Format(time.RFC3339)
@@ -1689,17 +1958,32 @@ func (a *app) cliproxyCodexAuth(item account) (codexAuthInfo, error) {
 	if err != nil || strings.TrimSpace(record.AccessToken) == "" {
 		return codexAuthInfo{}, fmt.Errorf("cliproxy auth is unavailable for account %s", item.ID)
 	}
-	info := codexAuthInfo{AccessToken: strings.TrimSpace(record.AccessToken), AccountID: strings.TrimSpace(record.AccountID), Email: normalizeEmail(record.Email), PlanType: normalizePlanType(record.PlanType)}
+	info := codexAuthInfo{AccessToken: strings.TrimSpace(record.AccessToken), AccountID: strings.TrimSpace(record.AccountID), Email: normalizeEmail(record.Email), OrganizationName: cleanOrganizationName(record.OrganizationName), PlanType: normalizePlanType(record.PlanType), PlanLimit: cleanPlanLimit(record.PlanLimit)}
 	if claims := jwtPayload(record.IDToken); claims != nil {
 		if info.Email == "" {
 			info.Email = normalizeEmail(claimString(claims, "email"))
+		}
+		if info.OrganizationName == "" {
+			info.OrganizationName = organizationNameFromMap(claims)
+		}
+		if info.PlanLimit == "" {
+			info.PlanLimit = planLimitFromMap(claims)
 		}
 		if authClaims, _ := claims["https://api.openai.com/auth"].(map[string]any); authClaims != nil {
 			if info.AccountID == "" {
 				info.AccountID = claimString(authClaims, "chatgpt_account_id")
 			}
-			if info.PlanType == "" {
+			if info.OrganizationName == "" {
+				info.OrganizationName = organizationNameFromMap(authClaims)
+			}
+			if info.PlanType == "" || info.PlanType == "unknown" {
 				info.PlanType = normalizePlanType(claimString(authClaims, "chatgpt_plan_type"))
+			}
+			if info.PlanLimit == "" {
+				info.PlanLimit = cleanPlanLimit(claimString(authClaims, "chatgpt_plan_type"))
+			}
+			if info.PlanLimit == "" {
+				info.PlanLimit = planLimitFromMap(authClaims)
 			}
 			if fedramp, ok := authClaims["chatgpt_account_is_fedramp"].(bool); ok {
 				info.FedRAMP = fedramp
@@ -1829,6 +2113,326 @@ func (a *app) codexUsageURL() string {
 	return strings.TrimRight(a.codexBaseURL, "/") + "/wham/usage"
 }
 
+func (a *app) codexSubscriptionsURL() string {
+	if value := strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_SUBSCRIPTIONS_URL")); value != "" {
+		return value
+	}
+	return strings.TrimRight(a.codexBaseURL, "/") + "/subscriptions"
+}
+
+func (a *app) codexAccountsCheckURL() string {
+	if value := strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_ACCOUNTS_CHECK_URL")); value != "" {
+		return value
+	}
+	return strings.TrimRight(a.codexBaseURL, "/") + "/accounts/check/v4-2023-04-27"
+}
+
+func (a *app) fetchCodexSubscriptionMetadata(ctx context.Context, auth codexAuthInfo) (codexSubscriptionMetadata, error) {
+	metadata, err := a.fetchCodexAccountCheckMetadata(ctx, auth)
+	if err != nil {
+		if auth.AccountID == "" {
+			return codexSubscriptionMetadata{}, err
+		}
+		return a.fetchCodexSubscriptionsMetadata(ctx, auth, auth.AccountID)
+	}
+	accountID := chooseString(metadata.AccountID, auth.AccountID)
+	if accountID == "" {
+		return metadata, nil
+	}
+	if metadata.PlanType == "" || metadata.PlanLimit == "" {
+		if subscriptions, err := a.fetchCodexSubscriptionsMetadata(ctx, auth, accountID); err == nil {
+			metadata.AccountID = chooseString(metadata.AccountID, subscriptions.AccountID)
+			metadata.OrganizationName = cleanOrganizationName(chooseString(metadata.OrganizationName, subscriptions.OrganizationName))
+			if subscriptions.PlanType != "" {
+				metadata.PlanType = subscriptions.PlanType
+			}
+			if subscriptions.PlanLimit != "" {
+				metadata.PlanLimit = subscriptions.PlanLimit
+			}
+		}
+	}
+	return metadata, nil
+}
+
+func (a *app) fetchCodexAccountCheckMetadata(ctx context.Context, auth codexAuthInfo) (codexSubscriptionMetadata, error) {
+	endpoint := a.codexAccountsCheckURL()
+	parsed, err := url.Parse(endpoint)
+	if err == nil {
+		query := parsed.Query()
+		query.Set("timezone_offset_min", strconv.Itoa(chatGPTTimezoneOffsetMinutes()))
+		parsed.RawQuery = query.Encode()
+		endpoint = parsed.String()
+	}
+	payload, err := a.fetchCodexMetadataPayload(ctx, auth, endpoint, "/backend-api/accounts/check/v4-2023-04-27", "")
+	if err != nil {
+		return codexSubscriptionMetadata{}, err
+	}
+	metadata, ok := subscriptionMetadataFromValue(payload, auth.AccountID)
+	if !ok {
+		return codexSubscriptionMetadata{}, errors.New("accounts/check did not include account metadata")
+	}
+	return metadata, nil
+}
+
+func (a *app) fetchCodexSubscriptionsMetadata(ctx context.Context, auth codexAuthInfo, accountID string) (codexSubscriptionMetadata, error) {
+	endpoint := a.codexSubscriptionsURL()
+	parsed, err := url.Parse(endpoint)
+	if err == nil {
+		query := parsed.Query()
+		query.Set("account_id", accountID)
+		parsed.RawQuery = query.Encode()
+		endpoint = parsed.String()
+	}
+	payload, err := a.fetchCodexMetadataPayload(ctx, auth, endpoint, "/backend-api/subscriptions", "")
+	if err != nil {
+		return codexSubscriptionMetadata{}, err
+	}
+	metadata := subscriptionMetadataFromMap(payload)
+	metadata.AccountID = accountID
+	return metadata, nil
+}
+
+func (a *app) fetchCodexMetadataPayload(ctx context.Context, auth codexAuthInfo, endpoint, targetPath, chatGPTAccountID string) (map[string]any, error) {
+	if strings.TrimSpace(auth.AccessToken) == "" {
+		return nil, errors.New("codex access token is missing")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	applyCodexWebMetadataHeaders(request, auth, targetPath, chatGPTAccountID)
+	response, err := a.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return nil, fmt.Errorf("subscription metadata returned status %d", response.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(io.LimitReader(response.Body, maxRequestBody)).Decode(&payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func applyCodexWebMetadataHeaders(request *http.Request, auth codexAuthInfo, targetPath, chatGPTAccountID string) {
+	request.Header.Set("Authorization", "Bearer "+auth.AccessToken)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Referer", chatGPTWebReferer)
+	request.Header.Set("User-Agent", chatGPTWebUserAgent)
+	if targetPath != "" {
+		request.Header.Set("X-OpenAI-Target-Path", targetPath)
+		request.Header.Set("X-OpenAI-Target-Route", targetPath)
+	}
+	if chatGPTAccountID != "" {
+		request.Header.Set("ChatGPT-Account-Id", chatGPTAccountID)
+	}
+	if auth.FedRAMP {
+		request.Header.Set("X-OpenAI-Fedramp", "true")
+	}
+}
+
+func chatGPTTimezoneOffsetMinutes() int {
+	_, offsetSeconds := time.Now().Zone()
+	return -offsetSeconds / 60
+}
+
+func subscriptionMetadataFromMap(values map[string]any) codexSubscriptionMetadata {
+	rawPlan := firstMetadataString(values, "plan_type", "planType", "subscription_plan", "subscriptionPlan", "plan_name", "planName", "sku", "sku_name", "product", "product_name")
+	metadata := codexSubscriptionMetadata{
+		AccountID:        firstMetadataString(values, "account_id", "accountId", "id", "chatgpt_account_id", "workspace_id", "workspaceId"),
+		OrganizationName: cleanOrganizationName(organizationNameFromMap(values)),
+		PlanType:         normalizePlanType(rawPlan),
+		PlanLimit:        cleanPlanLimit(rawPlan),
+	}
+	if metadata.PlanLimit == "" {
+		metadata.PlanLimit = planLimitFromMap(values)
+	}
+	if metadata.PlanLimit == "" {
+		metadata.PlanLimit = planLimitFromSubscriptionPlan(rawPlan)
+	}
+	if metadata.PlanType == "unknown" {
+		metadata.PlanType = ""
+	}
+	return metadata
+}
+
+type subscriptionAccountRecord struct {
+	key  string
+	node map[string]any
+}
+
+func subscriptionMetadataFromValue(value any, preferredAccountID string) (codexSubscriptionMetadata, bool) {
+	records := collectSubscriptionAccountRecords(value)
+	if len(records) == 0 {
+		values, _ := value.(map[string]any)
+		if values == nil {
+			return codexSubscriptionMetadata{}, false
+		}
+		return subscriptionMetadataFromMap(values), true
+	}
+	preferredAccountID = strings.TrimSpace(preferredAccountID)
+	selected := records[0]
+	if preferredAccountID != "" {
+		for _, record := range records {
+			metadata := subscriptionMetadataFromRecord(record.node)
+			if metadata.AccountID == preferredAccountID || strings.TrimSpace(record.key) == preferredAccountID {
+				selected = record
+				break
+			}
+		}
+	} else if orderingKey := firstAccountOrderingKey(value); orderingKey != "" {
+		for _, record := range records {
+			metadata := subscriptionMetadataFromRecord(record.node)
+			if metadata.AccountID == orderingKey || strings.TrimSpace(record.key) == orderingKey {
+				selected = record
+				break
+			}
+		}
+	}
+	metadata := subscriptionMetadataFromRecord(selected.node)
+	if metadata.AccountID == "" {
+		metadata.AccountID = strings.TrimSpace(selected.key)
+	}
+	return metadata, true
+}
+
+func firstAccountOrderingKey(value any) string {
+	values, _ := value.(map[string]any)
+	if values == nil {
+		return ""
+	}
+	ordering, _ := values["account_ordering"].([]any)
+	if len(ordering) == 0 {
+		return ""
+	}
+	first, _ := ordering[0].(string)
+	return strings.TrimSpace(first)
+}
+
+func collectSubscriptionAccountRecords(value any) []subscriptionAccountRecord {
+	switch typed := value.(type) {
+	case []any:
+		records := make([]subscriptionAccountRecord, 0, len(typed))
+		for _, item := range typed {
+			if values, ok := item.(map[string]any); ok {
+				records = append(records, subscriptionAccountRecord{node: values})
+			}
+		}
+		return records
+	case map[string]any:
+		for _, key := range []string{"accounts", "account_items", "items", "data"} {
+			if records := collectSubscriptionAccountRecordsFromField(typed[key]); len(records) > 0 {
+				return records
+			}
+		}
+		if _, ok := typed["account"].(map[string]any); ok {
+			return []subscriptionAccountRecord{{node: typed}}
+		}
+		if firstMetadataString(typed, "account_id", "accountId", "id", "chatgpt_account_id", "workspace_id", "workspaceId") != "" {
+			return []subscriptionAccountRecord{{node: typed}}
+		}
+	}
+	return nil
+}
+
+func collectSubscriptionAccountRecordsFromField(value any) []subscriptionAccountRecord {
+	switch typed := value.(type) {
+	case []any:
+		records := make([]subscriptionAccountRecord, 0, len(typed))
+		for _, item := range typed {
+			if values, ok := item.(map[string]any); ok {
+				records = append(records, subscriptionAccountRecord{node: values})
+			}
+		}
+		return records
+	case map[string]any:
+		records := make([]subscriptionAccountRecord, 0, len(typed))
+		for key, item := range typed {
+			if values, ok := item.(map[string]any); ok {
+				records = append(records, subscriptionAccountRecord{key: key, node: values})
+			}
+		}
+		return records
+	default:
+		return nil
+	}
+}
+
+func subscriptionMetadataFromRecord(record map[string]any) codexSubscriptionMetadata {
+	accountRecord, _ := record["account"].(map[string]any)
+	if accountRecord == nil {
+		accountRecord = record
+	}
+	entitlement, _ := record["entitlement"].(map[string]any)
+	rawPlan := ""
+	if entitlement != nil {
+		rawPlan = firstMetadataString(entitlement, "subscription_plan", "subscriptionPlan", "plan_type", "planType", "plan_name", "planName", "sku", "sku_name", "product", "product_name")
+	}
+	if rawPlan == "" {
+		rawPlan = firstMetadataString(accountRecord, "plan_type", "planType", "subscription_plan", "subscriptionPlan", "plan_name", "planName", "sku", "sku_name", "product", "product_name")
+	}
+	organizationName := cleanOrganizationName(organizationNameFromMap(accountRecord))
+	if organizationName == "" {
+		organizationName = cleanOrganizationName(organizationNameFromMap(record))
+	}
+	metadata := codexSubscriptionMetadata{
+		AccountID:        firstMetadataString(accountRecord, "account_id", "accountId", "id", "chatgpt_account_id", "workspace_id", "workspaceId"),
+		OrganizationName: organizationName,
+		PlanType:         normalizePlanType(rawPlan),
+		PlanLimit:        cleanPlanLimit(rawPlan),
+	}
+	if metadata.PlanLimit == "" && entitlement != nil {
+		metadata.PlanLimit = planLimitFromMap(entitlement)
+	}
+	if metadata.PlanLimit == "" {
+		metadata.PlanLimit = planLimitFromMap(accountRecord)
+	}
+	if metadata.PlanLimit == "" {
+		metadata.PlanLimit = planLimitFromSubscriptionPlan(rawPlan)
+	}
+	if metadata.PlanType == "unknown" {
+		metadata.PlanType = ""
+	}
+	return metadata
+}
+
+func planLimitFromSubscriptionPlan(value string) string {
+	compact := compactPlanLimitText(value)
+	switch compact {
+	case "chatgptpro", "chatgptproplan", "proplan":
+		return "20x"
+	default:
+		return ""
+	}
+}
+
+func firstMetadataString(values map[string]any, keys ...string) string {
+	if values == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if value := claimString(values, key); value != "" {
+			return value
+		}
+	}
+	for _, key := range []string{"plan", "subscription", "subscriptions", "entitlement", "billing", "account", "accounts", "items", "data", "quota", "rate_limit", "limits", "codex"} {
+		nested, _ := values[key].(map[string]any)
+		if value := firstMetadataString(nested, keys...); value != "" {
+			return value
+		}
+		items, _ := values[key].([]any)
+		for _, item := range items {
+			nested, _ := item.(map[string]any)
+			if value := firstMetadataString(nested, keys...); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
 func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaSnapshot, error) {
 	ctx, cancel := context.WithTimeout(ctx, quotaRefreshTimeout)
 	defer cancel()
@@ -1901,12 +2505,50 @@ func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaS
 		a.saveQuotaError(accountID, "decode_failed", "quota response JSON could not be decoded")
 		return quotaSnapshot{}, errors.New("quota response JSON could not be decoded")
 	}
+	var usageFields map[string]any
+	_ = json.Unmarshal(body, &usageFields)
 	quota := quotaFromUsage(usage, time.Now().UTC())
 	remaining := remainingQuotaHint(quota)
 	hasQuotaWindow := quota.Hourly.Present || quota.Weekly.Present
 	now := time.Now().UTC()
-	plan := normalizePlanType(chooseString(usage.PlanType, accountCopy.PlanType))
-	snapshot := quotaSnapshot{AccountID: accountID, PlanType: plan, Quota: &quota, UsageUpdatedAt: now}
+	planRaw := chooseString(usage.PlanType, usage.SubscriptionPlan)
+	plan := normalizePlanType(chooseString(planRaw, accountCopy.PlanType))
+	planLimit := cleanPlanLimit(planRaw)
+	if planLimit == "" {
+		planLimit = planLimitFromMap(usageFields)
+	}
+	if planLimit == "" {
+		planLimit = cleanPlanLimit(chooseString(auth.PlanLimit, accountCopy.PlanLimit))
+	}
+	organizationName := cleanOrganizationName(organizationNameFromMap(usageFields))
+	if organizationName == "" {
+		organizationName = cleanOrganizationName(chooseString(auth.OrganizationName, accountCopy.OrganizationName))
+	}
+	if (plan == "pro" && planLimit == "") || organizationName == "" || organizationScopedPlan(plan) {
+		if metadata, err := a.fetchCodexSubscriptionMetadata(ctx, auth); err == nil {
+			if metadata.AccountID != "" {
+				auth.AccountID = metadata.AccountID
+			}
+			if metadata.PlanType != "" && metadata.PlanType != "unknown" {
+				plan = metadata.PlanType
+			}
+			if planLimit == "" {
+				planLimit = metadata.PlanLimit
+			}
+			if metadata.OrganizationName != "" && organizationScopedPlan(plan) {
+				organizationName = metadata.OrganizationName
+			} else if organizationName == "" {
+				organizationName = metadata.OrganizationName
+			}
+		}
+	}
+	if plan == "pro" && planLimit == "" {
+		planLimit = "20x"
+	}
+	if !organizationScopedPlan(plan) {
+		organizationName = ""
+	}
+	snapshot := quotaSnapshot{AccountID: accountID, OrganizationName: organizationName, PlanType: plan, PlanLimit: planLimit, Quota: &quota, UsageUpdatedAt: now}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1917,15 +2559,25 @@ func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaS
 	if item == nil {
 		return quotaSnapshot{}, errors.New("account no longer exists")
 	}
-	if usage.PlanType != "" {
+	if planRaw != "" {
 		item.PlanType = plan
 		item.PlanRank = planRank(plan)
+	}
+	if planLimit != "" {
+		item.PlanLimit = planLimit
 	}
 	if auth.Email != "" {
 		item.Email = normalizeEmail(auth.Email)
 	}
 	if auth.AccountID != "" {
 		item.AccountID = auth.AccountID
+	}
+	if organizationScopedPlan(plan) {
+		if organizationName != "" {
+			item.OrganizationName = organizationName
+		}
+	} else {
+		item.OrganizationName = ""
 	}
 	item.Label = accountDisplayName(*item)
 	if hasQuotaWindow {
@@ -2261,10 +2913,17 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome strin
 				if auth.AccountID != "" {
 					item.AccountID = auth.AccountID
 				}
+				if auth.OrganizationName != "" {
+					item.OrganizationName = cleanOrganizationName(auth.OrganizationName)
+				}
 				if auth.PlanType != "" {
 					item.PlanType = normalizePlanType(auth.PlanType)
 					item.PlanRank = planRank(item.PlanType)
 				}
+				if auth.PlanLimit != "" {
+					item.PlanLimit = cleanPlanLimit(auth.PlanLimit)
+				}
+				a.clearAccountRuntimeStateLocked(accountID)
 				item.Label = accountDisplayName(*item)
 				item.LastLoginAt = time.Now().UTC()
 				item.UpdatedAt = item.LastLoginAt
@@ -2505,6 +3164,45 @@ func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]an
 	quota := a.state.Quotas[item.ID]
 	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
 }
+
+func (a *app) currentAccountStatusLocked(item account, index int, now time.Time) map[string]any {
+	status, reason := a.accountStatusLocked(item, now)
+	quota := a.state.Quotas[item.ID]
+	displayItem := item
+	if quota.OrganizationName != "" {
+		displayItem.OrganizationName = quota.OrganizationName
+	}
+	if quota.PlanType != "" {
+		displayItem.PlanType = quota.PlanType
+		displayItem.PlanRank = planRank(quota.PlanType)
+	}
+	if quota.PlanLimit != "" {
+		displayItem.PlanLimit = quota.PlanLimit
+	}
+	remainingQuota := displayItem.RemainingQuota
+	if remainingQuota == nil && quota.Quota != nil {
+		remaining := remainingQuotaHint(*quota.Quota)
+		remainingQuota = &remaining
+	}
+	return map[string]any{
+		"label":            currentAccountDisplayName(displayItem, index),
+		"displayName":      currentAccountDisplayName(displayItem, index),
+		"email":            maskedPublicEmail(displayItem.Email),
+		"organizationName": publicOrganizationName(displayItem.OrganizationName),
+		"planType":         normalizePlanType(displayItem.PlanType),
+		"planLimit":        cleanPlanLimit(displayItem.PlanLimit),
+		"planDisplayName":  accountPlanDisplayName(displayItem, false),
+		"planRank":         displayItem.PlanRank,
+		"status":           status,
+		"statusReason":     reason,
+		"available":        status == "ready" || status == "low",
+		"remainingQuota":   remainingQuota,
+		"quota":            quota.Quota,
+		"usageUpdatedAt":   quota.UsageUpdatedAt,
+		"quotaError":       quota.QuotaError,
+	}
+}
+
 func (a *app) accountStatusLocked(item account, now time.Time) (string, string) {
 	if !item.Enabled {
 		return "disabled", "Account is disabled"
@@ -2551,28 +3249,45 @@ func publicAccounts(values []account) []map[string]any {
 }
 func publicAccount(item account) map[string]any {
 	displayName := maskedAccountDisplayName(item)
-	return map[string]any{"id": item.ID, "label": displayName, "displayName": displayName, "email": maskedPublicEmail(item.Email), "planType": item.PlanType, "planRank": item.PlanRank, "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
+	return map[string]any{"id": item.ID, "label": displayName, "displayName": displayName, "email": maskedPublicEmail(item.Email), "organizationName": publicOrganizationName(item.OrganizationName), "planType": normalizePlanType(item.PlanType), "planLimit": cleanPlanLimit(item.PlanLimit), "planDisplayName": accountPlanDisplayName(item, false), "planRank": item.PlanRank, "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
 }
 
 func (a *app) publicDashboardAccountLocked(item account, index int, now time.Time) map[string]any {
 	status, reason := a.accountStatusLocked(item, now)
-	label := publicDashboardAccountLabel(item, index)
 	quota := a.state.Quotas[item.ID]
+	displayItem := item
+	if quota.OrganizationName != "" {
+		displayItem.OrganizationName = quota.OrganizationName
+	}
+	if quota.PlanType != "" {
+		displayItem.PlanType = quota.PlanType
+		displayItem.PlanRank = planRank(quota.PlanType)
+	}
+	if quota.PlanLimit != "" {
+		displayItem.PlanLimit = quota.PlanLimit
+	}
+	label := publicDashboardAccountLabel(displayItem, index)
 	if quota.QuotaError != nil {
 		reason = "Quota information is temporarily unavailable"
 	}
 	return map[string]any{
-		"label":          label,
-		"email":          maskedPublicEmail(item.Email),
-		"poolRef":        a.publicAccountRefLocked(item.ID),
-		"status":         status,
-		"statusReason":   reason,
-		"enabled":        item.Enabled,
-		"inPool":         item.InPool,
-		"remainingQuota": item.RemainingQuota,
-		"allowedModels":  item.AllowedModels,
-		"quota":          quota.Quota,
-		"usageUpdatedAt": quota.UsageUpdatedAt,
+		"label":            label,
+		"displayName":      label,
+		"email":            maskedPublicEmail(displayItem.Email),
+		"organizationName": publicOrganizationName(displayItem.OrganizationName),
+		"planType":         normalizePlanType(displayItem.PlanType),
+		"planLimit":        cleanPlanLimit(displayItem.PlanLimit),
+		"planDisplayName":  accountPlanDisplayName(displayItem, false),
+		"planRank":         displayItem.PlanRank,
+		"poolRef":          a.publicAccountRefLocked(item.ID),
+		"status":           status,
+		"statusReason":     reason,
+		"enabled":          item.Enabled,
+		"inPool":           item.InPool,
+		"remainingQuota":   item.RemainingQuota,
+		"allowedModels":    item.AllowedModels,
+		"quota":            quota.Quota,
+		"usageUpdatedAt":   quota.UsageUpdatedAt,
 	}
 }
 
@@ -2593,23 +3308,48 @@ func maskedPublicEmail(value string) string {
 	return local + "@" + parts[1]
 }
 
+var emailInDisplayPattern = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
+
+func publicOrganizationName(value string) string {
+	value = cleanOrganizationName(value)
+	if value == "" {
+		return ""
+	}
+	return emailInDisplayPattern.ReplaceAllStringFunc(value, maskedPublicEmail)
+}
+
 func maskedAccountDisplayName(item account) string {
 	maskedEmail := maskedPublicEmail(item.Email)
 	plan := normalizePlanType(item.PlanType)
+	planName := accountPlanDisplayName(item, false)
 	if maskedEmail != "" && plan != "unknown" {
-		return fmt.Sprintf("%s · %s", maskedEmail, planDisplayName(plan))
+		return fmt.Sprintf("%s · %s", maskedEmail, planName)
 	}
 	if maskedEmail != "" {
 		return maskedEmail
+	}
+	if plan != "unknown" && organizationScopedPlan(plan) && publicOrganizationName(item.OrganizationName) != "" {
+		return planName
 	}
 	label := strings.TrimSpace(item.Label)
 	if label != "" && !strings.Contains(label, "@") {
 		return label
 	}
 	if plan != "unknown" {
-		return planDisplayName(plan) + " account"
+		return accountPlanDisplayName(item, true)
 	}
 	return item.ID
+}
+
+func currentAccountDisplayName(item account, index int) string {
+	displayName := maskedAccountDisplayName(item)
+	if displayName == "" || displayName == item.ID {
+		displayName = publicDashboardAccountLabel(item, index)
+	}
+	if displayName == "" || displayName == item.ID {
+		displayName = fmt.Sprintf("Account %d", index+1)
+	}
+	return displayName
 }
 
 func (a *app) publicAccountRefLocked(accountID string) string {
@@ -2632,19 +3372,188 @@ func normalizeEmail(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
+func cleanOrganizationName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var builder strings.Builder
+	for _, char := range value {
+		if unicode.IsControl(char) {
+			continue
+		}
+		builder.WriteRune(char)
+	}
+	parts := strings.Fields(builder.String())
+	if len(parts) == 0 {
+		return ""
+	}
+	value = strings.Join(parts, " ")
+	if len([]rune(value)) > 120 {
+		runes := []rune(value)
+		value = string(runes[:120])
+	}
+	return value
+}
+
+func organizationNameFromMap(values map[string]any) string {
+	if values == nil {
+		return ""
+	}
+	for _, key := range []string{"organization_name", "organization_display_name", "org_name", "org_display_name", "workspace_name", "workspace_display_name", "team_name", "team_display_name", "account_name", "account_display_name", "name", "display_name", "title", "chatgpt_organization_name", "chatgpt_org_name", "chatgpt_workspace_name", "chatgpt_account_name"} {
+		if value := cleanOrganizationName(claimString(values, key)); value != "" {
+			return value
+		}
+	}
+	for _, key := range []string{"organization", "org", "workspace", "team", "account", "accounts", "subscriptions", "items", "data"} {
+		nested, _ := values[key].(map[string]any)
+		if value := organizationNameFromNestedMap(nested); value != "" {
+			return value
+		}
+		items, _ := values[key].([]any)
+		for _, item := range items {
+			nested, _ := item.(map[string]any)
+			if value := organizationNameFromMap(nested); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func organizationNameFromNestedMap(values map[string]any) string {
+	if values == nil {
+		return ""
+	}
+	for _, key := range []string{"display_name", "name", "title"} {
+		if value := cleanOrganizationName(claimString(values, key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func cleanPlanLimit(value string) string {
+	compact := compactPlanLimitText(value)
+	if compact == "" {
+		return ""
+	}
+	for _, limit := range []string{"20x", "10x", "5x"} {
+		if compact == limit || strings.Contains(compact, limit) {
+			return limit
+		}
+	}
+	return ""
+}
+
+func compactPlanLimitText(value string) string {
+	var builder strings.Builder
+	for _, char := range strings.ToLower(strings.TrimSpace(value)) {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') {
+			builder.WriteRune(char)
+		}
+	}
+	return builder.String()
+}
+
+func planLimitFromMap(values map[string]any) string {
+	if values == nil {
+		return ""
+	}
+	for _, key := range []string{
+		"plan_limit", "planLimit", "codex_plan_limit", "codexPlanLimit",
+		"usage_tier", "usageTier", "quota_tier", "quotaTier",
+		"rate_limit_tier", "rateLimitTier", "plan_tier", "planTier", "pro_tier", "proTier",
+		"subscription_plan", "subscriptionPlan", "plan_type", "planType", "plan_name", "planName",
+		"plan_display_name", "planDisplayName", "sku", "sku_name", "product", "product_name",
+		"entitlement", "entitlement_name",
+	} {
+		if limit := planLimitFromValue(values[key]); limit != "" {
+			return limit
+		}
+	}
+	for _, key := range []string{
+		"multiplier", "usage_multiplier", "usageMultiplier", "quota_multiplier", "quotaMultiplier",
+		"rate_limit_multiplier", "rateLimitMultiplier", "codex_" + "rate_limit_multiplier", "codexRateLimitMultiplier",
+	} {
+		if limit := planLimitFromValue(values[key]); limit != "" {
+			return limit
+		}
+	}
+	for _, key := range []string{"plan", "subscription", "subscriptions", "entitlement", "account", "accounts", "items", "data", "billing", "quota", "rate_limit", "limits", "codex"} {
+		if limit := planLimitFromValue(values[key]); limit != "" {
+			return limit
+		}
+	}
+	return ""
+}
+
+func planLimitFromValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return cleanPlanLimit(typed)
+	case json.Number:
+		if number, err := typed.Int64(); err == nil {
+			return planLimitFromNumber(number)
+		}
+	case float64:
+		number := int64(typed)
+		if typed == float64(number) {
+			return planLimitFromNumber(number)
+		}
+	case int:
+		return planLimitFromNumber(int64(typed))
+	case int64:
+		return planLimitFromNumber(typed)
+	case map[string]any:
+		return planLimitFromMap(typed)
+	case []any:
+		for _, item := range typed {
+			if limit := planLimitFromValue(item); limit != "" {
+				return limit
+			}
+		}
+	}
+	return ""
+}
+
+func planLimitFromNumber(value int64) string {
+	switch value {
+	case 5, 10, 20:
+		return strconv.FormatInt(value, 10) + "x"
+	default:
+		return ""
+	}
+}
+
 func normalizePlanType(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, "-", "_")
 	value = strings.ReplaceAll(value, " ", "_")
 	switch value {
-	case "free", "plus", "pro", "team", "enterprise", "edu":
+	case "free", "plus", "pro", "team", "business", "enterprise", "edu":
 		return value
 	case "chatgpt_plus":
 		return "plus"
 	case "chatgpt_pro":
 		return "pro"
+	case "chatgpt_team":
+		return "team"
+	case "chatgpt_business":
+		return "business"
+	case "chatgpt_enterprise":
+		return "enterprise"
+	case "chatgpt_edu":
+		return "edu"
 	default:
 		if value == "" {
 			return "unknown"
+		}
+		compact := compactPlanLimitText(value)
+		for _, candidate := range []string{"enterprise", "business", "team", "plus", "pro", "free", "edu"} {
+			if strings.Contains(compact, candidate) {
+				return candidate
+			}
 		}
 		return value
 	}
@@ -2654,7 +3563,7 @@ func planRank(plan string) int {
 	switch normalizePlanType(plan) {
 	case "enterprise":
 		return 500
-	case "team":
+	case "team", "business":
 		return 400
 	case "pro":
 		return 300
@@ -2680,6 +3589,8 @@ func planDisplayName(plan string) string {
 		return "Pro"
 	case "team":
 		return "Team"
+	case "business":
+		return "Business"
 	case "enterprise":
 		return "Enterprise"
 	case "edu":
@@ -2692,7 +3603,7 @@ func planDisplayName(plan string) string {
 }
 
 func accountDisplayName(item account) string {
-	plan := planDisplayName(item.PlanType)
+	plan := accountPlanDisplayName(item, false)
 	email := strings.TrimSpace(item.Email)
 	if email != "" && normalizePlanType(item.PlanType) != "unknown" {
 		return fmt.Sprintf("%s · %s", email, plan)
@@ -2700,8 +3611,14 @@ func accountDisplayName(item account) string {
 	if email != "" {
 		return email
 	}
+	if normalizePlanType(item.PlanType) != "unknown" && organizationScopedPlan(item.PlanType) && cleanOrganizationName(item.OrganizationName) != "" {
+		return plan
+	}
 	if strings.TrimSpace(item.Label) != "" {
 		return item.Label
+	}
+	if normalizePlanType(item.PlanType) != "unknown" {
+		return plan
 	}
 	return item.ID
 }
@@ -2709,12 +3626,39 @@ func accountDisplayName(item account) string {
 func publicDashboardAccountLabel(item account, index int) string {
 	plan := normalizePlanType(item.PlanType)
 	if plan != "unknown" {
-		return planDisplayName(plan) + " account"
+		return accountPlanDisplayName(item, true)
 	}
 	if strings.TrimSpace(item.Label) != "" && !strings.Contains(item.Label, "@") {
 		return item.Label
 	}
 	return fmt.Sprintf("Account %d", index+1)
+}
+
+func accountPlanDisplayName(item account, withAccountSuffix bool) string {
+	plan := normalizePlanType(item.PlanType)
+	name := planDisplayName(plan)
+	if plan == "pro" {
+		if limit := cleanPlanLimit(item.PlanLimit); limit != "" {
+			name += " " + limit
+		}
+	}
+	if withAccountSuffix {
+		name += " account"
+	}
+	organizationName := publicOrganizationName(item.OrganizationName)
+	if organizationName != "" && organizationScopedPlan(plan) {
+		return name + " · " + organizationName
+	}
+	return name
+}
+
+func organizationScopedPlan(plan string) bool {
+	switch normalizePlanType(plan) {
+	case "team", "business", "enterprise", "edu":
+		return true
+	default:
+		return false
+	}
 }
 
 func accountIDBase(email, plan string) string {

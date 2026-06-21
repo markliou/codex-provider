@@ -209,13 +209,10 @@
       const activity = health.status === "error" ? health.lastFailureAt : health.lastSuccessAt;
       const route = `${account.inPool ? "In pool" : "Out of pool"} · priority ${account.priority}`;
       const displayName = account.displayName || account.email || account.label || account.id;
-      const tier = account.planType ? `${account.planType} · ` : "";
-      const actions = [
-        account.authType === "codex_device_auth" ? actionButton("login", account.id, "Login") : "",
-        actionButton("delete", account.id, "Remove", "danger"),
-      ].join("");
+      const tier = account.planDisplayName || account.planType || "";
+      const actions = actionButton("delete", account.id, "Remove", "danger");
       return `<tr>
-        <td><div class="account-name">${escapeHTML(displayName)}<span class="account-id">${escapeHTML(tier + account.id)}</span></div></td>
+        <td><div class="account-name">${escapeHTML(displayName)}<span class="account-id">${escapeHTML(tier ? `${tier} · ${account.id}` : account.id)}</span></div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span></div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt)}</td>
         <td><div class="route"><strong>${escapeHTML(account.authType || "codex_device_auth")}</strong><br>${escapeHTML(route)}</div></td>
@@ -289,8 +286,6 @@
       if (action === "delete") {
         if (!window.confirm(`Remove account ${id}?`)) return;
         await api(`/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
-      } else if (action === "login") {
-        await startDeviceAuth(id);
       } else {
         await api(`/accounts/${encodeURIComponent(id)}/${action}`, { method: "POST" });
       }

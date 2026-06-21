@@ -174,7 +174,7 @@ mkdir -p "$CODEX_HOME"
 env > "$CODEX_HOME/env.txt"
 printf '%s\n' 'Open https://auth.openai.com/activate' 'ABCD-EFGH'
 cat > "$CODEX_HOME/auth.json" <<EOF
-{"auth_mode":"chatgpt","tokens":{"id_token":"` + fakeJWTClaims(map[string]any{"email": "user@example.test", "https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-chatgpt"}}) + `","access_token":"<access-token>","refresh_token":"<refresh-token>"}}
+{"auth_mode":"chatgpt","tokens":{"id_token":"` + fakeJWTClaims(map[string]any{"email": "user@example.test", "https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-chatgpt", "chatgpt_account_name": "Acme Workspace"}}) + `","access_token":"<access-token>","refresh_token":"<refresh-token>"}}
 EOF
 `
 	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0o755); err != nil {
@@ -184,6 +184,9 @@ EOF
 	t.Setenv("CODEX_POOL_API_KEY", "client-secret")
 	t.Setenv("CODEX_POOL_ADMIN_PASSWORD_HASH", "admin-secret")
 	t.Setenv("CODEX_POOL_UPSTREAM_API_KEY", "upstream-secret")
+	a.state.Health["acct-login"] = accountHealth{LastFailureAt: time.Now().Add(-time.Minute), LastFailureReason: "old auth error", ConsecutiveFailure: 2}
+	a.state.Cooldowns["acct-login"] = []cooldown{{ModelID: "gpt-test", NextRetryAt: time.Now().Add(time.Hour), Reason: "old cooldown"}}
+	a.state.Quotas["acct-login"] = quotaSnapshot{AccountID: "acct-login", QuotaError: &quotaErrorInfo{Code: "old_error", Message: "old quota error", Timestamp: time.Now().Add(-time.Minute)}}
 	a.mu.Lock()
 	job := a.startLoginJobLocked(a.config.Accounts[0])
 	a.mu.Unlock()
@@ -199,12 +202,21 @@ EOF
 			if current.CodeExpiresAt.IsZero() || time.Until(current.CodeExpiresAt) < 14*time.Minute {
 				t.Fatalf("job did not set a 15 minute code expiry: %#v", current)
 			}
-			if a.config.Accounts[0].Email != "user@example.test" || a.config.Accounts[0].AccountID != "acct-chatgpt" {
+			if a.config.Accounts[0].Email != "user@example.test" || a.config.Accounts[0].AccountID != "acct-chatgpt" || a.config.Accounts[0].OrganizationName != "" {
 				t.Fatalf("account metadata not updated: %#v", a.config.Accounts[0])
 			}
 			quota := a.state.Quotas["acct-login"].Quota
 			if quota == nil || quota.Hourly.Percentage != 90 {
 				t.Fatalf("quota was not refreshed before job completion: %#v", quota)
+			}
+			if health := a.state.Health["acct-login"]; health.ConsecutiveFailure != 0 || health.LastFailureReason != "" {
+				t.Fatalf("login did not clear stale health error: %#v", health)
+			}
+			if cooldowns := a.state.Cooldowns["acct-login"]; len(cooldowns) != 0 {
+				t.Fatalf("login did not clear stale cooldowns: %#v", cooldowns)
+			}
+			if errInfo := a.state.Quotas["acct-login"].QuotaError; errInfo != nil {
+				t.Fatalf("login did not clear stale quota error: %#v", errInfo)
 			}
 			envData, err := os.ReadFile(filepath.Join(a.accountCodexHome("acct-login"), "env.txt"))
 			if err != nil {
@@ -336,6 +348,9 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if strings.Contains(jsRecorder.Body.String(), "account-form") {
 		t.Fatal("admin JS still depends on add-account form inputs")
 	}
+	if strings.Contains(jsRecorder.Body.String(), `actionButton("login"`) || strings.Contains(jsRecorder.Body.String(), `data-account-action="login"`) {
+		t.Fatal("admin JS still renders a per-account login action")
+	}
 	if !strings.Contains(jsRecorder.Body.String(), "codeExpiresAt") {
 		t.Fatal("admin JS does not render the device-auth expiry countdown")
 	}
@@ -457,7 +472,7 @@ func TestAdminLoginRateLimit(t *testing.T) {
 func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 	quota := 12
 	a := testApp(t, []account{{
-		ID: "private-account-id", Label: "private@example.test · Plus", Email: "private@example.test", AccountID: "chatgpt-private-id", PlanType: "plus", CodexHome: "/data/accounts/private-account-id/.codex", Enabled: true, InPool: true, RemainingQuota: &quota,
+		ID: "private-account-id", Label: "private@example.test · Plus", Email: "private@example.test", AccountID: "chatgpt-private-id", OrganizationName: "Private private@example.test", PlanType: "plus", CodexHome: "/data/accounts/private-account-id/.codex", Enabled: true, InPool: true, RemainingQuota: &quota,
 		UpstreamBaseURL: "https://upstream.example.test/v1", UpstreamAPIKey: "upstream-secret-value", AllowedModels: []string{"gpt-test"},
 	}})
 
@@ -475,6 +490,9 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 	}
 	if !strings.Contains(publicBody, "pr***te@example.test") {
 		t.Fatalf("public dashboard omitted masked email: %s", publicBody)
+	}
+	if strings.Contains(publicBody, "Private private@example.test") || !strings.Contains(publicBody, "Private pr***te@example.test") {
+		t.Fatalf("public dashboard did not mask email in organization name: %s", publicBody)
 	}
 	if !strings.Contains(publicBody, "Plus account") || !strings.Contains(publicBody, `"status":"low"`) {
 		t.Fatalf("public dashboard omitted expected status data: %s", publicBody)
@@ -505,6 +523,9 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 	}
 	if !strings.Contains(managementBody, "pr***te@example.test") {
 		t.Fatalf("management account list omitted masked email: %s", managementBody)
+	}
+	if strings.Contains(managementBody, "Private private@example.test") || !strings.Contains(managementBody, "Private pr***te@example.test") {
+		t.Fatalf("management account list did not mask email in organization name: %s", managementBody)
 	}
 }
 
@@ -712,6 +733,83 @@ func TestResponsesProxyTranslatesModelAndUsesStickySession(t *testing.T) {
 	}
 }
 
+func TestResponsesProxyAddsCurrentAccountHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test","object":"response","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{
+		ID: "private-account-id", Label: "private@example.test · Team", Email: "private@example.test", OrganizationName: "Acme Workspace", PlanType: "team", Enabled: true, InPool: true, UpstreamBaseURL: upstream.URL + "/v1", UpstreamAPIKey: "upstream-key", Priority: 100,
+	}})
+	now := time.Now().UTC()
+	a.state.Quotas["private-account-id"] = quotaSnapshot{
+		AccountID:        "private-account-id",
+		OrganizationName: "Acme Workspace",
+		PlanType:         "team",
+		Quota:            &accountQuota{Hourly: quotaWindow{Percentage: 72, Present: true}, Weekly: quotaWindow{Percentage: 44, Present: true}},
+		UsageUpdatedAt:   now,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "session-a")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("X-Codex-Pool-Account"); got != "pr***te@example.test · Team · Acme Workspace" {
+		t.Fatalf("account header = %q", got)
+	}
+	if got := recorder.Header().Get("X-Codex-Pool-Quota-Hourly-Remaining"); got != "72" {
+		t.Fatalf("hourly quota header = %q", got)
+	}
+	if got := recorder.Header().Get("X-Codex-Pool-Quota-Weekly-Remaining"); got != "44" {
+		t.Fatalf("weekly quota header = %q", got)
+	}
+	for _, forbidden := range []string{"private-account-id", "private@example.test"} {
+		for key, values := range recorder.Header() {
+			if strings.Contains(strings.Join(values, " "), forbidden) {
+				t.Fatalf("response header %s exposed %q: %#v", key, forbidden, values)
+			}
+		}
+	}
+}
+
+func TestCurrentStatusReturnsSessionAccountQuota(t *testing.T) {
+	a := testApp(t, []account{{
+		ID: "private-account-id", Label: "private@example.test · Team", Email: "private@example.test", AccountID: "chatgpt-private-id", OrganizationName: "Private private@example.test", PlanType: "team", Enabled: true, InPool: true, UpstreamBaseURL: "https://upstream.example.test/v1", UpstreamAPIKey: "upstream-secret-value", Priority: 100,
+	}})
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:session-a"] = stickySession{Key: "gpt-test:session-a", ModelID: "gpt-test", AccountID: "private-account-id", CreatedAt: now.Add(-time.Minute), LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+	a.state.Quotas["private-account-id"] = quotaSnapshot{
+		AccountID:        "private-account-id",
+		OrganizationName: "Private private@example.test",
+		PlanType:         "team",
+		Quota:            &accountQuota{Hourly: quotaWindow{Percentage: 72, Present: true}, Weekly: quotaWindow{Percentage: 44, Present: true}},
+		UsageUpdatedAt:   now,
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/codex-pool/status?model=alias", nil)
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "session-a")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	for _, expected := range []string{`"model":"gpt-test"`, `"displayName":"pr***te@example.test · Team · Private pr***te@example.test"`, `"percentage":72`, `"percentage":44`} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("status body missing %s: %s", expected, body)
+		}
+	}
+	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "upstream.example.test", "upstream-secret-value"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("status body exposed %q: %s", forbidden, body)
+		}
+	}
+}
+
 func TestStickySessionTTLExpiresAndReselects(t *testing.T) {
 	a := testApp(t, []account{
 		{ID: "old", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://old.example.test", UpstreamAPIKey: "old"},
@@ -897,7 +995,7 @@ func TestCliproxyAuthAdapterUsesAnIsolatedRefreshOwner(t *testing.T) {
 	}
 	idToken := fakeJWTClaims(map[string]any{
 		"email":                       "pool-user@example.test",
-		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-one", "chatgpt_plan_type": "plus"},
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-one", "chatgpt_plan_type": "team", "chatgpt_account_name": "Acme Workspace"},
 	})
 	authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"id_token":%q,"access_token":"<pool-access-token>","refresh_token":"<pool-refresh-token>"}}`, idToken)
 	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
@@ -910,7 +1008,7 @@ func TestCliproxyAuthAdapterUsesAnIsolatedRefreshOwner(t *testing.T) {
 	if err := readJSON(a.cliproxyAuthPath(item.ID), &sidecar); err != nil {
 		t.Fatal(err)
 	}
-	if sidecar.Type != "codex" || sidecar.Prefix != "codex-pool-device-one" || sidecar.AccountID != "acct-one" || sidecar.PlanType != "plus" {
+	if sidecar.Type != "codex" || sidecar.Prefix != "codex-pool-device-one" || sidecar.AccountID != "acct-one" || sidecar.PlanType != "team" || sidecar.OrganizationName != "Acme Workspace" {
 		t.Fatalf("unexpected cliproxy auth record: %#v", sidecar)
 	}
 	if sidecar.AccessToken != "<pool-access-token>" || sidecar.RefreshToken != "<pool-refresh-token>" {
@@ -1041,18 +1139,18 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 	resetAt := time.Now().UTC().Add(7 * time.Hour).Unix()
 	var sawAccountHeader bool
 	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/backend-api/wham/usage" {
-			t.Fatalf("unexpected usage path %s", r.URL.Path)
-		}
-		if r.Header.Get("Authorization") == "" {
-			t.Fatal("missing authorization header")
-		}
-		if r.Header.Get("ChatGPT-Account-Id") == "acct-chatgpt" {
-			sawAccountHeader = true
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{
+		switch r.URL.Path {
+		case "/backend-api/wham/usage":
+			if r.Header.Get("Authorization") == "" {
+				t.Fatal("missing authorization header")
+			}
+			if r.Header.Get("ChatGPT-Account-Id") == "acct-chatgpt" {
+				sawAccountHeader = true
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{
 			"plan_type":"team",
+			"workspace_name":"Acme Workspace",
 			"rate_limit":{
 				"allowed":true,
 				"limit_reached":false,
@@ -1060,6 +1158,15 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 				"secondary_window":{"used_percent":80,"limit_window_seconds":604800,"reset_at":%d}
 			}
 		}`, resetAt)
+		case "/backend-api/accounts/check/v4-2023-04-27":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"accounts":{"acct-chatgpt":{"account":{"account_id":"acct-chatgpt","name":"Acme Workspace","plan_type":"team"},"entitlement":{"subscription_plan":"chatgptteamplan"}}},"account_ordering":["acct-chatgpt"]}`))
+		case "/backend-api/subscriptions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"subscription_plan":"chatgptteamplan"}`))
+		default:
+			t.Fatalf("unexpected usage path %s", r.URL.Path)
+		}
 	}))
 	defer usage.Close()
 
@@ -1081,8 +1188,20 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 	if !sawAccountHeader {
 		t.Fatal("quota refresh did not send ChatGPT-Account-Id")
 	}
-	if snapshot.PlanType != "team" || snapshot.Quota == nil {
+	if snapshot.PlanType != "team" || snapshot.OrganizationName != "Acme Workspace" || snapshot.Quota == nil {
 		t.Fatalf("unexpected quota snapshot: %#v", snapshot)
+	}
+	if a.config.Accounts[0].OrganizationName != "Acme Workspace" || a.config.Accounts[0].Label != "Team · Acme Workspace" {
+		t.Fatalf("quota refresh did not update account organization display: %#v", a.config.Accounts[0])
+	}
+	publicRequest := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
+	publicRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(publicRecorder, publicRequest)
+	if publicRecorder.Code != http.StatusOK {
+		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
+	}
+	if body := publicRecorder.Body.String(); !strings.Contains(body, "Team account · Acme Workspace") {
+		t.Fatalf("public dashboard omitted team organization label: %s", body)
 	}
 	if snapshot.Quota.Hourly.Percentage != 70 || snapshot.Quota.Hourly.WindowMinutes == nil || *snapshot.Quota.Hourly.WindowMinutes != 300 {
 		t.Fatalf("unexpected hourly quota: %#v", snapshot.Quota.Hourly)
@@ -1110,6 +1229,123 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 	}
 	if strings.Contains(body, "acct-chatgpt") || strings.Contains(body, "<refresh-token>") {
 		t.Fatalf("public dashboard exposed credential/account internals: %s", body)
+	}
+}
+
+func TestCodexQuotaRefreshUpdatesProPlanLimit(t *testing.T) {
+	var sawAccountCheckRequest bool
+	var sawSubscriptionRequest bool
+	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/wham/usage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"plan_type":"pro",
+				"rate_limit":{
+					"allowed":true,
+					"limit_reached":false,
+					"primary_window":{"used_percent":10,"limit_window_seconds":18000},
+					"secondary_window":{"used_percent":20,"limit_window_seconds":604800}
+				}
+			}`))
+		case "/backend-api/accounts/check/v4-2023-04-27":
+			if r.URL.Query().Get("timezone_offset_min") != "" && r.Header.Get("X-OpenAI-Target-Path") == "/backend-api/accounts/check/v4-2023-04-27" {
+				sawAccountCheckRequest = true
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"accounts":{"primary":{"account":{"account_id":"acct-pro","account_name":"Personal Pro","plan_type":"pro"},"entitlement":{"expires_at":"2020-01-01T00:00:00Z"}}}}`))
+		case "/backend-api/subscriptions":
+			if r.URL.Query().Get("account_id") == "acct-pro" && r.Header.Get("X-OpenAI-Target-Path") == "/backend-api/subscriptions" {
+				sawSubscriptionRequest = true
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"subscription_plan":"chatgptpro"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer usage.Close()
+
+	a := testApp(t, []account{{ID: "codex-pro", AccountID: "acct-pro", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.codexBaseURL = usage.URL + "/backend-api"
+	home := a.accountCodexHome("codex-pro")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"refresh_token":"<refresh-token>"}}`, fakeJWT(time.Now().Add(time.Hour)))
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := a.refreshAccountQuota(context.Background(), "codex-pro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawAccountCheckRequest {
+		t.Fatal("quota refresh did not fetch account metadata for Pro plan limit")
+	}
+	if !sawSubscriptionRequest {
+		t.Fatal("quota refresh did not fetch subscription metadata for Pro plan limit")
+	}
+	if snapshot.PlanType != "pro" || snapshot.PlanLimit != "20x" || snapshot.OrganizationName != "" {
+		t.Fatalf("unexpected Pro quota metadata: %#v", snapshot)
+	}
+	if a.config.Accounts[0].PlanLimit != "20x" || a.config.Accounts[0].Label != "Pro 20x" {
+		t.Fatalf("account did not store Pro plan limit display: %#v", a.config.Accounts[0])
+	}
+	request := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("public dashboard returned %d", recorder.Code)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, "Pro 20x account") || !strings.Contains(body, `"planLimit":"20x"`) {
+		t.Fatalf("public dashboard omitted Pro plan limit: %s", body)
+	}
+}
+
+func TestSubscriptionMetadataFromAccountCheckUsesDirectAccountName(t *testing.T) {
+	metadata, ok := subscriptionMetadataFromValue(map[string]any{
+		"accounts": map[string]any{
+			"acct-team": map[string]any{
+				"account": map[string]any{
+					"account_id": "acct-team",
+					"name":       "markliou",
+					"plan_type":  "team",
+				},
+				"entitlement": map[string]any{"subscription_plan": "chatgptteamplan"},
+			},
+			"acct-pro": map[string]any{
+				"account":     map[string]any{"account_id": "acct-pro", "plan_type": "pro"},
+				"entitlement": map[string]any{"subscription_plan": "chatgptpro"},
+			},
+		},
+		"account_ordering": []any{"acct-team"},
+	}, "acct-team")
+	if !ok {
+		t.Fatal("metadata parser did not find account records")
+	}
+	if metadata.AccountID != "acct-team" || metadata.OrganizationName != "markliou" || metadata.PlanType != "team" {
+		t.Fatalf("unexpected team metadata: %#v", metadata)
+	}
+
+	metadata, ok = subscriptionMetadataFromValue(map[string]any{
+		"accounts": map[string]any{
+			"acct-team": map[string]any{
+				"account":     map[string]any{"account_id": "acct-team", "name": "markliou", "plan_type": "team"},
+				"entitlement": map[string]any{"subscription_plan": "chatgptteamplan"},
+			},
+			"acct-pro": map[string]any{
+				"account":     map[string]any{"account_id": "acct-pro", "plan_type": "pro"},
+				"entitlement": map[string]any{"subscription_plan": "chatgptpro"},
+			},
+		},
+	}, "acct-pro")
+	if !ok {
+		t.Fatal("metadata parser did not find preferred Pro record")
+	}
+	if metadata.AccountID != "acct-pro" || metadata.PlanType != "pro" || metadata.PlanLimit != "20x" {
+		t.Fatalf("unexpected Pro metadata: %#v", metadata)
 	}
 }
 
@@ -1367,6 +1603,48 @@ func TestFailoverAfterRateLimit(t *testing.T) {
 	}
 	if reason := a.state.Health["first"].LastFailureReason; reason != "rate_limited" {
 		t.Fatalf("rate limit reason = %q, want rate_limited", reason)
+	}
+}
+
+func TestStickySessionWithExhaustedQuotaSnapshotReselects(t *testing.T) {
+	firstHits := 0
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstHits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer first.Close()
+	secondHits := 0
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_ok","object":"response","output":[]}`))
+	}))
+	defer second.Close()
+	a := testApp(t, []account{
+		{ID: "first", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL, UpstreamAPIKey: "one"},
+		{ID: "second", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: second.URL, UpstreamAPIKey: "two"},
+	})
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:quota-session"] = stickySession{Key: "gpt-test:quota-session", ModelID: "gpt-test", AccountID: "first", CreatedAt: now.Add(-time.Minute), LastSuccessAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)}
+	a.state.Quotas["first"] = quotaSnapshot{AccountID: "first", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 0, Present: true}}}
+	a.state.Quotas["second"] = quotaSnapshot{AccountID: "second", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 80, Present: true}}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "quota-session")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("quota snapshot failover returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if firstHits != 0 {
+		t.Fatalf("exhausted sticky account was called %d times", firstHits)
+	}
+	if secondHits != 1 {
+		t.Fatalf("available account was called %d times", secondHits)
+	}
+	if session := a.state.StickySessions["gpt-test:quota-session"]; session.AccountID != "second" || session.FailoverFrom != "first" {
+		t.Fatalf("sticky session was not rebound to available account: %#v", session)
 	}
 }
 
