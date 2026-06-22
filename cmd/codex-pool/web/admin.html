@@ -38,7 +38,14 @@
             <div id="dashboard-eyebrow" class="eyebrow">PUBLIC STATUS</div>
             <h1 id="dashboard-title">Pool status</h1>
           </div>
-          <button id="add-account-button" class="button primary management-only" type="button">Add account</button>
+          <div class="page-actions management-only">
+            <label class="switch-row" for="preserve-pro-quota-switch">
+              <span class="switch-label">Preserve Pro quota</span>
+              <input id="preserve-pro-quota-switch" type="checkbox" role="switch">
+              <span class="switch-ui" aria-hidden="true"></span>
+            </label>
+            <button id="add-account-button" class="button primary" type="button">Add account</button>
+          </div>
         </div>
 
         <section id="summary-grid" class="summary-grid" aria-label="Pool summary"></section>

@@ -28,9 +28,9 @@ func testApp(t *testing.T, accounts []account) *app {
 	}
 	return &app{
 		config:  config{DefaultModel: "gpt-test", ModelAliases: map[string]string{"alias": "gpt-test"}, Accounts: accounts},
-		state:   state{StickySessions: map[string]stickySession{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}},
+		state:   state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}},
 		dataDir: dir, apiKeys: [][]byte{[]byte("client-key")}, adminUser: "admin", adminHash: []byte(hash),
-		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second},
+		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, promptCacheKeyMode: "auto", codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second},
 	}
 }
 
@@ -334,7 +334,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page still includes %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"Console", "Access", "Passphrase", "Add account", "device-auth-url", "device-auth-code", "device-auth-countdown"} {
+	for _, expected := range []string{"Console", "Access", "Passphrase", "Add account", "Preserve Pro quota", "device-auth-url", "device-auth-code", "device-auth-countdown"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page does not include low-key label %q", expected)
 		}
@@ -356,6 +356,9 @@ func TestAdminDashboardAssets(t *testing.T) {
 	}
 	if !strings.Contains(jsRecorder.Body.String(), "5 * 60 * 1000") {
 		t.Fatal("admin JS does not use the 5 minute dashboard refresh interval")
+	}
+	if !strings.Contains(jsRecorder.Body.String(), "preserveProQuota") {
+		t.Fatal("admin JS does not render the Pro quota preservation switch")
 	}
 	for _, expected := range []string{"displayResetCountdown", "quotaTrackMarkup", "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
@@ -494,7 +497,7 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 	if strings.Contains(publicBody, "Private private@example.test") || !strings.Contains(publicBody, "Private pr***te@example.test") {
 		t.Fatalf("public dashboard did not mask email in organization name: %s", publicBody)
 	}
-	if !strings.Contains(publicBody, "Plus account") || !strings.Contains(publicBody, `"status":"low"`) {
+	if !strings.Contains(publicBody, "Credential 1") || !strings.Contains(publicBody, "Plus") || !strings.Contains(publicBody, `"status":"low"`) {
 		t.Fatalf("public dashboard omitted expected status data: %s", publicBody)
 	}
 
@@ -566,6 +569,54 @@ func TestManagementAPIsRequireAdminAndCSRF(t *testing.T) {
 	a.adminMux().ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("mutating management API without CSRF returned %d", recorder.Code)
+	}
+}
+
+func TestAdminSettingsTogglePreserveProQuota(t *testing.T) {
+	a := testApp(t, nil)
+	cookies, csrf := adminSession(t, a)
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(`{"preserveProQuota":true}`))
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	request.Header.Set("X-CSRF-Token", csrf)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("settings update returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !a.preserveProQuota {
+		t.Fatal("settings update did not enable preserveProQuota")
+	}
+	if !strings.Contains(recorder.Body.String(), `"preserveProQuota":true`) {
+		t.Fatalf("settings response did not include enabled preserveProQuota: %s", recorder.Body.String())
+	}
+	var saved config
+	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.PreserveProQuota == nil || !*saved.PreserveProQuota {
+		t.Fatalf("settings update did not persist preserveProQuota: %#v", saved.PreserveProQuota)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(`{"preserveProQuota":false}`))
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	request.Header.Set("X-CSRF-Token", csrf)
+	recorder = httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("settings disable returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if a.preserveProQuota {
+		t.Fatal("settings update did not disable preserveProQuota")
+	}
+	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.PreserveProQuota == nil || *saved.PreserveProQuota {
+		t.Fatalf("settings update did not persist disabled preserveProQuota: %#v", saved.PreserveProQuota)
 	}
 }
 
@@ -733,6 +784,108 @@ func TestResponsesProxyTranslatesModelAndUsesStickySession(t *testing.T) {
 	}
 }
 
+func TestResponsesProxyInjectsPromptCacheControlsAndTracksUsage(t *testing.T) {
+	var sawPromptCacheKey string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		sawPromptCacheKey, _ = body["prompt_cache_key"].(string)
+		if sawPromptCacheKey == "" || !strings.HasPrefix(sawPromptCacheKey, "cp_") {
+			t.Fatalf("prompt_cache_key was not auto-generated: %#v", body["prompt_cache_key"])
+		}
+		if body["prompt_cache_retention"] != "24h" {
+			t.Fatalf("prompt_cache_retention = %#v, want 24h", body["prompt_cache_retention"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_cache","object":"response","output":[],"usage":{"input_tokens":2006,"input_tokens_details":{"cached_tokens":1920}}}`))
+	}))
+	defer upstream.Close()
+
+	a := testApp(t, []account{{ID: "one", Enabled: true, InPool: true, UpstreamBaseURL: upstream.URL + "/v1", UpstreamAPIKey: "upstream-key", Priority: 100}})
+	a.promptCacheRetention = "24h"
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Project", "repo-main")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if binding := a.state.ResponseBindings["resp_cache"]; binding.AccountID != "one" || binding.StickyKey != "gpt-test:repo-main" {
+		t.Fatalf("response binding was not recorded: %#v", binding)
+	}
+	stat := a.state.PromptCache["one:gpt-test"]
+	if stat.RequestCount != 1 || stat.InputTokens != 2006 || stat.CachedTokens != 1920 {
+		t.Fatalf("prompt cache stats not recorded: %#v", stat)
+	}
+	if sawPromptCacheKey == "repo-main" {
+		t.Fatal("raw project id was sent as prompt_cache_key")
+	}
+}
+
+func TestChatCompletionConversionPreservesPromptCacheControls(t *testing.T) {
+	a := testApp(t, nil)
+	candidate := account{ID: "one", UpstreamBaseURL: "https://upstream.example.test/v1", WireAPI: "responses"}
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"system","content":"static"},{"role":"user","content":"dynamic"}],"prompt_cache_key":"cache-a","prompt_cache_retention":"24h","stream":true}`)
+	endpoint, outbound, convertResponse, err := a.prepareUpstreamRequest(candidate, body, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if endpoint != "https://upstream.example.test/v1/responses" || !convertResponse {
+		t.Fatalf("unexpected conversion endpoint=%q convert=%v", endpoint, convertResponse)
+	}
+	var converted map[string]any
+	if err := json.Unmarshal(outbound, &converted); err != nil {
+		t.Fatal(err)
+	}
+	if converted["prompt_cache_key"] != "cache-a" || converted["prompt_cache_retention"] != "24h" {
+		t.Fatalf("cache controls were not preserved: %#v", converted)
+	}
+	if _, ok := converted["input"].([]any); !ok {
+		t.Fatalf("messages were not converted to input: %#v", converted["input"])
+	}
+}
+
+func TestStickyFallbackUsesChatMessagesAndAPIKey(t *testing.T) {
+	a := testApp(t, nil)
+	reqA := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	reqB := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	payloadA := map[string]any{"messages": []any{map[string]any{"role": "system", "content": "static"}, map[string]any{"role": "user", "content": "one"}}}
+	payloadB := map[string]any{"messages": []any{map[string]any{"role": "system", "content": "static"}, map[string]any{"role": "user", "content": "two"}}}
+	keyA := a.routingDecision(reqA, payloadA, "gpt-test", "client-key").StickyKey
+	keyB := a.routingDecision(reqA, payloadB, "gpt-test", "client-key").StickyKey
+	keyOtherClient := a.routingDecision(reqB, payloadA, "gpt-test", "other-client-key").StickyKey
+	if keyA == keyB {
+		t.Fatalf("different chat messages produced same sticky fallback key %q", keyA)
+	}
+	if keyA == keyOtherClient {
+		t.Fatalf("different API keys produced same sticky fallback key %q", keyA)
+	}
+	if strings.Contains(keyA, "client-key") || strings.Contains(keyA, "static") || strings.Contains(keyA, "one") {
+		t.Fatalf("sticky fallback key leaked raw request data: %q", keyA)
+	}
+}
+
+func TestPreviousResponseIDRoutesToOriginalAccount(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "low", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://low.example.test/v1", UpstreamAPIKey: "low"},
+		{ID: "high", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://high.example.test/v1", UpstreamAPIKey: "high"},
+	})
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:conversation-a"] = stickySession{Key: "gpt-test:conversation-a", ModelID: "gpt-test", AccountID: "low", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+	a.state.ResponseBindings["resp_previous"] = responseBinding{ResponseID: "resp_previous", StickyKey: "gpt-test:conversation-a", ModelID: "gpt-test", AccountID: "low", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+	route := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), map[string]any{"previous_response_id": "resp_previous", "input": "next"}, "gpt-test", "client-key")
+	selected, err := a.selectAccount(route.StickyKey, "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "low" {
+		t.Fatalf("previous_response_id selected %q, want low", selected.ID)
+	}
+}
+
 func TestResponsesProxyAddsCurrentAccountHeaders(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -758,7 +911,7 @@ func TestResponsesProxyAddsCurrentAccountHeaders(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
 	}
-	if got := recorder.Header().Get("X-Codex-Pool-Account"); got != "pr***te@example.test · Team · Acme Workspace" {
+	if got := recorder.Header().Get("X-Codex-Pool-Account"); got != "Credential 1" {
 		t.Fatalf("account header = %q", got)
 	}
 	if got := recorder.Header().Get("X-Codex-Pool-Quota-Hourly-Remaining"); got != "72" {
@@ -798,7 +951,7 @@ func TestCurrentStatusReturnsSessionAccountQuota(t *testing.T) {
 		t.Fatalf("status returned %d: %s", recorder.Code, recorder.Body.String())
 	}
 	body := recorder.Body.String()
-	for _, expected := range []string{`"model":"gpt-test"`, `"displayName":"pr***te@example.test · Team · Private pr***te@example.test"`, `"percentage":72`, `"percentage":44`} {
+	for _, expected := range []string{`"model":"gpt-test"`, `"displayName":"Credential 1"`, `"planDisplayName":"Team · Private pr***te@example.test"`, `"percentage":72`, `"percentage":44`} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("status body missing %s: %s", expected, body)
 		}
@@ -845,10 +998,56 @@ func TestStickySessionTTLRefreshesOnSuccess(t *testing.T) {
 	if selected.ID != "one" {
 		t.Fatalf("active sticky session selected %q, want one", selected.ID)
 	}
-	a.markSuccess("gpt-test:session", "gpt-test", "one")
+	a.markSuccess("gpt-test:session", "gpt-test", "one", proxyResponseInfo{})
 	refreshed := a.state.StickySessions["gpt-test:session"]
 	if !refreshed.ExpiresAt.After(previousExpiry) {
 		t.Fatalf("sticky session expiry was not refreshed: before=%s after=%s", previousExpiry, refreshed.ExpiresAt)
+	}
+}
+
+func TestPreserveProQuotaModeMovesStickySessionBackToNonPro(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "plus", PlanType: "plus", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://plus.example.test", UpstreamAPIKey: "plus"},
+		{ID: "pro", PlanType: "pro", PlanLimit: "20x", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://pro.example.test", UpstreamAPIKey: "pro"},
+	})
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:session"] = stickySession{Key: "gpt-test:session", ModelID: "gpt-test", AccountID: "pro", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+
+	selected, err := a.selectAccount("gpt-test:session", "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "pro" {
+		t.Fatalf("preserve mode off selected %q, want existing pro sticky", selected.ID)
+	}
+
+	a.preserveProQuota = true
+	selected, err = a.selectAccount("gpt-test:session", "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "plus" {
+		t.Fatalf("preserve mode selected %q, want plus", selected.ID)
+	}
+	a.markSuccess("gpt-test:session", "gpt-test", selected.ID, proxyResponseInfo{})
+	if session := a.state.StickySessions["gpt-test:session"]; session.AccountID != "plus" || session.FailoverFrom != "pro" {
+		t.Fatalf("preserve mode did not rewrite sticky session from pro to plus: %#v", session)
+	}
+}
+
+func TestPreserveProQuotaModeUsesProWhenNonProCoolingDown(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "plus", PlanType: "plus", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://plus.example.test", UpstreamAPIKey: "plus"},
+		{ID: "pro", PlanType: "pro", PlanLimit: "20x", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://pro.example.test", UpstreamAPIKey: "pro"},
+	})
+	a.preserveProQuota = true
+	a.state.Cooldowns["plus"] = []cooldown{{ModelID: "gpt-test", NextRetryAt: time.Now().UTC().Add(time.Minute), Reason: "rate_limited"}}
+	selected, err := a.selectAccount("gpt-test:new", "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "pro" {
+		t.Fatalf("selected %q, want pro while plus is cooling down", selected.ID)
 	}
 }
 
@@ -1030,6 +1229,46 @@ func TestCliproxyAuthAdapterUsesAnIsolatedRefreshOwner(t *testing.T) {
 	}
 }
 
+func TestCliproxyMetadataUpdatePreservesSidecarRefreshTokens(t *testing.T) {
+	a := testApp(t, []account{{ID: "device-one", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.codexGatewayMode = "sidecar"
+	item := a.config.Accounts[0]
+	path := a.cliproxyAuthPath(item.ID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original := cliproxyCodexAuthFile{
+		Type:         "codex",
+		AccessToken:  "<sidecar-access-token>",
+		RefreshToken: "<sidecar-refresh-token>",
+		AccountID:    "acct-old",
+		Prefix:       cliproxyAccountPrefix(item.ID),
+		PlanType:     "plus",
+	}
+	if err := writeJSONAtomic(path, original); err != nil {
+		t.Fatal(err)
+	}
+
+	item.Email = "pool-user@example.test"
+	item.AccountID = "acct-new"
+	item.OrganizationName = "Acme Workspace"
+	item.PlanType = "team"
+	item.PlanRank = planRank(item.PlanType)
+	if err := a.updateCliproxyAuthMetadata(item); err != nil {
+		t.Fatal(err)
+	}
+	var updated cliproxyCodexAuthFile
+	if err := readJSON(path, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.AccessToken != original.AccessToken || updated.RefreshToken != original.RefreshToken {
+		t.Fatalf("metadata update changed sidecar-owned tokens: %#v", updated)
+	}
+	if updated.Email != "pool-user@example.test" || updated.AccountID != "acct-new" || updated.OrganizationName != "Acme Workspace" || updated.PlanType != "team" {
+		t.Fatalf("metadata update did not refresh account fields: %#v", updated)
+	}
+}
+
 func TestDeviceAuthFailoverThroughCliproxyAdapter(t *testing.T) {
 	seenModels := make([]string, 0, 2)
 	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1191,7 +1430,7 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 	if snapshot.PlanType != "team" || snapshot.OrganizationName != "Acme Workspace" || snapshot.Quota == nil {
 		t.Fatalf("unexpected quota snapshot: %#v", snapshot)
 	}
-	if a.config.Accounts[0].OrganizationName != "Acme Workspace" || a.config.Accounts[0].Label != "Team · Acme Workspace" {
+	if a.config.Accounts[0].OrganizationName != "Acme Workspace" || a.config.Accounts[0].Label != "codex-quota" {
 		t.Fatalf("quota refresh did not update account organization display: %#v", a.config.Accounts[0])
 	}
 	publicRequest := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
@@ -1200,7 +1439,7 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 	if publicRecorder.Code != http.StatusOK {
 		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
 	}
-	if body := publicRecorder.Body.String(); !strings.Contains(body, "Team account · Acme Workspace") {
+	if body := publicRecorder.Body.String(); !strings.Contains(body, "Credential 1") || !strings.Contains(body, "Team · Acme Workspace") {
 		t.Fatalf("public dashboard omitted team organization label: %s", body)
 	}
 	if snapshot.Quota.Hourly.Percentage != 70 || snapshot.Quota.Hourly.WindowMinutes == nil || *snapshot.Quota.Hourly.WindowMinutes != 300 {
@@ -1290,7 +1529,7 @@ func TestCodexQuotaRefreshUpdatesProPlanLimit(t *testing.T) {
 	if snapshot.PlanType != "pro" || snapshot.PlanLimit != "20x" || snapshot.OrganizationName != "" {
 		t.Fatalf("unexpected Pro quota metadata: %#v", snapshot)
 	}
-	if a.config.Accounts[0].PlanLimit != "20x" || a.config.Accounts[0].Label != "Pro 20x" {
+	if a.config.Accounts[0].PlanLimit != "20x" || a.config.Accounts[0].Label != "codex-pro" {
 		t.Fatalf("account did not store Pro plan limit display: %#v", a.config.Accounts[0])
 	}
 	request := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
@@ -1299,7 +1538,7 @@ func TestCodexQuotaRefreshUpdatesProPlanLimit(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("public dashboard returned %d", recorder.Code)
 	}
-	if body := recorder.Body.String(); !strings.Contains(body, "Pro 20x account") || !strings.Contains(body, `"planLimit":"20x"`) {
+	if body := recorder.Body.String(); !strings.Contains(body, "Credential 1") || !strings.Contains(body, "Pro 20x") || !strings.Contains(body, `"planLimit":"20x"`) {
 		t.Fatalf("public dashboard omitted Pro plan limit: %s", body)
 	}
 }
@@ -1774,7 +2013,7 @@ func TestAdminLoginAndCSRFMiddleware(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), `"authType":"codex_device_auth"`) {
 		t.Fatalf("admin account create did not default to Codex device auth: %s", recorder.Body.String())
 	}
-	for _, expected := range []string{`"id":"acct-user-example-test"`, `"email":"us***@example.test"`, `"displayName":"us***@example.test"`} {
+	for _, expected := range []string{`"id":"acct-credential"`, `"email":""`, `"displayName":"acct-credential"`} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin account create response missing %s: %s", expected, recorder.Body.String())
 		}
@@ -1790,5 +2029,21 @@ func TestAdminLoginAndCSRFMiddleware(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), `"allowedModels":["`) {
 		t.Fatalf("admin account create unexpectedly stored user-selected models: %s", recorder.Body.String())
+	}
+
+	secondRequest := httptest.NewRequest(http.MethodPost, "/admin/api/accounts", strings.NewReader(`{"email":"User@Example.Test","planType":"pro"}`))
+	secondRequest.AddCookie(sessionCookie)
+	secondRequest.AddCookie(csrfCookie)
+	secondRequest.Header.Set("X-CSRF-Token", response.CSRFToken)
+	secondRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(secondRecorder, secondRequest)
+	if secondRecorder.Code != http.StatusCreated {
+		t.Fatalf("second admin account create returned %d: %s", secondRecorder.Code, secondRecorder.Body.String())
+	}
+	if !strings.Contains(secondRecorder.Body.String(), `"id":"acct-credential-2"`) || !strings.Contains(secondRecorder.Body.String(), `"displayName":"acct-credential-2"`) {
+		t.Fatalf("second device-auth account did not use an independent credential id: %s", secondRecorder.Body.String())
+	}
+	if strings.Contains(secondRecorder.Body.String(), "user@example.test") || strings.Contains(secondRecorder.Body.String(), "us***@example.test") || strings.Contains(secondRecorder.Body.String(), `"planType":"pro"`) {
+		t.Fatalf("second device-auth account used caller-supplied identity metadata: %s", secondRecorder.Body.String())
 	}
 }

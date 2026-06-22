@@ -152,6 +152,9 @@ docker run -d \
 | `CODEX_POOL_ROUTING_STRATEGY` | no | `sticky_failover` | Routing strategy. |
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
+| `CODEX_POOL_PROMPT_CACHE_KEY_MODE` | no | `auto` | `auto` injects a hashed `prompt_cache_key` when the client omitted one. `off`/`passthrough` leave the request unchanged. |
+| `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | passthrough | Optional upstream prompt cache retention override. Valid values are `24h` and `in_memory`; unset/passthrough preserves upstream defaults. |
+| `CODEX_POOL_PRESERVE_PRO_QUOTA` | no | `false` | Initial default for the admin Console `Preserve Pro quota` switch. Once saved in `/data/config.json`, the Console setting takes precedence. |
 
 ### 2.2 Startup safety checks
 
@@ -428,8 +431,10 @@ Use the first available source:
 1. `X-Codex-Pool-Session`
 2. `X-Codex-Pool-Project`
 3. `prompt_cache_key` from JSON body
-4. `session_id`, `conversation_id`, or `thread_id` from JSON body
-5. Hash of `(apiKeyId + model + normalized prompt prefix)`
+4. `conversation` from JSON body
+5. `session_id`, `conversation_id`, or `thread_id` from JSON body
+6. `previous_response_id` mapped to the account that produced that response id
+7. Hash of `(apiKeyId + model + normalized prompt prefix)`
 
 Final sticky key format:
 
@@ -479,6 +484,8 @@ failback = new_session_only
 
 A session that failed over from `acct-a` to `acct-b` should remain on `acct-b` until it ends, unless `acct-b` also fails.
 
+Optional exception: when `preserveProQuota` is enabled from the admin Console, if the sticky account is a Pro account and any eligible non-Pro account is available, select the non-Pro account and rewrite the sticky binding on success. This keeps Pro quota as the last-resort pool while preserving normal failover for deployments that leave the mode disabled.
+
 On upstream quota exhaustion or rate limiting (`429`), mark the account/model in cooldown and retry the next eligible account in the same request. By default, the retry budget scales with the configured account count; `CODEX_POOL_MAX_RETRY_ACCOUNTS` can cap it.
 
 ### 6.5 Candidate account filter
@@ -505,8 +512,8 @@ not in model-level cooldown for requested model
 ```json
 {
   "id": "acct-org-a",
-  "label": "us***er@example.com · Plus",
-  "displayName": "us***er@example.com · Plus",
+  "label": "Credential 1",
+  "displayName": "Credential 1",
   "email": "us***er@example.com",
   "authType": "codex_device_auth",
   "enabled": true,
@@ -530,7 +537,7 @@ Notes:
 - `remainingQuota` is an integer routing hint. Treat it as a percentage or normalized score, not an exact token count.
 - Actual consumed tokens are tracked in usage stats.
 - Absolute remaining Codex token quota may not be available from upstream. Display both quota-window percentages and token usage counters.
-- Admin API account responses must not expose full email addresses, upstream account IDs, upstream URLs, API keys, `codexHome`, or auth file paths. The persisted config may keep those values for routing and credential isolation, but browser-facing account fields use masked display values.
+- Admin API account responses must not expose full email addresses, upstream account IDs, upstream URLs, API keys, `codexHome`, or auth file paths. A device-auth credential slot is the primary local identity. Email, plan, upstream account ID, and organization values are descriptive credential metadata; browser-facing account labels must not be derived from them, and metadata fields use masked display values.
 
 ### 7.2 Add account
 
@@ -545,7 +552,7 @@ Request:
 {}
 ```
 
-The admin UI sends no user-entered account fields. It creates an empty Codex device-auth slot, immediately starts device auth, and shows only the verification URL, user code, and a 15 minute countdown. `id`, `label`, `email`, `planType`, `planRank`, account ID, and model access are resolved after device auth from the authenticated Codex account; routing treats an empty `allowedModels` list as no per-account model restriction.
+The admin UI sends no user-entered account fields. It creates an empty Codex device-auth credential slot, immediately starts device auth, and shows only the verification URL, user code, and a 15 minute countdown. `id` and `label` are local slot identifiers and are not derived from email, plan, or upstream account metadata. `email`, `planType`, `planRank`, upstream account ID, organization, and model access are resolved after device auth from the authenticated Codex credential as metadata; routing treats an empty `allowedModels` list as no per-account model restriction.
 
 Response:
 
@@ -1079,6 +1086,7 @@ Response:
       "gatewayMode": "sidecar",
       "upstreamProxyUrl": null,
       "routingStrategy": "sticky_failover",
+      "preserveProQuota": false,
       "customRoutingRules": [],
       "accountModelRules": [],
       "modelAliases": [],
@@ -1115,6 +1123,23 @@ Response:
 ```
 
 All secrets must be redacted in state responses.
+
+### 11.1 Runtime Settings
+
+```http
+POST /admin/api/settings
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "preserveProQuota": true
+}
+```
+
+`preserveProQuota` backs the admin Console `Preserve Pro quota` switch and is persisted in `/data/config.json`.
 
 ---
 

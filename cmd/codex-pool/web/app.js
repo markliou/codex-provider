@@ -143,6 +143,13 @@
     $("#summary-grid").innerHTML = items.map(([label, value, tone]) => `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${value}</span></div>`).join("");
   }
 
+  function renderSettings(serviceState) {
+    const preserveSwitch = $("#preserve-pro-quota-switch");
+    if (!preserveSwitch) return;
+    preserveSwitch.checked = Boolean(serviceState?.preserveProQuota);
+    preserveSwitch.disabled = false;
+  }
+
   function displayUnixTime(value) {
     if (!value) return "";
     const date = new Date(Number(value) * 1000);
@@ -196,6 +203,16 @@
     return `<button class="button ${tone}" type="button" data-account-action="${action}" data-account-id="${escapeHTML(id)}">${label}</button>`;
   }
 
+  function accountMetadataLine(account, includeID = false) {
+    const metadata = account.credentialMetadata || account;
+    const parts = [];
+    if (metadata.planType && metadata.planType !== "unknown") parts.push(metadata.planDisplayName || metadata.planType);
+    if (metadata.organizationName) parts.push(metadata.organizationName);
+    if (metadata.email) parts.push(metadata.email);
+    if (includeID && account.id) parts.push(account.id);
+    return parts.join(" · ");
+  }
+
   function renderAccounts(accounts, healthByID) {
     $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th>Last activity</th><th>Action</th></tr>";
     $("#account-count").textContent = `${accounts.length} configured`;
@@ -208,11 +225,11 @@
       const health = healthByID.get(account.id) || { status: "standby", statusReason: "No health data" };
       const activity = health.status === "error" ? health.lastFailureAt : health.lastSuccessAt;
       const route = `${account.inPool ? "In pool" : "Out of pool"} · priority ${account.priority}`;
-      const displayName = account.displayName || account.email || account.label || account.id;
-      const tier = account.planDisplayName || account.planType || "";
+      const displayName = account.displayName || account.label || account.id || "Credential";
+      const metadata = accountMetadataLine(account, true);
       const actions = actionButton("delete", account.id, "Remove", "danger");
       return `<tr>
-        <td><div class="account-name">${escapeHTML(displayName)}<span class="account-id">${escapeHTML(tier ? `${tier} · ${account.id}` : account.id)}</span></div></td>
+        <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span></div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt)}</td>
         <td><div class="route"><strong>${escapeHTML(account.authType || "codex_device_auth")}</strong><br>${escapeHTML(route)}</div></td>
@@ -235,8 +252,10 @@
         ? `<button class="button warn" type="button" data-public-pool-action="pool-remove" data-pool-ref="${escapeHTML(account.poolRef)}">Leave pool</button>`
         : `<button class="button secondary" type="button" data-public-pool-action="pool-add" data-pool-ref="${escapeHTML(account.poolRef)}">Join pool</button>`;
       const poolLabel = account.inPool ? "In pool" : "Out of pool";
+      const displayName = account.displayName || account.label || "Credential";
+      const metadata = accountMetadataLine(account, false);
       return `<tr>
-      <td><div class="account-name">${escapeHTML(account.displayName || account.label || account.email || "Account")}${account.email ? `<span class="account-id">${escapeHTML(account.email)}</span>` : ""}</div></td>
+      <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
       <td><div class="status-stack"><span class="badge ${escapeHTML(account.status)}">${statusLabel(account.status)}</span></div></td>
       <td>${quotaMarkup(account.remainingQuota, account.quota, account.quotaError, account.usageUpdatedAt)}</td>
       <td><div class="route"><strong>${escapeHTML(poolLabel)}</strong></div></td>
@@ -257,6 +276,7 @@
       const serviceState = stateResponse.state;
       const healthByID = new Map(healthResponse.accounts.map((item) => [item.accountId, item]));
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
+      renderSettings(serviceState);
       renderSummary(serviceState.summary || {});
       renderAccounts(state.data.accounts, healthByID);
       renderSticky(state.data.sessions);
@@ -321,6 +341,23 @@
     }
   }
 
+  async function updatePreserveProQuota(event) {
+    const input = event.currentTarget;
+    const previous = state.data?.serviceState?.preserveProQuota ?? false;
+    input.disabled = true;
+    try {
+      const response = await api("/settings", { method: "POST", body: JSON.stringify({ preserveProQuota: input.checked }) });
+      state.data = { ...(state.data || {}), serviceState: response.state };
+      renderSettings(response.state);
+      $("#service-status").textContent = "Settings updated";
+      refresh(true);
+    } catch (error) {
+      input.checked = Boolean(previous);
+      input.disabled = false;
+      notify(error.message, true);
+    }
+  }
+
   async function watchLoginJob(jobId) {
     let attempts = 0;
     const tick = async () => {
@@ -375,6 +412,7 @@
   $("#sign-in-button").addEventListener("click", () => showLogin());
   $("#logout-button").addEventListener("click", async () => { try { await api("/logout", { method: "POST" }); } catch (_) {} sessionStorage.removeItem("codexPoolCsrf"); state.csrfToken = ""; showPublicDashboard(); });
   $("#add-account-button").addEventListener("click", createAccountAndStartLogin);
+  $("#preserve-pro-quota-switch").addEventListener("change", updatePreserveProQuota);
   $("#close-device-auth-button").addEventListener("click", () => closeDeviceAuth(true));
   $("#accounts-body").addEventListener("click", (event) => {
     const publicButton = event.target.closest("[data-public-pool-action]");

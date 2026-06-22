@@ -49,11 +49,12 @@ const (
 )
 
 type config struct {
-	DefaultModel string            `json:"defaultModel"`
-	ModelAliases map[string]string `json:"modelAliases"`
-	Accounts     []account         `json:"accounts"`
-	CreatedAt    time.Time         `json:"createdAt"`
-	UpdatedAt    time.Time         `json:"updatedAt"`
+	DefaultModel     string            `json:"defaultModel"`
+	ModelAliases     map[string]string `json:"modelAliases"`
+	Accounts         []account         `json:"accounts"`
+	PreserveProQuota *bool             `json:"preserveProQuota,omitempty"`
+	CreatedAt        time.Time         `json:"createdAt"`
+	UpdatedAt        time.Time         `json:"updatedAt"`
 }
 
 type account struct {
@@ -125,6 +126,24 @@ type stickySession struct {
 	FailoverFrom  string    `json:"failoverFrom,omitempty"`
 }
 
+type responseBinding struct {
+	ResponseID string    `json:"responseId"`
+	StickyKey  string    `json:"stickyKey"`
+	ModelID    string    `json:"modelId"`
+	AccountID  string    `json:"accountId"`
+	CreatedAt  time.Time `json:"createdAt"`
+	ExpiresAt  time.Time `json:"expiresAt"`
+}
+
+type promptCacheStat struct {
+	AccountID    string    `json:"accountId"`
+	ModelID      string    `json:"modelId"`
+	RequestCount uint64    `json:"requestCount"`
+	InputTokens  uint64    `json:"inputTokens"`
+	CachedTokens uint64    `json:"cachedTokens"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
 type accountHealth struct {
 	LastSuccessAt      time.Time `json:"lastSuccessAt,omitempty"`
 	LastFailureAt      time.Time `json:"lastFailureAt,omitempty"`
@@ -154,41 +173,46 @@ type loginFailure struct {
 }
 
 type state struct {
-	StickySessions map[string]stickySession `json:"stickySessions"`
-	Cooldowns      map[string][]cooldown    `json:"cooldowns"`
-	Health         map[string]accountHealth `json:"health"`
-	Quotas         map[string]quotaSnapshot `json:"quotas,omitempty"`
-	RequestCount   uint64                   `json:"requestCount"`
-	SuccessCount   uint64                   `json:"successCount"`
-	FailureCount   uint64                   `json:"failureCount"`
-	UpdatedAt      time.Time                `json:"updatedAt"`
+	StickySessions   map[string]stickySession   `json:"stickySessions"`
+	ResponseBindings map[string]responseBinding `json:"responseBindings,omitempty"`
+	Cooldowns        map[string][]cooldown      `json:"cooldowns"`
+	Health           map[string]accountHealth   `json:"health"`
+	Quotas           map[string]quotaSnapshot   `json:"quotas,omitempty"`
+	PromptCache      map[string]promptCacheStat `json:"promptCache,omitempty"`
+	RequestCount     uint64                     `json:"requestCount"`
+	SuccessCount     uint64                     `json:"successCount"`
+	FailureCount     uint64                     `json:"failureCount"`
+	UpdatedAt        time.Time                  `json:"updatedAt"`
 }
 
 type app struct {
-	mu                 sync.RWMutex
-	authLockMu         sync.Mutex
-	config             config
-	state              state
-	dataDir            string
-	apiKeys            [][]byte
-	adminUser          string
-	adminHash          []byte
-	sessionKey         []byte
-	sessionAffinityTTL time.Duration
-	maxRetryAccounts   int
-	publicAddress      string
-	adminAddress       string
-	allowRemoteAdmin   bool
-	codexBaseURL       string
-	codexGatewayMode   string
-	cliproxyBaseURL    string
-	cliproxyAPIKey     string
-	jobs               map[string]*loginJob
-	loginCancels       map[string]context.CancelFunc
-	loginFailures      map[string]loginFailure
-	authLocks          map[string]*sync.Mutex
-	client             *http.Client
-	logger             *log.Logger
+	mu                   sync.RWMutex
+	authLockMu           sync.Mutex
+	config               config
+	state                state
+	dataDir              string
+	apiKeys              [][]byte
+	adminUser            string
+	adminHash            []byte
+	sessionKey           []byte
+	sessionAffinityTTL   time.Duration
+	maxRetryAccounts     int
+	promptCacheKeyMode   string
+	promptCacheRetention string
+	preserveProQuota     bool
+	publicAddress        string
+	adminAddress         string
+	allowRemoteAdmin     bool
+	codexBaseURL         string
+	codexGatewayMode     string
+	cliproxyBaseURL      string
+	cliproxyAPIKey       string
+	jobs                 map[string]*loginJob
+	loginCancels         map[string]context.CancelFunc
+	loginFailures        map[string]loginFailure
+	authLocks            map[string]*sync.Mutex
+	client               *http.Client
+	logger               *log.Logger
 }
 
 func main() {
@@ -244,32 +268,47 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
+	promptCacheKeyMode, err := promptCacheKeyModeFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	promptCacheRetention, err := promptCacheRetentionFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	preserveProQuota, err := boolFromEnv("CODEX_POOL_PRESERVE_PRO_QUOTA")
+	if err != nil {
+		return nil, err
+	}
 
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("generate session key: %w", err)
 	}
 	a := &app{
-		dataDir:            envOr("CODEX_POOL_DATA_DIR", "/data"),
-		apiKeys:            keys,
-		adminUser:          envOr("CODEX_POOL_ADMIN_USERNAME", "admin"),
-		adminHash:          []byte(adminHash),
-		sessionKey:         key,
-		sessionAffinityTTL: sessionAffinityTTL,
-		maxRetryAccounts:   maxRetryAccounts,
-		publicAddress:      publicAddress,
-		adminAddress:       adminAddress,
-		allowRemoteAdmin:   allowRemote,
-		codexBaseURL:       strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
-		codexGatewayMode:   codexGatewayMode,
-		cliproxyBaseURL:    strings.TrimRight(envOr("CODEX_POOL_CLIPROXY_BASE_URL", cliproxyBaseURLDefault), "/"),
-		cliproxyAPIKey:     strings.TrimSpace(os.Getenv("CODEX_POOL_CLIPROXY_API_KEY")),
-		jobs:               map[string]*loginJob{},
-		loginCancels:       map[string]context.CancelFunc{},
-		loginFailures:      map[string]loginFailure{},
-		authLocks:          map[string]*sync.Mutex{},
-		client:             &http.Client{Timeout: 5 * time.Minute},
-		logger:             log.New(os.Stdout, "codex-pool ", log.LstdFlags|log.LUTC),
+		dataDir:              envOr("CODEX_POOL_DATA_DIR", "/data"),
+		apiKeys:              keys,
+		adminUser:            envOr("CODEX_POOL_ADMIN_USERNAME", "admin"),
+		adminHash:            []byte(adminHash),
+		sessionKey:           key,
+		sessionAffinityTTL:   sessionAffinityTTL,
+		maxRetryAccounts:     maxRetryAccounts,
+		promptCacheKeyMode:   promptCacheKeyMode,
+		promptCacheRetention: promptCacheRetention,
+		preserveProQuota:     preserveProQuota,
+		publicAddress:        publicAddress,
+		adminAddress:         adminAddress,
+		allowRemoteAdmin:     allowRemote,
+		codexBaseURL:         strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
+		codexGatewayMode:     codexGatewayMode,
+		cliproxyBaseURL:      strings.TrimRight(envOr("CODEX_POOL_CLIPROXY_BASE_URL", cliproxyBaseURLDefault), "/"),
+		cliproxyAPIKey:       strings.TrimSpace(os.Getenv("CODEX_POOL_CLIPROXY_API_KEY")),
+		jobs:                 map[string]*loginJob{},
+		loginCancels:         map[string]context.CancelFunc{},
+		loginFailures:        map[string]loginFailure{},
+		authLocks:            map[string]*sync.Mutex{},
+		client:               &http.Client{Timeout: 5 * time.Minute},
+		logger:               log.New(os.Stdout, "codex-pool ", log.LstdFlags|log.LUTC),
 	}
 	if err := a.load(); err != nil {
 		return nil, err
@@ -282,9 +321,12 @@ func (a *app) load() error {
 		return fmt.Errorf("create data directory: %w", err)
 	}
 	a.config = config{DefaultModel: envOr("CODEX_POOL_DEFAULT_MODEL", "gpt-5.5(xhigh)"), ModelAliases: map[string]string{}}
-	a.state = state{StickySessions: map[string]stickySession{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}}
+	a.state = state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}}
 	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &a.config); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read config: %w", err)
+	}
+	if a.config.PreserveProQuota != nil {
+		a.preserveProQuota = *a.config.PreserveProQuota
 	}
 	if configuredDefault := strings.TrimSpace(os.Getenv("CODEX_POOL_DEFAULT_MODEL")); configuredDefault != "" {
 		a.config.DefaultModel = configuredDefault
@@ -301,6 +343,9 @@ func (a *app) load() error {
 	if a.state.StickySessions == nil {
 		a.state.StickySessions = map[string]stickySession{}
 	}
+	if a.state.ResponseBindings == nil {
+		a.state.ResponseBindings = map[string]responseBinding{}
+	}
 	if a.state.Cooldowns == nil {
 		a.state.Cooldowns = map[string][]cooldown{}
 	}
@@ -310,7 +355,10 @@ func (a *app) load() error {
 	if a.state.Quotas == nil {
 		a.state.Quotas = map[string]quotaSnapshot{}
 	}
-	if a.pruneExpiredStickySessionsLocked(time.Now().UTC()) {
+	if a.state.PromptCache == nil {
+		a.state.PromptCache = map[string]promptCacheStat{}
+	}
+	if a.pruneExpiredRuntimeStateLocked(time.Now().UTC()) {
 		_ = a.saveLocked()
 	}
 	for i := range a.config.Accounts {
@@ -437,6 +485,7 @@ func (a *app) adminMux() http.Handler {
 	mux.HandleFunc("POST /admin/api/login", a.handleAdminLogin)
 	mux.HandleFunc("POST /admin/api/logout", a.requireAdmin(a.handleAdminLogout))
 	mux.HandleFunc("GET /admin/api/state", a.requireAdmin(a.handleAdminState))
+	mux.HandleFunc("POST /admin/api/settings", a.requireAdmin(a.handleAdminSettings))
 	mux.HandleFunc("GET /admin/api/accounts", a.requireAdmin(a.handleAccounts))
 	mux.HandleFunc("POST /admin/api/accounts", a.requireAdmin(a.handleAccounts))
 	mux.HandleFunc("GET /admin/api/accounts/health", a.requireAdmin(a.handleAccountHealth))
@@ -573,12 +622,14 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	if !chat && tier != "" && tier != "none" {
 		payload["reasoning"] = map[string]any{"effort": tier}
 	}
+	route := a.routingDecision(r, payload, model, requestAPIKey(r))
+	a.applyPromptCacheControls(payload, route)
 	updatedBody, err := json.Marshal(payload)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "unable to encode request")
 		return
 	}
-	stickyKey := a.stickyKey(r, payload, model)
+	stickyKey := route.StickyKey
 	excluded := map[string]bool{}
 	for attempt := 0; attempt < a.proxyAttemptLimit(); attempt++ {
 		candidate, err := a.selectAccount(stickyKey, model, excluded)
@@ -610,12 +661,18 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		}
 		defer response.Body.Close()
 		a.addCurrentAccountResponseHeaders(w, candidate.ID)
+		var info proxyResponseInfo
+		ok := true
 		if convertResponse {
-			a.writeChatFromResponse(w, response, model)
+			info, ok = a.writeChatFromResponse(w, response, model)
 		} else {
-			copyProxyResponse(w, response)
+			info, ok = copyProxyResponse(w, response)
 		}
-		a.markSuccess(stickyKey, model, candidate.ID)
+		if !ok {
+			a.markFailure(candidate.ID, model, "upstream_response_error", 30*time.Second)
+			return
+		}
+		a.markSuccess(stickyKey, model, candidate.ID, info)
 		return
 	}
 	writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", "all eligible upstream accounts failed")
@@ -656,6 +713,11 @@ func (a *app) prepareUpstreamRequest(candidate account, body []byte, chat bool) 
 		responsesRequest := map[string]any{"model": chatRequest["model"], "input": input}
 		if stream, _ := chatRequest["stream"].(bool); stream {
 			responsesRequest["stream"] = true
+		}
+		for _, name := range []string{"prompt_cache_key", "prompt_cache_retention"} {
+			if value, ok := chatRequest[name]; ok {
+				responsesRequest[name] = value
+			}
 		}
 		converted, err := json.Marshal(responsesRequest)
 		if err != nil {
@@ -734,15 +796,25 @@ func withCliproxyAccountModel(body []byte, accountID string) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
-func (a *app) writeChatFromResponse(w http.ResponseWriter, response *http.Response, model string) {
+type promptCacheUsage struct {
+	InputTokens  uint64
+	CachedTokens uint64
+	Present      bool
+}
+
+type proxyResponseInfo struct {
+	ResponseID string
+	Usage      promptCacheUsage
+}
+
+func (a *app) writeChatFromResponse(w http.ResponseWriter, response *http.Response, model string) (proxyResponseInfo, bool) {
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		copyProxyResponse(w, response)
-		return
+		return copyProxyResponse(w, response)
 	}
 	var data map[string]any
 	if err := json.NewDecoder(response.Body).Decode(&data); err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", "invalid Responses API payload from upstream")
-		return
+		return proxyResponseInfo{}, false
 	}
 	text := outputText(data)
 	created := time.Now().Unix()
@@ -750,6 +822,7 @@ func (a *app) writeChatFromResponse(w http.ResponseWriter, response *http.Respon
 		"id": "chatcmpl_" + randomID(), "object": "chat.completion", "created": created, "model": model,
 		"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": text}, "finish_reason": "stop"}},
 	})
+	return responseInfoFromPayload(data), true
 }
 
 func outputText(data map[string]any) string {
@@ -832,14 +905,146 @@ func safeHeaderValue(value string) string {
 	}, strings.TrimSpace(value))
 }
 
-func copyProxyResponse(w http.ResponseWriter, response *http.Response) {
+func copyProxyResponse(w http.ResponseWriter, response *http.Response) (proxyResponseInfo, bool) {
 	for _, header := range []string{"Content-Type", "Cache-Control", "X-Request-Id"} {
 		if value := response.Header.Get(header); value != "" {
 			w.Header().Set(header, value)
 		}
 	}
 	w.WriteHeader(response.StatusCode)
-	_, _ = io.Copy(w, response.Body)
+	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+		return copyStreamingProxyResponse(w, response.Body), true
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return proxyResponseInfo{}, false
+	}
+	var info proxyResponseInfo
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err == nil {
+		info = responseInfoFromPayload(payload)
+	}
+	_, _ = w.Write(body)
+	return info, true
+}
+
+func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResponseInfo {
+	var info proxyResponseInfo
+	reader := bufio.NewReader(body)
+	flusher, _ := w.(http.Flusher)
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			_, _ = io.WriteString(w, line)
+			info.merge(responseInfoFromSSELine(line))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			break
+		}
+	}
+	return info
+}
+
+func (info *proxyResponseInfo) merge(next proxyResponseInfo) {
+	if next.ResponseID != "" {
+		info.ResponseID = next.ResponseID
+	}
+	if next.Usage.Present {
+		info.Usage = next.Usage
+	}
+}
+
+func responseInfoFromSSELine(line string) proxyResponseInfo {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return proxyResponseInfo{}
+	}
+	data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if data == "" || data == "[DONE]" {
+		return proxyResponseInfo{}
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		return proxyResponseInfo{}
+	}
+	if response, ok := payload["response"].(map[string]any); ok {
+		return responseInfoFromPayload(response)
+	}
+	return responseInfoFromPayload(payload)
+}
+
+func responseInfoFromPayload(payload map[string]any) proxyResponseInfo {
+	if payload == nil {
+		return proxyResponseInfo{}
+	}
+	id, _ := payload["id"].(string)
+	return proxyResponseInfo{ResponseID: id, Usage: promptCacheUsageFromPayload(payload)}
+}
+
+func promptCacheUsageFromPayload(payload map[string]any) promptCacheUsage {
+	usage, _ := payload["usage"].(map[string]any)
+	if usage == nil {
+		return promptCacheUsage{}
+	}
+	inputTokens, inputOK := uint64Field(usage, "input_tokens")
+	if !inputOK {
+		inputTokens, inputOK = uint64Field(usage, "prompt_tokens")
+	}
+	var cachedTokens uint64
+	var cachedOK bool
+	for _, name := range []string{"input_tokens_details", "prompt_tokens_details"} {
+		details, _ := usage[name].(map[string]any)
+		if details == nil {
+			continue
+		}
+		cachedTokens, cachedOK = uint64Field(details, "cached_tokens")
+		if cachedOK {
+			break
+		}
+	}
+	return promptCacheUsage{InputTokens: inputTokens, CachedTokens: cachedTokens, Present: inputOK || cachedOK}
+}
+
+func uint64Field(values map[string]any, name string) (uint64, bool) {
+	value, ok := values[name]
+	if !ok {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case json.Number:
+		number, err := typed.Int64()
+		if err != nil || number < 0 {
+			return 0, false
+		}
+		return uint64(number), true
+	case float64:
+		if typed < 0 {
+			return 0, false
+		}
+		return uint64(typed), true
+	case int:
+		if typed < 0 {
+			return 0, false
+		}
+		return uint64(typed), true
+	case int64:
+		if typed < 0 {
+			return 0, false
+		}
+		return uint64(typed), true
+	case uint64:
+		return typed, true
+	case uint:
+		return uint64(typed), true
+	default:
+		return 0, false
+	}
 }
 
 func (a *app) handleAdminPage(w http.ResponseWriter, _ *http.Request) {
@@ -893,7 +1098,35 @@ func (a *app) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 func (a *app) handleAdminState(w http.ResponseWriter, _ *http.Request) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(time.Now().UTC())}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": a.adminStateLocked(time.Now().UTC())})
+}
+
+func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		PreserveProQuota *bool `json:"preserveProQuota"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&request); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid settings JSON")
+		return
+	}
+	if request.PreserveProQuota == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "preserveProQuota is required")
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.preserveProQuota = *request.PreserveProQuota
+	value := a.preserveProQuota
+	a.config.PreserveProQuota = &value
+	if err := a.saveLocked(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "storage_error", "unable to persist settings")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": a.adminStateLocked(time.Now().UTC())})
+}
+
+func (a *app) adminStateLocked(now time.Time) map[string]any {
+	return map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -971,6 +1204,7 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if isCodexDeviceAuth(input) {
+		input.Email = ""
 		input.AccountID = ""
 		input.OrganizationName = ""
 		input.PlanType = ""
@@ -992,7 +1226,11 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if generateID {
-		input.ID = a.uniqueAccountIDLocked(accountIDBase(input.Email, input.PlanType))
+		base := accountIDBase(input.Email, input.PlanType)
+		if isCodexDeviceAuth(input) {
+			base = "acct-credential"
+		}
+		input.ID = a.uniqueAccountIDLocked(base)
 	}
 	if input.Label == "" {
 		input.Label = accountDisplayName(input)
@@ -1016,7 +1254,7 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, "storage_error", "unable to persist account")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "account": publicAccount(input)})
+	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "account": publicAccount(input, len(a.config.Accounts)-1)})
 }
 
 func (a *app) handleAccountHealth(w http.ResponseWriter, _ *http.Request) {
@@ -1086,7 +1324,7 @@ func (a *app) handleStickySessions(w http.ResponseWriter, _ *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
-	pruned := a.pruneExpiredStickySessionsLocked(now)
+	pruned := a.pruneExpiredRuntimeStateLocked(now)
 	items := make([]stickySession, 0, len(a.state.StickySessions))
 	for _, item := range a.state.StickySessions {
 		item.ExpiresAt = a.stickyExpiresAt(item)
@@ -1123,7 +1361,7 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 	}
 	id, action := parts[0], strings.Join(parts[1:], "/")
 	a.mu.Lock()
-	item := a.accountLocked(id)
+	item, index := a.accountWithIndexLocked(id)
 	if item == nil {
 		a.mu.Unlock()
 		writeOpenAIError(w, 404, "not_found", "account not found")
@@ -1181,7 +1419,7 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, 500, "storage_error", "unable to persist account")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": publicAccount(*item)})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": publicAccount(*item, index)})
 }
 
 func (a *app) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
@@ -1205,6 +1443,7 @@ func (a *app) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 			delete(a.state.Cooldowns, id)
 			delete(a.state.Health, id)
 			delete(a.state.Quotas, id)
+			deletePromptCacheForAccount(a.state.PromptCache, id)
 			a.clearStickyForAccountLocked(id)
 			if err := a.saveLocked(); err != nil {
 				writeOpenAIError(w, 500, "storage_error", "unable to persist account")
@@ -1393,6 +1632,11 @@ func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (
 			delete(a.state.StickySessions, stickyKey)
 			stickyChanged = true
 		} else if item := a.accountLocked(existing.AccountID); item != nil && a.usableLocked(*item, model, now) {
+			if a.preserveProQuota && a.proAccountLocked(*item) {
+				if replacement, ok := a.preferredAccountLocked(model, excluded, now); ok && replacement.ID != item.ID && !a.proAccountLocked(replacement) {
+					return replacement, nil
+				}
+			}
 			return *item, nil
 		} else if item == nil {
 			delete(a.state.StickySessions, stickyKey)
@@ -1402,6 +1646,14 @@ func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (
 	if stickyChanged {
 		_ = a.saveLocked()
 	}
+	selected, ok := a.preferredAccountLocked(model, excluded, now)
+	if !ok {
+		return account{}, errors.New("no eligible account is available for the requested model")
+	}
+	return selected, nil
+}
+
+func (a *app) preferredAccountLocked(model string, excluded map[string]bool, now time.Time) (account, bool) {
 	eligible := make([]account, 0)
 	for _, item := range a.config.Accounts {
 		if !excluded[item.ID] && a.usableLocked(item, model, now) {
@@ -1409,15 +1661,22 @@ func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (
 		}
 	}
 	if len(eligible) == 0 {
-		return account{}, errors.New("no eligible account is available for the requested model")
+		return account{}, false
 	}
 	sort.SliceStable(eligible, func(i, j int) bool {
+		if a.preserveProQuota {
+			iPro := a.proAccountLocked(eligible[i])
+			jPro := a.proAccountLocked(eligible[j])
+			if iPro != jPro {
+				return !iPro
+			}
+		}
 		if eligible[i].Priority == eligible[j].Priority {
 			return eligible[i].ID < eligible[j].ID
 		}
 		return eligible[i].Priority > eligible[j].Priority
 	})
-	return eligible[0], nil
+	return eligible[0], true
 }
 
 func (a *app) proxyAttemptLimit() int {
@@ -1469,6 +1728,14 @@ func (a *app) quotaAvailableLocked(item account) bool {
 	return true
 }
 
+func (a *app) proAccountLocked(item account) bool {
+	plan := item.PlanType
+	if snapshot := a.state.Quotas[item.ID]; snapshot.PlanType != "" {
+		plan = snapshot.PlanType
+	}
+	return normalizePlanType(plan) == "pro"
+}
+
 func (a *app) markFailure(accountID, model, reason string, duration time.Duration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1486,7 +1753,7 @@ func (a *app) markFailure(accountID, model, reason string, duration time.Duratio
 	_ = a.saveLocked()
 }
 
-func (a *app) markSuccess(key, model, accountID string) {
+func (a *app) markSuccess(key, model, accountID string, info proxyResponseInfo) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
@@ -1503,9 +1770,41 @@ func (a *app) markSuccess(key, model, accountID string) {
 		failoverFrom = prior.AccountID
 	}
 	a.state.StickySessions[key] = stickySession{Key: key, ModelID: model, AccountID: accountID, CreatedAt: chooseTime(prior.CreatedAt, now), LastSuccessAt: now, ExpiresAt: now.Add(a.stickyTTL()), FailoverFrom: failoverFrom}
+	if info.ResponseID != "" {
+		if a.state.ResponseBindings == nil {
+			a.state.ResponseBindings = map[string]responseBinding{}
+		}
+		a.state.ResponseBindings[info.ResponseID] = responseBinding{ResponseID: info.ResponseID, StickyKey: key, ModelID: model, AccountID: accountID, CreatedAt: now, ExpiresAt: now.Add(a.stickyTTL())}
+	}
+	if info.Usage.Present {
+		a.recordPromptCacheUsageLocked(accountID, model, info.Usage, now)
+	}
 	a.state.RequestCount++
 	a.state.SuccessCount++
 	_ = a.saveLocked()
+}
+
+func (a *app) recordPromptCacheUsageLocked(accountID, model string, usage promptCacheUsage, now time.Time) {
+	if a.state.PromptCache == nil {
+		a.state.PromptCache = map[string]promptCacheStat{}
+	}
+	key := accountID + ":" + model
+	stat := a.state.PromptCache[key]
+	stat.AccountID = accountID
+	stat.ModelID = model
+	stat.RequestCount++
+	stat.InputTokens += usage.InputTokens
+	stat.CachedTokens += usage.CachedTokens
+	stat.UpdatedAt = now
+	a.state.PromptCache[key] = stat
+}
+
+func deletePromptCacheForAccount(values map[string]promptCacheStat, accountID string) {
+	for key, value := range values {
+		if value.AccountID == accountID {
+			delete(values, key)
+		}
+	}
 }
 
 func (a *app) clearAccountRuntimeStateLocked(accountID string) {
@@ -1565,6 +1864,17 @@ func (a *app) pruneExpiredStickySessionsLocked(now time.Time) bool {
 	return changed
 }
 
+func (a *app) pruneExpiredRuntimeStateLocked(now time.Time) bool {
+	changed := a.pruneExpiredStickySessionsLocked(now)
+	for id, binding := range a.state.ResponseBindings {
+		if !binding.ExpiresAt.After(now) {
+			delete(a.state.ResponseBindings, id)
+			changed = true
+		}
+	}
+	return changed
+}
+
 func (a *app) latestStickySessionLocked(model string, now time.Time) (stickySession, bool) {
 	var best stickySession
 	found := false
@@ -1608,6 +1918,11 @@ func (a *app) clearStickyForAccountLocked(id string) {
 	for key, item := range a.state.StickySessions {
 		if item.AccountID == id {
 			delete(a.state.StickySessions, key)
+		}
+	}
+	for key, item := range a.state.ResponseBindings {
+		if item.AccountID == id {
+			delete(a.state.ResponseBindings, key)
 		}
 	}
 }
@@ -1694,20 +2009,140 @@ func currentStatusStickyKey(r *http.Request, model string) (string, string) {
 	return "", ""
 }
 
-func (a *app) stickyKey(r *http.Request, payload map[string]any, model string) string {
-	for _, value := range []string{r.Header.Get("X-Codex-Pool-Session"), r.Header.Get("X-Codex-Pool-Project")} {
-		if value != "" {
-			return model + ":" + value
+type routingDecision struct {
+	StickyKey      string
+	PromptCacheKey string
+	Source         string
+}
+
+func (a *app) routingDecision(r *http.Request, payload map[string]any, model, apiKey string) routingDecision {
+	for _, item := range []struct {
+		value  string
+		source string
+	}{
+		{r.Header.Get("X-Codex-Pool-Session"), "session"},
+		{r.Header.Get("X-Codex-Pool-Project"), "project"},
+	} {
+		if value := strings.TrimSpace(item.value); value != "" {
+			return routingDecision{StickyKey: model + ":" + value, PromptCacheKey: promptCacheKeyHash(model, item.source, value), Source: item.source}
 		}
 	}
-	for _, name := range []string{"prompt_cache_key", "session_id", "conversation_id", "thread_id"} {
-		if value, ok := payload[name].(string); ok && value != "" {
-			return model + ":" + value
+	if value, ok := payload["prompt_cache_key"].(string); ok && strings.TrimSpace(value) != "" {
+		value = strings.TrimSpace(value)
+		return routingDecision{StickyKey: model + ":" + value, Source: "prompt_cache_key"}
+	}
+	if value := conversationID(payload); value != "" {
+		return routingDecision{StickyKey: model + ":" + value, PromptCacheKey: promptCacheKeyHash(model, "conversation", value), Source: "conversation"}
+	}
+	for _, name := range []string{"session_id", "conversation_id", "thread_id"} {
+		if value, ok := payload[name].(string); ok && strings.TrimSpace(value) != "" {
+			value = strings.TrimSpace(value)
+			return routingDecision{StickyKey: model + ":" + value, PromptCacheKey: promptCacheKeyHash(model, name, value), Source: name}
 		}
 	}
-	encoded, _ := json.Marshal(payload["input"])
-	sum := sha256.Sum256(append([]byte(model+":"), encoded...))
-	return model + ":" + fmt.Sprintf("%x", sum[:8])
+	if previousResponseID, ok := payload["previous_response_id"].(string); ok && strings.TrimSpace(previousResponseID) != "" {
+		previousResponseID = strings.TrimSpace(previousResponseID)
+		if binding, found := a.responseBinding(previousResponseID, model); found {
+			return routingDecision{StickyKey: binding.StickyKey, PromptCacheKey: promptCacheKeyHash(model, "previous_response_id", binding.StickyKey), Source: "previous_response_id"}
+		}
+		value := "previous:" + shortHash([]byte(previousResponseID))
+		return routingDecision{StickyKey: model + ":" + value, PromptCacheKey: promptCacheKeyHash(model, "previous_response_id", value), Source: "previous_response_id"}
+	}
+	return a.fallbackRoutingDecision(payload, model, apiKey)
+}
+
+func (a *app) responseBinding(responseID, model string) (responseBinding, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now().UTC()
+	binding, ok := a.state.ResponseBindings[responseID]
+	if !ok || binding.ModelID != model || !binding.ExpiresAt.After(now) {
+		if ok {
+			delete(a.state.ResponseBindings, responseID)
+			_ = a.saveLocked()
+		}
+		return responseBinding{}, false
+	}
+	return binding, true
+}
+
+func (a *app) fallbackRoutingDecision(payload map[string]any, model, apiKey string) routingDecision {
+	prefix := normalizedPromptPrefix(payload)
+	keyMaterial := append([]byte(apiKeyFingerprint(apiKey)+":"+model+":"), prefix...)
+	value := shortHash(keyMaterial)
+	stickyID := "prompt:" + value
+	return routingDecision{StickyKey: model + ":" + stickyID, PromptCacheKey: promptCacheKeyHash(model, "prompt", value), Source: "prompt"}
+}
+
+func (a *app) applyPromptCacheControls(payload map[string]any, route routingDecision) {
+	if a.promptCacheRetention != "" {
+		if _, exists := payload["prompt_cache_retention"]; !exists {
+			payload["prompt_cache_retention"] = a.promptCacheRetention
+		}
+	}
+	if !a.autoPromptCacheKeyEnabled() {
+		return
+	}
+	if _, exists := payload["prompt_cache_key"]; exists {
+		return
+	}
+	if route.PromptCacheKey != "" {
+		payload["prompt_cache_key"] = route.PromptCacheKey
+	}
+}
+
+func (a *app) autoPromptCacheKeyEnabled() bool {
+	return a.promptCacheKeyMode == "" || a.promptCacheKeyMode == "auto"
+}
+
+func conversationID(payload map[string]any) string {
+	switch value := payload["conversation"].(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case map[string]any:
+		for _, key := range []string{"id", "conversation_id", "conversationId"} {
+			if id, ok := value[key].(string); ok && strings.TrimSpace(id) != "" {
+				return strings.TrimSpace(id)
+			}
+		}
+	}
+	return ""
+}
+
+func normalizedPromptPrefix(payload map[string]any) []byte {
+	prefix := map[string]any{}
+	if value, ok := payload["input"]; ok {
+		prefix["input"] = value
+	} else if value, ok := payload["messages"]; ok {
+		prefix["messages"] = value
+	}
+	for _, name := range []string{"tools", "text", "response_format"} {
+		if value, ok := payload[name]; ok {
+			prefix[name] = value
+		}
+	}
+	encoded, _ := json.Marshal(prefix)
+	const maxPromptPrefixBytes = 8192
+	if len(encoded) > maxPromptPrefixBytes {
+		encoded = encoded[:maxPromptPrefixBytes]
+	}
+	return encoded
+}
+
+func promptCacheKeyHash(model, source, value string) string {
+	return "cp_" + shortHash([]byte(model+":"+source+":"+value))
+}
+
+func apiKeyFingerprint(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "anonymous"
+	}
+	return shortHash([]byte(value))
+}
+
+func shortHash(value []byte) string {
+	sum := sha256.Sum256(value)
+	return base64.RawURLEncoding.EncodeToString(sum[:16])
 }
 
 func allowedModel(item account, model string) bool {
@@ -1932,6 +2367,50 @@ func (a *app) syncCliproxyAuthLocked(item account, force bool) error {
 	}
 	if err := writeJSONAtomic(path, record); err != nil {
 		return fmt.Errorf("write cliproxy auth for account %s: %w", item.ID, err)
+	}
+	return nil
+}
+
+func (a *app) updateCliproxyAuthMetadata(item account) error {
+	if !a.usesCliproxySidecar(item) {
+		return nil
+	}
+	lock := a.codexAuthLock(item.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	path := a.cliproxyAuthPath(item.ID)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return a.syncCliproxyAuthLocked(item, false)
+	}
+	if err != nil {
+		return fmt.Errorf("read cliproxy auth for account %s: %w", item.ID, err)
+	}
+	var record cliproxyCodexAuthFile
+	if err := json.Unmarshal(data, &record); err != nil {
+		return fmt.Errorf("decode cliproxy auth for account %s: %w", item.ID, err)
+	}
+	if record.Type == "" {
+		record.Type = "codex"
+	}
+	if item.Email != "" {
+		record.Email = normalizeEmail(item.Email)
+	}
+	if item.AccountID != "" {
+		record.AccountID = item.AccountID
+	}
+	if item.OrganizationName != "" || !organizationScopedPlan(item.PlanType) {
+		record.OrganizationName = cleanOrganizationName(item.OrganizationName)
+	}
+	if item.PlanType != "" {
+		record.PlanType = normalizePlanType(item.PlanType)
+	}
+	if item.PlanLimit != "" || normalizePlanType(item.PlanType) == "pro" {
+		record.PlanLimit = cleanPlanLimit(item.PlanLimit)
+	}
+	record.Prefix = cliproxyAccountPrefix(item.ID)
+	if err := writeJSONAtomic(path, record); err != nil {
+		return fmt.Errorf("write cliproxy auth metadata for account %s: %w", item.ID, err)
 	}
 	return nil
 }
@@ -2551,12 +3030,12 @@ func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaS
 	snapshot := quotaSnapshot{AccountID: accountID, OrganizationName: organizationName, PlanType: plan, PlanLimit: planLimit, Quota: &quota, UsageUpdatedAt: now}
 
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.state.Quotas == nil {
 		a.state.Quotas = map[string]quotaSnapshot{}
 	}
 	item = a.accountLocked(accountID)
 	if item == nil {
+		a.mu.Unlock()
 		return quotaSnapshot{}, errors.New("account no longer exists")
 	}
 	if planRaw != "" {
@@ -2588,7 +3067,18 @@ func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaS
 	item.UpdatedAt = now
 	a.state.Quotas[accountID] = snapshot
 	if err := a.saveLocked(); err != nil {
+		a.mu.Unlock()
 		return quotaSnapshot{}, err
+	}
+	sidecarAccount := *item
+	syncSidecar := a.usesCliproxySidecar(sidecarAccount)
+	a.mu.Unlock()
+	if syncSidecar {
+		if err := a.updateCliproxyAuthMetadata(sidecarAccount); err != nil {
+			if a.logger != nil {
+				a.logger.Printf("cliproxy auth metadata update skipped for %s after quota metadata update: %s", accountID, err)
+			}
+		}
 	}
 	return snapshot, nil
 }
@@ -3184,22 +3674,24 @@ func (a *app) currentAccountStatusLocked(item account, index int, now time.Time)
 		remaining := remainingQuotaHint(*quota.Quota)
 		remainingQuota = &remaining
 	}
+	metadata := credentialMetadata(displayItem)
 	return map[string]any{
-		"label":            currentAccountDisplayName(displayItem, index),
-		"displayName":      currentAccountDisplayName(displayItem, index),
-		"email":            maskedPublicEmail(displayItem.Email),
-		"organizationName": publicOrganizationName(displayItem.OrganizationName),
-		"planType":         normalizePlanType(displayItem.PlanType),
-		"planLimit":        cleanPlanLimit(displayItem.PlanLimit),
-		"planDisplayName":  accountPlanDisplayName(displayItem, false),
-		"planRank":         displayItem.PlanRank,
-		"status":           status,
-		"statusReason":     reason,
-		"available":        status == "ready" || status == "low",
-		"remainingQuota":   remainingQuota,
-		"quota":            quota.Quota,
-		"usageUpdatedAt":   quota.UsageUpdatedAt,
-		"quotaError":       quota.QuotaError,
+		"label":              currentAccountDisplayName(displayItem, index),
+		"displayName":        currentAccountDisplayName(displayItem, index),
+		"credentialMetadata": metadata,
+		"email":              metadata["email"],
+		"organizationName":   metadata["organizationName"],
+		"planType":           metadata["planType"],
+		"planLimit":          metadata["planLimit"],
+		"planDisplayName":    metadata["planDisplayName"],
+		"planRank":           metadata["planRank"],
+		"status":             status,
+		"statusReason":       reason,
+		"available":          status == "ready" || status == "low",
+		"remainingQuota":     remainingQuota,
+		"quota":              quota.Quota,
+		"usageUpdatedAt":     quota.UsageUpdatedAt,
+		"quotaError":         quota.QuotaError,
 	}
 }
 
@@ -3242,14 +3734,15 @@ func (a *app) accountStatusLocked(item account, now time.Time) (string, string) 
 }
 func publicAccounts(values []account) []map[string]any {
 	result := make([]map[string]any, 0, len(values))
-	for _, item := range values {
-		result = append(result, publicAccount(item))
+	for index, item := range values {
+		result = append(result, publicAccount(item, index))
 	}
 	return result
 }
-func publicAccount(item account) map[string]any {
-	displayName := maskedAccountDisplayName(item)
-	return map[string]any{"id": item.ID, "label": displayName, "displayName": displayName, "email": maskedPublicEmail(item.Email), "organizationName": publicOrganizationName(item.OrganizationName), "planType": normalizePlanType(item.PlanType), "planLimit": cleanPlanLimit(item.PlanLimit), "planDisplayName": accountPlanDisplayName(item, false), "planRank": item.PlanRank, "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
+func publicAccount(item account, index int) map[string]any {
+	displayName := managementCredentialDisplayName(item)
+	metadata := credentialMetadata(item)
+	return map[string]any{"id": item.ID, "label": displayName, "displayName": displayName, "credentialMetadata": metadata, "email": metadata["email"], "organizationName": metadata["organizationName"], "planType": metadata["planType"], "planLimit": metadata["planLimit"], "planDisplayName": metadata["planDisplayName"], "planRank": metadata["planRank"], "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
 }
 
 func (a *app) publicDashboardAccountLocked(item account, index int, now time.Time) map[string]any {
@@ -3267,27 +3760,29 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 		displayItem.PlanLimit = quota.PlanLimit
 	}
 	label := publicDashboardAccountLabel(displayItem, index)
+	metadata := credentialMetadata(displayItem)
 	if quota.QuotaError != nil {
 		reason = "Quota information is temporarily unavailable"
 	}
 	return map[string]any{
-		"label":            label,
-		"displayName":      label,
-		"email":            maskedPublicEmail(displayItem.Email),
-		"organizationName": publicOrganizationName(displayItem.OrganizationName),
-		"planType":         normalizePlanType(displayItem.PlanType),
-		"planLimit":        cleanPlanLimit(displayItem.PlanLimit),
-		"planDisplayName":  accountPlanDisplayName(displayItem, false),
-		"planRank":         displayItem.PlanRank,
-		"poolRef":          a.publicAccountRefLocked(item.ID),
-		"status":           status,
-		"statusReason":     reason,
-		"enabled":          item.Enabled,
-		"inPool":           item.InPool,
-		"remainingQuota":   item.RemainingQuota,
-		"allowedModels":    item.AllowedModels,
-		"quota":            quota.Quota,
-		"usageUpdatedAt":   quota.UsageUpdatedAt,
+		"label":              label,
+		"displayName":        label,
+		"credentialMetadata": metadata,
+		"email":              metadata["email"],
+		"organizationName":   metadata["organizationName"],
+		"planType":           metadata["planType"],
+		"planLimit":          metadata["planLimit"],
+		"planDisplayName":    metadata["planDisplayName"],
+		"planRank":           metadata["planRank"],
+		"poolRef":            a.publicAccountRefLocked(item.ID),
+		"status":             status,
+		"statusReason":       reason,
+		"enabled":            item.Enabled,
+		"inPool":             item.InPool,
+		"remainingQuota":     item.RemainingQuota,
+		"allowedModels":      item.AllowedModels,
+		"quota":              quota.Quota,
+		"usageUpdatedAt":     quota.UsageUpdatedAt,
 	}
 }
 
@@ -3318,38 +3813,88 @@ func publicOrganizationName(value string) string {
 	return emailInDisplayPattern.ReplaceAllStringFunc(value, maskedPublicEmail)
 }
 
-func maskedAccountDisplayName(item account) string {
-	maskedEmail := maskedPublicEmail(item.Email)
-	plan := normalizePlanType(item.PlanType)
-	planName := accountPlanDisplayName(item, false)
-	if maskedEmail != "" && plan != "unknown" {
-		return fmt.Sprintf("%s · %s", maskedEmail, planName)
+func credentialMetadata(item account) map[string]any {
+	return map[string]any{
+		"email":            maskedPublicEmail(item.Email),
+		"organizationName": publicOrganizationName(item.OrganizationName),
+		"planType":         normalizePlanType(item.PlanType),
+		"planLimit":        cleanPlanLimit(item.PlanLimit),
+		"planDisplayName":  accountPlanDisplayName(item, false),
+		"planRank":         item.PlanRank,
 	}
-	if maskedEmail != "" {
-		return maskedEmail
-	}
-	if plan != "unknown" && organizationScopedPlan(plan) && publicOrganizationName(item.OrganizationName) != "" {
-		return planName
-	}
-	label := strings.TrimSpace(item.Label)
-	if label != "" && !strings.Contains(label, "@") {
+}
+
+func managementCredentialDisplayName(item account) string {
+	if label := credentialLabel(item); label != "" {
 		return label
 	}
-	if plan != "unknown" {
-		return accountPlanDisplayName(item, true)
+	if strings.TrimSpace(item.ID) != "" {
+		return item.ID
 	}
-	return item.ID
+	return "Credential"
+}
+
+func publicCredentialDisplayName(item account, index int) string {
+	if label := credentialLabel(item); label != "" && label != item.ID {
+		return label
+	}
+	if index >= 0 {
+		return fmt.Sprintf("Credential %d", index+1)
+	}
+	return "Credential"
+}
+
+func credentialLabel(item account) string {
+	label := strings.TrimSpace(item.Label)
+	if label == "" || metadataDerivedAccountLabel(item, label) {
+		return ""
+	}
+	return label
+}
+
+func metadataDerivedAccountLabel(item account, label string) bool {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return false
+	}
+	if strings.Contains(label, "@") {
+		return true
+	}
+	generated := []string{
+		legacyAccountDisplayName(item),
+		accountPlanDisplayName(item, false),
+		accountPlanDisplayName(item, true),
+		planDisplayName(item.PlanType),
+		planDisplayName(item.PlanType) + " account",
+	}
+	for _, value := range generated {
+		if value != "" && strings.EqualFold(label, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func legacyAccountDisplayName(item account) string {
+	plan := accountPlanDisplayName(item, false)
+	email := strings.TrimSpace(item.Email)
+	if email != "" && normalizePlanType(item.PlanType) != "unknown" {
+		return fmt.Sprintf("%s · %s", email, plan)
+	}
+	if email != "" {
+		return email
+	}
+	if normalizePlanType(item.PlanType) != "unknown" && organizationScopedPlan(item.PlanType) && cleanOrganizationName(item.OrganizationName) != "" {
+		return plan
+	}
+	if normalizePlanType(item.PlanType) != "unknown" {
+		return plan
+	}
+	return ""
 }
 
 func currentAccountDisplayName(item account, index int) string {
-	displayName := maskedAccountDisplayName(item)
-	if displayName == "" || displayName == item.ID {
-		displayName = publicDashboardAccountLabel(item, index)
-	}
-	if displayName == "" || displayName == item.ID {
-		displayName = fmt.Sprintf("Account %d", index+1)
-	}
-	return displayName
+	return publicCredentialDisplayName(item, index)
 }
 
 func (a *app) publicAccountRefLocked(accountID string) string {
@@ -3603,35 +4148,11 @@ func planDisplayName(plan string) string {
 }
 
 func accountDisplayName(item account) string {
-	plan := accountPlanDisplayName(item, false)
-	email := strings.TrimSpace(item.Email)
-	if email != "" && normalizePlanType(item.PlanType) != "unknown" {
-		return fmt.Sprintf("%s · %s", email, plan)
-	}
-	if email != "" {
-		return email
-	}
-	if normalizePlanType(item.PlanType) != "unknown" && organizationScopedPlan(item.PlanType) && cleanOrganizationName(item.OrganizationName) != "" {
-		return plan
-	}
-	if strings.TrimSpace(item.Label) != "" {
-		return item.Label
-	}
-	if normalizePlanType(item.PlanType) != "unknown" {
-		return plan
-	}
-	return item.ID
+	return managementCredentialDisplayName(item)
 }
 
 func publicDashboardAccountLabel(item account, index int) string {
-	plan := normalizePlanType(item.PlanType)
-	if plan != "unknown" {
-		return accountPlanDisplayName(item, true)
-	}
-	if strings.TrimSpace(item.Label) != "" && !strings.Contains(item.Label, "@") {
-		return item.Label
-	}
-	return fmt.Sprintf("Account %d", index+1)
+	return publicCredentialDisplayName(item, index)
 }
 
 func accountPlanDisplayName(item account, withAccountSuffix bool) string {
@@ -3739,6 +4260,13 @@ func envOr(name, fallback string) string {
 	return fallback
 }
 
+func envOrValue(value, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
+}
+
 func codexGatewayModeFromEnv() (string, error) {
 	mode := strings.ToLower(strings.TrimSpace(envOr("CODEX_POOL_CODEX_GATEWAY_MODE", "sidecar")))
 	switch mode {
@@ -3746,6 +4274,42 @@ func codexGatewayModeFromEnv() (string, error) {
 		return mode, nil
 	default:
 		return "", errors.New("CODEX_POOL_CODEX_GATEWAY_MODE must be sidecar or direct")
+	}
+}
+
+func promptCacheKeyModeFromEnv() (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(envOr("CODEX_POOL_PROMPT_CACHE_KEY_MODE", "auto")))
+	switch mode {
+	case "auto", "off", "passthrough":
+		return mode, nil
+	default:
+		return "", errors.New("CODEX_POOL_PROMPT_CACHE_KEY_MODE must be auto, off, or passthrough")
+	}
+}
+
+func promptCacheRetentionFromEnv() (string, error) {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_POOL_PROMPT_CACHE_RETENTION")))
+	switch value {
+	case "", "passthrough":
+		return "", nil
+	case "24h", "in_memory":
+		return value, nil
+	default:
+		return "", errors.New("CODEX_POOL_PROMPT_CACHE_RETENTION must be empty, passthrough, 24h, or in_memory")
+	}
+}
+
+func boolFromEnv(name string) (bool, error) {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	switch value {
+	case "":
+		return false, nil
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be true or false", name)
 	}
 }
 

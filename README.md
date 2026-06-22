@@ -61,7 +61,7 @@ Docker port mapping is always `host:container`. To expose the service externally
 
 ### Add Codex Accounts
 
-Open `/admin`, sign in, then select `Add account`. The UI does not ask for any account fields. It creates a Codex account slot, starts device auth, and shows only the verification URL, user code, and a 15 minute countdown. After you complete the browser login, subscription tier, account ID, email, and display name are updated from the authenticated Codex token. Do not select models during onboarding; model access is discovered from the authenticated Codex account and Codex clients can request the model they want later.
+Open `/admin`, sign in, then select `Add account`. The UI does not ask for any account fields. It creates an independent Codex credential slot, starts device auth, and shows only the verification URL, user code, and a 15 minute countdown. After you complete the browser login, subscription tier, upstream account ID, email, and organization are stored as credential metadata. They are shown as secondary status information, but the slot ID remains the primary identity used by routing and management. Do not select models during onboarding; model access is discovered from the authenticated Codex credential and Codex clients can request the model they want later.
 
 The container runs Codex CLI device auth with:
 
@@ -69,7 +69,7 @@ The container runs Codex CLI device auth with:
 CODEX_HOME=/data/accounts/<account-id>/.codex
 ```
 
-The admin page shows the verification URL and user code. After you complete the browser login, Codex stores `auth.json` under the account's `/data/accounts/<account-id>/.codex` directory. Those credentials never belong in the Git repository or Docker image. Use dedicated pool accounts when possible: the container isolates each account under its own `CODEX_HOME`, but the upstream Codex/ChatGPT service may revoke older refresh tokens when the same account is authenticated from another device or container.
+The admin page shows the verification URL and user code. After you complete the browser login, Codex stores `auth.json` under the account's `/data/accounts/<account-id>/.codex` directory. Those credentials never belong in the Git repository or Docker image. Pool treats each completed device-auth credential as its own slot even when two slots report the same email address. Email, subscription tier, and organization fields are descriptive metadata only; they are not used as local credential keys or primary dashboard labels.
 
 ### Bundled CLIProxy Sidecar
 
@@ -80,6 +80,18 @@ For every selected account, Pool writes an isolated CLIProxy auth record under `
 `CODEX_POOL_CODEX_GATEWAY_MODE=sidecar` is the default. `direct` exists only as a compatibility/test override and bypasses the sidecar; it is not the normal deployment mode. `CODEX_POOL_CLIPROXY_BASE_URL` and `CODEX_POOL_CLIPROXY_API_KEY` are internal test/compatibility overrides and should not be set in a normal `docker run` deployment.
 
 Quota is read from the authenticated Codex/ChatGPT backend after login and then refreshed every five minutes. The dashboard shows both short-window and weekly remaining percentages with reset times when upstream provides them. The optional `CODEX_POOL_CODEX_USAGE_URL` override exists for tests or backend compatibility; normal deployments use `CODEX_POOL_CODEX_BASE_URL + /wham/usage`.
+
+### Prompt Cache Locality
+
+Pool keeps requests sticky by project/session/model and automatically adds a hashed `prompt_cache_key` when the client did not provide one. The raw project or session value is not sent upstream. `prompt_cache_key` generation is controlled by `CODEX_POOL_PROMPT_CACHE_KEY_MODE=auto|off|passthrough`; `auto` is the default.
+
+`CODEX_POOL_PROMPT_CACHE_RETENTION` is optional and defaults to passthrough so upstream organization data-retention defaults remain in control. Set it to `24h` or `in_memory` only when that retention policy is intended for every relayed request.
+
+Successful responses update aggregate prompt-cache counters in the admin state from upstream `usage` fields, including input tokens and cached tokens. Response IDs are also bound to the selected account for the sticky TTL so follow-up `previous_response_id` requests stay on the original account.
+
+### Preserve Pro Quota
+
+Use the `Preserve Pro quota` switch in the admin Console to defer Pro accounts until no eligible non-Pro account is available. When this mode is enabled, a session that temporarily moved to Pro because other accounts were cooling down moves back to a non-Pro account once one becomes eligible again. The switch is stored in `/data/config.json`; `CODEX_POOL_PRESERVE_PRO_QUOTA=true` only sets the initial default before the Console setting is saved.
 
 ### Remote Admin Through A Router
 
@@ -132,7 +144,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - `POST /v1/responses` and `/v1/responses/compact`, with streaming passthrough.
 - `POST /v1/chat/completions`, including translation to a Responses upstream.
 - Model aliases and `(thinking-tier)` suffix translation.
-- Sticky failover routing with idle TTL, per-model cooldowns, quota-exhaustion failover, and JSON persistence in `/data`. When an upstream account returns `429` or server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
+- Sticky failover routing with idle TTL, per-model cooldowns, quota-exhaustion failover, optional Pro-quota preservation, prompt-cache-key routing, response-id continuation binding, and JSON persistence in `/data`. When an upstream account returns `429` or server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
 - Bundled, loopback-only CLIProxyAPI sidecar for Codex device-auth requests. Pool pins each request to the selected account through a sidecar model prefix, while the sidecar owns OAuth refreshes.
 - Public pool participation toggles on `/admin`, plus authenticated owner controls for add/remove account, device-auth login jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Disabled`, or `Standby`.
 - Codex quota refresh from `/backend-api/wham/usage`, including per-window percentages, reset times, plan-type updates, sanitized quota errors, and five-minute dashboard refresh.
