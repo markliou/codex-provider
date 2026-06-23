@@ -49,6 +49,8 @@ const (
 	quotaRefreshTimeout       = 30 * time.Second
 )
 
+var errAccountAuthFailed = errors.New("account authentication failed")
+
 type config struct {
 	DefaultModel     string            `json:"defaultModel"`
 	ModelAliases     map[string]string `json:"modelAliases"`
@@ -654,7 +656,19 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		response, err := a.forward(r.Context(), candidate, endpoint, outBody, r.Header.Get("Accept"))
 		if err != nil {
 			excluded[candidate.ID] = true
+			if errors.Is(err, errAccountAuthFailed) {
+				a.markAccountAuthFailure(candidate.ID, model, "account_auth_failed")
+				continue
+			}
 			a.markFailure(candidate.ID, model, "upstream_transport_error", 30*time.Second)
+			continue
+		}
+		if upstreamAuthFailureStatus(response.StatusCode) {
+			body, _ := io.ReadAll(io.LimitReader(response.Body, maxRequestBody))
+			_ = response.Body.Close()
+			excluded[candidate.ID] = true
+			reason := codeOr(extractUpstreamErrorCode(body), "account_auth_failed")
+			a.markAccountAuthFailure(candidate.ID, model, reason)
 			continue
 		}
 		if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {
@@ -782,6 +796,24 @@ func (a *app) forward(ctx context.Context, candidate account, endpoint string, b
 		}
 	}
 	return a.client.Do(req)
+}
+
+func upstreamAuthFailureStatus(status int) bool {
+	return status == http.StatusUnauthorized || status == http.StatusForbidden
+}
+
+func oauthRefreshAuthFailureStatus(status int) bool {
+	return status == http.StatusBadRequest || upstreamAuthFailureStatus(status)
+}
+
+func markAccountAuthError(err error) error {
+	if err == nil {
+		return errAccountAuthFailed
+	}
+	if errors.Is(err, errAccountAuthFailed) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errAccountAuthFailed, err)
 }
 
 func (a *app) usesCliproxySidecar(item account) bool {
@@ -1754,7 +1786,34 @@ func (a *app) markFailure(accountID, model, reason string, duration time.Duratio
 	health.ConsecutiveFailure++
 	a.state.Health[accountID] = health
 	a.state.FailureCount++
-	a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
+	if duration > 0 {
+		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
+	}
+	_ = a.saveLocked()
+}
+
+func (a *app) markAccountAuthFailure(accountID, model, reason string) {
+	reason = codeOr(sanitizedErrorCode(reason), "account_auth_failed")
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state.Health == nil {
+		a.state.Health = map[string]accountHealth{}
+	}
+	now := time.Now().UTC()
+	health := a.state.Health[accountID]
+	health.LastFailureAt = now
+	health.LastFailureReason = reason
+	health.ConsecutiveFailure++
+	a.state.Health[accountID] = health
+	a.state.FailureCount++
+	if item := a.accountLocked(accountID); item != nil && isCodexDeviceAuth(*item) {
+		prior := a.state.Quotas[accountID]
+		prior.AccountID = accountID
+		prior.QuotaError = &quotaErrorInfo{Code: reason, Message: "account credential is unavailable; sign in again", Timestamp: now}
+		a.state.Quotas[accountID] = prior
+	} else {
+		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(15 * time.Minute), Reason: reason})
+	}
 	_ = a.saveLocked()
 }
 
@@ -2260,14 +2319,14 @@ func (a *app) codexAuth(item account) (codexAuthInfo, error) {
 	home := a.accountCodexHome(item.ID)
 	data, err := os.ReadFile(filepath.Join(home, "auth.json"))
 	if err != nil {
-		return codexAuthInfo{}, fmt.Errorf("codex auth is missing for account %s", item.ID)
+		return codexAuthInfo{}, markAccountAuthError(fmt.Errorf("codex auth is missing for account %s", item.ID))
 	}
 	var auth codexAuthFile
 	if err := json.Unmarshal(data, &auth); err != nil {
-		return codexAuthInfo{}, fmt.Errorf("codex auth is invalid for account %s", item.ID)
+		return codexAuthInfo{}, markAccountAuthError(fmt.Errorf("codex auth is invalid for account %s", item.ID))
 	}
 	if auth.Tokens == nil || strings.TrimSpace(auth.Tokens.AccessToken) == "" {
-		return codexAuthInfo{}, fmt.Errorf("codex access token is missing for account %s", item.ID)
+		return codexAuthInfo{}, markAccountAuthError(fmt.Errorf("codex access token is missing for account %s", item.ID))
 	}
 	info := codexAuthInfo{AccessToken: strings.TrimSpace(auth.Tokens.AccessToken)}
 	if auth.Tokens.AccountID != nil {
@@ -2332,11 +2391,11 @@ func (a *app) syncCliproxyAuthLocked(item account, force bool) error {
 	}
 	data, err := os.ReadFile(filepath.Join(a.accountCodexHome(item.ID), "auth.json"))
 	if err != nil {
-		return fmt.Errorf("codex auth is missing for account %s", item.ID)
+		return markAccountAuthError(fmt.Errorf("codex auth is missing for account %s", item.ID))
 	}
 	var source codexAuthFile
 	if err := json.Unmarshal(data, &source); err != nil || source.Tokens == nil || strings.TrimSpace(source.Tokens.AccessToken) == "" {
-		return fmt.Errorf("codex auth is invalid for account %s", item.ID)
+		return markAccountAuthError(fmt.Errorf("codex auth is invalid for account %s", item.ID))
 	}
 	info, err := a.codexAuth(item)
 	if err != nil {
@@ -2578,7 +2637,11 @@ func (a *app) requestCodexTokenRefreshContext(ctx context.Context, refreshToken 
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		return codexRefreshResponse{}, fmt.Errorf("refresh codex token failed with status %d", response.StatusCode)
+		err := fmt.Errorf("refresh codex token failed with status %d", response.StatusCode)
+		if oauthRefreshAuthFailureStatus(response.StatusCode) {
+			return codexRefreshResponse{}, markAccountAuthError(err)
+		}
+		return codexRefreshResponse{}, err
 	}
 	var refreshed codexRefreshResponse
 	if err := json.NewDecoder(io.LimitReader(response.Body, maxRequestBody)).Decode(&refreshed); err != nil {

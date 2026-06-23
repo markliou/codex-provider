@@ -1451,6 +1451,143 @@ func TestDeviceAuthFailoverThroughCliproxyAdapter(t *testing.T) {
 	}
 }
 
+func TestDeviceAuthFailoverThroughCliproxyAdapterAfterAuthFailure(t *testing.T) {
+	seenModels := make([]string, 0, 2)
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected sidecar path %s", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		model, _ := payload["model"].(string)
+		seenModels = append(seenModels, model)
+		switch model {
+		case "codex-pool-device-first/gpt-test":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"invalid_token","message":"secret-token-body"}}`))
+		case "codex-pool-device-second/gpt-test":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_sidecar_auth_failover","object":"response","output":[]}`))
+		default:
+			t.Fatalf("unexpected sidecar model %q", model)
+		}
+	}))
+	defer sidecar.Close()
+
+	a := testApp(t, []account{
+		{ID: "device-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
+		{ID: "device-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10},
+	})
+	a.codexGatewayMode = "sidecar"
+	a.cliproxyBaseURL = sidecar.URL + "/v1"
+	a.cliproxyAPIKey = "sidecar-test-key"
+	for _, item := range a.config.Accounts {
+		home := a.accountCodexHome(item.ID)
+		if err := os.MkdirAll(home, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"<test-access-token>","refresh_token":"<test-refresh-token>"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:cliproxy-auth-failover"] = stickySession{Key: "gpt-test:cliproxy-auth-failover", ModelID: "gpt-test", AccountID: "device-first", CreatedAt: now.Add(-time.Minute), LastSuccessAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "cliproxy-auth-failover")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("cliproxy auth failover returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if got := strings.Join(seenModels, ","); got != "codex-pool-device-first/gpt-test,codex-pool-device-second/gpt-test" {
+		t.Fatalf("sidecar account sequence = %q", got)
+	}
+	if session := a.state.StickySessions["gpt-test:cliproxy-auth-failover"]; session.AccountID != "device-second" || session.FailoverFrom != "device-first" {
+		t.Fatalf("cliproxy auth failover sticky session = %#v", session)
+	}
+	snapshot := a.state.Quotas["device-first"]
+	if snapshot.QuotaError == nil || snapshot.QuotaError.Code != "invalid_token" {
+		t.Fatalf("auth failure did not mark first account unavailable: %#v", snapshot)
+	}
+	if strings.Contains(snapshot.QuotaError.Message, "secret-token-body") {
+		t.Fatalf("auth failure persisted upstream body: %#v", snapshot.QuotaError)
+	}
+	selected, err := a.selectAccount("gpt-test:new-session", "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "device-second" {
+		t.Fatalf("unavailable auth-failed account was selected: %q", selected.ID)
+	}
+}
+
+func TestDeviceAuthFailoverAfterRefreshTokenRevoked(t *testing.T) {
+	refresh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer refresh.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refresh.URL)
+
+	firstHits := 0
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstHits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer first.Close()
+	secondHits := 0
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHits++
+		if r.Header.Get("Authorization") != "Bearer <second-access-token>" {
+			t.Fatalf("second account used unexpected authorization header %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_refresh_failover","object":"response","output":[]}`))
+	}))
+	defer second.Close()
+
+	a := testApp(t, []account{
+		{ID: "device-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL},
+		{ID: "device-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: second.URL},
+	})
+	auths := map[string]string{
+		"device-first":  fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"refresh_token":"<revoked-refresh-token>"}}`, fakeJWT(time.Now().Add(-time.Minute))),
+		"device-second": `{"auth_mode":"chatgpt","tokens":{"access_token":"<second-access-token>"}}`,
+	}
+	for _, item := range a.config.Accounts {
+		home := a.accountCodexHome(item.ID)
+		if err := os.MkdirAll(home, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(auths[item.ID]), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "refresh-auth-failover")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("refresh auth failover returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if firstHits != 0 || secondHits != 1 {
+		t.Fatalf("refresh auth failover hits = first:%d second:%d", firstHits, secondHits)
+	}
+	if session := a.state.StickySessions["gpt-test:refresh-auth-failover"]; session.AccountID != "device-second" {
+		t.Fatalf("refresh auth failover sticky session = %#v", session)
+	}
+	snapshot := a.state.Quotas["device-first"]
+	if snapshot.QuotaError == nil || snapshot.QuotaError.Code != "account_auth_failed" {
+		t.Fatalf("refresh auth failure did not mark first account unavailable: %#v", snapshot)
+	}
+}
+
 func TestDeviceAuthZeroQuotaAccountIsNotSelected(t *testing.T) {
 	zero := 0
 	emptyHits := 0
