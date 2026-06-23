@@ -78,7 +78,7 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
 .switch-row input:checked + .switch-ui::after { transform: translateX(18px); background: #f8fafc; }
 .switch-row input:focus-visible + .switch-ui { box-shadow: 0 0 0 3px rgba(56, 189, 248, .28); }
 .switch-label { white-space: nowrap; }
-.summary-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 10px; margin-bottom: 28px; }
+.summary-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 28px; }
 .summary-item { min-height: 98px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: linear-gradient(180deg, rgba(24, 34, 51, .96) 0%, rgba(15, 23, 42, .96) 100%); box-shadow: 0 12px 32px rgba(0, 0, 0, .19); }
 .summary-item:first-child { grid-column: span 2; border-color: rgba(56, 189, 248, .5); background: linear-gradient(180deg, rgba(14, 165, 233, .18) 0%, rgba(17, 24, 39, .98) 100%); }
 .summary-value { display: block; margin-top: 8px; font-size: 27px; font-weight: 780; line-height: 1; }

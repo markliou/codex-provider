@@ -3890,7 +3890,7 @@ func publicDashboardStatus(status string) (string, string) {
 	case "cooldown":
 		return "cooldown", "Cooling down"
 	case "standby":
-		return "standby", "Standby"
+		return "standby", "Out of pool"
 	default:
 		return "error", "Unavailable"
 	}

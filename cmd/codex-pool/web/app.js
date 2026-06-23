@@ -12,7 +12,7 @@
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? "No activity" : date.toLocaleString();
   };
-  const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Standby", missing_auth: "Login needed" }[status] || "Unknown");
+  const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Out of pool", missing_auth: "Login needed" }[status] || "Unknown");
 
   function notify(message, error = false) {
     if (!error) return;
@@ -136,14 +136,12 @@
       ["Total accounts", summary.total || 0, ""],
       ["Ready", summary.ready || 0, ""],
       ["Limited", summary.low || 0, "low"],
-      ["Cooling down", summary.cooldown || 0, "cooldown"],
-      ["Standby", summary.standby || 0, "missing_auth"],
+      ["Out of pool", summary.standby || 0, "missing_auth"],
       ["Unavailable", summary.unavailable || 0, "error"],
     ] : [
       ["Total accounts", summary.total || 0, ""],
       ["Ready", summary.ready || 0, ""],
       ["Low quota", summary.low || 0, "low"],
-      ["Cooling down", summary.cooldown || 0, "cooldown"],
       ["Errors", summary.error || 0, "error"],
       ["Needs attention", summary.missing_auth || 0, "missing_auth"],
     ];
