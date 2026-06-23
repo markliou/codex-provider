@@ -607,7 +607,7 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
 	}
 	publicBody := publicRecorder.Body.String()
-	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "Private private@example.test", "upstream.example.test", "upstream-secret-value", "gpt-test", "credentialMetadata", "statusReason", "poolRef", "allowedModels", "planType", "planLimit", "email"} {
+	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "Private private@example.test", "upstream.example.test", "upstream-secret-value", "gpt-test", "credentialMetadata", "statusReason", "allowedModels", "planType", "planLimit", "email"} {
 		if strings.Contains(publicBody, forbidden) {
 			t.Fatalf("public dashboard exposed %q", forbidden)
 		}
@@ -660,7 +660,6 @@ func TestManagementAPIsRequireAdminAndCSRF(t *testing.T) {
 		{http.MethodPost, "/admin/api/accounts/acct/enable", ""},
 		{http.MethodPost, "/admin/api/accounts/acct/login", ""},
 		{http.MethodPost, "/admin/api/accounts/quota/refresh-all", ""},
-		{http.MethodPost, "/admin/api/public-dashboard/accounts/public-ref/pool-remove", ""},
 		{http.MethodPost, "/admin/api/jobs/job-id/cancel", ""},
 		{http.MethodDelete, "/admin/api/accounts/acct", ""},
 		{http.MethodDelete, "/admin/api/sticky-sessions/key", ""},
@@ -753,7 +752,7 @@ func adminSession(t *testing.T, a *app) ([]*http.Cookie, string) {
 	return loginRecorder.Result().Cookies(), response.CSRFToken
 }
 
-func TestPublicDashboardIsReadOnlyAndDoesNotExposeAccountID(t *testing.T) {
+func TestPublicPoolToggleDoesNotExposeAccountID(t *testing.T) {
 	a := testApp(t, []account{{
 		ID: "private-account-id", Label: "private@example.test · Plus", Email: "private@example.test", PlanType: "plus", Enabled: true, InPool: true, RemainingQuota: nil,
 		UpstreamBaseURL: "https://upstream.example.test/v1", UpstreamAPIKey: "upstream-secret-value",
@@ -767,7 +766,7 @@ func TestPublicDashboardIsReadOnlyAndDoesNotExposeAccountID(t *testing.T) {
 		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
 	}
 	publicBody := publicRecorder.Body.String()
-	for _, forbidden := range []string{"private-account-id", "private@example.test", "upstream.example.test", "upstream-secret-value", "poolRef", "credentialMetadata", "statusReason", "inPool"} {
+	for _, forbidden := range []string{"private-account-id", "private@example.test", "upstream.example.test", "upstream-secret-value", "credentialMetadata", "statusReason", "inPool"} {
 		if strings.Contains(publicBody, forbidden) {
 			t.Fatalf("public dashboard exposed %q", forbidden)
 		}
@@ -778,34 +777,39 @@ func TestPublicDashboardIsReadOnlyAndDoesNotExposeAccountID(t *testing.T) {
 				DisplayName string `json:"displayName"`
 				Detail      string `json:"detail"`
 				PoolLabel   string `json:"poolLabel"`
+				PoolRef     string `json:"poolRef"`
+				PoolAction  string `json:"poolAction"`
 			} `json:"accounts"`
 		} `json:"dashboard"`
 	}
 	if err := json.Unmarshal(publicRecorder.Body.Bytes(), &parsed); err != nil {
 		t.Fatal(err)
 	}
-	if len(parsed.Dashboard.Accounts) != 1 || parsed.Dashboard.Accounts[0].DisplayName != "pr***te@example.test" || parsed.Dashboard.Accounts[0].Detail != "Plus" || parsed.Dashboard.Accounts[0].PoolLabel != "In pool" {
+	if len(parsed.Dashboard.Accounts) != 1 || parsed.Dashboard.Accounts[0].DisplayName != "pr***te@example.test" || parsed.Dashboard.Accounts[0].Detail != "Plus" || parsed.Dashboard.Accounts[0].PoolLabel != "In pool" || parsed.Dashboard.Accounts[0].PoolRef == "" || parsed.Dashboard.Accounts[0].PoolAction != "pool-remove" {
 		t.Fatalf("public dashboard did not return expected display state: %s", publicBody)
 	}
 
-	removeRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/public-ref/pool-remove", nil)
+	removeRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/"+parsed.Dashboard.Accounts[0].PoolRef+"/pool-remove", nil)
 	removeRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(removeRecorder, removeRequest)
-	if removeRecorder.Code != http.StatusUnauthorized {
-		t.Fatalf("public pool-remove without admin returned %d: %s", removeRecorder.Code, removeRecorder.Body.String())
+	if removeRecorder.Code != http.StatusOK {
+		t.Fatalf("public pool-remove returned %d: %s", removeRecorder.Code, removeRecorder.Body.String())
 	}
-	if !a.config.Accounts[0].InPool {
-		t.Fatal("unauthenticated public pool-remove changed account pool state")
+	if a.config.Accounts[0].InPool {
+		t.Fatal("public pool-remove did not remove account from pool")
 	}
-	if _, ok := a.state.StickySessions["gpt-test:session"]; !ok {
-		t.Fatal("unauthenticated public pool-remove cleared account sticky sessions")
+	if _, ok := a.state.StickySessions["gpt-test:session"]; ok {
+		t.Fatal("public pool-remove did not clear account sticky sessions")
 	}
 
-	addRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/public-ref/pool-add", nil)
+	addRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/"+parsed.Dashboard.Accounts[0].PoolRef+"/pool-add", nil)
 	addRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(addRecorder, addRequest)
-	if addRecorder.Code != http.StatusUnauthorized {
-		t.Fatalf("public pool-add without admin returned %d: %s", addRecorder.Code, addRecorder.Body.String())
+	if addRecorder.Code != http.StatusOK {
+		t.Fatalf("public pool-add returned %d: %s", addRecorder.Code, addRecorder.Body.String())
+	}
+	if !a.config.Accounts[0].Enabled || !a.config.Accounts[0].InPool {
+		t.Fatalf("public pool-add did not enable pool participation: %#v", a.config.Accounts[0])
 	}
 }
 

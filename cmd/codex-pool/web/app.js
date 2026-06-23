@@ -88,6 +88,14 @@
     return body;
   }
 
+  async function publicApi(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    const response = await fetch(`/admin/api/public-dashboard${path}`, { credentials: "same-origin", ...options, headers });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
+    return body;
+  }
+
   function showLogin(message = "") {
     dashboardView.hidden = true;
     loginView.hidden = false;
@@ -247,11 +255,11 @@
   }
 
   function renderPublicAccounts(accounts) {
-    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th></tr>";
+    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th>Action</th></tr>";
     $("#account-count").textContent = `${accounts.length} visible`;
     const body = $("#accounts-body");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="4"><div class="empty-state">No accounts available</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="5"><div class="empty-state">No accounts available</div></td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
@@ -260,11 +268,15 @@
       const tone = account.statusTone || account.status || "standby";
       const label = account.statusLabel || statusLabel(account.status);
       const quota = account.quotaUnavailable ? '<span class="quota-unknown">Quota unavailable</span>' : quotaMarkup(account.remainingQuota, account.quota, null, null);
+      const action = account.poolRef && account.poolAction
+        ? `<button class="button ${account.poolAction === "pool-remove" ? "warn" : "secondary"}" type="button" data-public-pool-action="${escapeHTML(account.poolAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${escapeHTML(account.poolActionLabel || "Update")}</button>`
+        : "";
       return `<tr>
       <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
       <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span></div></td>
       <td>${quota}</td>
       <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong></div></td>
+      <td><div class="row-actions">${action}</div></td>
     </tr>`;
     }).join("");
   }
@@ -323,6 +335,19 @@
       notify("Account updated");
       refresh(true);
     } catch (error) { notify(error.message, true); }
+  }
+
+  async function handlePublicPoolAction(button) {
+    const action = button.dataset.publicPoolAction;
+    const ref = button.dataset.poolRef;
+    button.disabled = true;
+    try {
+      await publicApi(`/accounts/${encodeURIComponent(ref)}/${action}`, { method: "POST" });
+      await refreshPublic(true);
+    } catch (error) {
+      button.disabled = false;
+      notify(error.message, true);
+    }
   }
 
   async function startDeviceAuth(accountId) {
@@ -415,6 +440,11 @@
   $("#preserve-pro-quota-switch").addEventListener("change", updatePreserveProQuota);
   $("#close-device-auth-button").addEventListener("click", () => closeDeviceAuth(true));
   $("#accounts-body").addEventListener("click", (event) => {
+    const publicButton = event.target.closest("[data-public-pool-action]");
+    if (publicButton) {
+      handlePublicPoolAction(publicButton);
+      return;
+    }
     const button = event.target.closest("[data-account-action]");
     if (button) handleAccountAction(button);
   });

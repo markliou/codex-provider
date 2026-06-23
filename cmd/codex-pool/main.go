@@ -490,7 +490,7 @@ func (a *app) adminMux() http.Handler {
 	mux.HandleFunc("GET /admin/assets/logo.svg", handleAdminLogo)
 	mux.HandleFunc("GET /admin/manifest.webmanifest", handleAdminManifest)
 	mux.HandleFunc("GET /admin/api/public-dashboard", a.handlePublicDashboard)
-	mux.HandleFunc("POST /admin/api/public-dashboard/accounts/", a.requireAdmin(a.handlePublicAccountAction))
+	mux.HandleFunc("POST /admin/api/public-dashboard/accounts/", a.handlePublicAccountAction)
 	mux.HandleFunc("POST /admin/api/login", a.handleAdminLogin)
 	mux.HandleFunc("POST /admin/api/logout", a.requireAdmin(a.handleAdminLogout))
 	mux.HandleFunc("GET /admin/api/state", a.requireAdmin(a.handleAdminState))
@@ -3865,6 +3865,9 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 		"statusTone":       statusTone,
 		"statusLabel":      statusLabel,
 		"poolLabel":        publicPoolLabel(item),
+		"poolRef":          a.publicAccountRefLocked(item.ID),
+		"poolAction":       publicPoolAction(item),
+		"poolActionLabel":  publicPoolActionLabel(item),
 		"remainingQuota":   remainingQuota,
 		"quota":            quota.Quota,
 		"quotaUnavailable": quota.QuotaError != nil,
@@ -3901,6 +3904,20 @@ func publicPoolLabel(item account) string {
 		return "Out of pool"
 	}
 	return "In pool"
+}
+
+func publicPoolAction(item account) string {
+	if item.InPool {
+		return "pool-remove"
+	}
+	return "pool-add"
+}
+
+func publicPoolActionLabel(item account) string {
+	if item.InPool {
+		return "Leave pool"
+	}
+	return "Join pool"
 }
 
 func maskedPublicEmail(value string) string {
