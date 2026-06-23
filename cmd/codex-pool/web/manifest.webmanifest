@@ -1,0 +1,17 @@
+{
+  "name": "Codex Pool",
+  "short_name": "Codex Pool",
+  "start_url": "/admin",
+  "scope": "/admin",
+  "display": "standalone",
+  "background_color": "#f4f6ef",
+  "theme_color": "#1d231b",
+  "icons": [
+    {
+      "src": "/admin/assets/logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

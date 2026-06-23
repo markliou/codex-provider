@@ -33,10 +33,11 @@ button { cursor: pointer; }
 
 .topbar { position: sticky; top: 0; z-index: 10; height: 62px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 24px; color: var(--ink); background: rgba(244, 246, 239, .9); border-bottom: 1px solid rgba(125, 139, 105, .28); backdrop-filter: blur(18px); }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 760; }
-.brand-mark { display: grid; width: 29px; height: 29px; place-items: center; border: 1px solid #a3b73b; border-radius: 6px; color: #26300e; background: var(--accent); font-size: 11px; font-weight: 850; }
+.brand-mark { display: block; width: 34px; height: 34px; border-radius: 9px; box-shadow: 0 7px 18px rgba(31, 39, 12, .16); }
 .topbar-actions { display: flex; align-items: center; gap: 9px; }
 .service-status { color: var(--muted); font-size: 13px; }
 main { max-width: 1520px; margin: 0 auto; padding: 30px 24px 46px; }
+.app-footer { max-width: 1520px; margin: 0 auto; padding: 0 24px 22px; color: var(--muted); font-size: 11px; text-align: center; }
 .login-view { min-height: calc(100vh - 62px); display: grid; place-items: start center; padding-top: min(16vh, 118px); }
 .login-panel { width: min(100%, 340px); padding: 24px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 7px; background: var(--surface-soft); box-shadow: 0 14px 34px rgba(68, 78, 52, .12); backdrop-filter: blur(14px); }
 h1, h2, p { margin: 0; }
@@ -94,7 +95,7 @@ tbody tr:hover { background: #fbfcf3; }
 .route { color: #465664; font-size: 12px; line-height: 1.45; }.route strong { color: var(--ink); font-weight: 680; }.activity { color: var(--muted); font-size: 12px; line-height: 1.45; }
 .row-actions { display: flex; flex-wrap: wrap; gap: 5px; min-width: 160px; }.row-actions .button { min-height: 28px; padding: 5px 8px; font-size: 11px; }.button.danger { color: var(--red); background: #fff; border-color: #f0bbb6; }.button.warn { color: var(--amber); background: #fff; border-color: #ebce97; }
 .secondary-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 32px; margin-top: 32px; }
-.sticky-list { overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }.sticky-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 13px; border-bottom: 1px solid #e7ebed; }.sticky-item:last-child { border-bottom: 0; }.sticky-key { overflow: hidden; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }.sticky-meta { color: var(--muted); font-size: 11px; }.empty-state { padding: 21px 14px; color: var(--muted); font-size: 13px; text-align: center; }
+.sticky-list { overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }.sticky-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 13px; border-bottom: 1px solid #e7ebed; }.sticky-item:last-child { border-bottom: 0; }.sticky-key { overflow: hidden; color: var(--ink); font-size: 13px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }.sticky-meta { color: var(--muted); font-size: 11px; }.empty-state { padding: 21px 14px; color: var(--muted); font-size: 13px; text-align: center; }
 .device-dialog { padding: 0; border: 1px solid #bcc7cf; border-radius: 8px; color: var(--ink); background: var(--surface); box-shadow: 0 18px 48px rgba(17, 24, 29, .23); }
 .device-dialog { width: min(540px, calc(100% - 28px)); }
 .device-dialog::backdrop { background: rgba(20, 29, 35, .45); }

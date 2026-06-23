@@ -155,6 +155,117 @@ func TestCodexLoginEnvDoesNotInheritServiceSecrets(t *testing.T) {
 	}
 }
 
+func TestCodexAuthUsesAccountNameInsteadOfProfileName(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct-auth", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
+	home := a.accountCodexHome("acct-auth")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	idToken := fakeJWTClaims(map[string]any{
+		"email": "user@example.test",
+		"name":  "Yi Fan Liou",
+		"https://api.openai.com/profile": map[string]any{
+			"email":        "user@example.test",
+			"display_name": "Yi Fan Liou",
+		},
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id":   "acct-chatgpt",
+			"chatgpt_account_name": "markliou",
+			"chatgpt_plan_type":    "team",
+		},
+	})
+	authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"id_token":%q,"access_token":"<access-token>","refresh_token":"<refresh-token>"}}`, idToken)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	auth, err := a.codexAuth(a.config.Accounts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.OrganizationName != "markliou" {
+		t.Fatalf("organization name = %q, want markliou", auth.OrganizationName)
+	}
+}
+
+func TestCliproxyCodexAuthUsesJWTAccountNameOverStoredProfileName(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct-auth", AuthType: "codex_device_auth", Enabled: true, InPool: true, OrganizationName: "Yi Fan Liou", PlanType: "team"}})
+	a.codexGatewayMode = "cliproxy"
+	idToken := fakeJWTClaims(map[string]any{
+		"email": "user@example.test",
+		"name":  "Yi Fan Liou",
+		"https://api.openai.com/profile": map[string]any{
+			"email":        "user@example.test",
+			"display_name": "Yi Fan Liou",
+		},
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id":   "acct-chatgpt",
+			"chatgpt_account_name": "markliou",
+			"chatgpt_plan_type":    "team",
+		},
+	})
+	path := a.cliproxyAuthPath("acct-auth")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := cliproxyCodexAuthFile{
+		Type:             "codex",
+		Email:            "user@example.test",
+		IDToken:          idToken,
+		AccessToken:      "<access-token>",
+		AccountID:        "acct-chatgpt",
+		OrganizationName: "Yi Fan Liou",
+		Prefix:           cliproxyAccountPrefix("acct-auth"),
+		PlanType:         "team",
+	}
+	if err := writeJSONAtomic(path, record); err != nil {
+		t.Fatal(err)
+	}
+	auth, err := a.cliproxyCodexAuth(a.config.Accounts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.OrganizationName != "markliou" {
+		t.Fatalf("organization name = %q, want markliou", auth.OrganizationName)
+	}
+}
+
+func TestCliproxyCodexAuthIgnoresStoredOrganizationNameWithoutJWTOrganization(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct-auth", AuthType: "codex_device_auth", Enabled: true, InPool: true, OrganizationName: "Yi-Fan Liou", PlanType: "team"}})
+	a.codexGatewayMode = "cliproxy"
+	idToken := fakeJWTClaims(map[string]any{
+		"email": "user@example.test",
+		"name":  "Yi-Fan Liou",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acct-chatgpt",
+			"chatgpt_plan_type":  "team",
+		},
+	})
+	path := a.cliproxyAuthPath("acct-auth")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := cliproxyCodexAuthFile{
+		Type:             "codex",
+		Email:            "user@example.test",
+		IDToken:          idToken,
+		AccessToken:      "<access-token>",
+		AccountID:        "acct-chatgpt",
+		OrganizationName: "Yi-Fan Liou",
+		Prefix:           cliproxyAccountPrefix("acct-auth"),
+		PlanType:         "team",
+	}
+	if err := writeJSONAtomic(path, record); err != nil {
+		t.Fatal(err)
+	}
+	auth, err := a.cliproxyCodexAuth(a.config.Accounts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.OrganizationName != "" {
+		t.Fatalf("stored sidecar organization name was trusted: %q", auth.OrganizationName)
+	}
+}
+
 func TestDeviceAuthLoginJobLifecycle(t *testing.T) {
 	a := testApp(t, []account{{ID: "acct-login", Label: "Login", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
 	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct-login")
@@ -334,9 +445,14 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page still includes %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"Console", "Access", "Passphrase", "Add account", "Preserve Pro quota", "device-auth-url", "device-auth-code", "device-auth-countdown"} {
+	for _, expected := range []string{"ADMIN", "Sign in", "Password", "Add account", "Use Pro last", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page does not include low-key label %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"Console", "Preserve Pro quota", "PUBLIC STATUS", "DEVICE AUTH", "Passphrase", "Sticky sessions"} {
+		if strings.Contains(recorder.Body.String(), forbidden) {
+			t.Fatalf("admin page still exposes internal label %q", forbidden)
 		}
 	}
 	jsRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
@@ -347,6 +463,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 	}
 	if strings.Contains(jsRecorder.Body.String(), "account-form") {
 		t.Fatal("admin JS still depends on add-account form inputs")
+	}
+	for _, forbidden := range []string{"Device login completed", "Device login failed", "Sticky session cleared", "Refresh failed:", "No quota window", "Detected after login", "Need login"} {
+		if strings.Contains(jsRecorder.Body.String(), forbidden) {
+			t.Fatalf("admin JS still exposes internal label %q", forbidden)
+		}
 	}
 	if strings.Contains(jsRecorder.Body.String(), `actionButton("login"`) || strings.Contains(jsRecorder.Body.String(), `data-account-action="login"`) {
 		t.Fatal("admin JS still renders a per-account login action")
@@ -486,18 +607,12 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
 	}
 	publicBody := publicRecorder.Body.String()
-	for _, forbidden := range []string{"private-account-id", "private@example.test", "upstream.example.test", "upstream-secret-value"} {
+	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "Private private@example.test", "upstream.example.test", "upstream-secret-value", "gpt-test", "credentialMetadata", "statusReason", "poolRef", "allowedModels", "planType", "planLimit", "email"} {
 		if strings.Contains(publicBody, forbidden) {
 			t.Fatalf("public dashboard exposed %q", forbidden)
 		}
 	}
-	if !strings.Contains(publicBody, "pr***te@example.test") {
-		t.Fatalf("public dashboard omitted masked email: %s", publicBody)
-	}
-	if strings.Contains(publicBody, "Private private@example.test") || !strings.Contains(publicBody, "Private pr***te@example.test") {
-		t.Fatalf("public dashboard did not mask email in organization name: %s", publicBody)
-	}
-	if !strings.Contains(publicBody, "Credential 1") || !strings.Contains(publicBody, "Plus") || !strings.Contains(publicBody, `"status":"low"`) {
+	if !strings.Contains(publicBody, "pr***te@example.test") || !strings.Contains(publicBody, "Plus") || !strings.Contains(publicBody, `"statusTone":"low"`) || !strings.Contains(publicBody, `"statusLabel":"Limited"`) {
 		t.Fatalf("public dashboard omitted expected status data: %s", publicBody)
 	}
 
@@ -545,6 +660,7 @@ func TestManagementAPIsRequireAdminAndCSRF(t *testing.T) {
 		{http.MethodPost, "/admin/api/accounts/acct/enable", ""},
 		{http.MethodPost, "/admin/api/accounts/acct/login", ""},
 		{http.MethodPost, "/admin/api/accounts/quota/refresh-all", ""},
+		{http.MethodPost, "/admin/api/public-dashboard/accounts/public-ref/pool-remove", ""},
 		{http.MethodPost, "/admin/api/jobs/job-id/cancel", ""},
 		{http.MethodDelete, "/admin/api/accounts/acct", ""},
 		{http.MethodDelete, "/admin/api/sticky-sessions/key", ""},
@@ -637,7 +753,7 @@ func adminSession(t *testing.T, a *app) ([]*http.Cookie, string) {
 	return loginRecorder.Result().Cookies(), response.CSRFToken
 }
 
-func TestPublicPoolToggleDoesNotExposeAccountID(t *testing.T) {
+func TestPublicDashboardIsReadOnlyAndDoesNotExposeAccountID(t *testing.T) {
 	a := testApp(t, []account{{
 		ID: "private-account-id", Label: "private@example.test · Plus", Email: "private@example.test", PlanType: "plus", Enabled: true, InPool: true, RemainingQuota: nil,
 		UpstreamBaseURL: "https://upstream.example.test/v1", UpstreamAPIKey: "upstream-secret-value",
@@ -651,7 +767,7 @@ func TestPublicPoolToggleDoesNotExposeAccountID(t *testing.T) {
 		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
 	}
 	publicBody := publicRecorder.Body.String()
-	for _, forbidden := range []string{"private-account-id", "private@example.test", "upstream.example.test", "upstream-secret-value"} {
+	for _, forbidden := range []string{"private-account-id", "private@example.test", "upstream.example.test", "upstream-secret-value", "poolRef", "credentialMetadata", "statusReason", "inPool"} {
 		if strings.Contains(publicBody, forbidden) {
 			t.Fatalf("public dashboard exposed %q", forbidden)
 		}
@@ -659,39 +775,37 @@ func TestPublicPoolToggleDoesNotExposeAccountID(t *testing.T) {
 	var parsed struct {
 		Dashboard struct {
 			Accounts []struct {
-				PoolRef string `json:"poolRef"`
-				InPool  bool   `json:"inPool"`
+				DisplayName string `json:"displayName"`
+				Detail      string `json:"detail"`
+				PoolLabel   string `json:"poolLabel"`
 			} `json:"accounts"`
 		} `json:"dashboard"`
 	}
 	if err := json.Unmarshal(publicRecorder.Body.Bytes(), &parsed); err != nil {
 		t.Fatal(err)
 	}
-	if len(parsed.Dashboard.Accounts) != 1 || parsed.Dashboard.Accounts[0].PoolRef == "" || !parsed.Dashboard.Accounts[0].InPool {
-		t.Fatalf("public dashboard did not return expected pool ref: %s", publicBody)
+	if len(parsed.Dashboard.Accounts) != 1 || parsed.Dashboard.Accounts[0].DisplayName != "pr***te@example.test" || parsed.Dashboard.Accounts[0].Detail != "Plus" || parsed.Dashboard.Accounts[0].PoolLabel != "In pool" {
+		t.Fatalf("public dashboard did not return expected display state: %s", publicBody)
 	}
 
-	removeRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/"+parsed.Dashboard.Accounts[0].PoolRef+"/pool-remove", nil)
+	removeRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/public-ref/pool-remove", nil)
 	removeRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(removeRecorder, removeRequest)
-	if removeRecorder.Code != http.StatusOK {
-		t.Fatalf("public pool-remove returned %d: %s", removeRecorder.Code, removeRecorder.Body.String())
+	if removeRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("public pool-remove without admin returned %d: %s", removeRecorder.Code, removeRecorder.Body.String())
 	}
-	if a.config.Accounts[0].InPool {
-		t.Fatal("public pool-remove did not remove account from pool")
+	if !a.config.Accounts[0].InPool {
+		t.Fatal("unauthenticated public pool-remove changed account pool state")
 	}
-	if _, ok := a.state.StickySessions["gpt-test:session"]; ok {
-		t.Fatal("public pool-remove did not clear account sticky sessions")
+	if _, ok := a.state.StickySessions["gpt-test:session"]; !ok {
+		t.Fatal("unauthenticated public pool-remove cleared account sticky sessions")
 	}
 
-	addRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/"+parsed.Dashboard.Accounts[0].PoolRef+"/pool-add", nil)
+	addRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/public-ref/pool-add", nil)
 	addRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(addRecorder, addRequest)
-	if addRecorder.Code != http.StatusOK {
-		t.Fatalf("public pool-add returned %d: %s", addRecorder.Code, addRecorder.Body.String())
-	}
-	if !a.config.Accounts[0].Enabled || !a.config.Accounts[0].InPool {
-		t.Fatalf("public pool-add did not enable pool participation: %#v", a.config.Accounts[0])
+	if addRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("public pool-add without admin returned %d: %s", addRecorder.Code, addRecorder.Body.String())
 	}
 }
 
@@ -911,7 +1025,7 @@ func TestResponsesProxyAddsCurrentAccountHeaders(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
 	}
-	if got := recorder.Header().Get("X-Codex-Pool-Account"); got != "Credential 1" {
+	if got := recorder.Header().Get("X-Codex-Pool-Account"); got != "pr***te@example.test" {
 		t.Fatalf("account header = %q", got)
 	}
 	if got := recorder.Header().Get("X-Codex-Pool-Quota-Hourly-Remaining"); got != "72" {
@@ -951,7 +1065,7 @@ func TestCurrentStatusReturnsSessionAccountQuota(t *testing.T) {
 		t.Fatalf("status returned %d: %s", recorder.Code, recorder.Body.String())
 	}
 	body := recorder.Body.String()
-	for _, expected := range []string{`"model":"gpt-test"`, `"displayName":"Credential 1"`, `"planDisplayName":"Team · Private pr***te@example.test"`, `"percentage":72`, `"percentage":44`} {
+	for _, expected := range []string{`"model":"gpt-test"`, `"displayName":"pr***te@example.test"`, `"planDisplayName":"Team · Private pr***te@example.test"`, `"percentage":72`, `"percentage":44`} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("status body missing %s: %s", expected, body)
 		}
@@ -1471,6 +1585,75 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 	}
 }
 
+func TestCodexQuotaRefreshClearsStoredPersonalOrganizationName(t *testing.T) {
+	resetAt := time.Now().UTC().Add(time.Hour).Unix()
+	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/wham/usage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{
+				"plan_type":"team",
+				"rate_limit":{
+					"allowed":true,
+					"limit_reached":false,
+					"primary_window":{"used_percent":30,"limit_window_seconds":18000,"reset_after_seconds":60},
+					"secondary_window":{"used_percent":40,"limit_window_seconds":604800,"reset_at":%d}
+				}
+			}`, resetAt)
+		case "/backend-api/accounts/check/v4-2023-04-27":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"accounts":{"acct-chatgpt":{"account":{"account_id":"acct-chatgpt","name":"Yi-Fan Liou","plan_type":"team"},"entitlement":{"subscription_plan":"chatgptteamplan"}}},"account_ordering":["acct-chatgpt"]}`))
+		case "/backend-api/subscriptions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"subscription_plan":"chatgptteamplan"}`))
+		default:
+			t.Fatalf("unexpected usage path %s", r.URL.Path)
+		}
+	}))
+	defer usage.Close()
+
+	a := testApp(t, []account{{ID: "codex-team", AccountID: "acct-chatgpt", AuthType: "codex_device_auth", Enabled: true, InPool: true, OrganizationName: "Yi-Fan Liou", PlanType: "team"}})
+	a.codexBaseURL = usage.URL + "/backend-api"
+	home := a.accountCodexHome("codex-team")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"refresh_token":"<refresh-token>"}}`, fakeJWT(time.Now().Add(time.Hour)))
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := a.refreshAccountQuota(context.Background(), "codex-team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.PlanType != "team" || snapshot.OrganizationName != "" {
+		t.Fatalf("personal account name was retained in quota snapshot: %#v", snapshot)
+	}
+	if a.config.Accounts[0].OrganizationName != "" {
+		t.Fatalf("personal account name was retained in account config: %#v", a.config.Accounts[0])
+	}
+}
+
+func TestOrganizationSetActionIsNotAvailable(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct-team", Email: "user@example.test", AuthType: "codex_device_auth", Enabled: true, InPool: true, PlanType: "team"}})
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/acct-team/organization/set", strings.NewReader(`{"organizationName":"markliou"}`))
+	recorder := httptest.NewRecorder()
+	a.handleAccountAction(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("organization override action returned %d, want 404: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestQuotaOrganizationControlsTeamDisplayName(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct-team", Email: "user@example.test", AuthType: "codex_device_auth", Enabled: true, InPool: true, PlanType: "team"}})
+	a.state.Quotas["acct-team"] = quotaSnapshot{AccountID: "acct-team", OrganizationName: "markliou", PlanType: "team"}
+	dashboard := a.publicDashboardAccountLocked(a.config.Accounts[0], 0, time.Now().UTC())
+	if dashboard["detail"] != "Team · markliou" {
+		t.Fatalf("quota organization was not used in team display: %#v", dashboard)
+	}
+}
+
 func TestCodexQuotaRefreshUpdatesProPlanLimit(t *testing.T) {
 	var sawAccountCheckRequest bool
 	var sawSubscriptionRequest bool
@@ -1538,19 +1721,20 @@ func TestCodexQuotaRefreshUpdatesProPlanLimit(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("public dashboard returned %d", recorder.Code)
 	}
-	if body := recorder.Body.String(); !strings.Contains(body, "Credential 1") || !strings.Contains(body, "Pro 20x") || !strings.Contains(body, `"planLimit":"20x"`) {
+	if body := recorder.Body.String(); !strings.Contains(body, "Credential 1") || !strings.Contains(body, "Pro 20x") || strings.Contains(body, `"planLimit":"20x"`) {
 		t.Fatalf("public dashboard omitted Pro plan limit: %s", body)
 	}
 }
 
-func TestSubscriptionMetadataFromAccountCheckUsesDirectAccountName(t *testing.T) {
+func TestSubscriptionMetadataFromAccountCheckUsesExplicitWorkspaceName(t *testing.T) {
 	metadata, ok := subscriptionMetadataFromValue(map[string]any{
 		"accounts": map[string]any{
 			"acct-team": map[string]any{
 				"account": map[string]any{
-					"account_id": "acct-team",
-					"name":       "markliou",
-					"plan_type":  "team",
+					"account_id":     "acct-team",
+					"name":           "Yi-Fan Liou",
+					"workspace_name": "markliou",
+					"plan_type":      "team",
 				},
 				"entitlement": map[string]any{"subscription_plan": "chatgptteamplan"},
 			},
@@ -1566,6 +1750,47 @@ func TestSubscriptionMetadataFromAccountCheckUsesDirectAccountName(t *testing.T)
 	}
 	if metadata.AccountID != "acct-team" || metadata.OrganizationName != "markliou" || metadata.PlanType != "team" {
 		t.Fatalf("unexpected team metadata: %#v", metadata)
+	}
+
+	metadata, ok = subscriptionMetadataFromValue(map[string]any{
+		"accounts": map[string]any{
+			"acct-team": map[string]any{
+				"account": map[string]any{
+					"account_id": "acct-team",
+					"name":       "Yi-Fan Liou",
+					"plan_type":  "team",
+				},
+				"entitlement": map[string]any{"subscription_plan": "chatgptteamplan"},
+			},
+		},
+		"account_ordering": []any{"acct-team"},
+	}, "acct-team")
+	if !ok {
+		t.Fatal("metadata parser did not find account records with personal account name")
+	}
+	if metadata.AccountID != "acct-team" || metadata.OrganizationName != "" || metadata.PlanType != "team" {
+		t.Fatalf("personal account name was used as team organization metadata: %#v", metadata)
+	}
+
+	metadata, ok = subscriptionMetadataFromValue(map[string]any{
+		"accounts": map[string]any{
+			"acct-team": map[string]any{
+				"account": map[string]any{
+					"account_id": "acct-team",
+					"name":       "markliou",
+					"structure":  "workspace",
+					"plan_type":  "team",
+				},
+				"entitlement": map[string]any{"subscription_plan": "chatgptteamplan"},
+			},
+		},
+		"account_ordering": []any{"acct-team"},
+	}, "acct-team")
+	if !ok {
+		t.Fatal("metadata parser did not find workspace account records")
+	}
+	if metadata.AccountID != "acct-team" || metadata.OrganizationName != "markliou" || metadata.PlanType != "team" {
+		t.Fatalf("workspace account name was not used as team organization metadata: %#v", metadata)
 	}
 
 	metadata, ok = subscriptionMetadataFromValue(map[string]any{
@@ -2045,5 +2270,24 @@ func TestAdminLoginAndCSRFMiddleware(t *testing.T) {
 	}
 	if strings.Contains(secondRecorder.Body.String(), "user@example.test") || strings.Contains(secondRecorder.Body.String(), "us***@example.test") || strings.Contains(secondRecorder.Body.String(), `"planType":"pro"`) {
 		t.Fatalf("second device-auth account used caller-supplied identity metadata: %s", secondRecorder.Body.String())
+	}
+
+	providerRequest := httptest.NewRequest(http.MethodPost, "/admin/api/accounts", strings.NewReader(`{"authType":"provider_api_key","email":"Provider@Example.Test","planType":"team","upstreamBaseUrl":"https://upstream.example.test","upstreamApiKey":"provider-secret"}`))
+	providerRequest.AddCookie(sessionCookie)
+	providerRequest.AddCookie(csrfCookie)
+	providerRequest.Header.Set("X-CSRF-Token", response.CSRFToken)
+	providerRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(providerRecorder, providerRequest)
+	if providerRecorder.Code != http.StatusCreated {
+		t.Fatalf("provider account create returned %d: %s", providerRecorder.Code, providerRecorder.Body.String())
+	}
+	providerBody := providerRecorder.Body.String()
+	for _, expected := range []string{`"id":"acct-provider"`, `"displayName":"pr***er@example.test"`, `"email":"pr***er@example.test"`} {
+		if !strings.Contains(providerBody, expected) {
+			t.Fatalf("provider account create response missing %s: %s", expected, providerBody)
+		}
+	}
+	if strings.Contains(providerBody, "provider@example.test") || strings.Contains(providerBody, "provider-secret") || strings.Contains(providerBody, "provider-team") {
+		t.Fatalf("provider account create response used sensitive metadata as identity: %s", providerBody)
 	}
 }

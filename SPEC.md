@@ -154,7 +154,7 @@ docker run -d \
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_MODE` | no | `auto` | `auto` injects a hashed `prompt_cache_key` when the client omitted one. `off`/`passthrough` leave the request unchanged. |
 | `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | passthrough | Optional upstream prompt cache retention override. Valid values are `24h` and `in_memory`; unset/passthrough preserves upstream defaults. |
-| `CODEX_POOL_PRESERVE_PRO_QUOTA` | no | `false` | Initial default for the admin Console `Preserve Pro quota` switch. Once saved in `/data/config.json`, the Console setting takes precedence. |
+| `CODEX_POOL_PRESERVE_PRO_QUOTA` | no | `false` | Initial default for the admin Console `Use Pro last` switch. Once saved in `/data/config.json`, the Console setting takes precedence. |
 
 ### 2.2 Startup safety checks
 
@@ -512,8 +512,8 @@ not in model-level cooldown for requested model
 ```json
 {
   "id": "acct-org-a",
-  "label": "Credential 1",
-  "displayName": "Credential 1",
+  "label": "us***er@example.com",
+  "displayName": "us***er@example.com",
   "email": "us***er@example.com",
   "authType": "codex_device_auth",
   "enabled": true,
@@ -537,7 +537,7 @@ Notes:
 - `remainingQuota` is an integer routing hint. Treat it as a percentage or normalized score, not an exact token count.
 - Actual consumed tokens are tracked in usage stats.
 - Absolute remaining Codex token quota may not be available from upstream. Display both quota-window percentages and token usage counters.
-- Admin API account responses must not expose full email addresses, upstream account IDs, upstream URLs, API keys, `codexHome`, or auth file paths. A device-auth credential slot is the primary local identity. Email, plan, upstream account ID, and organization values are descriptive credential metadata; browser-facing account labels must not be derived from them, and metadata fields use masked display values.
+- Admin API account responses must not expose full email addresses, upstream account IDs, upstream URLs, API keys, `codexHome`, or auth file paths. A device-auth credential slot is the primary local identity. Email, plan, upstream account ID, and organization values are descriptive credential metadata; browser-facing account labels may use masked email for recognition, but routing, storage, and management actions must use the local credential slot ID.
 
 ### 7.2 Add account
 
@@ -1139,7 +1139,7 @@ Request:
 }
 ```
 
-`preserveProQuota` backs the admin Console `Preserve Pro quota` switch and is persisted in `/data/config.json`.
+`preserveProQuota` backs the admin Console `Use Pro last` switch and is persisted in `/data/config.json`.
 
 ---
 

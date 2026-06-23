@@ -88,14 +88,6 @@
     return body;
   }
 
-  async function publicApi(path, options = {}) {
-    const headers = new Headers(options.headers || {});
-    const response = await fetch(`/admin/api/public-dashboard${path}`, { credentials: "same-origin", ...options, headers });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
-    return body;
-  }
-
   function showLogin(message = "") {
     dashboardView.hidden = true;
     loginView.hidden = false;
@@ -111,7 +103,7 @@
     dashboardView.hidden = false;
     $$(".management-only").forEach((element) => { element.hidden = false; });
     $$(".public-only").forEach((element) => { element.hidden = true; });
-    $("#dashboard-eyebrow").textContent = "OPERATIONAL OVERVIEW";
+    $("#dashboard-eyebrow").textContent = "ADMIN";
     $("#dashboard-title").textContent = "Account pool";
     refresh();
     window.clearInterval(state.refreshTimer);
@@ -124,21 +116,28 @@
     dashboardView.hidden = false;
     $$(".management-only").forEach((element) => { element.hidden = true; });
     $$(".public-only").forEach((element) => { element.hidden = false; });
-    $("#dashboard-eyebrow").textContent = "PUBLIC STATUS";
+    $("#dashboard-eyebrow").textContent = "SERVICE STATUS";
     $("#dashboard-title").textContent = "Pool status";
     refreshPublic();
     window.clearInterval(state.refreshTimer);
     state.refreshTimer = window.setInterval(() => refreshPublic(true), refreshIntervalMs);
   }
 
-  function renderSummary(summary) {
-    const items = [
+  function renderSummary(summary, publicMode = false) {
+    const items = publicMode ? [
+      ["Total accounts", summary.total || 0, ""],
+      ["Ready", summary.ready || 0, ""],
+      ["Limited", summary.low || 0, "low"],
+      ["Cooling down", summary.cooldown || 0, "cooldown"],
+      ["Standby", summary.standby || 0, "missing_auth"],
+      ["Unavailable", summary.unavailable || 0, "error"],
+    ] : [
       ["Total accounts", summary.total || 0, ""],
       ["Ready", summary.ready || 0, ""],
       ["Low quota", summary.low || 0, "low"],
       ["Cooling down", summary.cooldown || 0, "cooldown"],
       ["Errors", summary.error || 0, "error"],
-      ["Need login", summary.missing_auth || 0, "missing_auth"],
+      ["Needs attention", summary.missing_auth || 0, "missing_auth"],
     ];
     $("#summary-grid").innerHTML = items.map(([label, value, tone]) => `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${value}</span></div>`).join("");
   }
@@ -188,15 +187,21 @@
   }
 
   function quotaMarkup(value, quota, quotaError, usageUpdatedAt) {
-    const refreshError = quotaError ? `<span class="quota-error" title="${escapeHTML(quotaError.message)}">Refresh failed${quotaError.code ? `: ${escapeHTML(quotaError.code)}` : ""}</span>` : "";
+    const refreshError = quotaError ? `<span class="quota-error" title="${escapeHTML(quotaError.message)}">Quota update unavailable</span>` : "";
     if (quota) {
       const windows = [quotaWindowMarkup("5h", quota.hourly), quotaWindowMarkup("Week", quota.weekly)].filter(Boolean).join("");
       const updated = usageUpdatedAt && usageUpdatedAt !== "0001-01-01T00:00:00Z" ? `<div class="quota-updated">Updated ${escapeHTML(displayTime(usageUpdatedAt))}</div>` : "";
-      return `<div class="quota quota-detailed">${windows || '<span class="quota-unknown">No quota window</span>'}${updated}${refreshError}</div>`;
+      return `<div class="quota quota-detailed">${windows || '<span class="quota-unknown">Quota unavailable</span>'}${updated}${refreshError}</div>`;
     }
     if (quotaError) return refreshError;
     if (value === null || value === undefined) return '<span class="quota-unknown">Not reported</span>';
     return `<div class="quota"><div class="quota-line"><span>Quota</span><strong>${value}% left</strong></div>${quotaTrackMarkup(value, "Quota")}</div>`;
+  }
+
+  function authLabel(value) {
+    if (value === "codex_device_auth") return "Codex sign-in";
+    if (value === "provider_api_key") return "Provider API key";
+    return value ? value.replaceAll("_", " ") : "Codex sign-in";
   }
 
   function actionButton(action, id, label, tone = "secondary") {
@@ -206,8 +211,10 @@
   function accountMetadataLine(account, includeID = false) {
     const metadata = account.credentialMetadata || account;
     const parts = [];
-    if (metadata.planType && metadata.planType !== "unknown") parts.push(metadata.planDisplayName || metadata.planType);
-    if (metadata.organizationName) parts.push(metadata.organizationName);
+    const planDisplay = metadata.planDisplayName || metadata.planType;
+    if (metadata.planType && metadata.planType !== "unknown") parts.push(planDisplay);
+    const planSegments = String(planDisplay || "").split(" · ").map((part) => part.trim()).filter(Boolean);
+    if (metadata.organizationName && !planSegments.includes(metadata.organizationName)) parts.push(metadata.organizationName);
     if (metadata.email) parts.push(metadata.email);
     if (includeID && account.id) parts.push(account.id);
     return parts.join(" · ");
@@ -224,15 +231,15 @@
     body.innerHTML = accounts.map((account) => {
       const health = healthByID.get(account.id) || { status: "standby", statusReason: "No health data" };
       const activity = health.status === "error" ? health.lastFailureAt : health.lastSuccessAt;
-      const route = `${account.inPool ? "In pool" : "Out of pool"} · priority ${account.priority}`;
+      const route = account.inPool ? "In pool" : "Out of pool";
       const displayName = account.displayName || account.label || account.id || "Credential";
-      const metadata = accountMetadataLine(account, true);
+      const metadata = accountMetadataLine(account, false);
       const actions = actionButton("delete", account.id, "Remove", "danger");
-      return `<tr>
+      return `<tr data-account-row="${escapeHTML(account.id)}">
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span></div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt)}</td>
-        <td><div class="route"><strong>${escapeHTML(account.authType || "codex_device_auth")}</strong><br>${escapeHTML(route)}</div></td>
+        <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)}</div></td>
         <td><div class="activity">${displayTime(activity)}${health.consecutiveFailure ? `<br>${health.consecutiveFailure} consecutive failure${health.consecutiveFailure === 1 ? "" : "s"}` : ""}</div></td>
         <td><div class="row-actions">${actions}</div></td>
       </tr>`;
@@ -240,34 +247,38 @@
   }
 
   function renderPublicAccounts(accounts) {
-    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th>Model access</th><th>Action</th></tr>";
+    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th></tr>";
     $("#account-count").textContent = `${accounts.length} visible`;
     const body = $("#accounts-body");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="6"><div class="empty-state">No accounts available</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="4"><div class="empty-state">No accounts available</div></td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
-      const action = account.inPool
-        ? `<button class="button warn" type="button" data-public-pool-action="pool-remove" data-pool-ref="${escapeHTML(account.poolRef)}">Leave pool</button>`
-        : `<button class="button secondary" type="button" data-public-pool-action="pool-add" data-pool-ref="${escapeHTML(account.poolRef)}">Join pool</button>`;
-      const poolLabel = account.inPool ? "In pool" : "Out of pool";
       const displayName = account.displayName || account.label || "Credential";
-      const metadata = accountMetadataLine(account, false);
+      const metadata = account.detail || "";
+      const tone = account.statusTone || account.status || "standby";
+      const label = account.statusLabel || statusLabel(account.status);
+      const quota = account.quotaUnavailable ? '<span class="quota-unknown">Quota unavailable</span>' : quotaMarkup(account.remainingQuota, account.quota, null, null);
       return `<tr>
       <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
-      <td><div class="status-stack"><span class="badge ${escapeHTML(account.status)}">${statusLabel(account.status)}</span></div></td>
-      <td>${quotaMarkup(account.remainingQuota, account.quota, account.quotaError, account.usageUpdatedAt)}</td>
-      <td><div class="route"><strong>${escapeHTML(poolLabel)}</strong></div></td>
-      <td><div class="route">${escapeHTML((account.allowedModels || []).join(", ") || "Detected after login")}</div></td>
-      <td><div class="row-actions">${action}</div></td>
+      <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span></div></td>
+      <td>${quota}</td>
+      <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong></div></td>
     </tr>`;
     }).join("");
   }
 
-  function renderSticky(sessions) {
-    $("#sticky-count").textContent = `${sessions.length} active`;
-    $("#sticky-list").innerHTML = sessions.length ? sessions.map((session) => `<div class="sticky-item"><div><div class="sticky-key" title="${escapeHTML(session.key)}">${escapeHTML(session.key)}</div><div class="sticky-meta">${escapeHTML(session.accountId)} · ${displayTime(session.lastSuccessAt)}</div></div><button class="button secondary" type="button" data-sticky-key="${escapeHTML(session.key)}">Clear</button></div>`).join("") : '<div class="empty-state">No active sticky sessions</div>';
+  function renderSticky(sessions, accounts = []) {
+    const accountsByID = new Map(accounts.map((account) => [account.id, account]));
+    $("#sticky-count").textContent = sessions.length === 1 ? "1 active route" : `${sessions.length} active routes`;
+    $("#sticky-list").innerHTML = sessions.length ? sessions.map((session) => {
+      const account = accountsByID.get(session.accountId);
+      const accountName = account?.displayName || account?.label || "Assigned credential";
+      const routeName = session.modelId || "Default model";
+      const expires = session.expiresAt && session.expiresAt !== "0001-01-01T00:00:00Z" ? ` · Expires ${escapeHTML(displayTime(session.expiresAt))}` : "";
+      return `<div class="sticky-item"><div><div class="sticky-key">${escapeHTML(routeName)}</div><div class="sticky-meta">${escapeHTML(accountName)} · Last used ${escapeHTML(displayTime(session.lastSuccessAt))}${expires}</div></div><button class="button secondary" type="button" data-sticky-key="${escapeHTML(session.key)}">Clear</button></div>`;
+    }).join("") : '<div class="empty-state">No active routes</div>';
   }
 
   async function refresh(silent = false) {
@@ -279,7 +290,7 @@
       renderSettings(serviceState);
       renderSummary(serviceState.summary || {});
       renderAccounts(state.data.accounts, healthByID);
-      renderSticky(state.data.sessions);
+      renderSticky(state.data.sessions, state.data.accounts);
       $("#service-status").textContent = "Service online";
     } catch (error) {
       if (!silent) notify(error.message, true);
@@ -292,7 +303,7 @@
       const response = await fetch("/admin/api/public-dashboard", { credentials: "same-origin" });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
-      renderSummary(body.dashboard.summary || {});
+      renderSummary(body.dashboard.summary || {}, true);
       renderPublicAccounts(body.dashboard.accounts || []);
     } catch (error) {
       if (!silent) notify(error.message, true);
@@ -312,17 +323,6 @@
       notify("Account updated");
       refresh(true);
     } catch (error) { notify(error.message, true); }
-  }
-
-  async function handlePublicPoolAction(button) {
-    const action = button.dataset.publicPoolAction;
-    const ref = button.dataset.poolRef;
-    try {
-      await publicApi(`/accounts/${encodeURIComponent(ref)}/${action}`, { method: "POST" });
-      await refreshPublic(true);
-    } catch (error) {
-      notify(error.message, true);
-    }
   }
 
   async function startDeviceAuth(accountId) {
@@ -372,7 +372,7 @@
         }
         if (job.status === "completed") {
           closeDeviceAuth(false);
-          notify("Device login completed");
+          notify("Sign-in completed");
           refresh(true);
           return;
         }
@@ -382,7 +382,7 @@
             refresh(true);
             return;
           }
-          notify(job.error || job.message || "Device login failed", true);
+          notify("Sign-in failed", true);
           refresh(true);
           return;
         }
@@ -415,15 +415,10 @@
   $("#preserve-pro-quota-switch").addEventListener("change", updatePreserveProQuota);
   $("#close-device-auth-button").addEventListener("click", () => closeDeviceAuth(true));
   $("#accounts-body").addEventListener("click", (event) => {
-    const publicButton = event.target.closest("[data-public-pool-action]");
-    if (publicButton) {
-      handlePublicPoolAction(publicButton);
-      return;
-    }
     const button = event.target.closest("[data-account-action]");
     if (button) handleAccountAction(button);
   });
-  $("#sticky-list").addEventListener("click", async (event) => { const button = event.target.closest("[data-sticky-key]"); if (!button) return; try { await api(`/sticky-sessions/${encodeURIComponent(button.dataset.stickyKey)}`, { method: "DELETE" }); notify("Sticky session cleared"); refresh(true); } catch (error) { notify(error.message, true); } });
+  $("#sticky-list").addEventListener("click", async (event) => { const button = event.target.closest("[data-sticky-key]"); if (!button) return; try { await api(`/sticky-sessions/${encodeURIComponent(button.dataset.stickyKey)}`, { method: "DELETE" }); notify("Route cleared"); refresh(true); } catch (error) { notify(error.message, true); } });
 
   showPublicDashboard();
 })();

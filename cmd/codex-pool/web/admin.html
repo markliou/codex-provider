@@ -4,29 +4,32 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#1d231b">
   <title>Codex Pool</title>
+  <link rel="icon" href="/admin/assets/logo.svg" type="image/svg+xml">
+  <link rel="manifest" href="/admin/manifest.webmanifest">
   <link rel="stylesheet" href="/admin/assets/app.css">
 </head>
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand"><span class="brand-mark">CP</span><span>Codex Pool</span></div>
+      <div class="brand"><img class="brand-mark" src="/admin/assets/logo.svg" alt="" aria-hidden="true"><span>Codex Pool</span></div>
       <div class="topbar-actions management-only">
         <span id="service-status" class="service-status">Checking service</span>
         <button id="refresh-button" class="button secondary" type="button">Refresh</button>
         <button id="logout-button" class="button quiet" type="button">Sign out</button>
       </div>
       <div class="topbar-actions public-only">
-        <button id="sign-in-button" class="button quiet" type="button">Console</button>
+        <button id="sign-in-button" class="button quiet" type="button">Admin</button>
       </div>
     </header>
 
     <main>
       <section id="login-view" class="login-view" aria-labelledby="login-title">
         <form id="login-form" class="login-panel">
-          <div class="eyebrow">CONSOLE</div>
-          <h1 id="login-title">Access</h1>
-          <label>Passphrase<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+          <div class="eyebrow">ADMIN</div>
+          <h1 id="login-title">Sign in</h1>
+          <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
           <p id="login-error" class="form-error" role="alert" hidden></p>
           <button class="button primary full" type="submit">Continue</button>
         </form>
@@ -35,12 +38,12 @@
       <section id="dashboard-view" class="dashboard-view" hidden>
         <div class="page-heading">
           <div>
-            <div id="dashboard-eyebrow" class="eyebrow">PUBLIC STATUS</div>
+            <div id="dashboard-eyebrow" class="eyebrow">SERVICE STATUS</div>
             <h1 id="dashboard-title">Pool status</h1>
           </div>
           <div class="page-actions management-only">
             <label class="switch-row" for="preserve-pro-quota-switch">
-              <span class="switch-label">Preserve Pro quota</span>
+              <span class="switch-label">Use Pro last</span>
               <input id="preserve-pro-quota-switch" type="checkbox" role="switch">
               <span class="switch-ui" aria-hidden="true"></span>
             </label>
@@ -65,20 +68,23 @@
 
         <div class="secondary-grid management-only">
           <section class="section-block compact" aria-labelledby="sticky-title">
-            <div class="section-heading"><div><h2 id="sticky-title">Sticky sessions</h2><p id="sticky-count" class="muted"></p></div></div>
+            <div class="section-heading"><div><h2 id="sticky-title">Active routes</h2><p id="sticky-count" class="muted"></p></div></div>
             <div id="sticky-list" class="sticky-list"></div>
           </section>
         </div>
       </section>
     </main>
+    <footer class="app-footer">
+      <span>Codex Pool v2026.06.23.6</span>
+    </footer>
   </div>
 
   <dialog id="device-auth-dialog" class="device-dialog">
     <div class="device-auth-panel">
-      <div class="dialog-heading"><div><div class="eyebrow">DEVICE AUTH</div><h2>Codex <span id="device-auth-countdown" class="device-auth-countdown">15:00</span></h2></div><button id="close-device-auth-button" class="button quiet" type="button">Close</button></div>
+      <div class="dialog-heading"><div><div class="eyebrow">CODEX SIGN-IN</div><h2>Codex <span id="device-auth-countdown" class="device-auth-countdown">15:00</span></h2></div><button id="close-device-auth-button" class="button quiet" type="button">Close</button></div>
       <div class="device-auth-grid">
-        <div class="device-auth-row"><span class="device-auth-label">URL</span><a id="device-auth-url" class="device-auth-value" target="_blank" rel="noreferrer"></a></div>
-        <div class="device-auth-row"><span class="device-auth-label">Code</span><code id="device-auth-code" class="device-auth-code"></code></div>
+        <div class="device-auth-row"><span class="device-auth-label">Verification link</span><a id="device-auth-url" class="device-auth-value" target="_blank" rel="noreferrer"></a></div>
+        <div class="device-auth-row"><span class="device-auth-label">Verification code</span><code id="device-auth-code" class="device-auth-code"></code></div>
       </div>
     </div>
   </dialog>

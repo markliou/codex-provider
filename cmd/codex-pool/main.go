@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -58,28 +59,30 @@ type config struct {
 }
 
 type account struct {
-	ID               string    `json:"id"`
-	Label            string    `json:"label"`
-	Email            string    `json:"email,omitempty"`
-	AccountID        string    `json:"accountId,omitempty"`
-	OrganizationName string    `json:"organizationName,omitempty"`
-	PlanType         string    `json:"planType,omitempty"`
-	PlanLimit        string    `json:"planLimit,omitempty"`
-	PlanRank         int       `json:"planRank,omitempty"`
-	AuthType         string    `json:"authType"`
-	CodexHome        string    `json:"codexHome,omitempty"`
-	Enabled          bool      `json:"enabled"`
-	InPool           bool      `json:"inPool"`
-	Priority         int       `json:"priority"`
-	RemainingQuota   *int      `json:"remainingQuota,omitempty"`
-	AllowedModels    []string  `json:"allowedModels,omitempty"`
-	ExcludedModels   []string  `json:"excludedModels,omitempty"`
-	UpstreamBaseURL  string    `json:"upstreamBaseUrl,omitempty"`
-	UpstreamAPIKey   string    `json:"upstreamApiKey,omitempty"`
-	WireAPI          string    `json:"wireApi,omitempty"`
-	CreatedAt        time.Time `json:"createdAt"`
-	UpdatedAt        time.Time `json:"updatedAt"`
-	LastLoginAt      time.Time `json:"lastLoginAt,omitempty"`
+	ID               string `json:"id"`
+	Label            string `json:"label"`
+	Email            string `json:"email,omitempty"`
+	AccountID        string `json:"accountId,omitempty"`
+	OrganizationName string `json:"organizationName,omitempty"`
+	// Deprecated: migrated into OrganizationName at load time. Not exposed in admin APIs.
+	OrganizationNameOverride string    `json:"organizationNameOverride,omitempty"`
+	PlanType                 string    `json:"planType,omitempty"`
+	PlanLimit                string    `json:"planLimit,omitempty"`
+	PlanRank                 int       `json:"planRank,omitempty"`
+	AuthType                 string    `json:"authType"`
+	CodexHome                string    `json:"codexHome,omitempty"`
+	Enabled                  bool      `json:"enabled"`
+	InPool                   bool      `json:"inPool"`
+	Priority                 int       `json:"priority"`
+	RemainingQuota           *int      `json:"remainingQuota,omitempty"`
+	AllowedModels            []string  `json:"allowedModels,omitempty"`
+	ExcludedModels           []string  `json:"excludedModels,omitempty"`
+	UpstreamBaseURL          string    `json:"upstreamBaseUrl,omitempty"`
+	UpstreamAPIKey           string    `json:"upstreamApiKey,omitempty"`
+	WireAPI                  string    `json:"wireApi,omitempty"`
+	CreatedAt                time.Time `json:"createdAt"`
+	UpdatedAt                time.Time `json:"updatedAt"`
+	LastLoginAt              time.Time `json:"lastLoginAt,omitempty"`
 }
 
 type cooldown struct {
@@ -364,6 +367,10 @@ func (a *app) load() error {
 	for i := range a.config.Accounts {
 		a.config.Accounts[i].Email = normalizeEmail(a.config.Accounts[i].Email)
 		a.config.Accounts[i].OrganizationName = cleanOrganizationName(a.config.Accounts[i].OrganizationName)
+		if a.config.Accounts[i].OrganizationName == "" {
+			a.config.Accounts[i].OrganizationName = cleanOrganizationName(a.config.Accounts[i].OrganizationNameOverride)
+		}
+		a.config.Accounts[i].OrganizationNameOverride = ""
 		a.config.Accounts[i].PlanType = normalizePlanType(a.config.Accounts[i].PlanType)
 		a.config.Accounts[i].PlanLimit = cleanPlanLimit(a.config.Accounts[i].PlanLimit)
 		a.config.Accounts[i].PlanRank = planRank(a.config.Accounts[i].PlanType)
@@ -480,8 +487,10 @@ func (a *app) adminMux() http.Handler {
 	mux.HandleFunc("GET /admin", a.handleAdminPage)
 	mux.HandleFunc("GET /admin/assets/app.css", handleAdminCSS)
 	mux.HandleFunc("GET /admin/assets/app.js", handleAdminJS)
+	mux.HandleFunc("GET /admin/assets/logo.svg", handleAdminLogo)
+	mux.HandleFunc("GET /admin/manifest.webmanifest", handleAdminManifest)
 	mux.HandleFunc("GET /admin/api/public-dashboard", a.handlePublicDashboard)
-	mux.HandleFunc("POST /admin/api/public-dashboard/accounts/", a.handlePublicAccountAction)
+	mux.HandleFunc("POST /admin/api/public-dashboard/accounts/", a.requireAdmin(a.handlePublicAccountAction))
 	mux.HandleFunc("POST /admin/api/login", a.handleAdminLogin)
 	mux.HandleFunc("POST /admin/api/logout", a.requireAdmin(a.handleAdminLogout))
 	mux.HandleFunc("GET /admin/api/state", a.requireAdmin(a.handleAdminState))
@@ -860,7 +869,7 @@ func (a *app) addCurrentAccountResponseHeaders(w http.ResponseWriter, accountID 
 	}
 	status, _ := a.accountStatusLocked(*item, time.Now().UTC())
 	displayName := currentAccountDisplayName(displayItem, index)
-	organizationName := publicOrganizationName(displayItem.OrganizationName)
+	organizationName := publicOrganizationName(effectiveOrganizationName(displayItem))
 	planType := normalizePlanType(displayItem.PlanType)
 	planDisplay := accountPlanDisplayName(displayItem, false)
 	quotaValue := quota.Quota
@@ -1137,7 +1146,7 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 	for index, item := range a.config.Accounts {
 		accounts = append(accounts, a.publicDashboardAccountLocked(item, index, now))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.dashboardSummaryLocked(now), "accounts": accounts}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "accounts": accounts}})
 }
 
 func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) {
@@ -1226,11 +1235,7 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if generateID {
-		base := accountIDBase(input.Email, input.PlanType)
-		if isCodexDeviceAuth(input) {
-			base = "acct-credential"
-		}
-		input.ID = a.uniqueAccountIDLocked(base)
+		input.ID = a.uniqueAccountIDLocked(generatedAccountIDBase(input))
 	}
 	if input.Label == "" {
 		input.Label = accountDisplayName(input)
@@ -2276,9 +2281,6 @@ func (a *app) codexAuth(item account) (codexAuthInfo, error) {
 			if info.Email == "" {
 				info.Email = claimString(profile, "email")
 			}
-			if info.OrganizationName == "" {
-				info.OrganizationName = organizationNameFromMap(profile)
-			}
 			if info.PlanLimit == "" {
 				info.PlanLimit = planLimitFromMap(profile)
 			}
@@ -2287,8 +2289,8 @@ func (a *app) codexAuth(item account) (codexAuthInfo, error) {
 			if info.AccountID == "" {
 				info.AccountID = claimString(authClaims, "chatgpt_account_id")
 			}
-			if info.OrganizationName == "" {
-				info.OrganizationName = organizationNameFromMap(authClaims)
+			if organizationName := organizationNameFromMap(authClaims); organizationName != "" {
+				info.OrganizationName = organizationName
 			}
 			info.PlanType = claimString(authClaims, "chatgpt_plan_type")
 			if info.PlanLimit == "" {
@@ -2437,13 +2439,13 @@ func (a *app) cliproxyCodexAuth(item account) (codexAuthInfo, error) {
 	if err != nil || strings.TrimSpace(record.AccessToken) == "" {
 		return codexAuthInfo{}, fmt.Errorf("cliproxy auth is unavailable for account %s", item.ID)
 	}
-	info := codexAuthInfo{AccessToken: strings.TrimSpace(record.AccessToken), AccountID: strings.TrimSpace(record.AccountID), Email: normalizeEmail(record.Email), OrganizationName: cleanOrganizationName(record.OrganizationName), PlanType: normalizePlanType(record.PlanType), PlanLimit: cleanPlanLimit(record.PlanLimit)}
+	info := codexAuthInfo{AccessToken: strings.TrimSpace(record.AccessToken), AccountID: strings.TrimSpace(record.AccountID), Email: normalizeEmail(record.Email), PlanType: normalizePlanType(record.PlanType), PlanLimit: cleanPlanLimit(record.PlanLimit)}
 	if claims := jwtPayload(record.IDToken); claims != nil {
 		if info.Email == "" {
 			info.Email = normalizeEmail(claimString(claims, "email"))
 		}
-		if info.OrganizationName == "" {
-			info.OrganizationName = organizationNameFromMap(claims)
+		if organizationName := organizationNameFromMap(claims); organizationName != "" {
+			info.OrganizationName = organizationName
 		}
 		if info.PlanLimit == "" {
 			info.PlanLimit = planLimitFromMap(claims)
@@ -2452,8 +2454,8 @@ func (a *app) cliproxyCodexAuth(item account) (codexAuthInfo, error) {
 			if info.AccountID == "" {
 				info.AccountID = claimString(authClaims, "chatgpt_account_id")
 			}
-			if info.OrganizationName == "" {
-				info.OrganizationName = organizationNameFromMap(authClaims)
+			if organizationName := organizationNameFromMap(authClaims); organizationName != "" {
+				info.OrganizationName = organizationName
 			}
 			if info.PlanType == "" || info.PlanType == "unknown" {
 				info.PlanType = normalizePlanType(claimString(authClaims, "chatgpt_plan_type"))
@@ -2644,7 +2646,10 @@ func (a *app) fetchCodexAccountCheckMetadata(ctx context.Context, auth codexAuth
 	}
 	payload, err := a.fetchCodexMetadataPayload(ctx, auth, endpoint, "/backend-api/accounts/check/v4-2023-04-27", "")
 	if err != nil {
-		return codexSubscriptionMetadata{}, err
+		payload, err = a.fetchCodexMetadataPayloadWithNode(ctx, auth, endpoint, "/backend-api/accounts/check/v4-2023-04-27", "")
+		if err != nil {
+			return codexSubscriptionMetadata{}, err
+		}
 	}
 	metadata, ok := subscriptionMetadataFromValue(payload, auth.AccountID)
 	if !ok {
@@ -2695,10 +2700,82 @@ func (a *app) fetchCodexMetadataPayload(ctx context.Context, auth codexAuthInfo,
 	return payload, nil
 }
 
+const codexMetadataNodeFetchScript = `
+const chunks = [];
+process.stdin.on("data", (chunk) => chunks.push(chunk));
+process.stdin.on("end", async () => {
+  try {
+    const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const headers = {
+      "Authorization": "Bearer " + input.accessToken,
+      "Accept": "application/json",
+      "Accept-Language": "en-US,en;q=0.9",
+      "OAI-Language": "en-US",
+      "Origin": "https://chatgpt.com",
+      "Referer": "https://chatgpt.com/",
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "same-origin",
+      "User-Agent": input.userAgent
+    };
+    if (input.targetPath) {
+      headers["X-OpenAI-Target-Path"] = input.targetPath;
+      headers["X-OpenAI-Target-Route"] = input.targetPath;
+    }
+    if (input.chatGPTAccountID) headers["ChatGPT-Account-Id"] = input.chatGPTAccountID;
+    if (input.fedramp) headers["X-OpenAI-Fedramp"] = "true";
+    const response = await fetch(input.endpoint, { headers });
+    const body = await response.text();
+    if (!response.ok) {
+      console.error("metadata fetch returned status " + response.status);
+      process.exit(2);
+    }
+    process.stdout.write(body);
+  } catch (error) {
+    console.error(error && error.message ? error.message : String(error));
+    process.exit(1);
+  }
+});
+`
+
+func (a *app) fetchCodexMetadataPayloadWithNode(ctx context.Context, auth codexAuthInfo, endpoint, targetPath, chatGPTAccountID string) (map[string]any, error) {
+	if strings.TrimSpace(auth.AccessToken) == "" {
+		return nil, errors.New("codex access token is missing")
+	}
+	input, err := json.Marshal(map[string]any{
+		"accessToken":      auth.AccessToken,
+		"endpoint":         endpoint,
+		"targetPath":       targetPath,
+		"chatGPTAccountID": chatGPTAccountID,
+		"fedramp":          auth.FedRAMP,
+		"userAgent":        chatGPTWebUserAgent,
+	})
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, "node", "-e", codexMetadataNodeFetchScript)
+	cmd.Stdin = strings.NewReader(string(input))
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("node metadata fetch failed: %w", err)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(io.LimitReader(bytes.NewReader(output), maxRequestBody)).Decode(&payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
 func applyCodexWebMetadataHeaders(request *http.Request, auth codexAuthInfo, targetPath, chatGPTAccountID string) {
 	request.Header.Set("Authorization", "Bearer "+auth.AccessToken)
 	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	request.Header.Set("OAI-Language", "en-US")
+	request.Header.Set("Origin", "https://chatgpt.com")
 	request.Header.Set("Referer", chatGPTWebReferer)
+	request.Header.Set("Sec-Fetch-Dest", "empty")
+	request.Header.Set("Sec-Fetch-Mode", "cors")
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
 	request.Header.Set("User-Agent", chatGPTWebUserAgent)
 	if targetPath != "" {
 		request.Header.Set("X-OpenAI-Target-Path", targetPath)
@@ -3000,8 +3077,8 @@ func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaS
 		planLimit = cleanPlanLimit(chooseString(auth.PlanLimit, accountCopy.PlanLimit))
 	}
 	organizationName := cleanOrganizationName(organizationNameFromMap(usageFields))
-	if organizationName == "" {
-		organizationName = cleanOrganizationName(chooseString(auth.OrganizationName, accountCopy.OrganizationName))
+	if organizationName == "" && auth.OrganizationName != "" {
+		organizationName = cleanOrganizationName(auth.OrganizationName)
 	}
 	if (plan == "pro" && planLimit == "") || organizationName == "" || organizationScopedPlan(plan) {
 		if metadata, err := a.fetchCodexSubscriptionMetadata(ctx, auth); err == nil {
@@ -3052,9 +3129,7 @@ func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaS
 		item.AccountID = auth.AccountID
 	}
 	if organizationScopedPlan(plan) {
-		if organizationName != "" {
-			item.OrganizationName = organizationName
-		}
+		item.OrganizationName = organizationName
 	} else {
 		item.OrganizationName = ""
 	}
@@ -3647,6 +3722,25 @@ func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
 	}
 	return summary
 }
+func (a *app) publicDashboardSummaryLocked(now time.Time) map[string]int {
+	summary := map[string]int{"total": len(a.config.Accounts), "ready": 0, "low": 0, "cooldown": 0, "standby": 0, "unavailable": 0}
+	for _, item := range a.config.Accounts {
+		status, _ := a.accountStatusLocked(item, now)
+		switch status {
+		case "ready":
+			summary["ready"]++
+		case "low":
+			summary["low"]++
+		case "cooldown":
+			summary["cooldown"]++
+		case "standby":
+			summary["standby"]++
+		default:
+			summary["unavailable"]++
+		}
+	}
+	return summary
+}
 func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]any {
 	cooldowns := activeCooldowns(a.state.Cooldowns[item.ID], now)
 	status, reason := a.accountStatusLocked(item, now)
@@ -3746,7 +3840,7 @@ func publicAccount(item account, index int) map[string]any {
 }
 
 func (a *app) publicDashboardAccountLocked(item account, index int, now time.Time) map[string]any {
-	status, reason := a.accountStatusLocked(item, now)
+	status, _ := a.accountStatusLocked(item, now)
 	quota := a.state.Quotas[item.ID]
 	displayItem := item
 	if quota.OrganizationName != "" {
@@ -3759,31 +3853,54 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 	if quota.PlanLimit != "" {
 		displayItem.PlanLimit = quota.PlanLimit
 	}
-	label := publicDashboardAccountLabel(displayItem, index)
-	metadata := credentialMetadata(displayItem)
-	if quota.QuotaError != nil {
-		reason = "Quota information is temporarily unavailable"
+	statusTone, statusLabel := publicDashboardStatus(status)
+	remainingQuota := displayItem.RemainingQuota
+	if remainingQuota == nil && quota.Quota != nil {
+		remaining := remainingQuotaHint(*quota.Quota)
+		remainingQuota = &remaining
 	}
 	return map[string]any{
-		"label":              label,
-		"displayName":        label,
-		"credentialMetadata": metadata,
-		"email":              metadata["email"],
-		"organizationName":   metadata["organizationName"],
-		"planType":           metadata["planType"],
-		"planLimit":          metadata["planLimit"],
-		"planDisplayName":    metadata["planDisplayName"],
-		"planRank":           metadata["planRank"],
-		"poolRef":            a.publicAccountRefLocked(item.ID),
-		"status":             status,
-		"statusReason":       reason,
-		"enabled":            item.Enabled,
-		"inPool":             item.InPool,
-		"remainingQuota":     item.RemainingQuota,
-		"allowedModels":      item.AllowedModels,
-		"quota":              quota.Quota,
-		"usageUpdatedAt":     quota.UsageUpdatedAt,
+		"displayName":      publicDashboardAccountLabel(displayItem, index),
+		"detail":           publicDashboardAccountDetail(displayItem),
+		"statusTone":       statusTone,
+		"statusLabel":      statusLabel,
+		"poolLabel":        publicPoolLabel(item),
+		"remainingQuota":   remainingQuota,
+		"quota":            quota.Quota,
+		"quotaUnavailable": quota.QuotaError != nil,
 	}
+}
+
+func publicDashboardAccountDetail(item account) string {
+	if normalizePlanType(item.PlanType) == "unknown" {
+		return ""
+	}
+	return accountPlanDisplayName(item, false)
+}
+
+func publicDashboardStatus(status string) (string, string) {
+	switch status {
+	case "ready":
+		return "ready", "Ready"
+	case "low":
+		return "low", "Limited"
+	case "cooldown":
+		return "cooldown", "Cooling down"
+	case "standby":
+		return "standby", "Standby"
+	default:
+		return "error", "Unavailable"
+	}
+}
+
+func publicPoolLabel(item account) string {
+	if !item.Enabled {
+		return "Unavailable"
+	}
+	if !item.InPool {
+		return "Out of pool"
+	}
+	return "In pool"
 }
 
 func maskedPublicEmail(value string) string {
@@ -3813,10 +3930,14 @@ func publicOrganizationName(value string) string {
 	return emailInDisplayPattern.ReplaceAllStringFunc(value, maskedPublicEmail)
 }
 
+func effectiveOrganizationName(item account) string {
+	return cleanOrganizationName(item.OrganizationName)
+}
+
 func credentialMetadata(item account) map[string]any {
 	return map[string]any{
 		"email":            maskedPublicEmail(item.Email),
-		"organizationName": publicOrganizationName(item.OrganizationName),
+		"organizationName": publicOrganizationName(effectiveOrganizationName(item)),
 		"planType":         normalizePlanType(item.PlanType),
 		"planLimit":        cleanPlanLimit(item.PlanLimit),
 		"planDisplayName":  accountPlanDisplayName(item, false),
@@ -3825,6 +3946,9 @@ func credentialMetadata(item account) map[string]any {
 }
 
 func managementCredentialDisplayName(item account) string {
+	if email := maskedPublicEmail(item.Email); email != "" {
+		return email
+	}
 	if label := credentialLabel(item); label != "" {
 		return label
 	}
@@ -3835,6 +3959,9 @@ func managementCredentialDisplayName(item account) string {
 }
 
 func publicCredentialDisplayName(item account, index int) string {
+	if email := maskedPublicEmail(item.Email); email != "" {
+		return email
+	}
 	if label := credentialLabel(item); label != "" && label != item.ID {
 		return label
 	}
@@ -3884,7 +4011,7 @@ func legacyAccountDisplayName(item account) string {
 	if email != "" {
 		return email
 	}
-	if normalizePlanType(item.PlanType) != "unknown" && organizationScopedPlan(item.PlanType) && cleanOrganizationName(item.OrganizationName) != "" {
+	if normalizePlanType(item.PlanType) != "unknown" && organizationScopedPlan(item.PlanType) && effectiveOrganizationName(item) != "" {
 		return plan
 	}
 	if normalizePlanType(item.PlanType) != "unknown" {
@@ -3945,14 +4072,25 @@ func organizationNameFromMap(values map[string]any) string {
 	if values == nil {
 		return ""
 	}
-	for _, key := range []string{"organization_name", "organization_display_name", "org_name", "org_display_name", "workspace_name", "workspace_display_name", "team_name", "team_display_name", "account_name", "account_display_name", "name", "display_name", "title", "chatgpt_organization_name", "chatgpt_org_name", "chatgpt_workspace_name", "chatgpt_account_name"} {
+	for _, key := range []string{"organization_name", "organization_display_name", "org_name", "org_display_name", "workspace_name", "workspace_display_name", "team_name", "team_display_name", "account_name", "account_display_name", "chatgpt_organization_name", "chatgpt_org_name", "chatgpt_workspace_name", "chatgpt_account_name"} {
 		if value := cleanOrganizationName(claimString(values, key)); value != "" {
 			return value
 		}
 	}
-	for _, key := range []string{"organization", "org", "workspace", "team", "account", "accounts", "subscriptions", "items", "data"} {
+	if strings.EqualFold(claimString(values, "structure"), "workspace") {
+		if value := organizationNameFromNestedMap(values); value != "" {
+			return value
+		}
+	}
+	for _, key := range []string{"organization", "org", "workspace", "team"} {
 		nested, _ := values[key].(map[string]any)
 		if value := organizationNameFromNestedMap(nested); value != "" {
+			return value
+		}
+	}
+	for _, key := range []string{"account", "accounts", "subscription", "subscriptions", "entitlement", "billing", "items", "data"} {
+		nested, _ := values[key].(map[string]any)
+		if value := organizationNameFromMap(nested); value != "" {
 			return value
 		}
 		items, _ := values[key].([]any)
@@ -4166,7 +4304,7 @@ func accountPlanDisplayName(item account, withAccountSuffix bool) string {
 	if withAccountSuffix {
 		name += " account"
 	}
-	organizationName := publicOrganizationName(item.OrganizationName)
+	organizationName := publicOrganizationName(effectiveOrganizationName(item))
 	if organizationName != "" && organizationScopedPlan(plan) {
 		return name + " · " + organizationName
 	}
@@ -4182,37 +4320,14 @@ func organizationScopedPlan(plan string) bool {
 	}
 }
 
-func accountIDBase(email, plan string) string {
-	seed := normalizeEmail(email)
-	if seed == "" {
-		seed = "account"
+func generatedAccountIDBase(item account) string {
+	if isCodexDeviceAuth(item) {
+		return "acct-credential"
 	}
-	if plan := normalizePlanType(plan); plan != "unknown" {
-		seed += "-" + plan
+	if item.AuthType == "provider_api_key" {
+		return "acct-provider"
 	}
-	var builder strings.Builder
-	builder.WriteString("acct-")
-	lastDash := false
-	for _, r := range seed {
-		valid := r >= 'a' && r <= 'z' || r >= '0' && r <= '9'
-		if valid {
-			builder.WriteRune(r)
-			lastDash = false
-			continue
-		}
-		if !lastDash {
-			builder.WriteByte('-')
-			lastDash = true
-		}
-	}
-	id := strings.Trim(builder.String(), "-")
-	if len(id) > 64 {
-		id = strings.TrimRight(id[:64], "-")
-	}
-	if id == "" || id == "acct" {
-		return "acct-account"
-	}
-	return id
+	return "acct-account"
 }
 
 func (a *app) uniqueAccountIDLocked(base string) string {

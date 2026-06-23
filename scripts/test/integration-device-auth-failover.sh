@@ -44,6 +44,7 @@ docker run -d --name "$POOL" --network "$NETWORK" --network-alias codex-pool -v 
   -e CODEX_POOL_ADMIN_PASSWORD_HASH="$ADMIN_HASH" \
   -e CODEX_POOL_DEFAULT_MODEL=gpt-test \
   -e CODEX_POOL_CODEX_GATEWAY_MODE=sidecar \
+  -e CODEX_POOL_CODEX_BASE_URL=http://codex-mock:4010/backend-api \
   -e CODEX_POOL_CLIPROXY_BASE_URL=http://codex-mock:4010/v1 \
   -e CODEX_POOL_CLIPROXY_API_KEY=cliproxy-test-key \
   -e CODEX_POOL_ADMIN_ADDR=0.0.0.0:8318 \
