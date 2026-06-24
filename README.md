@@ -89,7 +89,7 @@ Pool treats the local slot ID as the management identity, but routing also track
 
 ### Preserve Pro Quota
 
-Use the `Use Pro last` switch in the admin Console to defer Pro accounts until no eligible non-Pro account is available. When this mode is enabled, a session that temporarily moved to Pro because other accounts were cooling down moves back to a non-Pro account once one becomes eligible again. Duplicate slots for the same upstream identity are still not extra capacity, but a positive quota hint on one duplicate can make the preferred non-Pro slot eligible before Pro. The switch is stored in `/data/config.json`; `CODEX_POOL_PRESERVE_PRO_QUOTA=true` only sets the initial default before the Console setting is saved.
+Use the `Use Pro last` switch in the admin Console to defer Pro accounts until no eligible non-Pro account is available. When this mode is enabled, a session that temporarily moved to Pro because other accounts were cooling down moves back to a non-Pro account once one becomes eligible again. Duplicate slots for the same upstream identity are still not extra capacity, but a positive quota hint on one duplicate can make the preferred non-Pro slot eligible before Pro. If the preferred slot has a persisted auth/quota metadata error, a healthy duplicate credential copy may represent that same non-Pro identity. The switch is stored in `/data/config.json`; `CODEX_POOL_PRESERVE_PRO_QUOTA=true` only sets the initial default before the Console setting is saved.
 
 ### Remote Admin
 

@@ -1782,10 +1782,14 @@ func (a *app) primaryUpstreamAccountIDLocked(item account, model string) string 
 	if identity == "" {
 		return ""
 	}
-	// Choose the same canonical slot the normal router would prefer, but ignore
-	// quota/cooldown/health here. Those are runtime states of a slot; duplicate
-	// detection is about identity ownership, so a secondary slot must not become
-	// capacity merely because the primary is temporarily exhausted or cooling.
+	// Choose the same canonical slot the normal router would prefer, but do not
+	// let a slot with persisted auth/quota metadata errors keep owning the
+	// identity. Duplicate slots are still not extra capacity: quota exhaustion,
+	// cooldown, and upstream 5xx on the representative do not make siblings
+	// failover targets in the same request. This exception only lets a healthy
+	// credential copy represent the same non-Pro upstream identity when the prior
+	// representative credential has been marked unusable, preventing unnecessary
+	// fallback to Pro.
 	candidates := make([]account, 0)
 	for _, candidate := range a.config.Accounts {
 		if !candidate.Enabled || !candidate.InPool {
@@ -1795,6 +1799,9 @@ func (a *app) primaryUpstreamAccountIDLocked(item account, model string) string 
 			continue
 		}
 		if !a.hasUsableAuthLocked(candidate) {
+			continue
+		}
+		if a.accountMetadataErrorLocked(candidate.ID) {
 			continue
 		}
 		if a.upstreamIdentityKeyLocked(candidate) == identity {
@@ -1820,6 +1827,10 @@ func (a *app) duplicateUpstreamAccountPrimaryLocked(item account) string {
 		return ""
 	}
 	return primaryID
+}
+
+func (a *app) accountMetadataErrorLocked(accountID string) bool {
+	return a.state.Quotas[accountID].QuotaError != nil
 }
 
 func (a *app) hasUsableAuthLocked(item account) bool {

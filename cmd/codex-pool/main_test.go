@@ -1758,6 +1758,61 @@ func TestDuplicateUpstreamQuotaHintKeepsPrimaryBeforePro(t *testing.T) {
 	}
 }
 
+func TestDuplicateUpstreamHealthyCredentialCanRepresentIdentity(t *testing.T) {
+	primaryHits := 0
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer primary.Close()
+	duplicateHits := 0
+	duplicate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		duplicateHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_team_credential_copy","object":"response","output":[]}`))
+	}))
+	defer duplicate.Close()
+	proHits := 0
+	pro := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer pro.Close()
+
+	a := testApp(t, []account{
+		{ID: "team-primary", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: primary.URL},
+		{ID: "team-duplicate", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: duplicate.URL},
+		{ID: "pro-backup", AuthType: "codex_device_auth", AccountID: "upstream-pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: pro.URL},
+	})
+	a.preserveProQuota = true
+	a.state.Quotas["team-primary"] = quotaSnapshot{AccountID: "team-primary", PlanType: "team", QuotaError: &quotaErrorInfo{Code: "token_invalidated", Message: "credential unavailable", Timestamp: time.Now().UTC()}}
+	a.state.Quotas["team-duplicate"] = quotaSnapshot{AccountID: "team-duplicate", PlanType: "team", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 99, Present: true}, Weekly: quotaWindow{Percentage: 61, Present: true}}}
+	a.state.Quotas["pro-backup"] = quotaSnapshot{AccountID: "pro-backup", PlanType: "pro", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 97, Present: true}, Weekly: quotaWindow{Percentage: 11, Present: true}}}
+	writeCodexDeviceAuth(t, a, "team-primary", "upstream-team", "team@example.test")
+	writeCodexDeviceAuth(t, a, "team-duplicate", "upstream-team", "team@example.test")
+	writeCodexDeviceAuth(t, a, "pro-backup", "upstream-pro", "pro@example.test")
+
+	// A metadata/auth error means the local credential copy is unavailable, not
+	// that the shared upstream identity should be abandoned for Pro. Select one
+	// healthy sibling as the representative, while still treating that identity
+	// as a single piece of capacity.
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "healthy-copy-before-pro")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("healthy duplicate credential routing returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if primaryHits != 0 || duplicateHits != 1 || proHits != 0 {
+		t.Fatalf("routing hits = primary:%d duplicate:%d pro:%d", primaryHits, duplicateHits, proHits)
+	}
+	session := a.state.StickySessions["gpt-test:healthy-copy-before-pro"]
+	if session.AccountID != "team-duplicate" {
+		t.Fatalf("healthy duplicate credential sticky session = %#v", session)
+	}
+}
+
 func TestDeviceAuthZeroQuotaAccountIsNotSelected(t *testing.T) {
 	zero := 0
 	emptyHits := 0

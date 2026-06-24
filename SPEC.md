@@ -938,6 +938,8 @@ Device-auth slots are local management records, not proof of separate upstream c
 
 Quota hints for duplicate slots describe the same upstream quota pool. A positive quota hint on a duplicate slot may make the preferred slot for that upstream identity eligible, especially when `Use Pro last` is enabled and non-Pro quota should be consumed before Pro. This must not make the duplicate slot itself selectable; routing still uses only the preferred slot for that identity.
 
+If the preferred local slot for an upstream identity has a persisted auth or quota metadata error, a healthy duplicate credential slot may become the single representative for that same identity. This preserves the duplicate-capacity guard while avoiding unnecessary fallback to Pro when the upstream non-Pro identity still has a usable credential copy.
+
 ---
 
 ## 10. Usage Statistics
