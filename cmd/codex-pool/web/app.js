@@ -286,6 +286,13 @@
     }).join("");
   }
 
+  function maskRouteKey(value) {
+    const key = String(value || "").trim();
+    if (!key) return "";
+    if (key.length <= 28) return key;
+    return `${key.slice(0, 16)}...${key.slice(-8)}`;
+  }
+
   function renderSticky(sessions, accounts = []) {
     const accountsByID = new Map(accounts.map((account) => [account.id, account]));
     $("#sticky-count").textContent = sessions.length === 1 ? "1 active route" : `${sessions.length} active routes`;
@@ -293,8 +300,13 @@
       const account = accountsByID.get(session.accountId);
       const accountName = account?.displayName || account?.label || "Assigned credential";
       const routeName = session.modelId || "Default model";
+      // Active routes are management diagnostics. Show a masked route key so the
+      // owner can tell sessions apart, but keep the full key out of visible text
+      // because it may include project or client-provided session hints.
+      const routeKey = maskRouteKey(session.key);
+      const sessionDetail = routeKey ? ` · Session ${escapeHTML(routeKey)}` : "";
       const expires = session.expiresAt && session.expiresAt !== "0001-01-01T00:00:00Z" ? ` · Expires ${escapeHTML(displayTime(session.expiresAt))}` : "";
-      return `<div class="sticky-item"><div><div class="sticky-key">${escapeHTML(routeName)}</div><div class="sticky-meta">${escapeHTML(accountName)} · Last used ${escapeHTML(displayTime(session.lastSuccessAt))}${expires}</div></div><button class="button secondary" type="button" data-sticky-key="${escapeHTML(session.key)}">Clear</button></div>`;
+      return `<div class="sticky-item"><div><div class="sticky-key">${escapeHTML(routeName)}</div><div class="sticky-meta">${escapeHTML(accountName)}${sessionDetail} · Last used ${escapeHTML(displayTime(session.lastSuccessAt))}${expires}</div></div><button class="button secondary" type="button" data-sticky-key="${escapeHTML(session.key)}">Clear</button></div>`;
     }).join("") : '<div class="empty-state">No active routes</div>';
   }
 

@@ -464,6 +464,9 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if strings.Contains(jsRecorder.Body.String(), "account-form") {
 		t.Fatal("admin JS still depends on add-account form inputs")
 	}
+	if !strings.Contains(jsRecorder.Body.String(), "maskRouteKey") || !strings.Contains(jsRecorder.Body.String(), "Session ") {
+		t.Fatal("admin JS must keep masked sticky route keys visible in Active routes")
+	}
 	for _, forbidden := range []string{"Device login completed", "Device login failed", "Sticky session cleared", "Refresh failed:", "No quota window", "Detected after login", "Need login"} {
 		if strings.Contains(jsRecorder.Body.String(), forbidden) {
 			t.Fatalf("admin JS still exposes internal label %q", forbidden)

@@ -1457,6 +1457,8 @@ Clear sticky session
 
 ### 16.4 Sticky session table
 
+Management-mode Active routes must show enough information for the owner to identify each sticky session. The visible row must include the model, assigned account label, last-used time, expiry, and a masked route key. Do not regress this to model-only rows: without a route key, multiple active sessions for the same model become indistinguishable. Do not render the full route key as visible text because it may include project names, client session IDs, or prompt-derived routing hints; use the full key only for authenticated management actions such as clearing the route.
+
 ```json
 {
   "key": "gpt-5.5:repo-main",
