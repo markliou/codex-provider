@@ -1738,7 +1738,7 @@ func (a *app) preferredAccountLocked(model string, excluded map[string]bool, now
 		if identity != "" && excludedIdentities[identity] {
 			continue
 		}
-		if primaryID := a.primaryUpstreamAccountIDLocked(item, model); primaryID != "" && primaryID != item.ID {
+		if primaryID := a.primaryUpstreamAccountIDLocked(item, model, now); primaryID != "" && primaryID != item.ID {
 			continue
 		}
 		eligible = append(eligible, item)
@@ -1777,19 +1777,20 @@ func (a *app) excludedUpstreamIdentitiesLocked(excluded map[string]bool) map[str
 	return identities
 }
 
-func (a *app) primaryUpstreamAccountIDLocked(item account, model string) string {
+func (a *app) primaryUpstreamAccountIDLocked(item account, model string, now time.Time) string {
 	identity := a.upstreamIdentityKeyLocked(item)
 	if identity == "" {
 		return ""
 	}
-	// Choose the same canonical slot the normal router would prefer, but do not
-	// let a slot with persisted auth/quota metadata errors keep owning the
-	// identity. Duplicate slots are still not extra capacity: quota exhaustion,
-	// cooldown, and upstream 5xx on the representative do not make siblings
-	// failover targets in the same request. This exception only lets a healthy
-	// credential copy represent the same non-Pro upstream identity when the prior
-	// representative credential has been marked unusable, preventing unnecessary
-	// fallback to Pro.
+	// Choose the representative from the local credential copies that are usable
+	// right now, not merely from the first slot with this upstream account id.
+	// ChatGPT/Codex device-auth slots from the same visible account can carry
+	// different quota snapshots or session-scoped rate limits; if a stale,
+	// zero-quota, or cooling-down slot keeps owning the identity, the router falls
+	// through to Pro while a healthy Team/Plus credential copy sits idle. The
+	// duplicate guard still applies inside one failed request through
+	// excludedUpstreamIdentitiesLocked, so a sibling is not used as an immediate
+	// retry target after the representative gets a 429/5xx.
 	candidates := make([]account, 0)
 	for _, candidate := range a.config.Accounts {
 		if !candidate.Enabled || !candidate.InPool {
@@ -1811,18 +1812,70 @@ func (a *app) primaryUpstreamAccountIDLocked(item account, model string) string 
 	if len(candidates) == 0 {
 		return ""
 	}
-	sort.SliceStable(candidates, func(i, j int) bool { return a.preferredBeforeLocked(candidates[i], candidates[j]) })
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return a.identityRepresentativeBeforeLocked(candidates[i], candidates[j], model, now)
+	})
 	return candidates[0].ID
 }
 
-func (a *app) duplicateUpstreamAccountPrimaryLocked(item account) string {
+func (a *app) identityRepresentativeBeforeLocked(left, right account, model string, now time.Time) bool {
+	leftCooldown := a.accountCoolingDownLocked(left.ID, model, now)
+	rightCooldown := a.accountCoolingDownLocked(right.ID, model, now)
+	if leftCooldown != rightCooldown {
+		return !leftCooldown
+	}
+	leftQuotaClass, leftRemaining := a.identityRepresentativeQuotaClassLocked(left)
+	rightQuotaClass, rightRemaining := a.identityRepresentativeQuotaClassLocked(right)
+	if leftQuotaClass != rightQuotaClass {
+		return leftQuotaClass > rightQuotaClass
+	}
+	if leftQuotaClass == 2 && leftRemaining != rightRemaining {
+		return leftRemaining > rightRemaining
+	}
+	return a.preferredBeforeLocked(left, right)
+}
+
+func (a *app) identityRepresentativeQuotaClassLocked(item account) (int, int) {
+	snapshot := a.state.Quotas[item.ID]
+	if snapshot.QuotaError != nil {
+		return 0, 0
+	}
+	if snapshot.Quota != nil {
+		remaining := remainingQuotaHint(*snapshot.Quota)
+		if remaining > 0 {
+			return 2, remaining
+		}
+		return 0, 0
+	}
+	if available, decided := manualQuotaAvailable(item); decided {
+		if available {
+			return 2, *item.RemainingQuota
+		}
+		return 0, 0
+	}
+	return 1, 0
+}
+
+func (a *app) accountCoolingDownLocked(accountID, model string, now time.Time) bool {
+	for _, cd := range a.state.Cooldowns[accountID] {
+		if model != "" && cd.ModelID != model {
+			continue
+		}
+		if cd.NextRetryAt.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *app) duplicateUpstreamAccountPrimaryLocked(item account, now time.Time) string {
 	// Dashboard/status view mirrors the routing rule. A duplicate slot is only
 	// called duplicate when it is otherwise active and authenticated; disabled,
 	// out-of-pool, or missing-auth slots keep their more direct status.
 	if !item.Enabled || !item.InPool || !a.hasUsableAuthLocked(item) {
 		return ""
 	}
-	primaryID := a.primaryUpstreamAccountIDLocked(item, "")
+	primaryID := a.primaryUpstreamAccountIDLocked(item, "", now)
 	if primaryID == "" || primaryID == item.ID {
 		return ""
 	}
@@ -1891,10 +1944,10 @@ func (a *app) usableLocked(item account, model string, now time.Time) bool {
 	if !item.Enabled || !item.InPool || !allowedModel(item, model) {
 		return false
 	}
-	if primaryID := a.primaryUpstreamAccountIDLocked(item, model); primaryID != "" && primaryID != item.ID {
+	if primaryID := a.primaryUpstreamAccountIDLocked(item, model, now); primaryID != "" && primaryID != item.ID {
 		return false
 	}
-	if !a.quotaAvailableLocked(item) {
+	if !a.quotaAvailableLocked(item, model, now) {
 		return false
 	}
 	if isCodexDeviceAuth(item) {
@@ -1904,15 +1957,13 @@ func (a *app) usableLocked(item account, model string, now time.Time) bool {
 	} else if item.UpstreamBaseURL == "" {
 		return false
 	}
-	for _, cd := range a.state.Cooldowns[item.ID] {
-		if cd.ModelID == model && cd.NextRetryAt.After(now) {
-			return false
-		}
+	if a.accountCoolingDownLocked(item.ID, model, now) {
+		return false
 	}
 	return true
 }
 
-func (a *app) quotaAvailableLocked(item account) bool {
+func (a *app) quotaAvailableLocked(item account, model string, now time.Time) bool {
 	snapshot := a.state.Quotas[item.ID]
 	if snapshot.QuotaError != nil {
 		return false
@@ -1921,13 +1972,13 @@ func (a *app) quotaAvailableLocked(item account) bool {
 		if remainingQuotaHint(*snapshot.Quota) > 0 {
 			return true
 		}
-		return a.sameIdentityQuotaHintAvailableLocked(item)
+		return a.sameIdentityQuotaHintAvailableLocked(item, model, now)
 	}
 	if available, decided := manualQuotaAvailable(item); decided {
 		if available {
 			return true
 		}
-		return a.sameIdentityQuotaHintAvailableLocked(item)
+		return a.sameIdentityQuotaHintAvailableLocked(item, model, now)
 	}
 	return true
 }
@@ -1950,17 +2001,17 @@ func manualQuotaAvailable(item account) (bool, bool) {
 	return false, false
 }
 
-func (a *app) sameIdentityQuotaHintAvailableLocked(item account) bool {
-	// Duplicate slots are not independent failover capacity, but a quota hint
-	// discovered on any slot with the same upstream identity describes the same
-	// upstream quota pool. Let the primary slot represent that identity when a
-	// sibling slot has a positive hint, instead of falling through to Pro merely
-	// because the primary slot carries stale or stricter zero-quota metadata.
+func (a *app) sameIdentityQuotaHintAvailableLocked(item account, model string, now time.Time) bool {
+	// This is only a last-resort eligibility hint for the current representative.
+	// The representative chooser should normally move traffic to the local
+	// credential copy that has the positive quota snapshot. Keeping this fallback
+	// prevents a transiently incomplete snapshot from forcing Pro usage, while the
+	// primary-id check below stops a zero-quota duplicate from becoming routable.
 	identity := a.upstreamIdentityKeyLocked(item)
 	if identity == "" {
 		return false
 	}
-	if primaryID := a.primaryUpstreamAccountIDLocked(item, ""); primaryID != "" && primaryID != item.ID {
+	if primaryID := a.primaryUpstreamAccountIDLocked(item, model, now); primaryID != "" && primaryID != item.ID {
 		return false
 	}
 	for _, candidate := range a.config.Accounts {
@@ -4085,7 +4136,7 @@ func (a *app) accountStatusLocked(item account, now time.Time) (string, string) 
 	// Check duplicate identity before cooldown/quota so the operator sees the
 	// structural reason this slot is not routable. The primary slot owns the
 	// upstream identity; runtime cooldown and quota are evaluated on that slot.
-	if primaryID := a.duplicateUpstreamAccountPrimaryLocked(item); primaryID != "" {
+	if primaryID := a.duplicateUpstreamAccountPrimaryLocked(item, now); primaryID != "" {
 		return "duplicate", "Duplicate upstream account; routing uses " + primaryID
 	}
 	if cooldowns := activeCooldowns(a.state.Cooldowns[item.ID], now); len(cooldowns) > 0 {

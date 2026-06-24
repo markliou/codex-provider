@@ -1677,9 +1677,10 @@ func TestDuplicateUpstreamAccountsAreNotFailoverCapacity(t *testing.T) {
 	writeCodexDeviceAuth(t, a, "slot-backup", "upstream-backup", "backup@example.test")
 
 	// Regression guard: two local device-auth slots for one upstream ChatGPT
-	// account are not two pieces of capacity. If the primary slot fails, routing
-	// must skip the duplicate slot and either use a different upstream account or
-	// fail closed.
+	// account must not become immediate retry targets inside the same request.
+	// The next request may elect a healthy sibling as the single representative,
+	// but same-request failover still skips the duplicate identity and either
+	// uses a different upstream account or fails closed.
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
 	req.Header.Set("Authorization", "Bearer client-key")
 	req.Header.Set("X-Codex-Pool-Session", "duplicate-upstream")
@@ -1696,12 +1697,12 @@ func TestDuplicateUpstreamAccountsAreNotFailoverCapacity(t *testing.T) {
 		t.Fatalf("duplicate upstream sticky session = %#v", session)
 	}
 	status, reason := a.accountStatusLocked(a.config.Accounts[1], time.Now().UTC())
-	if status != "duplicate" || !strings.Contains(reason, "slot-primary") {
-		t.Fatalf("duplicate slot status = %q, %q", status, reason)
+	if status != "ready" {
+		t.Fatalf("duplicate sibling did not become next-request representative: %q, %q", status, reason)
 	}
 }
 
-func TestDuplicateUpstreamQuotaHintKeepsPrimaryBeforePro(t *testing.T) {
+func TestDuplicateUpstreamPositiveQuotaCredentialRepresentsIdentityBeforePro(t *testing.T) {
 	primaryHits := 0
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		primaryHits++
@@ -1712,7 +1713,8 @@ func TestDuplicateUpstreamQuotaHintKeepsPrimaryBeforePro(t *testing.T) {
 	duplicateHits := 0
 	duplicate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		duplicateHits++
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_team_duplicate","object":"response","output":[]}`))
 	}))
 	defer duplicate.Close()
 	proHits := 0
@@ -1737,10 +1739,10 @@ func TestDuplicateUpstreamQuotaHintKeepsPrimaryBeforePro(t *testing.T) {
 	writeCodexDeviceAuth(t, a, "team-duplicate", "upstream-team", "team@example.test")
 	writeCodexDeviceAuth(t, a, "pro-backup", "upstream-pro", "pro@example.test")
 
-	// Same-identity quota hints belong to one upstream quota pool. Even when the
-	// canonical slot has a stricter zero snapshot, a positive sibling snapshot
-	// may make it eligible before Pro; the duplicate slot itself is still not a
-	// second routing target.
+	// The representative must come from the credential copy with positive quota,
+	// not from the stale zero-quota slot that happens to sort first. Otherwise a
+	// Team identity with healthy local auth copies falls through to Pro even
+	// though one duplicate slot can still serve the next request.
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
 	req.Header.Set("Authorization", "Bearer client-key")
 	req.Header.Set("X-Codex-Pool-Session", "team-before-pro")
@@ -1749,12 +1751,67 @@ func TestDuplicateUpstreamQuotaHintKeepsPrimaryBeforePro(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("same-identity quota routing returned %d: %s", recorder.Code, recorder.Body.String())
 	}
-	if primaryHits != 1 || duplicateHits != 0 || proHits != 0 {
+	if primaryHits != 0 || duplicateHits != 1 || proHits != 0 {
 		t.Fatalf("routing hits = primary:%d duplicate:%d pro:%d", primaryHits, duplicateHits, proHits)
 	}
 	session := a.state.StickySessions["gpt-test:team-before-pro"]
-	if session.AccountID != "team-primary" {
+	if session.AccountID != "team-duplicate" {
 		t.Fatalf("same-identity quota sticky session = %#v", session)
+	}
+}
+
+func TestDuplicateUpstreamCoolingRepresentativeUsesHealthyCredentialBeforePro(t *testing.T) {
+	primaryHits := 0
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer primary.Close()
+	duplicateHits := 0
+	duplicate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		duplicateHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_team_cooldown_duplicate","object":"response","output":[]}`))
+	}))
+	defer duplicate.Close()
+	proHits := 0
+	pro := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer pro.Close()
+
+	a := testApp(t, []account{
+		{ID: "team-primary", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: primary.URL},
+		{ID: "team-duplicate", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: duplicate.URL},
+		{ID: "pro-backup", AuthType: "codex_device_auth", AccountID: "upstream-pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: pro.URL},
+	})
+	a.preserveProQuota = true
+	a.state.Cooldowns["team-primary"] = []cooldown{{ModelID: "gpt-test", NextRetryAt: time.Now().UTC().Add(time.Minute), Reason: "rate_limited"}}
+	a.state.Quotas["team-primary"] = quotaSnapshot{AccountID: "team-primary", PlanType: "team", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 80, Present: true}, Weekly: quotaWindow{Percentage: 80, Present: true}}}
+	a.state.Quotas["team-duplicate"] = quotaSnapshot{AccountID: "team-duplicate", PlanType: "team", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 99, Present: true}, Weekly: quotaWindow{Percentage: 61, Present: true}}}
+	a.state.Quotas["pro-backup"] = quotaSnapshot{AccountID: "pro-backup", PlanType: "pro", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 97, Present: true}, Weekly: quotaWindow{Percentage: 11, Present: true}}}
+	writeCodexDeviceAuth(t, a, "team-primary", "upstream-team", "team@example.test")
+	writeCodexDeviceAuth(t, a, "team-duplicate", "upstream-team", "team@example.test")
+	writeCodexDeviceAuth(t, a, "pro-backup", "upstream-pro", "pro@example.test")
+
+	// Cooldown is scoped to the local representative that just hit a rate limit.
+	// For a later request, a healthy credential copy for the same non-Pro
+	// identity should represent that identity before the router burns Pro quota.
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "cooling-team-before-pro")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("cooldown duplicate routing returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if primaryHits != 0 || duplicateHits != 1 || proHits != 0 {
+		t.Fatalf("routing hits = primary:%d duplicate:%d pro:%d", primaryHits, duplicateHits, proHits)
+	}
+	session := a.state.StickySessions["gpt-test:cooling-team-before-pro"]
+	if session.AccountID != "team-duplicate" {
+		t.Fatalf("cooldown duplicate sticky session = %#v", session)
 	}
 }
 
