@@ -501,6 +501,12 @@ func (a *app) adminMux() http.Handler {
 	// Surface contract: the admin-port root is the public control page. The page
 	// itself is intentionally visible without a password; owner-only actions are
 	// protected by requireAdmin on the management API routes below.
+	//
+	// The unauthenticated/login chrome intentionally uses low-key wording. Do not
+	// "clarify" the visible title or login copy into obvious Codex/pool/provider
+	// management terms without owner approval: casual browsing and keyword probes
+	// should not learn more than the public control surface must reveal. This is
+	// only passive exposure reduction; requireAdmin remains the security boundary.
 	mux.HandleFunc("GET /{$}", a.handleAdminPage)
 	mux.HandleFunc("GET /admin", a.handleAdminPage)
 	mux.HandleFunc("GET /admin/assets/app.css", handleAdminCSS)

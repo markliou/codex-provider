@@ -107,6 +107,8 @@ Admin API prefix:
 
 Public mode is visible without admin login and may show pool status plus join/leave controls. Management APIs under `/admin/api/*`, except login and public-dashboard endpoints, require strong password authentication. If remote admin is enabled, require explicit opt-in with `CODEX_POOL_ALLOW_REMOTE_ADMIN=true`.
 
+Unauthenticated and login chrome must use deliberately neutral copy, such as `Service`, `Access`, and `Continue`, instead of obvious Codex, pool, provider, or admin labels. This is passive exposure reduction for casual browsing and keyword probes, not a security boundary; management APIs remain protected server-side.
+
 ---
 
 ## 2. Docker Runtime Contract

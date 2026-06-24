@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#080d14">
+  <!-- Public-facing title is intentionally neutral because this document can be fetched before unlock. -->
   <title>Service</title>
   <link rel="icon" href="/admin/assets/logo.svg" type="image/svg+xml">
   <link rel="manifest" href="/admin/manifest.webmanifest">
@@ -13,6 +14,7 @@
 <body>
   <div class="app-shell">
     <header class="topbar">
+      <!-- Keep pre-unlock chrome generic; detailed labels belong behind the unlocked mode or specific dialogs. -->
       <div class="brand"><img class="brand-mark" src="/admin/assets/logo.svg" alt="" aria-hidden="true"><span>Service</span></div>
       <div class="topbar-actions management-only">
         <span id="service-status" class="service-status">Checking service</span>
@@ -25,6 +27,7 @@
     </header>
 
     <main>
+      <!-- Neutral unlock copy is intentional; do not make this surface describe private operator functions. -->
       <section id="login-view" class="login-view" aria-labelledby="login-title">
         <form id="login-form" class="login-panel">
           <div class="eyebrow">ACCESS</div>
