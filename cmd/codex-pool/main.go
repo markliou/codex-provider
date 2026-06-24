@@ -1902,8 +1902,15 @@ func (a *app) usableLocked(item account, model string, now time.Time) bool {
 }
 
 func (a *app) quotaAvailableLocked(item account) bool {
-	if available, decided := a.quotaSnapshotAvailableLocked(item.ID); decided {
-		return available
+	snapshot := a.state.Quotas[item.ID]
+	if snapshot.QuotaError != nil {
+		return false
+	}
+	if snapshot.Quota != nil {
+		if remainingQuotaHint(*snapshot.Quota) > 0 {
+			return true
+		}
+		return a.sameIdentityQuotaHintAvailableLocked(item)
 	}
 	if available, decided := manualQuotaAvailable(item); decided {
 		if available {
@@ -1937,7 +1944,7 @@ func (a *app) sameIdentityQuotaHintAvailableLocked(item account) bool {
 	// discovered on any slot with the same upstream identity describes the same
 	// upstream quota pool. Let the primary slot represent that identity when a
 	// sibling slot has a positive hint, instead of falling through to Pro merely
-	// because the primary slot carries stale manual quota metadata.
+	// because the primary slot carries stale or stricter zero-quota metadata.
 	identity := a.upstreamIdentityKeyLocked(item)
 	if identity == "" {
 		return false

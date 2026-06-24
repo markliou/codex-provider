@@ -1702,8 +1702,6 @@ func TestDuplicateUpstreamAccountsAreNotFailoverCapacity(t *testing.T) {
 }
 
 func TestDuplicateUpstreamQuotaHintKeepsPrimaryBeforePro(t *testing.T) {
-	empty := 0
-	ready := 80
 	primaryHits := 0
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		primaryHits++
@@ -1725,20 +1723,24 @@ func TestDuplicateUpstreamQuotaHintKeepsPrimaryBeforePro(t *testing.T) {
 	defer pro.Close()
 
 	a := testApp(t, []account{
-		{ID: "team-primary", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 100, RemainingQuota: &empty, UpstreamBaseURL: primary.URL},
-		{ID: "team-duplicate", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 90, RemainingQuota: &ready, UpstreamBaseURL: duplicate.URL},
-		{ID: "pro-backup", AuthType: "codex_device_auth", AccountID: "upstream-pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 100, RemainingQuota: &ready, UpstreamBaseURL: pro.URL},
+		{ID: "team-primary", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: primary.URL},
+		{ID: "team-duplicate", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: duplicate.URL},
+		{ID: "pro-backup", AuthType: "codex_device_auth", AccountID: "upstream-pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: pro.URL},
 	})
 	a.preserveProQuota = true
 	preserve := true
 	a.config.PreserveProQuota = &preserve
+	a.state.Quotas["team-primary"] = quotaSnapshot{AccountID: "team-primary", PlanType: "team", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 99, Present: true}, Weekly: quotaWindow{Percentage: 0, Present: true}}}
+	a.state.Quotas["team-duplicate"] = quotaSnapshot{AccountID: "team-duplicate", PlanType: "team", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 99, Present: true}, Weekly: quotaWindow{Percentage: 61, Present: true}}}
+	a.state.Quotas["pro-backup"] = quotaSnapshot{AccountID: "pro-backup", PlanType: "pro", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 97, Present: true}, Weekly: quotaWindow{Percentage: 11, Present: true}}}
 	writeCodexDeviceAuth(t, a, "team-primary", "upstream-team", "team@example.test")
 	writeCodexDeviceAuth(t, a, "team-duplicate", "upstream-team", "team@example.test")
 	writeCodexDeviceAuth(t, a, "pro-backup", "upstream-pro", "pro@example.test")
 
-	// Same-identity quota hints belong to one upstream quota pool. They may make
-	// the canonical team slot eligible before Pro, but they must not make the
-	// duplicate slot itself a second routing target.
+	// Same-identity quota hints belong to one upstream quota pool. Even when the
+	// canonical slot has a stricter zero snapshot, a positive sibling snapshot
+	// may make it eligible before Pro; the duplicate slot itself is still not a
+	// second routing target.
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
 	req.Header.Set("Authorization", "Bearer client-key")
 	req.Header.Set("X-Codex-Pool-Session", "team-before-pro")
