@@ -536,15 +536,15 @@ func TestRootEndpointsAreHelpful(t *testing.T) {
 	adminRequest := httptest.NewRequest(http.MethodGet, "/", nil)
 	adminRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(adminRecorder, adminRequest)
-	if adminRecorder.Code != http.StatusFound {
+	if adminRecorder.Code != http.StatusOK {
 		t.Fatalf("admin root returned %d", adminRecorder.Code)
 	}
-	if location := adminRecorder.Header().Get("Location"); location != "/admin" {
-		t.Fatalf("admin root redirected to %q", location)
+	if body := adminRecorder.Body.String(); !strings.Contains(body, `id="dashboard-view"`) || !strings.Contains(body, `id="login-view"`) {
+		t.Fatalf("admin root did not serve dashboard shell: %s", body)
 	}
 }
 
-func TestPublicDashboardDisabledByDefaultFromEnv(t *testing.T) {
+func TestPublicDashboardEnabledByDefaultFromEnv(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
 		t.Fatal(err)
@@ -560,8 +560,36 @@ func TestPublicDashboardDisabledByDefaultFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !a.publicDashboard {
+		t.Fatal("public dashboard should be enabled by default")
+	}
+	request := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("default public dashboard returned %d", recorder.Code)
+	}
+}
+
+func TestPublicDashboardCanBeDisabledFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_POOL_DATA_DIR", dir)
+	t.Setenv("CODEX_POOL_API_KEY", "client-key")
+	t.Setenv("CODEX_POOL_PUBLIC_DASHBOARD", "false")
+	hash, err := newPasswordHash("admin-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_POOL_ADMIN_PASSWORD_HASH", hash)
+	a, err := newAppFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a.publicDashboard {
-		t.Fatal("public dashboard should be disabled by default")
+		t.Fatal("public dashboard should be disabled by explicit env")
 	}
 	request := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
 	recorder := httptest.NewRecorder()

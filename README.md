@@ -46,15 +46,16 @@ Open these paths after startup:
 
 ```text
 Public API: http://<api-host>:<api-port>/v1
+Control UI: http://<admin-host>:<admin-port>/
 Admin UI:   http://<admin-host>:<admin-port>/admin
 Health:     http://<api-host>:<api-port>/healthz
 ```
 
-The admin root redirects to `/admin`. Public API root intentionally returns `404` so the API port does not advertise service details in a browser. Public API endpoints under `/v1` and `/healthz` require the configured API key.
+The admin-port root and `/admin` serve the same control page. Public mode is visible without a password; selecting `Access` unlocks management mode after password authentication. Public API root intentionally returns `404` so the API port does not advertise service details in a browser. Public API endpoints under `/v1` and `/healthz` require the configured API key.
 
 ### Add Codex Accounts
 
-Open `/admin`, sign in, then select `Add account`. The UI does not ask for any account fields. It creates an independent Codex credential slot, starts device auth, and shows only the verification URL, user code, and a 15 minute countdown. After you complete the browser login, subscription tier, upstream account ID, email, and organization are stored as credential metadata. They are shown as secondary status information, but the slot ID remains the primary identity used by routing and management. Do not select models during onboarding; model access is discovered from the authenticated Codex credential and Codex clients can request the model they want later.
+Open the control page, select `Access`, sign in, then select `Add account`. The UI does not ask for any account fields. It creates an independent Codex credential slot, starts device auth, and shows only the verification URL, user code, and a 15 minute countdown. After you complete the browser login, subscription tier, upstream account ID, email, and organization are stored as credential metadata. They are shown as secondary status information, but the slot ID remains the primary identity used by routing and management. Do not select models during onboarding; model access is discovered from the authenticated Codex credential and Codex clients can request the model they want later.
 
 The container runs Codex CLI device auth with:
 
@@ -99,9 +100,9 @@ Do not forward the admin port directly from the Internet: the admin service does
 
 ### Public Status And Protected Management
 
-`GET /admin` opens the management page. Unauthenticated public pool status is disabled by default to reduce scan surface. If you need trusted account owners to join or leave the pool without the admin password, set `CODEX_POOL_PUBLIC_DASHBOARD=true`; the public JSON uses an opaque per-process account reference for this toggle and returns only a partially masked email for account recognition. It never returns full email addresses, account IDs, upstream URLs, API keys, sticky sessions, traffic details, quota error codes, or upstream error bodies.
+`GET /` on the admin port and `GET /admin` open the control page. Unauthenticated public pool status and join/leave controls are enabled by default; set `CODEX_POOL_PUBLIC_DASHBOARD=false` only when the public control page should be hidden. The public JSON uses an opaque per-process account reference for this toggle and returns only a partially masked email for account recognition. It never returns full email addresses, account IDs, upstream URLs, API keys, sticky sessions, traffic details, quota error codes, or upstream error bodies.
 
-Authenticate with the admin password to add accounts, remove accounts, restart device auth, and inspect or clear sticky sessions. Both views use the same admin port `8318`; no additional port is required. The dashboard auto-refreshes every five minutes; use `Refresh` for an immediate status read.
+Authenticate with the admin password to add accounts, remove accounts, restart device auth, and inspect or clear sticky sessions. Public and management modes use the same admin port `8318`; no additional port is required. The dashboard auto-refreshes every five minutes; use `Refresh` for an immediate status read.
 
 ## Codex CLI
 

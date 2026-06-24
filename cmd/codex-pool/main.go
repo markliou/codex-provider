@@ -286,7 +286,7 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	publicDashboard, err := boolFromEnv("CODEX_POOL_PUBLIC_DASHBOARD")
+	publicDashboard, err := boolFromEnvDefault("CODEX_POOL_PUBLIC_DASHBOARD", true)
 	if err != nil {
 		return nil, err
 	}
@@ -491,7 +491,7 @@ func (a *app) publicMux() http.Handler {
 
 func (a *app) adminMux() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", a.handleAdminRoot)
+	mux.HandleFunc("GET /{$}", a.handleAdminPage)
 	mux.HandleFunc("GET /admin", a.handleAdminPage)
 	mux.HandleFunc("GET /admin/assets/app.css", handleAdminCSS)
 	mux.HandleFunc("GET /admin/assets/app.js", handleAdminJS)
@@ -518,10 +518,6 @@ func (a *app) adminMux() http.Handler {
 
 func (a *app) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
-}
-
-func (a *app) handleAdminRoot(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/admin", http.StatusFound)
 }
 
 func (a *app) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -4501,10 +4497,14 @@ func promptCacheRetentionFromEnv() (string, error) {
 }
 
 func boolFromEnv(name string) (bool, error) {
+	return boolFromEnvDefault(name, false)
+}
+
+func boolFromEnvDefault(name string, fallback bool) (bool, error) {
 	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
 	switch value {
 	case "":
-		return false, nil
+		return fallback, nil
 	case "1", "true", "yes", "on":
 		return true, nil
 	case "0", "false", "no", "off":

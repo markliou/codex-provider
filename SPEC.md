@@ -82,9 +82,9 @@ POST /v1/responses
 POST /v1/chat/completions
 ```
 
-### 1.2 Admin UI/API surface
+### 1.2 Control UI and Admin API surface
 
-This is used only by the owner to manage accounts, quota status, sticky sessions, cooldowns, and runtime settings.
+This serves a public control page for account owners and a password-protected management mode for the owner.
 
 Default bind:
 
@@ -92,9 +92,10 @@ Default bind:
 127.0.0.1:8318
 ```
 
-Admin UI path:
+UI paths:
 
 ```text
+GET /
 GET /admin
 ```
 
@@ -104,7 +105,7 @@ Admin API prefix:
 /admin/api/*
 ```
 
-Do not expose `/admin` to the public Internet by default. If remote admin is enabled, require explicit opt-in with `CODEX_POOL_ALLOW_REMOTE_ADMIN=true` and strong password authentication.
+Public mode is visible without admin login and may show pool status plus join/leave controls. Management APIs under `/admin/api/*`, except login and public-dashboard endpoints, require strong password authentication. If remote admin is enabled, require explicit opt-in with `CODEX_POOL_ALLOW_REMOTE_ADMIN=true`.
 
 ---
 
@@ -143,7 +144,7 @@ docker run -d \
 | `CODEX_POOL_PUBLIC_ADDR` | no | `0.0.0.0:8317` | Public API bind address. |
 | `CODEX_POOL_ADMIN_ADDR` | no | `127.0.0.1:8318` | Admin UI/API bind address. |
 | `CODEX_POOL_ALLOW_REMOTE_ADMIN` | no | `false` | Required if admin address is non-loopback. |
-| `CODEX_POOL_PUBLIC_DASHBOARD` | no | `false` | Enable unauthenticated public pool status and join/leave controls. Keep disabled unless the admin port is protected by network controls. |
+| `CODEX_POOL_PUBLIC_DASHBOARD` | no | `true` | Enable unauthenticated public pool status and join/leave controls on the control page. Set to `false` to hide the public mode. |
 | `CODEX_POOL_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error`. |
 | `CODEX_POOL_REDACT_LOGS` | no | `true` | Redact tokens, auth headers, API keys, refresh tokens. |
 | `CODEX_POOL_DEFAULT_MODEL` | no | `gpt-5.5(xhigh)` | Default model when request omits model. |
@@ -1401,7 +1402,7 @@ Build a minimal web UI on the single admin port.
 
 ### 16.1 Pages
 
-Single-page dashboard is enough. Public mode is visible without admin login and may show pool status plus join/leave pool controls. Management mode is unlocked with the admin password and is reserved for account creation, deletion, device-auth repair, and sticky-session inspection.
+Single-page dashboard is enough. `/` on the admin port and `/admin` serve the same page. Public mode is visible without admin login and may show pool status plus join/leave pool controls. Management mode is unlocked with the admin password and is reserved for account creation, deletion, device-auth repair, and sticky-session inspection.
 
 Sections:
 
