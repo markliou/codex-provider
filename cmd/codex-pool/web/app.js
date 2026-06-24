@@ -119,6 +119,9 @@
   }
 
   async function showPublicDashboard() {
+    // Product contract: the control page opens in public mode. Do not replace
+    // this with an immediate login screen; password auth unlocks management mode
+    // on the same page, while public status stays visible by default.
     state.mode = "public";
     $("#dashboard-eyebrow").textContent = "SERVICE STATUS";
     $("#dashboard-title").textContent = "Pool status";

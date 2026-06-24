@@ -286,6 +286,10 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Product contract: the admin-port root is a public control page, while
+	// management actions require password auth. A previous hardening pass flipped
+	// this default and broke the expected landing page, so keep the default true
+	// unless the operator explicitly hides the public control view.
 	publicDashboard, err := boolFromEnvDefault("CODEX_POOL_PUBLIC_DASHBOARD", true)
 	if err != nil {
 		return nil, err
@@ -656,6 +660,10 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		response, err := a.forward(r.Context(), candidate, endpoint, outBody, r.Header.Get("Accept"))
 		if err != nil {
 			excluded[candidate.ID] = true
+			// A revoked or invalid device-auth credential must not end the user
+			// request while other upstream accounts are eligible. Mark it
+			// unavailable and continue; selectAccount also suppresses any local
+			// duplicate slot for the same upstream identity during this attempt.
 			if errors.Is(err, errAccountAuthFailed) {
 				a.markAccountAuthFailure(candidate.ID, model, "account_auth_failed")
 				continue
@@ -667,6 +675,9 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			body, _ := io.ReadAll(io.LimitReader(response.Body, maxRequestBody))
 			_ = response.Body.Close()
 			excluded[candidate.ID] = true
+			// 401/403 from an upstream account is credential state, not quota or
+			// transient capacity. Keep the error body out of persisted state and
+			// route to a different upstream account if one exists.
 			reason := codeOr(extractUpstreamErrorCode(body), "account_auth_failed")
 			a.markAccountAuthFailure(candidate.ID, model, reason)
 			continue
@@ -807,6 +818,9 @@ func oauthRefreshAuthFailureStatus(status int) bool {
 }
 
 func markAccountAuthError(err error) error {
+	// This sentinel separates credential failures from transport failures. The
+	// proxy loop uses it to quarantine the account and try another eligible
+	// account instead of turning one revoked token into a request outage.
 	if err == nil {
 		return errAccountAuthFailed
 	}
@@ -1175,6 +1189,9 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "not found")
 		return
 	}
+	// This endpoint is intentionally unauthenticated: it powers the public
+	// control page on the admin port. Keep it redacted and limited to pool state;
+	// owner-only state stays behind requireAdmin routes.
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	now := time.Now().UTC()
@@ -1190,6 +1207,9 @@ func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) 
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "not found")
 		return
 	}
+	// Public users may only join/leave the pool through an opaque per-process
+	// reference. Do not add account IDs, delete/login actions, or unmasked
+	// metadata to this surface; those belong to authenticated management APIs.
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/admin/api/public-dashboard/accounts/"), "/")
 	if len(parts) != 2 || parts[0] == "" {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "public account action not found")
@@ -1700,6 +1720,9 @@ func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (
 
 func (a *app) preferredAccountLocked(model string, excluded map[string]bool, now time.Time) (account, bool) {
 	eligible := make([]account, 0)
+	// `excluded` is per user request. If one local slot failed, any other slot
+	// with the same upstream identity must be excluded too; otherwise a single
+	// upstream ChatGPT account can masquerade as multiple failover accounts.
 	excludedIdentities := a.excludedUpstreamIdentitiesLocked(excluded)
 	for _, item := range a.config.Accounts {
 		if excluded[item.ID] || !a.usableLocked(item, model, now) {
@@ -1753,6 +1776,10 @@ func (a *app) primaryUpstreamAccountIDLocked(item account, model string) string 
 	if identity == "" {
 		return ""
 	}
+	// Choose the same canonical slot the normal router would prefer, but ignore
+	// quota/cooldown/health here. Those are runtime states of a slot; duplicate
+	// detection is about identity ownership, so a secondary slot must not become
+	// capacity merely because the primary is temporarily exhausted or cooling.
 	candidates := make([]account, 0)
 	for _, candidate := range a.config.Accounts {
 		if !candidate.Enabled || !candidate.InPool {
@@ -1776,6 +1803,9 @@ func (a *app) primaryUpstreamAccountIDLocked(item account, model string) string 
 }
 
 func (a *app) duplicateUpstreamAccountPrimaryLocked(item account) string {
+	// Dashboard/status view mirrors the routing rule. A duplicate slot is only
+	// called duplicate when it is otherwise active and authenticated; disabled,
+	// out-of-pool, or missing-auth slots keep their more direct status.
 	if !item.Enabled || !item.InPool || !a.hasUsableAuthLocked(item) {
 		return ""
 	}
@@ -2706,6 +2736,9 @@ func (a *app) refreshedCodexAuthContext(ctx context.Context, item account) (code
 
 func (a *app) activeCodexAuthContext(ctx context.Context, item account) (codexAuthInfo, error) {
 	if a.usesCliproxySidecar(item) {
+		// In sidecar mode, inference uses the sidecar-owned auth copy. Pool must
+		// not refresh the original Codex CLI auth file on the request path, or the
+		// two processes can race refresh-token rotation.
 		return a.cliproxyCodexAuth(item)
 	}
 	return a.refreshedCodexAuthContext(ctx, item)
@@ -3978,6 +4011,9 @@ func (a *app) accountStatusLocked(item account, now time.Time) (string, string) 
 	if !item.InPool {
 		return "standby", "Account is not in the pool"
 	}
+	// Check duplicate identity before cooldown/quota so the operator sees the
+	// structural reason this slot is not routable. The primary slot owns the
+	// upstream identity; runtime cooldown and quota are evaluated on that slot.
 	if primaryID := a.duplicateUpstreamAccountPrimaryLocked(item); primaryID != "" {
 		return "duplicate", "Duplicate upstream account; routing uses " + primaryID
 	}
@@ -4072,6 +4108,8 @@ func publicDashboardStatus(status string) (string, string) {
 	case "standby":
 		return "standby", "Out of pool"
 	case "duplicate":
+		// Public mode groups duplicate slots with standby visually, but keeps the
+		// label explicit so users do not interpret the slot as extra capacity.
 		return "standby", "Duplicate"
 	default:
 		return "error", "Unavailable"
