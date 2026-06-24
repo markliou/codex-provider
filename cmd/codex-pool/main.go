@@ -1902,17 +1902,64 @@ func (a *app) usableLocked(item account, model string, now time.Time) bool {
 }
 
 func (a *app) quotaAvailableLocked(item account) bool {
-	snapshot := a.state.Quotas[item.ID]
-	if snapshot.QuotaError != nil {
-		return false
+	if available, decided := a.quotaSnapshotAvailableLocked(item.ID); decided {
+		return available
 	}
-	if snapshot.Quota != nil {
-		return remainingQuotaHint(*snapshot.Quota) > 0
-	}
-	if item.RemainingQuota != nil {
-		return *item.RemainingQuota > 0
+	if available, decided := manualQuotaAvailable(item); decided {
+		if available {
+			return true
+		}
+		return a.sameIdentityQuotaHintAvailableLocked(item)
 	}
 	return true
+}
+
+func (a *app) quotaSnapshotAvailableLocked(accountID string) (bool, bool) {
+	snapshot := a.state.Quotas[accountID]
+	if snapshot.QuotaError != nil {
+		return false, true
+	}
+	if snapshot.Quota != nil {
+		return remainingQuotaHint(*snapshot.Quota) > 0, true
+	}
+	return false, false
+}
+
+func manualQuotaAvailable(item account) (bool, bool) {
+	if item.RemainingQuota != nil {
+		return *item.RemainingQuota > 0, true
+	}
+	return false, false
+}
+
+func (a *app) sameIdentityQuotaHintAvailableLocked(item account) bool {
+	// Duplicate slots are not independent failover capacity, but a quota hint
+	// discovered on any slot with the same upstream identity describes the same
+	// upstream quota pool. Let the primary slot represent that identity when a
+	// sibling slot has a positive hint, instead of falling through to Pro merely
+	// because the primary slot carries stale manual quota metadata.
+	identity := a.upstreamIdentityKeyLocked(item)
+	if identity == "" {
+		return false
+	}
+	if primaryID := a.primaryUpstreamAccountIDLocked(item, ""); primaryID != "" && primaryID != item.ID {
+		return false
+	}
+	for _, candidate := range a.config.Accounts {
+		if candidate.ID == item.ID || !candidate.Enabled || !candidate.InPool || !a.hasUsableAuthLocked(candidate) {
+			continue
+		}
+		if a.upstreamIdentityKeyLocked(candidate) != identity {
+			continue
+		}
+		if available, decided := a.quotaSnapshotAvailableLocked(candidate.ID); decided && available {
+			return true
+		}
+		if available, decided := manualQuotaAvailable(candidate); decided && available {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *app) proAccountLocked(item account) bool {

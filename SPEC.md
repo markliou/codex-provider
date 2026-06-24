@@ -936,6 +936,8 @@ Quota refresh must not block normal `/v1` request handling. Run refresh jobs in 
 
 Device-auth slots are local management records, not proof of separate upstream capacity. If multiple enabled, in-pool slots resolve to the same upstream ChatGPT/Codex account identity, routing must treat only the preferred slot as eligible. Duplicate slots must be shown as duplicate/standby in the dashboard and must not be selected as failover capacity after the preferred slot fails. This protects the pool from reusing the same upstream account through multiple local device-auth sessions from the same host/IP, which can amplify shared quota, refresh-token revocation, and team-workspace policy failures.
 
+Quota hints for duplicate slots describe the same upstream quota pool. A positive quota hint on a duplicate slot may make the preferred slot for that upstream identity eligible, especially when `Use Pro last` is enabled and non-Pro quota should be consumed before Pro. This must not make the duplicate slot itself selectable; routing still uses only the preferred slot for that identity.
+
 ---
 
 ## 10. Usage Statistics

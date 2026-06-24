@@ -1701,6 +1701,61 @@ func TestDuplicateUpstreamAccountsAreNotFailoverCapacity(t *testing.T) {
 	}
 }
 
+func TestDuplicateUpstreamQuotaHintKeepsPrimaryBeforePro(t *testing.T) {
+	empty := 0
+	ready := 80
+	primaryHits := 0
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_team_primary","object":"response","output":[]}`))
+	}))
+	defer primary.Close()
+	duplicateHits := 0
+	duplicate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		duplicateHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer duplicate.Close()
+	proHits := 0
+	pro := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer pro.Close()
+
+	a := testApp(t, []account{
+		{ID: "team-primary", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 100, RemainingQuota: &empty, UpstreamBaseURL: primary.URL},
+		{ID: "team-duplicate", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 90, RemainingQuota: &ready, UpstreamBaseURL: duplicate.URL},
+		{ID: "pro-backup", AuthType: "codex_device_auth", AccountID: "upstream-pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 100, RemainingQuota: &ready, UpstreamBaseURL: pro.URL},
+	})
+	a.preserveProQuota = true
+	preserve := true
+	a.config.PreserveProQuota = &preserve
+	writeCodexDeviceAuth(t, a, "team-primary", "upstream-team", "team@example.test")
+	writeCodexDeviceAuth(t, a, "team-duplicate", "upstream-team", "team@example.test")
+	writeCodexDeviceAuth(t, a, "pro-backup", "upstream-pro", "pro@example.test")
+
+	// Same-identity quota hints belong to one upstream quota pool. They may make
+	// the canonical team slot eligible before Pro, but they must not make the
+	// duplicate slot itself a second routing target.
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "team-before-pro")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("same-identity quota routing returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if primaryHits != 1 || duplicateHits != 0 || proHits != 0 {
+		t.Fatalf("routing hits = primary:%d duplicate:%d pro:%d", primaryHits, duplicateHits, proHits)
+	}
+	session := a.state.StickySessions["gpt-test:team-before-pro"]
+	if session.AccountID != "team-primary" {
+		t.Fatalf("same-identity quota sticky session = %#v", session)
+	}
+}
+
 func TestDeviceAuthZeroQuotaAccountIsNotSelected(t *testing.T) {
 	zero := 0
 	emptyHits := 0
