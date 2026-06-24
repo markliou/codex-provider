@@ -208,6 +208,7 @@ type app struct {
 	publicAddress        string
 	adminAddress         string
 	allowRemoteAdmin     bool
+	publicDashboard      bool
 	codexBaseURL         string
 	codexGatewayMode     string
 	cliproxyBaseURL      string
@@ -285,6 +286,10 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
+	publicDashboard, err := boolFromEnv("CODEX_POOL_PUBLIC_DASHBOARD")
+	if err != nil {
+		return nil, err
+	}
 
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
@@ -304,6 +309,7 @@ func newAppFromEnv() (*app, error) {
 		publicAddress:        publicAddress,
 		adminAddress:         adminAddress,
 		allowRemoteAdmin:     allowRemote,
+		publicDashboard:      publicDashboard,
 		codexBaseURL:         strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
 		codexGatewayMode:     codexGatewayMode,
 		cliproxyBaseURL:      strings.TrimRight(envOr("CODEX_POOL_CLIPROXY_BASE_URL", cliproxyBaseURLDefault), "/"),
@@ -485,7 +491,7 @@ func (a *app) publicMux() http.Handler {
 
 func (a *app) adminMux() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", a.handleAdminRoot)
+	mux.HandleFunc("GET /{$}", a.handleNotFound)
 	mux.HandleFunc("GET /admin", a.handleAdminPage)
 	mux.HandleFunc("GET /admin/assets/app.css", handleAdminCSS)
 	mux.HandleFunc("GET /admin/assets/app.js", handleAdminJS)
@@ -512,18 +518,15 @@ func (a *app) adminMux() http.Handler {
 
 func (a *app) handlePublicRoot(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":        true,
-		"service":   "codex-pool",
-		"api":       "/v1",
-		"health":    "/healthz",
-		"admin":     "/admin on the configured admin port",
-		"message":   "Use /v1 for Codex/OpenAI-compatible API requests. Use /admin on the admin port for the dashboard.",
-		"adminPort": "container 8318 by default",
+		"ok":      true,
+		"service": "api",
+		"api":     "/v1",
+		"health":  "/healthz",
 	})
 }
 
-func (a *app) handleAdminRoot(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/admin", http.StatusFound)
+func (a *app) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	http.NotFound(w, r)
 }
 
 func (a *app) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -1171,6 +1174,10 @@ func (a *app) adminStateLocked(now time.Time) map[string]any {
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
+	if !a.publicDashboard {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "not found")
+		return
+	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	now := time.Now().UTC()
@@ -1182,6 +1189,10 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) {
+	if !a.publicDashboard {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "not found")
+		return
+	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/admin/api/public-dashboard/accounts/"), "/")
 	if len(parts) != 2 || parts[0] == "" {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "public account action not found")

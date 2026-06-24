@@ -111,23 +111,27 @@
     dashboardView.hidden = false;
     $$(".management-only").forEach((element) => { element.hidden = false; });
     $$(".public-only").forEach((element) => { element.hidden = true; });
-    $("#dashboard-eyebrow").textContent = "ADMIN";
+    $("#dashboard-eyebrow").textContent = "MANAGE";
     $("#dashboard-title").textContent = "Account pool";
     refresh();
     window.clearInterval(state.refreshTimer);
     state.refreshTimer = window.setInterval(() => refresh(true), refreshIntervalMs);
   }
 
-  function showPublicDashboard() {
+  async function showPublicDashboard() {
     state.mode = "public";
+    $("#dashboard-eyebrow").textContent = "SERVICE STATUS";
+    $("#dashboard-title").textContent = "Pool status";
+    window.clearInterval(state.refreshTimer);
+    const ok = await refreshPublic(true);
+    if (!ok && state.mode === "public") {
+      showLogin();
+      return;
+    }
     loginView.hidden = true;
     dashboardView.hidden = false;
     $$(".management-only").forEach((element) => { element.hidden = true; });
     $$(".public-only").forEach((element) => { element.hidden = false; });
-    $("#dashboard-eyebrow").textContent = "SERVICE STATUS";
-    $("#dashboard-title").textContent = "Pool status";
-    refreshPublic();
-    window.clearInterval(state.refreshTimer);
     state.refreshTimer = window.setInterval(() => refreshPublic(true), refreshIntervalMs);
   }
 
@@ -315,8 +319,10 @@
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
       renderSummary(body.dashboard.summary || {}, true);
       renderPublicAccounts(body.dashboard.accounts || []);
+      return true;
     } catch (error) {
       if (!silent) notify(error.message, true);
+      return false;
     }
   }
 

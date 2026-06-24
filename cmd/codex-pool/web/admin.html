@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#080d14">
-  <title>Codex Pool</title>
+  <title>Service</title>
   <link rel="icon" href="/admin/assets/logo.svg" type="image/svg+xml">
   <link rel="manifest" href="/admin/manifest.webmanifest">
   <link rel="stylesheet" href="/admin/assets/app.css">
@@ -13,22 +13,22 @@
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand"><img class="brand-mark" src="/admin/assets/logo.svg" alt="" aria-hidden="true"><span>Codex Pool</span></div>
+      <div class="brand"><img class="brand-mark" src="/admin/assets/logo.svg" alt="" aria-hidden="true"><span>Service</span></div>
       <div class="topbar-actions management-only">
         <span id="service-status" class="service-status">Checking service</span>
         <button id="refresh-button" class="button secondary" type="button">Refresh</button>
         <button id="logout-button" class="button quiet" type="button">Sign out</button>
       </div>
       <div class="topbar-actions public-only">
-        <button id="sign-in-button" class="button quiet" type="button">Admin</button>
+        <button id="sign-in-button" class="button quiet" type="button">Access</button>
       </div>
     </header>
 
     <main>
       <section id="login-view" class="login-view" aria-labelledby="login-title">
         <form id="login-form" class="login-panel">
-          <div class="eyebrow">ADMIN</div>
-          <h1 id="login-title">Sign in</h1>
+          <div class="eyebrow">ACCESS</div>
+          <h1 id="login-title">Continue</h1>
           <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
           <p id="login-error" class="form-error" role="alert" hidden></p>
           <button class="button primary full" type="submit">Continue</button>
@@ -75,7 +75,7 @@
       </section>
     </main>
     <footer class="app-footer">
-      <span>Codex Pool v2026.06.23.10</span>
+      <span>v2026.06.24.01</span>
     </footer>
   </div>
 

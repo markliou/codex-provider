@@ -46,11 +46,11 @@ Open these paths after startup:
 
 ```text
 Public API: http://<server-host>:8317/v1
-Admin UI:   http://<server-host>:8318/admin
+Admin UI:   http://127.0.0.1:8318/admin
 Health:     http://<server-host>:8317/healthz
 ```
 
-The admin root `http://<server-host>:8318/` redirects to `/admin`. Public API paths, including `/` and `/healthz`, require the configured API key; unauthenticated requests receive `401`, while authenticated root requests receive a small service-info JSON response.
+The admin root `http://127.0.0.1:8318/` intentionally returns `404`; open `/admin` directly. Public API paths, including `/` and `/healthz`, require the configured API key; unauthenticated requests receive `401`, while authenticated root requests receive a small service-info JSON response that does not advertise the admin path.
 
 Docker port mapping is always `host:container`. To expose the service externally as `<api-port>` for API and `<admin-port>` for admin while keeping the container defaults, use:
 
@@ -116,9 +116,9 @@ Do not forward TCP `8318` directly from the Internet: the admin service does not
 
 ### Public Status And Protected Management
 
-`GET /admin` opens the shared dashboard. Without signing in, it shows pool status and lets trusted account owners join or leave the pool. The public JSON uses an opaque per-process account reference for this toggle and returns only a partially masked email for account recognition; it never returns full email addresses, account IDs, upstream URLs, API keys, sticky sessions, traffic details, quota error codes, or upstream error bodies.
+`GET /admin` opens the management page. Unauthenticated public pool status is disabled by default to reduce scan surface. If you need trusted account owners to join or leave the pool without the admin password, set `CODEX_POOL_PUBLIC_DASHBOARD=true`; the public JSON uses an opaque per-process account reference for this toggle and returns only a partially masked email for account recognition. It never returns full email addresses, account IDs, upstream URLs, API keys, sticky sessions, traffic details, quota error codes, or upstream error bodies.
 
-Select `Console` on the same page to authenticate with the admin password. Only an authenticated owner can add accounts, remove accounts, restart device auth, and inspect or clear sticky sessions. Both views use the same admin port `8318`; no additional port is required. The dashboard auto-refreshes every five minutes; use `Refresh` for an immediate status read.
+Authenticate with the admin password to add accounts, remove accounts, restart device auth, and inspect or clear sticky sessions. Both views use the same admin port `8318`; no additional port is required. The dashboard auto-refreshes every five minutes; use `Refresh` for an immediate status read.
 
 ## Codex CLI
 

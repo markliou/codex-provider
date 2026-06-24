@@ -143,6 +143,7 @@ docker run -d \
 | `CODEX_POOL_PUBLIC_ADDR` | no | `0.0.0.0:8317` | Public API bind address. |
 | `CODEX_POOL_ADMIN_ADDR` | no | `127.0.0.1:8318` | Admin UI/API bind address. |
 | `CODEX_POOL_ALLOW_REMOTE_ADMIN` | no | `false` | Required if admin address is non-loopback. |
+| `CODEX_POOL_PUBLIC_DASHBOARD` | no | `false` | Enable unauthenticated public pool status and join/leave controls. Keep disabled unless the admin port is protected by network controls. |
 | `CODEX_POOL_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error`. |
 | `CODEX_POOL_REDACT_LOGS` | no | `true` | Redact tokens, auth headers, API keys, refresh tokens. |
 | `CODEX_POOL_DEFAULT_MODEL` | no | `gpt-5.5(xhigh)` | Default model when request omits model. |

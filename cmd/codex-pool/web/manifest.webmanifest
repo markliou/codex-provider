@@ -1,6 +1,6 @@
 {
-  "name": "Codex Pool",
-  "short_name": "Codex Pool",
+  "name": "Service",
+  "short_name": "Service",
   "start_url": "/admin",
   "scope": "/admin",
   "display": "standalone",

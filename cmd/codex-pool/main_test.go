@@ -30,7 +30,7 @@ func testApp(t *testing.T, accounts []account) *app {
 		config:  config{DefaultModel: "gpt-test", ModelAliases: map[string]string{"alias": "gpt-test"}, Accounts: accounts},
 		state:   state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}},
 		dataDir: dir, apiKeys: [][]byte{[]byte("client-key")}, adminUser: "admin", adminHash: []byte(hash),
-		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, promptCacheKeyMode: "auto", codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second},
+		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, promptCacheKeyMode: "auto", publicDashboard: true, codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second},
 	}
 }
 
@@ -445,12 +445,12 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page still includes %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"ADMIN", "Sign in", "Password", "Add account", "Use Pro last", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown"} {
+	for _, expected := range []string{"ACCESS", "Continue", "Password", "Add account", "Use Pro last", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page does not include low-key label %q", expected)
 		}
 	}
-	for _, forbidden := range []string{"Console", "Preserve Pro quota", "PUBLIC STATUS", "DEVICE AUTH", "Passphrase", "Sticky sessions"} {
+	for _, forbidden := range []string{"Codex Pool", "ADMIN", "Sign in", "Console", "Preserve Pro quota", "PUBLIC STATUS", "DEVICE AUTH", "Passphrase", "Sticky sessions"} {
 		if strings.Contains(recorder.Body.String(), forbidden) {
 			t.Fatalf("admin page still exposes internal label %q", forbidden)
 		}
@@ -514,7 +514,7 @@ func TestRootEndpointsAreHelpful(t *testing.T) {
 	if publicRecorder.Code != http.StatusOK {
 		t.Fatalf("public root with key returned %d", publicRecorder.Code)
 	}
-	if body := publicRecorder.Body.String(); !strings.Contains(body, "codex-pool") || !strings.Contains(body, "/v1") {
+	if body := publicRecorder.Body.String(); strings.Contains(body, "admin") || !strings.Contains(body, "/v1") {
 		t.Fatalf("public root did not describe service endpoints: %s", body)
 	}
 
@@ -536,11 +536,35 @@ func TestRootEndpointsAreHelpful(t *testing.T) {
 	adminRequest := httptest.NewRequest(http.MethodGet, "/", nil)
 	adminRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(adminRecorder, adminRequest)
-	if adminRecorder.Code != http.StatusFound {
+	if adminRecorder.Code != http.StatusNotFound {
 		t.Fatalf("admin root returned %d", adminRecorder.Code)
 	}
-	if location := adminRecorder.Header().Get("Location"); location != "/admin" {
-		t.Fatalf("admin root redirected to %q", location)
+}
+
+func TestPublicDashboardDisabledByDefaultFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_POOL_DATA_DIR", dir)
+	t.Setenv("CODEX_POOL_API_KEY", "client-key")
+	hash, err := newPasswordHash("admin-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_POOL_ADMIN_PASSWORD_HASH", hash)
+	a, err := newAppFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.publicDashboard {
+		t.Fatal("public dashboard should be disabled by default")
+	}
+	request := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("disabled public dashboard returned %d", recorder.Code)
 	}
 }
 
