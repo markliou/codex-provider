@@ -1112,7 +1112,7 @@ Response:
     "defaultProfile": null,
     "apiPortUrl": "http://127.0.0.1:8317/v1",
     "baseUrl": "http://localhost:8317/v1",
-    "lanBaseUrl": "http://<lan-host>:8317/v1",
+    "lanBaseUrl": "http://<lan-host>:<api-port>/v1",
     "modelIds": ["gpt-5.5", "gpt-5.5(high)"],
     "modelPricingPresets": [],
     "lastError": null,

@@ -503,7 +503,7 @@ func TestRootEndpointsAreHelpful(t *testing.T) {
 	publicRequest := httptest.NewRequest(http.MethodGet, "/", nil)
 	publicRecorder := httptest.NewRecorder()
 	a.publicMux().ServeHTTP(publicRecorder, publicRequest)
-	if publicRecorder.Code != http.StatusUnauthorized {
+	if publicRecorder.Code != http.StatusNotFound {
 		t.Fatalf("public root without key returned %d", publicRecorder.Code)
 	}
 
@@ -511,11 +511,11 @@ func TestRootEndpointsAreHelpful(t *testing.T) {
 	publicRequest.Header.Set("Authorization", "Bearer client-key")
 	publicRecorder = httptest.NewRecorder()
 	a.publicMux().ServeHTTP(publicRecorder, publicRequest)
-	if publicRecorder.Code != http.StatusOK {
+	if publicRecorder.Code != http.StatusNotFound {
 		t.Fatalf("public root with key returned %d", publicRecorder.Code)
 	}
-	if body := publicRecorder.Body.String(); strings.Contains(body, "admin") || !strings.Contains(body, "/v1") {
-		t.Fatalf("public root did not describe service endpoints: %s", body)
+	if body := publicRecorder.Body.String(); strings.Contains(body, "codex-pool") || strings.Contains(body, "admin") || strings.Contains(body, "/v1") {
+		t.Fatalf("public root exposed service details: %s", body)
 	}
 
 	healthRequest := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -536,8 +536,11 @@ func TestRootEndpointsAreHelpful(t *testing.T) {
 	adminRequest := httptest.NewRequest(http.MethodGet, "/", nil)
 	adminRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(adminRecorder, adminRequest)
-	if adminRecorder.Code != http.StatusNotFound {
+	if adminRecorder.Code != http.StatusFound {
 		t.Fatalf("admin root returned %d", adminRecorder.Code)
+	}
+	if location := adminRecorder.Header().Get("Location"); location != "/admin" {
+		t.Fatalf("admin root redirected to %q", location)
 	}
 }
 

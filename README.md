@@ -26,8 +26,8 @@ Copy the emitted `pbkdf2-sha256:...` value into `CODEX_POOL_ADMIN_PASSWORD_HASH`
 docker run -d \
   --name codex-pool \
   --restart unless-stopped \
-  -p 8317:8317 \
-  -p 127.0.0.1:8318:8318 \
+  -p <host-api-bind>:8317 \
+  -p <host-admin-bind>:8318 \
   -v codex-pool-data:/data \
   -e CODEX_POOL_API_KEY='replace-with-a-long-random-client-key' \
   -e CODEX_POOL_ADMIN_PASSWORD_HASH='pbkdf2-sha256:...' \
@@ -45,19 +45,12 @@ All persistent configuration, sticky sessions, cooldowns, and account data are s
 Open these paths after startup:
 
 ```text
-Public API: http://<server-host>:8317/v1
-Admin UI:   http://127.0.0.1:8318/admin
-Health:     http://<server-host>:8317/healthz
+Public API: http://<api-host>:<api-port>/v1
+Admin UI:   http://<admin-host>:<admin-port>/admin
+Health:     http://<api-host>:<api-port>/healthz
 ```
 
-The admin root `http://127.0.0.1:8318/` intentionally returns `404`; open `/admin` directly. Public API paths, including `/` and `/healthz`, require the configured API key; unauthenticated requests receive `401`, while authenticated root requests receive a small service-info JSON response that does not advertise the admin path.
-
-Docker port mapping is always `host:container`. To expose the service externally as `<api-port>` for API and `<admin-port>` for admin while keeping the container defaults, use:
-
-```bash
--p <api-port>:8317 \
--p <admin-port>:8318
-```
+The admin root redirects to `/admin`. Public API root intentionally returns `404` so the API port does not advertise service details in a browser. Public API endpoints under `/v1` and `/healthz` require the configured API key.
 
 ### Add Codex Accounts
 
@@ -93,26 +86,16 @@ Successful responses update aggregate prompt-cache counters in the admin state f
 
 Use the `Use Pro last` switch in the admin Console to defer Pro accounts until no eligible non-Pro account is available. When this mode is enabled, a session that temporarily moved to Pro because other accounts were cooling down moves back to a non-Pro account once one becomes eligible again. The switch is stored in `/data/config.json`; `CODEX_POOL_PRESERVE_PRO_QUOTA=true` only sets the initial default before the Console setting is saved.
 
-### Remote Admin Through A Router
+### Remote Admin
 
-Set the container up once with remote admin enabled, then use the router's port-forward rule as the on/off switch. Toggling that router rule does not restart or otherwise alter the container.
-
-Replace the loopback admin mapping in the run command with the host's fixed LAN address:
-
-```bash
--p <lan-host>:8318:8318
-```
-
-Keep these two environment variables in the container configuration:
+Keep the admin port on loopback unless it is behind a private network or a reverse proxy with TLS and access controls. For remote administration, keep these two environment variables in the container configuration and publish the admin port only through your protected network path:
 
 ```bash
 -e CODEX_POOL_ADMIN_ADDR='0.0.0.0:8318' \
 -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true
 ```
 
-Configure the router to forward an external TCP port only to the HTTPS reverse proxy in front of `<lan-host>:8318`. When remote administration is not needed, disable that router forwarding rule. The service continues serving the public API and remains ready for the next time the rule is enabled.
-
-Do not forward TCP `8318` directly from the Internet: the admin service does not terminate TLS itself. Use a reverse proxy with a valid TLS certificate, preserve the original `Host` header, and restrict the proxy to `/admin` and `/admin/api/` if the public API is served separately.
+Do not forward the admin port directly from the Internet: the admin service does not terminate TLS itself. Use a reverse proxy with a valid TLS certificate, preserve the original `Host` header, and restrict the proxy to `/admin` and `/admin/api/` if the public API is served separately.
 
 ### Public Status And Protected Management
 
@@ -130,7 +113,7 @@ model_provider = "codex-pool"
 
 [model_providers.codex-pool]
 name = "Codex Pool"
-base_url = "http://<server-host>:8317/v1"
+base_url = "http://<api-host>:<api-port>/v1"
 env_key = "CODEX_POOL_API_KEY"
 wire_api = "responses"
 ```

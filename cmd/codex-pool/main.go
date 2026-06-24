@@ -479,7 +479,7 @@ func (a *app) refreshAllCodexQuotas(ctx context.Context) {
 
 func (a *app) publicMux() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", a.requireAPIKey(a.handlePublicRoot))
+	mux.HandleFunc("GET /{$}", a.handleNotFound)
 	mux.HandleFunc("GET /healthz", a.requireAPIKey(a.handleHealthz))
 	mux.HandleFunc("GET /v1/codex-pool/status", a.requireAPIKey(a.handleCurrentStatus))
 	mux.HandleFunc("GET /v1/models", a.requireAPIKey(a.handleModels))
@@ -491,7 +491,7 @@ func (a *app) publicMux() http.Handler {
 
 func (a *app) adminMux() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", a.handleNotFound)
+	mux.HandleFunc("GET /{$}", a.handleAdminRoot)
 	mux.HandleFunc("GET /admin", a.handleAdminPage)
 	mux.HandleFunc("GET /admin/assets/app.css", handleAdminCSS)
 	mux.HandleFunc("GET /admin/assets/app.js", handleAdminJS)
@@ -516,17 +516,12 @@ func (a *app) adminMux() http.Handler {
 	return recovery(mux)
 }
 
-func (a *app) handlePublicRoot(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"service": "api",
-		"api":     "/v1",
-		"health":  "/healthz",
-	})
-}
-
 func (a *app) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
+}
+
+func (a *app) handleAdminRoot(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/admin", http.StatusFound)
 }
 
 func (a *app) handleHealthz(w http.ResponseWriter, _ *http.Request) {
