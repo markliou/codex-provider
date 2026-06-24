@@ -83,6 +83,10 @@ Pool keeps requests sticky by project/session/model and automatically adds a has
 
 Successful responses update aggregate prompt-cache counters in the admin state from upstream `usage` fields, including input tokens and cached tokens. Response IDs are also bound to the selected account for the sticky TTL so follow-up `previous_response_id` requests stay on the original account.
 
+### Duplicate Upstream Accounts
+
+Pool treats the local slot ID as the management identity, but routing also tracks the upstream ChatGPT/Codex account identity reported by device auth. Multiple local slots that point at the same upstream account are not counted as multiple capacity. The highest-priority enabled slot is eligible; duplicate slots are shown as `Duplicate` and are skipped during failover so one revoked token, team-workspace policy issue, or shared quota window is not amplified as if it were separate backup accounts.
+
 ### Preserve Pro Quota
 
 Use the `Use Pro last` switch in the admin Console to defer Pro accounts until no eligible non-Pro account is available. When this mode is enabled, a session that temporarily moved to Pro because other accounts were cooling down moves back to a non-Pro account once one becomes eligible again. The switch is stored in `/data/config.json`; `CODEX_POOL_PRESERVE_PRO_QUOTA=true` only sets the initial default before the Console setting is saved.
@@ -130,7 +134,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - Model aliases and `(thinking-tier)` suffix translation.
 - Sticky failover routing with idle TTL, per-model cooldowns, quota-exhaustion failover, optional Pro-quota preservation, prompt-cache-key routing, response-id continuation binding, and JSON persistence in `/data`. When an upstream account returns `429` or server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
 - Bundled, loopback-only CLIProxyAPI sidecar for Codex device-auth requests. Pool pins each request to the selected account through a sidecar model prefix, while the sidecar owns OAuth refreshes.
-- Public pool participation toggles on `/admin`, plus authenticated owner controls for add/remove account, device-auth login jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Disabled`, or `Standby`.
+- Public pool participation toggles on `/admin`, plus authenticated owner controls for add/remove account, device-auth login jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Duplicate`, `Disabled`, or `Standby`.
 - Codex quota refresh from `/backend-api/wham/usage`, including per-window percentages, reset times, plan-type updates, sanitized quota errors, and five-minute dashboard refresh.
 
 Codex accounts are created through the admin UI/API as empty device-auth slots, then authenticated with device auth. The UI does not ask for email, subscription tier, or model selection during onboarding; account metadata is read from the authenticated Codex token after login. A legacy provider API-key gateway path remains for testing and advanced OpenAI-compatible providers, but it is not the default runtime path.

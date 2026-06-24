@@ -924,6 +924,10 @@ Response:
 
 Quota refresh must not block normal `/v1` request handling. Run refresh jobs in background with bounded concurrency. The service refreshes Codex quotas once after a successful device-auth login, once during startup, and then every five minutes. `remainingQuota` is a routing hint derived from the lowest present quota window.
 
+### 9.1 Duplicate upstream identity guard
+
+Device-auth slots are local management records, not proof of separate upstream capacity. If multiple enabled, in-pool slots resolve to the same upstream ChatGPT/Codex account identity, routing must treat only the preferred slot as eligible. Duplicate slots must be shown as duplicate/standby in the dashboard and must not be selected as failover capacity after the preferred slot fails. This protects the pool from reusing the same upstream account through multiple local device-auth sessions from the same host/IP, which can amplify shared quota, refresh-token revocation, and team-workspace policy failures.
+
 ---
 
 ## 10. Usage Statistics
@@ -1432,6 +1436,12 @@ Public mode:
 ```text
 Add to pool
 Remove from pool
+```
+
+Duplicate upstream accounts:
+
+```text
+Duplicate
 ```
 
 Management mode:

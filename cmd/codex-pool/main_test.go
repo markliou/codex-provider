@@ -1643,6 +1643,61 @@ func TestDeviceAuthFailoverAfterRefreshTokenRevoked(t *testing.T) {
 	}
 }
 
+func TestDuplicateUpstreamAccountsAreNotFailoverCapacity(t *testing.T) {
+	primaryHits := 0
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer primary.Close()
+	duplicateHits := 0
+	duplicate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		duplicateHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer duplicate.Close()
+	backupHits := 0
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backupHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_duplicate_guard","object":"response","output":[]}`))
+	}))
+	defer backup.Close()
+
+	a := testApp(t, []account{
+		{ID: "slot-primary", AuthType: "codex_device_auth", AccountID: "upstream-shared", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: primary.URL},
+		{ID: "slot-duplicate", AuthType: "codex_device_auth", AccountID: "upstream-shared", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: duplicate.URL},
+		{ID: "slot-backup", AuthType: "codex_device_auth", AccountID: "upstream-backup", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: backup.URL},
+	})
+	writeCodexDeviceAuth(t, a, "slot-primary", "upstream-shared", "shared@example.test")
+	writeCodexDeviceAuth(t, a, "slot-duplicate", "upstream-shared", "shared@example.test")
+	writeCodexDeviceAuth(t, a, "slot-backup", "upstream-backup", "backup@example.test")
+
+	// Regression guard: two local device-auth slots for one upstream ChatGPT
+	// account are not two pieces of capacity. If the primary slot fails, routing
+	// must skip the duplicate slot and either use a different upstream account or
+	// fail closed.
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "duplicate-upstream")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("duplicate upstream guard returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if primaryHits != 1 || duplicateHits != 0 || backupHits != 1 {
+		t.Fatalf("routing hits = primary:%d duplicate:%d backup:%d", primaryHits, duplicateHits, backupHits)
+	}
+	session := a.state.StickySessions["gpt-test:duplicate-upstream"]
+	if session.AccountID != "slot-backup" {
+		t.Fatalf("duplicate upstream sticky session = %#v", session)
+	}
+	status, reason := a.accountStatusLocked(a.config.Accounts[1], time.Now().UTC())
+	if status != "duplicate" || !strings.Contains(reason, "slot-primary") {
+		t.Fatalf("duplicate slot status = %q, %q", status, reason)
+	}
+}
+
 func TestDeviceAuthZeroQuotaAccountIsNotSelected(t *testing.T) {
 	zero := 0
 	emptyHits := 0
@@ -2384,6 +2439,26 @@ func TestZeroQuotaAccountIsNotSelected(t *testing.T) {
 
 func fakeJWT(exp time.Time) string {
 	return fakeJWTClaims(map[string]any{"exp": exp.Unix()})
+}
+
+func writeCodexDeviceAuth(t *testing.T, a *app, accountID, upstreamAccountID, email string) {
+	t.Helper()
+	home := a.accountCodexHome(accountID)
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	idToken := fakeJWTClaims(map[string]any{
+		"email": email,
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id":   upstreamAccountID,
+			"chatgpt_account_name": "Workspace",
+			"chatgpt_plan_type":    "team",
+		},
+	})
+	authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"id_token":%q,"access_token":%q,"refresh_token":"<refresh-token>","account_id":%q}}`, idToken, fakeJWT(time.Now().Add(time.Hour)), upstreamAccountID)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func fakeJWTClaims(claims map[string]any) string {

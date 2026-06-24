@@ -12,7 +12,7 @@
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? "No activity" : date.toLocaleString();
   };
-  const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Out of pool", missing_auth: "Login needed" }[status] || "Unknown");
+  const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Out of pool", duplicate: "Duplicate", missing_auth: "Login needed" }[status] || "Unknown");
 
   function notify(message, error = false) {
     if (!error) return;

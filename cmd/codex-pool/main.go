@@ -479,6 +479,9 @@ func (a *app) refreshAllCodexQuotas(ctx context.Context) {
 
 func (a *app) publicMux() http.Handler {
 	mux := http.NewServeMux()
+	// Surface contract: the public API port is for authenticated API calls only.
+	// Its root must stay dark so a browser scan of the API entrypoint does not
+	// advertise the service or the control page.
 	mux.HandleFunc("GET /{$}", a.handleNotFound)
 	mux.HandleFunc("GET /healthz", a.requireAPIKey(a.handleHealthz))
 	mux.HandleFunc("GET /v1/codex-pool/status", a.requireAPIKey(a.handleCurrentStatus))
@@ -491,6 +494,9 @@ func (a *app) publicMux() http.Handler {
 
 func (a *app) adminMux() http.Handler {
 	mux := http.NewServeMux()
+	// Surface contract: the admin-port root is the public control page. The page
+	// itself is intentionally visible without a password; owner-only actions are
+	// protected by requireAdmin on the management API routes below.
 	mux.HandleFunc("GET /{$}", a.handleAdminPage)
 	mux.HandleFunc("GET /admin", a.handleAdminPage)
 	mux.HandleFunc("GET /admin/assets/app.css", handleAdminCSS)
@@ -1694,28 +1700,131 @@ func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (
 
 func (a *app) preferredAccountLocked(model string, excluded map[string]bool, now time.Time) (account, bool) {
 	eligible := make([]account, 0)
+	excludedIdentities := a.excludedUpstreamIdentitiesLocked(excluded)
 	for _, item := range a.config.Accounts {
-		if !excluded[item.ID] && a.usableLocked(item, model, now) {
-			eligible = append(eligible, item)
+		if excluded[item.ID] || !a.usableLocked(item, model, now) {
+			continue
 		}
+		identity := a.upstreamIdentityKeyLocked(item)
+		if identity != "" && excludedIdentities[identity] {
+			continue
+		}
+		if primaryID := a.primaryUpstreamAccountIDLocked(item, model); primaryID != "" && primaryID != item.ID {
+			continue
+		}
+		eligible = append(eligible, item)
 	}
 	if len(eligible) == 0 {
 		return account{}, false
 	}
-	sort.SliceStable(eligible, func(i, j int) bool {
-		if a.preserveProQuota {
-			iPro := a.proAccountLocked(eligible[i])
-			jPro := a.proAccountLocked(eligible[j])
-			if iPro != jPro {
-				return !iPro
-			}
-		}
-		if eligible[i].Priority == eligible[j].Priority {
-			return eligible[i].ID < eligible[j].ID
-		}
-		return eligible[i].Priority > eligible[j].Priority
-	})
+	sort.SliceStable(eligible, func(i, j int) bool { return a.preferredBeforeLocked(eligible[i], eligible[j]) })
 	return eligible[0], true
+}
+
+func (a *app) preferredBeforeLocked(left, right account) bool {
+	if a.preserveProQuota {
+		leftPro := a.proAccountLocked(left)
+		rightPro := a.proAccountLocked(right)
+		if leftPro != rightPro {
+			return !leftPro
+		}
+	}
+	if left.Priority == right.Priority {
+		return left.ID < right.ID
+	}
+	return left.Priority > right.Priority
+}
+
+func (a *app) excludedUpstreamIdentitiesLocked(excluded map[string]bool) map[string]bool {
+	identities := map[string]bool{}
+	for _, item := range a.config.Accounts {
+		if !excluded[item.ID] {
+			continue
+		}
+		if identity := a.upstreamIdentityKeyLocked(item); identity != "" {
+			identities[identity] = true
+		}
+	}
+	return identities
+}
+
+func (a *app) primaryUpstreamAccountIDLocked(item account, model string) string {
+	identity := a.upstreamIdentityKeyLocked(item)
+	if identity == "" {
+		return ""
+	}
+	candidates := make([]account, 0)
+	for _, candidate := range a.config.Accounts {
+		if !candidate.Enabled || !candidate.InPool {
+			continue
+		}
+		if model != "" && !allowedModel(candidate, model) {
+			continue
+		}
+		if !a.hasUsableAuthLocked(candidate) {
+			continue
+		}
+		if a.upstreamIdentityKeyLocked(candidate) == identity {
+			candidates = append(candidates, candidate)
+		}
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	sort.SliceStable(candidates, func(i, j int) bool { return a.preferredBeforeLocked(candidates[i], candidates[j]) })
+	return candidates[0].ID
+}
+
+func (a *app) duplicateUpstreamAccountPrimaryLocked(item account) string {
+	if !item.Enabled || !item.InPool || !a.hasUsableAuthLocked(item) {
+		return ""
+	}
+	primaryID := a.primaryUpstreamAccountIDLocked(item, "")
+	if primaryID == "" || primaryID == item.ID {
+		return ""
+	}
+	return primaryID
+}
+
+func (a *app) hasUsableAuthLocked(item account) bool {
+	if isCodexDeviceAuth(item) {
+		_, err := a.codexAuth(item)
+		return err == nil
+	}
+	return strings.TrimSpace(item.UpstreamBaseURL) != ""
+}
+
+// upstreamIdentityKeyLocked is deliberately based on the upstream ChatGPT/Codex
+// account identity, not the local slot ID. A single browser login can create
+// several local device-auth slots from the same upstream account, especially
+// when the host's own Codex session and the pool are authenticated from the same
+// IP. Treating those slots as separate capacity causes noisy failover and can
+// amplify refresh-token or team-workspace policy failures, so routing only lets
+// one enabled slot per upstream identity become eligible.
+func (a *app) upstreamIdentityKeyLocked(item account) string {
+	if !isCodexDeviceAuth(item) {
+		return ""
+	}
+	if accountID := strings.TrimSpace(item.AccountID); accountID != "" {
+		return "codex-account:" + accountID
+	}
+	auth, err := a.codexAuth(item)
+	if err == nil {
+		if accountID := strings.TrimSpace(auth.AccountID); accountID != "" {
+			return "codex-account:" + accountID
+		}
+		email := normalizeEmail(auth.Email)
+		organization := cleanOrganizationName(auth.OrganizationName)
+		if email != "" || organization != "" {
+			return "codex-profile:" + email + "|" + organization
+		}
+	}
+	email := normalizeEmail(item.Email)
+	organization := cleanOrganizationName(item.OrganizationName)
+	if email != "" || organization != "" {
+		return "codex-profile:" + email + "|" + organization
+	}
+	return ""
 }
 
 func (a *app) proxyAttemptLimit() int {
@@ -1733,6 +1842,9 @@ func (a *app) proxyAttemptLimit() int {
 
 func (a *app) usableLocked(item account, model string, now time.Time) bool {
 	if !item.Enabled || !item.InPool || !allowedModel(item, model) {
+		return false
+	}
+	if primaryID := a.primaryUpstreamAccountIDLocked(item, model); primaryID != "" && primaryID != item.ID {
 		return false
 	}
 	if !a.quotaAvailableLocked(item) {
@@ -3778,7 +3890,7 @@ func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 	return result
 }
 func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
-	summary := map[string]int{"total": len(a.config.Accounts), "ready": 0, "low": 0, "cooldown": 0, "error": 0, "missing_auth": 0}
+	summary := map[string]int{"total": len(a.config.Accounts), "ready": 0, "low": 0, "cooldown": 0, "error": 0, "missing_auth": 0, "duplicate": 0}
 	for _, item := range a.config.Accounts {
 		status, _ := a.accountStatusLocked(item, now)
 		if _, ok := summary[status]; ok {
@@ -3798,7 +3910,7 @@ func (a *app) publicDashboardSummaryLocked(now time.Time) map[string]int {
 			summary["low"]++
 		case "cooldown":
 			summary["cooldown"]++
-		case "standby":
+		case "standby", "duplicate":
 			summary["standby"]++
 		default:
 			summary["unavailable"]++
@@ -3865,6 +3977,9 @@ func (a *app) accountStatusLocked(item account, now time.Time) (string, string) 
 	}
 	if !item.InPool {
 		return "standby", "Account is not in the pool"
+	}
+	if primaryID := a.duplicateUpstreamAccountPrimaryLocked(item); primaryID != "" {
+		return "duplicate", "Duplicate upstream account; routing uses " + primaryID
 	}
 	if cooldowns := activeCooldowns(a.state.Cooldowns[item.ID], now); len(cooldowns) > 0 {
 		return "cooldown", cooldowns[0].Reason
@@ -3956,6 +4071,8 @@ func publicDashboardStatus(status string) (string, string) {
 		return "cooldown", "Cooling down"
 	case "standby":
 		return "standby", "Out of pool"
+	case "duplicate":
+		return "standby", "Duplicate"
 	default:
 		return "error", "Unavailable"
 	}
