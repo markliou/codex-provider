@@ -38,6 +38,12 @@ Primary goals:
 
 This is not a multi-tenant product. Assume one trusted owner/operator.
 
+### 0.1 Intent comments and regression guardrails
+
+Implementation changes must preserve source comments that explain non-obvious behavioral intent. Any change to fragile routing, failover, auth, device-auth refresh ownership, sticky sessions, duplicate-account handling, public/admin exposure, low-key UI wording, or code that was previously regressed must include a nearby comment explaining why the behavior exists and what future changes must not undo.
+
+These comments are part of the product contract. They must explain purpose and regression risk, not merely describe the code. If a change alters one of these contracts, update this specification and the relevant source comment together.
+
 ---
 
 ## 1. Public vs Admin Surface
