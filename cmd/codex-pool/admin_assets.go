@@ -3,6 +3,19 @@ package main
 import (
 	_ "embed"
 	"net/http"
+	"strings"
+)
+
+// Keep the visible admin version tied to git metadata injected at build time.
+// The HTML deliberately contains a placeholder instead of a hand-edited release
+// string, because stale manual footer bumps made it hard to tell which fix was
+// actually deployed. Do not simplify this back to a static value.
+const adminVersionPlaceholder = "{{CODEX_POOL_VERSION}}"
+
+var (
+	buildVersion = "dev"
+	buildCommit  = "unknown"
+	buildBuiltAt = "unknown"
 )
 
 //go:embed web/admin.html
@@ -19,6 +32,25 @@ var adminLogoSVG string
 
 //go:embed web/manifest.webmanifest
 var adminManifest string
+
+func adminPage() string {
+	return strings.ReplaceAll(adminPageHTML, adminVersionPlaceholder, adminDisplayVersion())
+}
+
+func adminDisplayVersion() string {
+	version := strings.TrimSpace(buildVersion)
+	if version == "" {
+		version = "dev"
+	}
+	commit := strings.TrimSpace(buildCommit)
+	if commit != "" && commit != "unknown" && !strings.Contains(version, commit) {
+		if len(commit) > 8 {
+			commit = commit[:8]
+		}
+		version += "+" + commit
+	}
+	return version
+}
 
 func handleAdminCSS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")

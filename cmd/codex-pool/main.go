@@ -1113,7 +1113,8 @@ func uint64Field(values map[string]any, name string) (uint64, bool) {
 func (a *app) handleAdminPage(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
-	_, _ = io.WriteString(w, adminPageHTML)
+	w.Header().Set("X-Codex-Pool-Version", adminDisplayVersion())
+	_, _ = io.WriteString(w, adminPage())
 }
 
 func (a *app) handleAdminLogin(w http.ResponseWriter, r *http.Request) {

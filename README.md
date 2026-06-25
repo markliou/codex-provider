@@ -169,6 +169,16 @@ The checked-in [test config](test/codex-config.toml) uses the same provider cont
 
 `integration-cliproxy-sidecar.sh` starts the real bundled sidecar and verifies its isolated auth conversion plus loopback-only binding. `integration-device-auth-failover.sh` runs a real `codex exec` through the Pool sidecar adapter, forces the first device-auth account to return `429`, and verifies that the request completes through the second account with a persisted cooldown and sticky binding.
 
+## Local Build
+
+Build local images through the repository script so the admin page version comes from git instead of a hand-edited HTML string:
+
+```bash
+sh scripts/build-local-image.sh
+```
+
+The script injects `CODEX_POOL_VERSION` and `CODEX_POOL_COMMIT` as Docker build args. The footer displays a git-derived version such as `v2026.06.25-222b57e`; dirty staged or unstaged changes append `-dirty`.
+
 ## Commit Security
 
 Install the repository hook once:

@@ -1,11 +1,20 @@
 FROM golang:1.24-bookworm AS build
 
+# .dockerignore keeps .git out of the image context, so release identity must be
+# passed in by the build command. The admin UI depends on these args to avoid
+# manual footer edits that can drift from the deployed commit.
+ARG CODEX_POOL_VERSION=dev
+ARG CODEX_POOL_COMMIT=unknown
+ARG CODEX_POOL_BUILT_AT=unknown
+
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download
 COPY cmd ./cmd
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags='-s -w' -o /out/codex-pool ./cmd/codex-pool
+    CGO_ENABLED=0 go build -buildvcs=false -trimpath \
+    -ldflags="-s -w -X main.buildVersion=${CODEX_POOL_VERSION} -X main.buildCommit=${CODEX_POOL_COMMIT} -X main.buildBuiltAt=${CODEX_POOL_BUILT_AT}" \
+    -o /out/codex-pool ./cmd/codex-pool
 
 FROM node:22-bookworm-slim AS codex-cli
 

@@ -451,6 +451,12 @@ while true; do sleep 1; done
 }
 
 func TestAdminDashboardAssets(t *testing.T) {
+	oldVersion, oldCommit, oldBuiltAt := buildVersion, buildCommit, buildBuiltAt
+	buildVersion, buildCommit, buildBuiltAt = "vtest", "abcdef123456", "2026-06-25T02:30:00Z"
+	defer func() {
+		buildVersion, buildCommit, buildBuiltAt = oldVersion, oldCommit, oldBuiltAt
+	}()
+
 	a := testApp(t, nil)
 	checks := map[string]string{
 		"/admin":                "Pool status",
@@ -471,6 +477,12 @@ func TestAdminDashboardAssets(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/admin", nil)
 	recorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Header().Get("X-Codex-Pool-Version") != "vtest+abcdef12" {
+		t.Fatalf("admin version header = %q", recorder.Header().Get("X-Codex-Pool-Version"))
+	}
+	if strings.Contains(recorder.Body.String(), adminVersionPlaceholder) || !strings.Contains(recorder.Body.String(), "vtest+abcdef12") {
+		t.Fatal("admin page did not inject build metadata version")
+	}
 	for _, forbidden := range []string{"Admin sign in", "Username", "Account ID", "Label", "Models", "Subscription tier", "Email hint", "Quota hint", "account-form", "toast"} {
 		if strings.Contains(recorder.Body.String(), forbidden) {
 			t.Fatalf("admin page still includes %q", forbidden)

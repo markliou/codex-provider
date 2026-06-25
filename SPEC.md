@@ -1422,6 +1422,8 @@ Build a minimal web UI on the single admin port.
 
 Single-page dashboard is enough. `/` on the admin port and `/admin` serve the same page. Public mode is visible without admin login and may show pool status plus join/leave pool controls. Management mode is unlocked with the admin password and is reserved for account creation, deletion, device-auth repair, and sticky-session inspection.
 
+The footer version must be injected from git-derived build metadata. Keep the HTML source as a placeholder and build local images through `scripts/build-local-image.sh` or an equivalent command that passes `CODEX_POOL_VERSION` and `CODEX_POOL_COMMIT`. Do not manually edit the footer string for releases; that has already caused deployed fixes to be indistinguishable from stale builds.
+
 Sections:
 
 1. Service status
