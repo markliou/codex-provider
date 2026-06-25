@@ -184,6 +184,8 @@ For a device-auth account, Pool writes a separate CLIProxy auth record under `/d
 
 The sidecar owns refreshes of its copied OAuth credential. Pool must read the sidecar copy for quota polling and must not concurrently refresh the original Codex CLI auth file. Sidecar auth records, its internal API key, and generated config are runtime `/data` content and must never be committed.
 
+The original Codex `auth.json` is still read for account metadata, routing eligibility, and sidecar sync. Codex CLI or the sidecar may rewrite that file while requests are selecting accounts, so Pool must use bounded retry when a read sees missing, invalid, or incomplete auth content. A transient partial write must not make all device-auth slots look missing and produce a false `503 no eligible account` response.
+
 The service should warn when:
 
 1. `/data` has overly permissive permissions.

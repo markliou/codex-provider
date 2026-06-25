@@ -187,6 +187,37 @@ func TestCodexAuthUsesAccountNameInsteadOfProfileName(t *testing.T) {
 	}
 }
 
+func TestCodexAuthRetriesDuringAuthFileRewrite(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct-auth", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
+	home := a.accountCodexHome("acct-auth")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, "auth.json")
+	if err := os.WriteFile(path, []byte(`{"auth_mode":"chatgpt","tokens":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(25 * time.Millisecond)
+		authJSON := `{"auth_mode":"chatgpt","tokens":{"access_token":"<access-token>","refresh_token":"<refresh-token>","account_id":"acct-chatgpt"}}`
+		_ = os.WriteFile(path, []byte(authJSON), 0o600)
+	}()
+
+	// Codex CLI rewrites auth.json outside Pool's locks. A request that lands on
+	// the partial-write window must wait briefly and use the completed file
+	// instead of marking every device-auth slot missing and returning 503.
+	auth, err := a.codexAuth(a.config.Accounts[0])
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.AccessToken != "<access-token>" || auth.AccountID != "acct-chatgpt" {
+		t.Fatalf("auth after rewrite = %#v", auth)
+	}
+}
+
 func TestCliproxyCodexAuthUsesJWTAccountNameOverStoredProfileName(t *testing.T) {
 	a := testApp(t, []account{{ID: "acct-auth", AuthType: "codex_device_auth", Enabled: true, InPool: true, OrganizationName: "Yi Fan Liou", PlanType: "team"}})
 	a.codexGatewayMode = "cliproxy"

@@ -47,6 +47,8 @@ const (
 	sessionAffinityTTLDefault = 24 * time.Hour
 	quotaRefreshInterval      = 5 * time.Minute
 	quotaRefreshTimeout       = 30 * time.Second
+	codexAuthReadAttempts     = 20
+	codexAuthReadRetryDelay   = 50 * time.Millisecond
 )
 
 var errAccountAuthFailed = errors.New("account authentication failed")
@@ -2582,18 +2584,50 @@ type codexResetCreditInfo struct {
 }
 
 func (a *app) codexAuth(item account) (codexAuthInfo, error) {
-	home := a.accountCodexHome(item.ID)
-	data, err := os.ReadFile(filepath.Join(home, "auth.json"))
+	auth, err := a.readCodexAuthFile(item)
 	if err != nil {
-		return codexAuthInfo{}, markAccountAuthError(fmt.Errorf("codex auth is missing for account %s", item.ID))
+		return codexAuthInfo{}, markAccountAuthError(err)
+	}
+	return codexAuthInfoFromFile(auth), nil
+}
+
+func (a *app) readCodexAuthFile(item account) (codexAuthFile, error) {
+	path := filepath.Join(a.accountCodexHome(item.ID), "auth.json")
+	var lastErr error
+	for attempt := 0; attempt < codexAuthReadAttempts; attempt++ {
+		auth, err := readCodexAuthFileOnce(path, item.ID)
+		if err == nil {
+			return auth, nil
+		}
+		lastErr = err
+		if attempt+1 < codexAuthReadAttempts {
+			// The Codex CLI and the sidecar can rewrite auth.json while requests
+			// are selecting accounts. Treat a short missing/invalid read as a
+			// file-write race, not proof that every credential disappeared; a
+			// false missing-auth decision here surfaces as "no eligible account"
+			// even though the next read succeeds.
+			time.Sleep(codexAuthReadRetryDelay)
+		}
+	}
+	return codexAuthFile{}, lastErr
+}
+
+func readCodexAuthFileOnce(path, accountID string) (codexAuthFile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return codexAuthFile{}, fmt.Errorf("codex auth is missing for account %s", accountID)
 	}
 	var auth codexAuthFile
 	if err := json.Unmarshal(data, &auth); err != nil {
-		return codexAuthInfo{}, markAccountAuthError(fmt.Errorf("codex auth is invalid for account %s", item.ID))
+		return codexAuthFile{}, fmt.Errorf("codex auth is invalid for account %s", accountID)
 	}
 	if auth.Tokens == nil || strings.TrimSpace(auth.Tokens.AccessToken) == "" {
-		return codexAuthInfo{}, markAccountAuthError(fmt.Errorf("codex access token is missing for account %s", item.ID))
+		return codexAuthFile{}, fmt.Errorf("codex access token is missing for account %s", accountID)
 	}
+	return auth, nil
+}
+
+func codexAuthInfoFromFile(auth codexAuthFile) codexAuthInfo {
 	info := codexAuthInfo{AccessToken: strings.TrimSpace(auth.Tokens.AccessToken)}
 	if auth.Tokens.AccountID != nil {
 		info.AccountID = strings.TrimSpace(*auth.Tokens.AccountID)
@@ -2629,7 +2663,7 @@ func (a *app) codexAuth(item account) (codexAuthInfo, error) {
 			}
 		}
 	}
-	return info, nil
+	return info
 }
 
 func (a *app) cliproxyAuthPath(accountID string) string {
@@ -2655,18 +2689,11 @@ func (a *app) syncCliproxyAuthLocked(item account, force bool) error {
 			return fmt.Errorf("inspect cliproxy auth for account %s: %w", item.ID, err)
 		}
 	}
-	data, err := os.ReadFile(filepath.Join(a.accountCodexHome(item.ID), "auth.json"))
+	source, err := a.readCodexAuthFile(item)
 	if err != nil {
-		return markAccountAuthError(fmt.Errorf("codex auth is missing for account %s", item.ID))
+		return markAccountAuthError(err)
 	}
-	var source codexAuthFile
-	if err := json.Unmarshal(data, &source); err != nil || source.Tokens == nil || strings.TrimSpace(source.Tokens.AccessToken) == "" {
-		return markAccountAuthError(fmt.Errorf("codex auth is invalid for account %s", item.ID))
-	}
-	info, err := a.codexAuth(item)
-	if err != nil {
-		return err
-	}
+	info := codexAuthInfoFromFile(source)
 	accountID := info.AccountID
 	if accountID == "" {
 		accountID = item.AccountID
@@ -2806,15 +2833,11 @@ func (a *app) refreshCodexAuthIfNeeded(item account) error {
 func (a *app) refreshCodexAuthIfNeededContext(ctx context.Context, item account) error {
 	home := a.accountCodexHome(item.ID)
 	path := filepath.Join(home, "auth.json")
-	data, err := os.ReadFile(path)
+	auth, err := a.readCodexAuthFile(item)
 	if err != nil {
-		return fmt.Errorf("codex auth is missing for account %s", item.ID)
+		return err
 	}
-	var auth codexAuthFile
-	if err := json.Unmarshal(data, &auth); err != nil {
-		return fmt.Errorf("codex auth is invalid for account %s", item.ID)
-	}
-	if auth.Tokens == nil || auth.Tokens.AccessToken == "" || auth.Tokens.RefreshToken == "" {
+	if auth.Tokens.RefreshToken == "" {
 		return nil
 	}
 	expiry, ok := jwtExpiry(auth.Tokens.AccessToken)
