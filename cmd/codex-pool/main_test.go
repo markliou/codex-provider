@@ -2159,6 +2159,17 @@ func TestPromptCacheStatsForAccountLocked(t *testing.T) {
 	}
 }
 
+func TestPublicDashboardAccountIncludesCacheStats(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct", Enabled: true, InPool: true}})
+	a.state.PromptCache = map[string]promptCacheStat{
+		"acct:gpt-test": {AccountID: "acct", ModelID: "gpt-test", RequestCount: 4, InputTokens: 1000, CachedTokens: 750},
+	}
+	item := a.publicDashboardAccountLocked(a.config.Accounts[0], 0, time.Now().UTC())
+	if item["cacheInputTokens"].(uint64) != 1000 || item["cacheCachedTokens"].(uint64) != 750 || item["cacheRequestCount"].(uint64) != 4 {
+		t.Fatalf("public dashboard missing cache stats: %#v", item)
+	}
+}
+
 func TestScopedPromptCacheKeyGroupsByProject(t *testing.T) {
 	a := testApp(t, nil)
 	a.promptCacheKeyScope = "auto"

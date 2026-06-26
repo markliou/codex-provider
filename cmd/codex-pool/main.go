@@ -4324,19 +4324,23 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 		remaining := remainingQuotaHint(*quota.Quota)
 		remainingQuota = &remaining
 	}
+	cacheInput, cacheCached, cacheRequests := a.promptCacheStatsForAccountLocked(item.ID)
 	return map[string]any{
-		"displayName":      publicDashboardAccountLabel(displayItem, index),
-		"detail":           publicDashboardAccountDetail(displayItem),
-		"statusTone":       statusTone,
-		"statusLabel":      statusLabel,
-		"poolLabel":        publicPoolLabel(item),
-		"poolRef":          a.publicAccountRefLocked(item.ID),
-		"poolAction":       publicPoolAction(item),
-		"poolActionLabel":  publicPoolActionLabel(item),
-		"remainingQuota":   remainingQuota,
-		"quota":            quota.Quota,
-		"quotaUnavailable": quota.QuotaError != nil,
-		"active":           accountActiveLocked(a.state.Health[item.ID], now),
+		"displayName":       publicDashboardAccountLabel(displayItem, index),
+		"detail":            publicDashboardAccountDetail(displayItem),
+		"statusTone":        statusTone,
+		"statusLabel":       statusLabel,
+		"poolLabel":         publicPoolLabel(item),
+		"poolRef":           a.publicAccountRefLocked(item.ID),
+		"poolAction":        publicPoolAction(item),
+		"poolActionLabel":   publicPoolActionLabel(item),
+		"remainingQuota":    remainingQuota,
+		"quota":             quota.Quota,
+		"quotaUnavailable":  quota.QuotaError != nil,
+		"active":            accountActiveLocked(a.state.Health[item.ID], now),
+		"cacheInputTokens":  cacheInput,
+		"cacheCachedTokens": cacheCached,
+		"cacheRequestCount": cacheRequests,
 	}
 }
 

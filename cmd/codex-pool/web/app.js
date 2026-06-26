@@ -165,6 +165,7 @@
       ["Limited", summary.low || 0, "low"],
       ["Out of pool", summary.standby || 0, "missing_auth"],
       ["Unavailable", summary.unavailable || 0, "error"],
+      ["Cache hit", cacheAggregate, "cache"],
     ] : [
       ["Total accounts", summary.total || 0, ""],
       ["Ready", summary.ready || 0, ""],
@@ -287,11 +288,11 @@
   }
 
   function renderPublicAccounts(accounts) {
-    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th>Action</th></tr>";
+    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th>Cache hit</th><th>Action</th></tr>";
     $("#account-count").textContent = `${accounts.length} visible`;
     const body = $("#accounts-body");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="5"><div class="empty-state">No accounts available</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="6"><div class="empty-state">No accounts available</div></td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
@@ -308,6 +309,7 @@
       <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span>${activeBadge(account.active)}</div></td>
       <td>${quota}</td>
       <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong></div></td>
+      <td>${cacheHitMarkup(account)}</td>
       <td><div class="row-actions">${action}</div></td>
     </tr>`;
     }).join("");
@@ -373,8 +375,14 @@
       const response = await fetch("/admin/api/public-dashboard", { credentials: "same-origin" });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
-      renderSummary(body.dashboard.summary || {}, true);
-      renderPublicAccounts(body.dashboard.accounts || []);
+      const accounts = body.dashboard.accounts || [];
+      let cacheInput = 0, cacheCached = 0;
+      for (const account of accounts) {
+        cacheInput += Number(account.cacheInputTokens) || 0;
+        cacheCached += Number(account.cacheCachedTokens) || 0;
+      }
+      renderSummary(body.dashboard.summary || {}, true, cacheHitRate(cacheInput, cacheCached));
+      renderPublicAccounts(accounts);
       return true;
     } catch (error) {
       if (!silent) notify(error.message, true);
