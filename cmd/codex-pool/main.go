@@ -46,6 +46,12 @@ const (
 	sessionLifetime           = 12 * time.Hour
 	sessionAffinityTTLDefault = 24 * time.Hour
 	accountActiveWindow       = 60 * time.Second
+	// promptCacheBucketsDefault spreads a coarse (project/user) prompt cache key
+	// across a few buckets so a hot scope stays under OpenAI's ~15 RPM per
+	// (prefix + prompt_cache_key) limit while still sharing the static prefix
+	// across conversations. 4 covers a heavy single user (~60 RPM) before any
+	// overflow; raise it if the dashboard shows a hot account with a low hit rate.
+	promptCacheBucketsDefault = 4
 	quotaRefreshInterval      = 5 * time.Minute
 	quotaRefreshTimeout       = 30 * time.Second
 	codexAuthReadAttempts     = 20
@@ -206,6 +212,8 @@ type app struct {
 	sessionAffinityTTL   time.Duration
 	maxRetryAccounts     int
 	promptCacheKeyMode   string
+	promptCacheKeyScope  string
+	promptCacheBuckets   int
 	promptCacheRetention string
 	preserveProQuota     bool
 	publicAddress        string
@@ -281,6 +289,14 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
+	promptCacheKeyScope, err := promptCacheKeyScopeFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	promptCacheBuckets, err := promptCacheBucketsFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	promptCacheRetention, err := promptCacheRetentionFromEnv()
 	if err != nil {
 		return nil, err
@@ -311,6 +327,8 @@ func newAppFromEnv() (*app, error) {
 		sessionAffinityTTL:   sessionAffinityTTL,
 		maxRetryAccounts:     maxRetryAccounts,
 		promptCacheKeyMode:   promptCacheKeyMode,
+		promptCacheKeyScope:  promptCacheKeyScope,
+		promptCacheBuckets:   promptCacheBuckets,
 		promptCacheRetention: promptCacheRetention,
 		preserveProQuota:     preserveProQuota,
 		publicAddress:        publicAddress,
@@ -1191,7 +1209,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -2358,7 +2376,8 @@ func (a *app) routingDecision(r *http.Request, payload map[string]any, model, ap
 		{r.Header.Get("X-Codex-Pool-Project"), "project"},
 	} {
 		if value := strings.TrimSpace(item.value); value != "" {
-			return routingDecision{StickyKey: model + ":" + value, PromptCacheKey: promptCacheKeyHash(model, item.source, value), Source: item.source}
+			stickyKey := model + ":" + value
+			return routingDecision{StickyKey: stickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, item.source, value, stickyKey), Source: item.source}
 		}
 	}
 	if value, ok := payload["prompt_cache_key"].(string); ok && strings.TrimSpace(value) != "" {
@@ -2366,23 +2385,80 @@ func (a *app) routingDecision(r *http.Request, payload map[string]any, model, ap
 		return routingDecision{StickyKey: model + ":" + value, Source: "prompt_cache_key"}
 	}
 	if value := conversationID(payload); value != "" {
-		return routingDecision{StickyKey: model + ":" + value, PromptCacheKey: promptCacheKeyHash(model, "conversation", value), Source: "conversation"}
+		stickyKey := model + ":" + value
+		return routingDecision{StickyKey: stickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, "conversation", value, stickyKey), Source: "conversation"}
 	}
 	for _, name := range []string{"session_id", "conversation_id", "thread_id"} {
 		if value, ok := payload[name].(string); ok && strings.TrimSpace(value) != "" {
 			value = strings.TrimSpace(value)
-			return routingDecision{StickyKey: model + ":" + value, PromptCacheKey: promptCacheKeyHash(model, name, value), Source: name}
+			stickyKey := model + ":" + value
+			return routingDecision{StickyKey: stickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, name, value, stickyKey), Source: name}
 		}
 	}
 	if previousResponseID, ok := payload["previous_response_id"].(string); ok && strings.TrimSpace(previousResponseID) != "" {
 		previousResponseID = strings.TrimSpace(previousResponseID)
 		if binding, found := a.responseBinding(previousResponseID, model); found {
-			return routingDecision{StickyKey: binding.StickyKey, PromptCacheKey: promptCacheKeyHash(model, "previous_response_id", binding.StickyKey), Source: "previous_response_id"}
+			return routingDecision{StickyKey: binding.StickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, "previous_response_id", binding.StickyKey, binding.StickyKey), Source: "previous_response_id"}
 		}
 		value := "previous:" + shortHash([]byte(previousResponseID))
-		return routingDecision{StickyKey: model + ":" + value, PromptCacheKey: promptCacheKeyHash(model, "previous_response_id", value), Source: "previous_response_id"}
+		stickyKey := model + ":" + value
+		return routingDecision{StickyKey: stickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, "previous_response_id", value, stickyKey), Source: "previous_response_id"}
 	}
-	return a.fallbackRoutingDecision(payload, model, apiKey)
+	return a.fallbackRoutingDecision(r, payload, model, apiKey)
+}
+
+// scopedPromptCacheKey builds the prompt_cache_key. The default "auto" (and the
+// explicit "project"/"user") scopes group conversations that share the same
+// static prefix (system prompt + tools) under one key so they reuse each other's
+// prompt cache on the account the router already concentrates them on. stickyKey,
+// the stable per-conversation routing key, is hashed into a small number of
+// buckets so each (prefix + key) combination stays under OpenAI's ~15 RPM
+// cache-routing limit. When no coarse signal is available the key falls back to
+// the historical per-conversation format, so behaviour never gets worse.
+func (a *app) scopedPromptCacheKey(r *http.Request, model, apiKey, source, value, stickyKey string) string {
+	scope, coarse := a.promptCacheScope(r, apiKey)
+	if scope == "" {
+		return promptCacheKeyHash(model, source, value)
+	}
+	bucket := promptCacheBucketIndex(stickyKey, a.promptCacheBuckets)
+	return promptCacheKeyHash(model, scope, fmt.Sprintf("%s#%d", coarse, bucket))
+}
+
+// promptCacheScope returns the coarse grouping ("project" or "user") and its
+// value, or ("", "") to fall back to per-conversation keys.
+func (a *app) promptCacheScope(r *http.Request, apiKey string) (string, string) {
+	project := strings.TrimSpace(r.Header.Get("X-Codex-Pool-Project"))
+	fingerprint := apiKeyFingerprint(apiKey)
+	hasUser := fingerprint != "anonymous"
+	switch a.promptCacheKeyScope {
+	case "project":
+		if project != "" {
+			return "project", project
+		}
+		if hasUser {
+			return "user", fingerprint
+		}
+	case "user":
+		if hasUser {
+			return "user", fingerprint
+		}
+	case "auto":
+		if project != "" {
+			return "project", project
+		}
+		if hasUser {
+			return "user", fingerprint
+		}
+	}
+	return "", ""
+}
+
+func promptCacheBucketIndex(stickyKey string, buckets int) int {
+	if buckets <= 1 {
+		return 0
+	}
+	sum := sha256.Sum256([]byte(stickyKey))
+	return int(sum[0]) % buckets
 }
 
 func (a *app) responseBinding(responseID, model string) (responseBinding, bool) {
@@ -2400,12 +2476,13 @@ func (a *app) responseBinding(responseID, model string) (responseBinding, bool) 
 	return binding, true
 }
 
-func (a *app) fallbackRoutingDecision(payload map[string]any, model, apiKey string) routingDecision {
+func (a *app) fallbackRoutingDecision(r *http.Request, payload map[string]any, model, apiKey string) routingDecision {
 	prefix := normalizedPromptPrefix(payload)
 	keyMaterial := append([]byte(apiKeyFingerprint(apiKey)+":"+model+":"), prefix...)
 	value := shortHash(keyMaterial)
 	stickyID := "prompt:" + value
-	return routingDecision{StickyKey: model + ":" + stickyID, PromptCacheKey: promptCacheKeyHash(model, "prompt", value), Source: "prompt"}
+	stickyKey := model + ":" + stickyID
+	return routingDecision{StickyKey: stickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, "prompt", value, stickyKey), Source: "prompt"}
 }
 
 func (a *app) applyPromptCacheControls(payload map[string]any, route routingDecision) {
@@ -4810,6 +4887,28 @@ func promptCacheKeyModeFromEnv() (string, error) {
 	default:
 		return "", errors.New("CODEX_POOL_PROMPT_CACHE_KEY_MODE must be auto, off, or passthrough")
 	}
+}
+
+func promptCacheKeyScopeFromEnv() (string, error) {
+	scope := strings.ToLower(strings.TrimSpace(envOr("CODEX_POOL_PROMPT_CACHE_KEY_SCOPE", "auto")))
+	switch scope {
+	case "auto", "conversation", "project", "user":
+		return scope, nil
+	default:
+		return "", errors.New("CODEX_POOL_PROMPT_CACHE_KEY_SCOPE must be auto, conversation, project, or user")
+	}
+}
+
+func promptCacheBucketsFromEnv() (int, error) {
+	value := strings.TrimSpace(os.Getenv("CODEX_POOL_PROMPT_CACHE_BUCKETS"))
+	if value == "" {
+		return promptCacheBucketsDefault, nil
+	}
+	buckets, err := strconv.Atoi(value)
+	if err != nil || buckets < 1 || buckets > 256 {
+		return 0, errors.New("CODEX_POOL_PROMPT_CACHE_BUCKETS must be an integer between 1 and 256")
+	}
+	return buckets, nil
 }
 
 func promptCacheRetentionFromEnv() (string, error) {

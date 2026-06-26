@@ -2159,6 +2159,97 @@ func TestPromptCacheStatsForAccountLocked(t *testing.T) {
 	}
 }
 
+func TestScopedPromptCacheKeyGroupsByProject(t *testing.T) {
+	a := testApp(t, nil)
+	a.promptCacheKeyScope = "auto"
+	a.promptCacheBuckets = 1
+	mk := func(session, project string) routingDecision {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		req.Header.Set("X-Codex-Pool-Session", session)
+		req.Header.Set("X-Codex-Pool-Project", project)
+		return a.routingDecision(req, map[string]any{"input": "x"}, "gpt-test", "client-key")
+	}
+	a1 := mk("sess-1", "repo-x")
+	a2 := mk("sess-2", "repo-x")
+	b := mk("sess-3", "repo-y")
+	// Same project, different conversations share one cache key (buckets=1) so
+	// they reuse the static prefix, while routing stays per-conversation.
+	if a1.PromptCacheKey == "" || a1.PromptCacheKey != a2.PromptCacheKey {
+		t.Fatalf("same-project conversations did not share cache key: %q vs %q", a1.PromptCacheKey, a2.PromptCacheKey)
+	}
+	if a1.StickyKey == a2.StickyKey {
+		t.Fatalf("conversations collapsed to a single sticky route: %q", a1.StickyKey)
+	}
+	if a1.PromptCacheKey == b.PromptCacheKey {
+		t.Fatalf("different projects shared a cache key: %q", a1.PromptCacheKey)
+	}
+	if !strings.HasPrefix(a1.PromptCacheKey, "cp_") || strings.Contains(a1.PromptCacheKey, "repo-x") {
+		t.Fatalf("cache key leaked raw data or was malformed: %q", a1.PromptCacheKey)
+	}
+}
+
+func TestScopedPromptCacheKeyConversationScopeUnchanged(t *testing.T) {
+	a := testApp(t, nil) // testApp leaves scope empty == conversation behavior
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("X-Codex-Pool-Project", "repo-x")
+	got := a.routingDecision(req, map[string]any{"input": "x"}, "gpt-test", "client-key").PromptCacheKey
+	want := promptCacheKeyHash("gpt-test", "project", "repo-x")
+	if got != want {
+		t.Fatalf("conversation-scope cache key = %q, want historical %q", got, want)
+	}
+}
+
+func TestPromptCacheBucketIndex(t *testing.T) {
+	if promptCacheBucketIndex("anything", 1) != 0 || promptCacheBucketIndex("anything", 0) != 0 {
+		t.Fatal("single/zero bucket must map to index 0")
+	}
+	for _, size := range []int{4, 16, 256} {
+		for i := 0; i < 200; i++ {
+			idx := promptCacheBucketIndex(fmt.Sprintf("sticky-%d", i), size)
+			if idx < 0 || idx >= size {
+				t.Fatalf("bucket index %d out of range for size %d", idx, size)
+			}
+		}
+		if promptCacheBucketIndex("stable", size) != promptCacheBucketIndex("stable", size) {
+			t.Fatalf("bucket index not deterministic for size %d", size)
+		}
+	}
+}
+
+func TestPromptCacheKeyScopeFromEnv(t *testing.T) {
+	for _, env := range []string{"", "auto", "conversation", "project", "user", "  PROJECT "} {
+		t.Setenv("CODEX_POOL_PROMPT_CACHE_KEY_SCOPE", env)
+		if _, err := promptCacheKeyScopeFromEnv(); err != nil {
+			t.Fatalf("promptCacheKeyScopeFromEnv(%q) error: %v", env, err)
+		}
+	}
+	t.Setenv("CODEX_POOL_PROMPT_CACHE_KEY_SCOPE", "")
+	if got, _ := promptCacheKeyScopeFromEnv(); got != "auto" {
+		t.Fatalf("default scope = %q, want auto", got)
+	}
+	t.Setenv("CODEX_POOL_PROMPT_CACHE_KEY_SCOPE", "bogus")
+	if _, err := promptCacheKeyScopeFromEnv(); err == nil {
+		t.Fatal("expected error for invalid scope")
+	}
+}
+
+func TestPromptCacheBucketsFromEnv(t *testing.T) {
+	t.Setenv("CODEX_POOL_PROMPT_CACHE_BUCKETS", "")
+	if got, _ := promptCacheBucketsFromEnv(); got != promptCacheBucketsDefault {
+		t.Fatalf("default buckets = %d, want %d", got, promptCacheBucketsDefault)
+	}
+	t.Setenv("CODEX_POOL_PROMPT_CACHE_BUCKETS", "8")
+	if got, _ := promptCacheBucketsFromEnv(); got != 8 {
+		t.Fatalf("buckets = %d, want 8", got)
+	}
+	for _, bad := range []string{"0", "-1", "300", "abc"} {
+		t.Setenv("CODEX_POOL_PROMPT_CACHE_BUCKETS", bad)
+		if _, err := promptCacheBucketsFromEnv(); err == nil {
+			t.Fatalf("expected error for buckets=%q", bad)
+		}
+	}
+}
+
 func TestPromptCacheRetentionFromEnv(t *testing.T) {
 	cases := []struct {
 		env  string
