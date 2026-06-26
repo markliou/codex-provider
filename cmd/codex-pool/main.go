@@ -45,6 +45,7 @@ const (
 	maxRequestBody            = 16 << 20
 	sessionLifetime           = 12 * time.Hour
 	sessionAffinityTTLDefault = 24 * time.Hour
+	accountActiveWindow       = 60 * time.Second
 	quotaRefreshInterval      = 5 * time.Minute
 	quotaRefreshTimeout       = 30 * time.Second
 	codexAuthReadAttempts     = 20
@@ -4097,12 +4098,21 @@ func (a *app) publicDashboardSummaryLocked(now time.Time) map[string]int {
 	}
 	return summary
 }
+
+// accountActiveLocked reports whether the account served a successful request
+// within accountActiveWindow. It reads the passively-recorded LastSuccessAt and
+// never touches upstream, so it is a cheap, side-effect-free "currently being
+// consumed" signal.
+func accountActiveLocked(health accountHealth, now time.Time) bool {
+	return !health.LastSuccessAt.IsZero() && now.Sub(health.LastSuccessAt) < accountActiveWindow
+}
+
 func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]any {
 	cooldowns := activeCooldowns(a.state.Cooldowns[item.ID], now)
 	status, reason := a.accountStatusLocked(item, now)
 	health := a.state.Health[item.ID]
 	quota := a.state.Quotas[item.ID]
-	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
+	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
 }
 
 func (a *app) currentAccountStatusLocked(item account, index int, now time.Time) map[string]any {
@@ -4233,6 +4243,7 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 		"remainingQuota":   remainingQuota,
 		"quota":            quota.Quota,
 		"quotaUnavailable": quota.QuotaError != nil,
+		"active":           accountActiveLocked(a.state.Health[item.ID], now),
 	}
 }
 

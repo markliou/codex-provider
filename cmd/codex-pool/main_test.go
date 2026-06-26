@@ -2120,6 +2120,29 @@ func TestQuotaOrganizationControlsTeamDisplayName(t *testing.T) {
 	}
 }
 
+func TestAccountActiveLocked(t *testing.T) {
+	now := time.Now().UTC()
+	cases := []struct {
+		name string
+		last time.Time
+		want bool
+	}{
+		{"never used", time.Time{}, false},
+		{"just now", now, true},
+		{"within window", now.Add(-30 * time.Second), true},
+		{"on boundary", now.Add(-accountActiveWindow), false},
+		{"past window", now.Add(-2 * time.Minute), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := accountActiveLocked(accountHealth{LastSuccessAt: tc.last}, now)
+			if got != tc.want {
+				t.Fatalf("accountActiveLocked(last=%v) = %v, want %v", tc.last, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCodexQuotaRefreshUpdatesProPlanLimit(t *testing.T) {
 	var sawAccountCheckRequest bool
 	var sawSubscriptionRequest bool

@@ -4,7 +4,7 @@
   const $$ = (selector) => document.querySelectorAll(selector);
   const loginView = $("#login-view");
   const dashboardView = $("#dashboard-view");
-  const refreshIntervalMs = 5 * 60 * 1000;
+  const refreshIntervalMs = 30 * 1000;
 
   const escapeHTML = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
   const displayTime = (value) => {
@@ -13,6 +13,7 @@
     return Number.isNaN(date.getTime()) ? "No activity" : date.toLocaleString();
   };
   const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Out of pool", duplicate: "Duplicate", missing_auth: "Login needed" }[status] || "Unknown");
+  const activeBadge = (active) => active ? '<span class="badge active">Active</span>' : "";
 
   function notify(message, error = false) {
     if (!error) return;
@@ -250,7 +251,7 @@
       const actions = actionButton("delete", account.id, "Remove", "danger");
       return `<tr data-account-row="${escapeHTML(account.id)}">
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
-        <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span></div></td>
+        <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt)}</td>
         <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)}</div></td>
         <td><div class="activity">${displayTime(activity)}${health.consecutiveFailure ? `<br>${health.consecutiveFailure} consecutive failure${health.consecutiveFailure === 1 ? "" : "s"}` : ""}</div></td>
@@ -278,7 +279,7 @@
         : "";
       return `<tr>
       <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
-      <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span></div></td>
+      <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span>${activeBadge(account.active)}</div></td>
       <td>${quota}</td>
       <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong></div></td>
       <td><div class="row-actions">${action}</div></td>
