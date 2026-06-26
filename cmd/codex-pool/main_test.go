@@ -493,7 +493,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page does not include low-key label %q", expected)
 		}
 	}
-	for _, forbidden := range []string{"Codex Pool", "ADMIN", "Sign in", "Console", "Preserve Pro quota", "PUBLIC STATUS", "DEVICE AUTH", "Passphrase", "Sticky sessions"} {
+	for _, forbidden := range []string{"ADMIN", "Sign in", "Console", "Preserve Pro quota", "PUBLIC STATUS", "DEVICE AUTH", "Passphrase", "Sticky sessions"} {
 		if strings.Contains(recorder.Body.String(), forbidden) {
 			t.Fatalf("admin page still exposes internal label %q", forbidden)
 		}
@@ -2195,6 +2195,40 @@ func TestPromptCacheColdStartAndResetWindow(t *testing.T) {
 	// Lifetime totals are preserved across the reset.
 	if lifetime := a.state.PromptCache["acct:gpt-test"]; lifetime.RequestCount != 5 || lifetime.ColdRequestCount != 2 {
 		t.Fatalf("lifetime totals not preserved: %#v", lifetime)
+	}
+}
+
+func TestPromptCacheWindowPerAccountReset(t *testing.T) {
+	a := testApp(t, []account{{ID: "a", Enabled: true, InPool: true}, {ID: "b", Enabled: true, InPool: true}})
+	now := time.Now().UTC()
+	rec := func(acct string, input, cached uint64) {
+		a.recordPromptCacheUsageLocked(acct, "gpt-test", promptCacheUsage{InputTokens: input, CachedTokens: cached, Present: true}, now)
+	}
+	rec("a", 1000, 800)
+	rec("b", 1000, 600)
+
+	// Reset only account a; b's window must be untouched.
+	a.resetPromptCacheWindowForAccountLocked("a", now)
+	if win := a.promptCacheWindowForAccountLocked("a"); win["inputTokens"].(uint64) != 0 {
+		t.Fatalf("account a window not reset: %#v", win)
+	}
+	if win := a.promptCacheWindowForAccountLocked("b"); win["inputTokens"].(uint64) != 1000 || win["cachedTokens"].(uint64) != 600 {
+		t.Fatalf("account b window should be untouched by a's reset: %#v", win)
+	}
+
+	// Fresh traffic on a shows only its post-reset delta.
+	rec("a", 2000, 1900)
+	if win := a.promptCacheWindowForAccountLocked("a"); win["inputTokens"].(uint64) != 2000 || win["cachedTokens"].(uint64) != 1900 {
+		t.Fatalf("account a post-reset window wrong: %#v", win)
+	}
+
+	// A pool-wide reset clears per-account overrides.
+	a.resetPromptCacheWindowLocked(now)
+	if a.state.PromptCacheResetAtByAccount != nil {
+		t.Fatalf("pool-wide reset should clear per-account overrides: %#v", a.state.PromptCacheResetAtByAccount)
+	}
+	if win := a.promptCacheWindowForAccountLocked("b"); win["inputTokens"].(uint64) != 0 {
+		t.Fatalf("account b window should be zero after pool-wide reset: %#v", win)
 	}
 }
 

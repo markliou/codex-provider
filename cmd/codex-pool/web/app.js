@@ -19,12 +19,23 @@
     if (total <= 0) return null;
     return Math.max(0, Math.min(1, (Number(cached) || 0) / total));
   };
-  const cacheHitMarkup = (health) => {
-    const rate = cacheHitRate(health.cacheInputTokens, health.cacheCachedTokens);
-    if (rate === null) return '<div class="cache-hit"><span class="cache-empty">No data</span></div>';
+  // Per-account cache hit cell. Shows the "since reset" window (which equals the
+  // all-time figure until that account is reset) so each account can be
+  // recalculated independently. Pass resetId to render a management-only reset
+  // control for that account.
+  const cacheHitMarkup = (obj, resetId) => {
+    const win = obj.cacheWindow || {};
+    const input = win.inputTokens !== undefined ? win.inputTokens : obj.cacheInputTokens;
+    const cached = win.cachedTokens !== undefined ? win.cachedTokens : obj.cacheCachedTokens;
+    const reqs = Number(win.requestCount) || 0;
+    const cold = Number(win.coldRequestCount) || 0;
+    const rate = cacheHitRate(input, cached);
+    const resetBtn = resetId ? ` <button class="cache-reset-btn" type="button" data-cache-reset="${escapeHTML(resetId)}" title="Recalculate this account's hit rate (reset its window)">↺</button>` : "";
+    if (rate === null) return `<div class="cache-hit"><span class="cache-empty">No data</span>${resetBtn}</div>`;
     const pct = (rate * 100).toFixed(1);
     const tone = rate >= 0.6 ? "good" : rate >= 0.3 ? "fair" : "poor";
-    return `<div class="cache-hit"><span class="cache-rate ${tone}">${pct}%</span><span class="cache-detail">${formatTokens(health.cacheCachedTokens)} / ${formatTokens(health.cacheInputTokens)} tok</span></div>`;
+    const coldText = reqs ? ` · ${cold} cold` : "";
+    return `<div class="cache-hit"><span class="cache-rate ${tone}">${pct}%${resetBtn}</span><span class="cache-detail">${formatTokens(cached)} / ${formatTokens(input)} tok${coldText}</span></div>`;
   };
   const formatTokens = (value) => {
     const n = Number(value) || 0;
@@ -158,28 +169,23 @@
     state.refreshTimer = window.setInterval(() => refreshPublic(true), refreshIntervalMs);
   }
 
-  function renderSummary(summary, publicMode = false, cacheAggregate = null) {
+  // Pool status cards. The aggregate cache hit rate lives in its own
+  // #cache-window row, so it is intentionally not duplicated here.
+  function renderSummary(summary, publicMode = false) {
     const items = publicMode ? [
       ["Total accounts", summary.total || 0, ""],
       ["Ready", summary.ready || 0, ""],
       ["Limited", summary.low || 0, "low"],
       ["Out of pool", summary.standby || 0, "missing_auth"],
       ["Unavailable", summary.unavailable || 0, "error"],
-      ["Cache hit (all-time)", cacheAggregate, "cache"],
     ] : [
       ["Total accounts", summary.total || 0, ""],
       ["Ready", summary.ready || 0, ""],
       ["Low quota", summary.low || 0, "low"],
       ["Errors", summary.error || 0, "error"],
       ["Needs attention", summary.missing_auth || 0, "missing_auth"],
-      ["Cache hit (all-time)", cacheAggregate, "cache"],
     ];
-    $("#summary-grid").innerHTML = items.map(([label, value, tone]) => {
-      const display = tone === "cache"
-        ? (value === null || value === undefined ? "No data" : `${(value * 100).toFixed(1)}%`)
-        : value;
-      return `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${display}</span></div>`;
-    }).join("");
+    $("#summary-grid").innerHTML = items.map(([label, value, tone]) => `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${value}</span></div>`).join("");
   }
 
   // Renders the "since reset" cache window. This isolates fresh traffic from the
@@ -301,7 +307,7 @@
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt)}</td>
         <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)}</div></td>
-        <td>${cacheHitMarkup(health)}</td>
+        <td>${cacheHitMarkup(health, account.id)}</td>
         <td><div class="activity">${displayTime(activity)}${health.consecutiveFailure ? `<br>${health.consecutiveFailure} consecutive failure${health.consecutiveFailure === 1 ? "" : "s"}` : ""}</div></td>
         <td><div class="row-actions">${actions}</div></td>
       </tr>`;
@@ -375,13 +381,8 @@
       const serviceState = stateResponse.state;
       const healthByID = new Map(healthResponse.accounts.map((item) => [item.accountId, item]));
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
-      let cacheInput = 0, cacheCached = 0;
-      for (const item of healthResponse.accounts) {
-        cacheInput += Number(item.cacheInputTokens) || 0;
-        cacheCached += Number(item.cacheCachedTokens) || 0;
-      }
       renderSettings(serviceState);
-      renderSummary(serviceState.summary || {}, false, cacheHitRate(cacheInput, cacheCached));
+      renderSummary(serviceState.summary || {});
       renderCacheWindow(serviceState.promptCacheWindow);
       renderAccounts(state.data.accounts, healthByID);
       renderSticky(state.data.sessions, state.data.accounts);
@@ -398,12 +399,7 @@
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
       const accounts = body.dashboard.accounts || [];
-      let cacheInput = 0, cacheCached = 0;
-      for (const account of accounts) {
-        cacheInput += Number(account.cacheInputTokens) || 0;
-        cacheCached += Number(account.cacheCachedTokens) || 0;
-      }
-      renderSummary(body.dashboard.summary || {}, true, cacheHitRate(cacheInput, cacheCached));
+      renderSummary(body.dashboard.summary || {}, true);
       renderCacheWindow(body.dashboard.promptCacheWindow);
       renderPublicAccounts(accounts);
       return true;
@@ -538,6 +534,15 @@
     const publicButton = event.target.closest("[data-public-pool-action]");
     if (publicButton) {
       handlePublicPoolAction(publicButton);
+      return;
+    }
+    const resetButton = event.target.closest("[data-cache-reset]");
+    if (resetButton) {
+      const id = resetButton.dataset.cacheReset;
+      (async () => {
+        try { await api(`/accounts/${encodeURIComponent(id)}/cache/reset`, { method: "POST" }); notify("Account cache window reset"); refresh(true); }
+        catch (error) { notify(error.message, true); }
+      })();
       return;
     }
     const button = event.target.closest("[data-account-action]");

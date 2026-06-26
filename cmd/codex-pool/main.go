@@ -207,10 +207,13 @@ type state struct {
 	// reset timestamp (zero == never reset, so the window equals lifetime).
 	PromptCacheBaseline map[string]promptCacheStat `json:"promptCacheBaseline,omitempty"`
 	PromptCacheResetAt  time.Time                  `json:"promptCacheResetAt,omitempty"`
-	RequestCount        uint64                     `json:"requestCount"`
-	SuccessCount        uint64                     `json:"successCount"`
-	FailureCount        uint64                     `json:"failureCount"`
-	UpdatedAt           time.Time                  `json:"updatedAt"`
+	// PromptCacheResetAtByAccount records per-account window resets so a single
+	// account's hit rate can be recalculated independently of the pool-wide reset.
+	PromptCacheResetAtByAccount map[string]time.Time `json:"promptCacheResetAtByAccount,omitempty"`
+	RequestCount                uint64               `json:"requestCount"`
+	SuccessCount                uint64               `json:"successCount"`
+	FailureCount                uint64               `json:"failureCount"`
+	UpdatedAt                   time.Time            `json:"updatedAt"`
 }
 
 type app struct {
@@ -1520,6 +1523,14 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 		a.clearStickyForAccountLocked(id)
 	case "cooldowns/clear":
 		delete(a.state.Cooldowns, id)
+	case "cache/reset":
+		a.resetPromptCacheWindowForAccountLocked(id, time.Now().UTC())
+		if err := a.saveLocked(); err != nil {
+			writeOpenAIError(w, 500, "storage_error", "unable to persist cache window reset")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "promptCacheWindow": a.promptCacheWindowForAccountLocked(id)})
+		return
 	case "quota/set":
 		var request struct {
 			RemainingQuota *int `json:"remainingQuota"`
@@ -1564,6 +1575,7 @@ func (a *app) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 			delete(a.state.Quotas, id)
 			deletePromptCacheForAccount(a.state.PromptCache, id)
 			deletePromptCacheForAccount(a.state.PromptCacheBaseline, id)
+			delete(a.state.PromptCacheResetAtByAccount, id)
 			a.clearStickyForAccountLocked(id)
 			if err := a.saveLocked(); err != nil {
 				writeOpenAIError(w, 500, "storage_error", "unable to persist account")
@@ -4229,20 +4241,40 @@ func (a *app) promptCacheStatsForAccountLocked(accountID string) (input, cached,
 	return input, cached, requests
 }
 
-// promptCacheWindowLocked returns the prompt-cache totals accumulated since the
-// last reset (PromptCache minus PromptCacheBaseline) so the dashboard can report
-// a hit rate over fresh traffic, plus the reset timestamp. With no reset yet the
-// baseline is empty and the window equals the lifetime totals.
+// promptCacheWindowLocked returns the pool-wide prompt-cache totals accumulated
+// since the last reset (PromptCache minus PromptCacheBaseline) so the dashboard
+// can report a hit rate over fresh traffic, plus the reset timestamp. With no
+// reset yet the baseline is empty and the window equals the lifetime totals.
 func (a *app) promptCacheWindowLocked() map[string]any {
+	return a.promptCacheWindowFilteredLocked("", a.state.PromptCacheResetAt)
+}
+
+// promptCacheWindowForAccountLocked is the per-account equivalent: it sums only
+// that account's keys and reports the per-account reset time when set, otherwise
+// the pool-wide reset time.
+func (a *app) promptCacheWindowForAccountLocked(accountID string) map[string]any {
+	resetAt := a.state.PromptCacheResetAt
+	if at, ok := a.state.PromptCacheResetAtByAccount[accountID]; ok {
+		resetAt = at
+	}
+	return a.promptCacheWindowFilteredLocked(accountID, resetAt)
+}
+
+// promptCacheWindowFilteredLocked computes the since-baseline deltas. An empty
+// accountID aggregates every account.
+func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Time) map[string]any {
 	var input, cached, requests, cold uint64
 	for key, stat := range a.state.PromptCache {
+		if accountID != "" && stat.AccountID != accountID {
+			continue
+		}
 		base := a.state.PromptCacheBaseline[key]
 		input += subSat(stat.InputTokens, base.InputTokens)
 		cached += subSat(stat.CachedTokens, base.CachedTokens)
 		requests += subSat(stat.RequestCount, base.RequestCount)
 		cold += subSat(stat.ColdRequestCount, base.ColdRequestCount)
 	}
-	return map[string]any{"inputTokens": input, "cachedTokens": cached, "requestCount": requests, "coldRequestCount": cold, "resetAt": a.state.PromptCacheResetAt}
+	return map[string]any{"inputTokens": input, "cachedTokens": cached, "requestCount": requests, "coldRequestCount": cold, "resetAt": resetAt}
 }
 
 // subSat is a saturating subtraction; a baseline can briefly exceed the live
@@ -4256,7 +4288,8 @@ func subSat(value, base uint64) uint64 {
 }
 
 // resetPromptCacheWindowLocked snapshots the current totals as the new baseline,
-// starting a fresh measurement window without discarding the lifetime totals.
+// starting a fresh pool-wide window without discarding lifetime totals. It also
+// clears any per-account overrides so every account shares this reset time.
 func (a *app) resetPromptCacheWindowLocked(now time.Time) {
 	baseline := make(map[string]promptCacheStat, len(a.state.PromptCache))
 	for key, stat := range a.state.PromptCache {
@@ -4264,6 +4297,24 @@ func (a *app) resetPromptCacheWindowLocked(now time.Time) {
 	}
 	a.state.PromptCacheBaseline = baseline
 	a.state.PromptCacheResetAt = now
+	a.state.PromptCacheResetAtByAccount = nil
+}
+
+// resetPromptCacheWindowForAccountLocked rebaselines only one account's keys and
+// records a per-account reset time, leaving every other account's window intact.
+func (a *app) resetPromptCacheWindowForAccountLocked(accountID string, now time.Time) {
+	if a.state.PromptCacheBaseline == nil {
+		a.state.PromptCacheBaseline = map[string]promptCacheStat{}
+	}
+	for key, stat := range a.state.PromptCache {
+		if stat.AccountID == accountID {
+			a.state.PromptCacheBaseline[key] = stat
+		}
+	}
+	if a.state.PromptCacheResetAtByAccount == nil {
+		a.state.PromptCacheResetAtByAccount = map[string]time.Time{}
+	}
+	a.state.PromptCacheResetAtByAccount[accountID] = now
 }
 
 func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]any {
@@ -4272,7 +4323,7 @@ func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]an
 	health := a.state.Health[item.ID]
 	quota := a.state.Quotas[item.ID]
 	cacheInput, cacheCached, cacheRequests := a.promptCacheStatsForAccountLocked(item.ID)
-	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "cacheInputTokens": cacheInput, "cacheCachedTokens": cacheCached, "cacheRequestCount": cacheRequests, "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
+	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "cacheInputTokens": cacheInput, "cacheCachedTokens": cacheCached, "cacheRequestCount": cacheRequests, "cacheWindow": a.promptCacheWindowForAccountLocked(item.ID), "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
 }
 
 func (a *app) currentAccountStatusLocked(item account, index int, now time.Time) map[string]any {
@@ -4408,6 +4459,7 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 		"cacheInputTokens":  cacheInput,
 		"cacheCachedTokens": cacheCached,
 		"cacheRequestCount": cacheRequests,
+		"cacheWindow":       a.promptCacheWindowForAccountLocked(item.ID),
 	}
 }
 
