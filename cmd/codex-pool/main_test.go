@@ -2143,6 +2143,49 @@ func TestAccountActiveLocked(t *testing.T) {
 	}
 }
 
+func TestPromptCacheStatsForAccountLocked(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct", Enabled: true, InPool: true}})
+	a.state.PromptCache = map[string]promptCacheStat{
+		"acct:gpt-a":  {AccountID: "acct", ModelID: "gpt-a", RequestCount: 3, InputTokens: 1000, CachedTokens: 700},
+		"acct:gpt-b":  {AccountID: "acct", ModelID: "gpt-b", RequestCount: 2, InputTokens: 500, CachedTokens: 100},
+		"other:gpt-a": {AccountID: "other", ModelID: "gpt-a", RequestCount: 9, InputTokens: 9000, CachedTokens: 9000},
+	}
+	input, cached, requests := a.promptCacheStatsForAccountLocked("acct")
+	if input != 1500 || cached != 800 || requests != 5 {
+		t.Fatalf("aggregate = input %d cached %d requests %d, want 1500/800/5", input, cached, requests)
+	}
+	if input, cached, requests := a.promptCacheStatsForAccountLocked("missing"); input != 0 || cached != 0 || requests != 0 {
+		t.Fatalf("missing account aggregate = %d/%d/%d, want 0/0/0", input, cached, requests)
+	}
+}
+
+func TestPromptCacheRetentionFromEnv(t *testing.T) {
+	cases := []struct {
+		env  string
+		want string
+	}{
+		{"", "24h"},
+		{"passthrough", ""},
+		{"24h", "24h"},
+		{"in_memory", "in_memory"},
+		{"  24H ", "24h"},
+	}
+	for _, tc := range cases {
+		t.Setenv("CODEX_POOL_PROMPT_CACHE_RETENTION", tc.env)
+		got, err := promptCacheRetentionFromEnv()
+		if err != nil {
+			t.Fatalf("promptCacheRetentionFromEnv(%q) error: %v", tc.env, err)
+		}
+		if got != tc.want {
+			t.Fatalf("promptCacheRetentionFromEnv(%q) = %q, want %q", tc.env, got, tc.want)
+		}
+	}
+	t.Setenv("CODEX_POOL_PROMPT_CACHE_RETENTION", "forever")
+	if _, err := promptCacheRetentionFromEnv(); err == nil {
+		t.Fatal("expected error for invalid retention value")
+	}
+}
+
 func TestCodexQuotaRefreshUpdatesProPlanLimit(t *testing.T) {
 	var sawAccountCheckRequest bool
 	var sawSubscriptionRequest bool

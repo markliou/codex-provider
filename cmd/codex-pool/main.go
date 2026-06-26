@@ -4107,12 +4107,28 @@ func accountActiveLocked(health accountHealth, now time.Time) bool {
 	return !health.LastSuccessAt.IsZero() && now.Sub(health.LastSuccessAt) < accountActiveWindow
 }
 
+// promptCacheStatsForAccountLocked aggregates the recorded prompt-cache usage
+// across every model for one account. CachedTokens/InputTokens is the prompt
+// (KV) cache hit rate; the numbers come straight from upstream usage payloads
+// recorded on each success, so reading them adds no upstream calls.
+func (a *app) promptCacheStatsForAccountLocked(accountID string) (input, cached, requests uint64) {
+	for _, stat := range a.state.PromptCache {
+		if stat.AccountID == accountID {
+			input += stat.InputTokens
+			cached += stat.CachedTokens
+			requests += stat.RequestCount
+		}
+	}
+	return input, cached, requests
+}
+
 func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]any {
 	cooldowns := activeCooldowns(a.state.Cooldowns[item.ID], now)
 	status, reason := a.accountStatusLocked(item, now)
 	health := a.state.Health[item.ID]
 	quota := a.state.Quotas[item.ID]
-	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
+	cacheInput, cacheCached, cacheRequests := a.promptCacheStatsForAccountLocked(item.ID)
+	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "cacheInputTokens": cacheInput, "cacheCachedTokens": cacheCached, "cacheRequestCount": cacheRequests, "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
 }
 
 func (a *app) currentAccountStatusLocked(item account, index int, now time.Time) map[string]any {
@@ -4799,7 +4815,13 @@ func promptCacheKeyModeFromEnv() (string, error) {
 func promptCacheRetentionFromEnv() (string, error) {
 	value := strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_POOL_PROMPT_CACHE_RETENTION")))
 	switch value {
-	case "", "passthrough":
+	case "":
+		// Default to extended retention so prompt (KV) caches survive the idle
+		// gaps between conversation turns, which is the single biggest lever for
+		// cache hit rate. Set "passthrough" to opt out and leave requests
+		// untouched.
+		return "24h", nil
+	case "passthrough":
 		return "", nil
 	case "24h", "in_memory":
 		return value, nil

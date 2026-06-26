@@ -79,7 +79,7 @@ Quota is read from the authenticated Codex/ChatGPT backend after login and then 
 
 Pool keeps requests sticky by project/session/model and automatically adds a hashed `prompt_cache_key` when the client did not provide one. The raw project or session value is not sent upstream. `prompt_cache_key` generation is controlled by `CODEX_POOL_PROMPT_CACHE_KEY_MODE=auto|off|passthrough`; `auto` is the default.
 
-`CODEX_POOL_PROMPT_CACHE_RETENTION` is optional and defaults to passthrough so upstream organization data-retention defaults remain in control. Set it to `24h` or `in_memory` only when that retention policy is intended for every relayed request.
+`CODEX_POOL_PROMPT_CACHE_RETENTION` defaults to `24h` (extended retention) so prompt (KV) caches survive the idle gaps between conversation turns, which is the biggest lever for cache hit rate. Set it to `passthrough` to leave requests untouched and keep upstream organization data-retention defaults in control, or to `in_memory` for the shorter built-in retention.
 
 Successful responses update aggregate prompt-cache counters in the admin state from upstream `usage` fields, including input tokens and cached tokens. Response IDs are also bound to the selected account for the sticky TTL so follow-up `previous_response_id` requests stay on the original account.
 

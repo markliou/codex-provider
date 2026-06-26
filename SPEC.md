@@ -163,7 +163,7 @@ docker run -d \
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_MODE` | no | `auto` | `auto` injects a hashed `prompt_cache_key` when the client omitted one. `off`/`passthrough` leave the request unchanged. |
-| `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | passthrough | Optional upstream prompt cache retention override. Valid values are `24h` and `in_memory`; unset/passthrough preserves upstream defaults. |
+| `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | `24h` | Upstream prompt cache retention. Defaults to `24h` (extended retention) to maximize cache hit rate across conversation turns. Set `passthrough` to leave requests untouched, or `in_memory` for the shorter built-in retention. |
 | `CODEX_POOL_PRESERVE_PRO_QUOTA` | no | `false` | Initial default for the admin Console `Use Pro last` switch. Once saved in `/data/config.json`, the Console setting takes precedence. |
 
 ### 2.2 Startup safety checks

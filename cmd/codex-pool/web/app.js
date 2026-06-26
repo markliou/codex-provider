@@ -14,6 +14,25 @@
   };
   const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Out of pool", duplicate: "Duplicate", missing_auth: "Login needed" }[status] || "Unknown");
   const activeBadge = (active) => active ? '<span class="badge active">Active</span>' : "";
+  const cacheHitRate = (input, cached) => {
+    const total = Number(input) || 0;
+    if (total <= 0) return null;
+    return Math.max(0, Math.min(1, (Number(cached) || 0) / total));
+  };
+  const cacheHitMarkup = (health) => {
+    const rate = cacheHitRate(health.cacheInputTokens, health.cacheCachedTokens);
+    if (rate === null) return '<div class="cache-hit"><span class="cache-empty">No data</span></div>';
+    const pct = (rate * 100).toFixed(1);
+    const tone = rate >= 0.6 ? "good" : rate >= 0.3 ? "fair" : "poor";
+    return `<div class="cache-hit"><span class="cache-rate ${tone}">${pct}%</span><span class="cache-detail">${formatTokens(health.cacheCachedTokens)} / ${formatTokens(health.cacheInputTokens)} tok</span></div>`;
+  };
+  const formatTokens = (value) => {
+    const n = Number(value) || 0;
+    if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+    if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+    return String(n);
+  };
 
   function notify(message, error = false) {
     if (!error) return;
@@ -139,7 +158,7 @@
     state.refreshTimer = window.setInterval(() => refreshPublic(true), refreshIntervalMs);
   }
 
-  function renderSummary(summary, publicMode = false) {
+  function renderSummary(summary, publicMode = false, cacheAggregate = null) {
     const items = publicMode ? [
       ["Total accounts", summary.total || 0, ""],
       ["Ready", summary.ready || 0, ""],
@@ -152,8 +171,14 @@
       ["Low quota", summary.low || 0, "low"],
       ["Errors", summary.error || 0, "error"],
       ["Needs attention", summary.missing_auth || 0, "missing_auth"],
+      ["Cache hit", cacheAggregate, "cache"],
     ];
-    $("#summary-grid").innerHTML = items.map(([label, value, tone]) => `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${value}</span></div>`).join("");
+    $("#summary-grid").innerHTML = items.map(([label, value, tone]) => {
+      const display = tone === "cache"
+        ? (value === null || value === undefined ? "No data" : `${(value * 100).toFixed(1)}%`)
+        : value;
+      return `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${display}</span></div>`;
+    }).join("");
   }
 
   function renderSettings(serviceState) {
@@ -235,11 +260,11 @@
   }
 
   function renderAccounts(accounts, healthByID) {
-    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th>Last activity</th><th>Action</th></tr>";
+    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th>Cache hit</th><th>Last activity</th><th>Action</th></tr>";
     $("#account-count").textContent = `${accounts.length} configured`;
     const body = $("#accounts-body");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="6"><div class="empty-state">No accounts configured</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="7"><div class="empty-state">No accounts configured</div></td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
@@ -254,6 +279,7 @@
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt)}</td>
         <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)}</div></td>
+        <td>${cacheHitMarkup(health)}</td>
         <td><div class="activity">${displayTime(activity)}${health.consecutiveFailure ? `<br>${health.consecutiveFailure} consecutive failure${health.consecutiveFailure === 1 ? "" : "s"}` : ""}</div></td>
         <td><div class="row-actions">${actions}</div></td>
       </tr>`;
@@ -307,7 +333,16 @@
       const routeKey = maskRouteKey(session.key);
       const sessionDetail = routeKey ? ` · Session ${escapeHTML(routeKey)}` : "";
       const expires = session.expiresAt && session.expiresAt !== "0001-01-01T00:00:00Z" ? ` · Expires ${escapeHTML(displayTime(session.expiresAt))}` : "";
-      return `<div class="sticky-item"><div><div class="sticky-key">${escapeHTML(routeName)}</div><div class="sticky-meta">${escapeHTML(accountName)}${sessionDetail} · Last used ${escapeHTML(displayTime(session.lastSuccessAt))}${expires}</div></div><button class="button secondary" type="button" data-sticky-key="${escapeHTML(session.key)}">Clear</button></div>`;
+      // A populated failoverFrom means this route was moved off another account
+      // (e.g. after a 429/5xx). That switch starts the new account's prompt cache
+      // cold, so flag it as a hit-rate diagnostic.
+      let switched = "";
+      if (session.failoverFrom && session.failoverFrom !== session.accountId) {
+        const from = accountsByID.get(session.failoverFrom);
+        const fromName = from?.displayName || from?.label || session.failoverFrom;
+        switched = ` <span class="sticky-switched" title="Routing switched accounts; prompt cache restarted cold">↪ switched from ${escapeHTML(fromName)}</span>`;
+      }
+      return `<div class="sticky-item"><div><div class="sticky-key">${escapeHTML(routeName)}</div><div class="sticky-meta">${escapeHTML(accountName)}${sessionDetail} · Last used ${escapeHTML(displayTime(session.lastSuccessAt))}${expires}${switched}</div></div><button class="button secondary" type="button" data-sticky-key="${escapeHTML(session.key)}">Clear</button></div>`;
     }).join("") : '<div class="empty-state">No active routes</div>';
   }
 
@@ -317,8 +352,13 @@
       const serviceState = stateResponse.state;
       const healthByID = new Map(healthResponse.accounts.map((item) => [item.accountId, item]));
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
+      let cacheInput = 0, cacheCached = 0;
+      for (const item of healthResponse.accounts) {
+        cacheInput += Number(item.cacheInputTokens) || 0;
+        cacheCached += Number(item.cacheCachedTokens) || 0;
+      }
       renderSettings(serviceState);
-      renderSummary(serviceState.summary || {});
+      renderSummary(serviceState.summary || {}, false, cacheHitRate(cacheInput, cacheCached));
       renderAccounts(state.data.accounts, healthByID);
       renderSticky(state.data.sessions, state.data.accounts);
       $("#service-status").textContent = "Service online";
