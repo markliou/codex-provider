@@ -83,6 +83,8 @@ Pool keeps requests sticky by project/session/model and automatically adds a has
 
 `CODEX_POOL_PROMPT_CACHE_RETENTION` defaults to `24h` (extended retention) so prompt (KV) caches survive the idle gaps between conversation turns, which is the biggest lever for cache hit rate. Set it to `passthrough` to leave requests untouched and keep upstream organization data-retention defaults in control, or to `in_memory` for the shorter built-in retention.
 
+The dashboard shows the cache hit rate per account (`cachedTokens / inputTokens`, taken from upstream usage) and an all-time aggregate. Because the all-time number moves slowly, there is also a "since reset" window — hit rate, cold-start count (cache-eligible requests that returned zero cached tokens), and request count over fresh traffic only. Use the **Reset window** control (management mode) right after changing a cache setting to measure its real effect; the lifetime totals are preserved across resets.
+
 Successful responses update aggregate prompt-cache counters in the admin state from upstream `usage` fields, including input tokens and cached tokens. Response IDs are also bound to the selected account for the sticky TTL so follow-up `previous_response_id` requests stay on the original account.
 
 ### Duplicate Upstream Accounts

@@ -56,6 +56,18 @@
 
         <section id="summary-grid" class="summary-grid" aria-label="Pool summary"></section>
 
+        <section id="cache-window" class="cache-window" aria-label="Cache hit rate since reset" hidden>
+          <div class="cache-window-stats">
+            <div class="cache-window-stat"><div class="eyebrow">Cache hit (since reset)</div><span id="cache-window-hit" class="cache-window-value">—</span></div>
+            <div class="cache-window-stat"><div class="eyebrow">Cold starts (since reset)</div><span id="cache-window-cold" class="cache-window-value">—</span></div>
+            <div class="cache-window-stat"><div class="eyebrow">Requests (since reset)</div><span id="cache-window-reqs" class="cache-window-value">—</span></div>
+          </div>
+          <div class="cache-window-controls">
+            <span id="cache-window-since" class="muted"></span>
+            <button id="cache-window-reset" class="button secondary" type="button" hidden>Reset window</button>
+          </div>
+        </section>
+
         <section class="section-block" aria-labelledby="accounts-title">
           <div class="section-heading">
             <div><h2 id="accounts-title">Accounts</h2><p id="account-count" class="muted"></p></div>

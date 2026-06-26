@@ -2159,6 +2159,54 @@ func TestPromptCacheStatsForAccountLocked(t *testing.T) {
 	}
 }
 
+func TestPromptCacheColdStartAndResetWindow(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct", Enabled: true, InPool: true}})
+	now := time.Now().UTC()
+	rec := func(input, cached uint64) {
+		a.recordPromptCacheUsageLocked("acct", "gpt-test", promptCacheUsage{InputTokens: input, CachedTokens: cached, Present: true}, now)
+	}
+	rec(2000, 1900) // warm
+	rec(1500, 0)    // cold start (eligible, no cache)
+	rec(500, 0)     // sub-1024: not cache-eligible, must not count as cold
+
+	stat := a.state.PromptCache["acct:gpt-test"]
+	if stat.ColdRequestCount != 1 {
+		t.Fatalf("cold request count = %d, want 1", stat.ColdRequestCount)
+	}
+
+	// No reset yet: window equals lifetime totals.
+	win := a.promptCacheWindowLocked()
+	if win["inputTokens"].(uint64) != 4000 || win["cachedTokens"].(uint64) != 1900 || win["coldRequestCount"].(uint64) != 1 || win["requestCount"].(uint64) != 3 {
+		t.Fatalf("pre-reset window = %#v", win)
+	}
+
+	a.resetPromptCacheWindowLocked(now)
+	if win := a.promptCacheWindowLocked(); win["inputTokens"].(uint64) != 0 || win["cachedTokens"].(uint64) != 0 || win["coldRequestCount"].(uint64) != 0 {
+		t.Fatalf("window right after reset should be zero: %#v", win)
+	}
+
+	// Fresh traffic after reset shows only the delta.
+	rec(3000, 2700)
+	rec(1200, 0)
+	win = a.promptCacheWindowLocked()
+	if win["inputTokens"].(uint64) != 4200 || win["cachedTokens"].(uint64) != 2700 || win["coldRequestCount"].(uint64) != 1 || win["requestCount"].(uint64) != 2 {
+		t.Fatalf("post-reset window = %#v", win)
+	}
+	// Lifetime totals are preserved across the reset.
+	if lifetime := a.state.PromptCache["acct:gpt-test"]; lifetime.RequestCount != 5 || lifetime.ColdRequestCount != 2 {
+		t.Fatalf("lifetime totals not preserved: %#v", lifetime)
+	}
+}
+
+func TestSubSatClampsToZero(t *testing.T) {
+	if subSat(5, 8) != 0 {
+		t.Fatal("subSat should clamp underflow to 0")
+	}
+	if subSat(10, 3) != 7 {
+		t.Fatal("subSat normal subtraction failed")
+	}
+}
+
 func TestPublicDashboardAccountIncludesCacheStats(t *testing.T) {
 	a := testApp(t, []account{{ID: "acct", Enabled: true, InPool: true}})
 	a.state.PromptCache = map[string]promptCacheStat{

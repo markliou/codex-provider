@@ -46,6 +46,10 @@ const (
 	sessionLifetime           = 12 * time.Hour
 	sessionAffinityTTLDefault = 24 * time.Hour
 	accountActiveWindow       = 60 * time.Second
+	// promptCacheMinTokens is OpenAI's minimum prompt size for caching to engage;
+	// requests below it can never cache, so they are excluded from cold-start
+	// accounting.
+	promptCacheMinTokens = 1024
 	// promptCacheBucketsDefault spreads a coarse (project/user) prompt cache key
 	// across a few buckets so a hot scope stays under OpenAI's ~15 RPM per
 	// (prefix + prompt_cache_key) limit while still sharing the static prefix
@@ -150,12 +154,16 @@ type responseBinding struct {
 }
 
 type promptCacheStat struct {
-	AccountID    string    `json:"accountId"`
-	ModelID      string    `json:"modelId"`
-	RequestCount uint64    `json:"requestCount"`
-	InputTokens  uint64    `json:"inputTokens"`
-	CachedTokens uint64    `json:"cachedTokens"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+	AccountID    string `json:"accountId"`
+	ModelID      string `json:"modelId"`
+	RequestCount uint64 `json:"requestCount"`
+	InputTokens  uint64 `json:"inputTokens"`
+	CachedTokens uint64 `json:"cachedTokens"`
+	// ColdRequestCount counts cache-eligible requests (input >= 1024 tokens)
+	// that returned zero cached tokens, i.e. a cold start. It quantifies why a
+	// hit rate is low: new conversations, failover hand-offs, or 15 RPM overflow.
+	ColdRequestCount uint64    `json:"coldRequestCount"`
+	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
 type accountHealth struct {
@@ -193,10 +201,16 @@ type state struct {
 	Health           map[string]accountHealth   `json:"health"`
 	Quotas           map[string]quotaSnapshot   `json:"quotas,omitempty"`
 	PromptCache      map[string]promptCacheStat `json:"promptCache,omitempty"`
-	RequestCount     uint64                     `json:"requestCount"`
-	SuccessCount     uint64                     `json:"successCount"`
-	FailureCount     uint64                     `json:"failureCount"`
-	UpdatedAt        time.Time                  `json:"updatedAt"`
+	// PromptCacheBaseline snapshots PromptCache at the last reset so the
+	// dashboard can show a "since reset" hit rate over fresh traffic only, which
+	// the slow-moving lifetime total cannot reveal. PromptCacheResetAt is the
+	// reset timestamp (zero == never reset, so the window equals lifetime).
+	PromptCacheBaseline map[string]promptCacheStat `json:"promptCacheBaseline,omitempty"`
+	PromptCacheResetAt  time.Time                  `json:"promptCacheResetAt,omitempty"`
+	RequestCount        uint64                     `json:"requestCount"`
+	SuccessCount        uint64                     `json:"successCount"`
+	FailureCount        uint64                     `json:"failureCount"`
+	UpdatedAt           time.Time                  `json:"updatedAt"`
 }
 
 type app struct {
@@ -544,6 +558,7 @@ func (a *app) adminMux() http.Handler {
 	mux.HandleFunc("POST /admin/api/accounts", a.requireAdmin(a.handleAccounts))
 	mux.HandleFunc("GET /admin/api/accounts/health", a.requireAdmin(a.handleAccountHealth))
 	mux.HandleFunc("POST /admin/api/accounts/quota/refresh-all", a.requireAdmin(a.handleRefreshAllQuota))
+	mux.HandleFunc("POST /admin/api/cache/reset", a.requireAdmin(a.handleResetPromptCacheWindow))
 	mux.HandleFunc("GET /admin/api/jobs/", a.requireAdmin(a.handleJob))
 	mux.HandleFunc("POST /admin/api/jobs/", a.requireAdmin(a.handleJobCancel))
 	mux.HandleFunc("GET /admin/api/sticky-sessions", a.requireAdmin(a.handleStickySessions))
@@ -1209,7 +1224,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -1227,7 +1242,7 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 	for index, item := range a.config.Accounts {
 		accounts = append(accounts, a.publicDashboardAccountLocked(item, index, now))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "accounts": accounts}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked()}})
 }
 
 func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) {
@@ -1413,6 +1428,17 @@ func (a *app) handleJobCancel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "job": job})
 }
 
+func (a *app) handleResetPromptCacheWindow(w http.ResponseWriter, _ *http.Request) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.resetPromptCacheWindowLocked(time.Now().UTC())
+	if err := a.saveLocked(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "storage_error", "unable to persist cache window reset")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "promptCacheWindow": a.promptCacheWindowLocked()})
+}
+
 func (a *app) handleStickySessions(w http.ResponseWriter, _ *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1537,6 +1563,7 @@ func (a *app) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 			delete(a.state.Health, id)
 			delete(a.state.Quotas, id)
 			deletePromptCacheForAccount(a.state.PromptCache, id)
+			deletePromptCacheForAccount(a.state.PromptCacheBaseline, id)
 			a.clearStickyForAccountLocked(id)
 			if err := a.saveLocked(); err != nil {
 				writeOpenAIError(w, 500, "storage_error", "unable to persist account")
@@ -2147,6 +2174,9 @@ func (a *app) recordPromptCacheUsageLocked(accountID, model string, usage prompt
 	stat.RequestCount++
 	stat.InputTokens += usage.InputTokens
 	stat.CachedTokens += usage.CachedTokens
+	if usage.InputTokens >= promptCacheMinTokens && usage.CachedTokens == 0 {
+		stat.ColdRequestCount++
+	}
 	stat.UpdatedAt = now
 	a.state.PromptCache[key] = stat
 }
@@ -4197,6 +4227,43 @@ func (a *app) promptCacheStatsForAccountLocked(accountID string) (input, cached,
 		}
 	}
 	return input, cached, requests
+}
+
+// promptCacheWindowLocked returns the prompt-cache totals accumulated since the
+// last reset (PromptCache minus PromptCacheBaseline) so the dashboard can report
+// a hit rate over fresh traffic, plus the reset timestamp. With no reset yet the
+// baseline is empty and the window equals the lifetime totals.
+func (a *app) promptCacheWindowLocked() map[string]any {
+	var input, cached, requests, cold uint64
+	for key, stat := range a.state.PromptCache {
+		base := a.state.PromptCacheBaseline[key]
+		input += subSat(stat.InputTokens, base.InputTokens)
+		cached += subSat(stat.CachedTokens, base.CachedTokens)
+		requests += subSat(stat.RequestCount, base.RequestCount)
+		cold += subSat(stat.ColdRequestCount, base.ColdRequestCount)
+	}
+	return map[string]any{"inputTokens": input, "cachedTokens": cached, "requestCount": requests, "coldRequestCount": cold, "resetAt": a.state.PromptCacheResetAt}
+}
+
+// subSat is a saturating subtraction; a baseline can briefly exceed the live
+// counter if an account's stats were cleared after the snapshot, so clamp to 0
+// instead of underflowing the unsigned counter.
+func subSat(value, base uint64) uint64 {
+	if value < base {
+		return 0
+	}
+	return value - base
+}
+
+// resetPromptCacheWindowLocked snapshots the current totals as the new baseline,
+// starting a fresh measurement window without discarding the lifetime totals.
+func (a *app) resetPromptCacheWindowLocked(now time.Time) {
+	baseline := make(map[string]promptCacheStat, len(a.state.PromptCache))
+	for key, stat := range a.state.PromptCache {
+		baseline[key] = stat
+	}
+	a.state.PromptCacheBaseline = baseline
+	a.state.PromptCacheResetAt = now
 }
 
 func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]any {

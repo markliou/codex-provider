@@ -165,14 +165,14 @@
       ["Limited", summary.low || 0, "low"],
       ["Out of pool", summary.standby || 0, "missing_auth"],
       ["Unavailable", summary.unavailable || 0, "error"],
-      ["Cache hit", cacheAggregate, "cache"],
+      ["Cache hit (all-time)", cacheAggregate, "cache"],
     ] : [
       ["Total accounts", summary.total || 0, ""],
       ["Ready", summary.ready || 0, ""],
       ["Low quota", summary.low || 0, "low"],
       ["Errors", summary.error || 0, "error"],
       ["Needs attention", summary.missing_auth || 0, "missing_auth"],
-      ["Cache hit", cacheAggregate, "cache"],
+      ["Cache hit (all-time)", cacheAggregate, "cache"],
     ];
     $("#summary-grid").innerHTML = items.map(([label, value, tone]) => {
       const display = tone === "cache"
@@ -180,6 +180,27 @@
         : value;
       return `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${display}</span></div>`;
     }).join("");
+  }
+
+  // Renders the "since reset" cache window. This isolates fresh traffic from the
+  // slow-moving all-time total so the effect of tuning (retention, cache scope)
+  // is visible. The reset control is management-only; public view is read-only.
+  function renderCacheWindow(win) {
+    const section = $("#cache-window");
+    if (!section) return;
+    if (!win) { section.hidden = true; return; }
+    section.hidden = false;
+    const input = Number(win.inputTokens) || 0;
+    const cached = Number(win.cachedTokens) || 0;
+    const reqs = Number(win.requestCount) || 0;
+    const cold = Number(win.coldRequestCount) || 0;
+    const rate = cacheHitRate(input, cached);
+    $("#cache-window-hit").textContent = rate === null ? "No data" : `${(rate * 100).toFixed(1)}%`;
+    $("#cache-window-cold").textContent = reqs ? `${cold} (${((cold / reqs) * 100).toFixed(1)}%)` : String(cold);
+    $("#cache-window-reqs").textContent = String(reqs);
+    const resetAt = win.resetAt && win.resetAt !== "0001-01-01T00:00:00Z" ? win.resetAt : null;
+    $("#cache-window-since").textContent = resetAt ? `since ${displayTime(resetAt)}` : "since service start (never reset)";
+    $("#cache-window-reset").hidden = state.mode !== "management";
   }
 
   function renderSettings(serviceState) {
@@ -361,6 +382,7 @@
       }
       renderSettings(serviceState);
       renderSummary(serviceState.summary || {}, false, cacheHitRate(cacheInput, cacheCached));
+      renderCacheWindow(serviceState.promptCacheWindow);
       renderAccounts(state.data.accounts, healthByID);
       renderSticky(state.data.sessions, state.data.accounts);
       $("#service-status").textContent = "Service online";
@@ -382,6 +404,7 @@
         cacheCached += Number(account.cacheCachedTokens) || 0;
       }
       renderSummary(body.dashboard.summary || {}, true, cacheHitRate(cacheInput, cacheCached));
+      renderCacheWindow(body.dashboard.promptCacheWindow);
       renderPublicAccounts(accounts);
       return true;
     } catch (error) {
@@ -502,6 +525,10 @@
   });
 
   $("#refresh-button").addEventListener("click", () => refresh());
+  $("#cache-window-reset").addEventListener("click", async () => {
+    try { await api("/cache/reset", { method: "POST" }); notify("Cache window reset"); refresh(true); }
+    catch (error) { notify(error.message, true); }
+  });
   $("#sign-in-button").addEventListener("click", () => showLogin());
   $("#logout-button").addEventListener("click", async () => { try { await api("/logout", { method: "POST" }); } catch (_) {} sessionStorage.removeItem("codexPoolCsrf"); state.csrfToken = ""; showPublicDashboard(); });
   $("#add-account-button").addEventListener("click", createAccountAndStartLogin);
