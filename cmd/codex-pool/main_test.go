@@ -96,16 +96,18 @@ func TestDashboardStatusSeparatesQuotaAndErrors(t *testing.T) {
 	a := testApp(t, []account{
 		{ID: "ready", Enabled: true, InPool: true},
 		{ID: "low", Enabled: true, InPool: true, RemainingQuota: &quota},
-		{ID: "error", Enabled: true, InPool: true},
+		{ID: "quota-error", Enabled: true, InPool: true},
+		{ID: "stale-failure", Enabled: true, InPool: true},
 		{ID: "cooldown", Enabled: true, InPool: true},
 		{ID: "disabled", Enabled: false, InPool: true},
 		{ID: "missing", AuthType: "codex_device_auth", Enabled: true, InPool: true},
 	})
 	now := time.Now().UTC()
-	a.state.Health = map[string]accountHealth{"error": {ConsecutiveFailure: 2, LastFailureReason: "upstream_transport_error"}}
+	a.state.Health = map[string]accountHealth{"stale-failure": {ConsecutiveFailure: 2, LastFailureReason: "upstream_transport_error", LastFailureAt: now.Add(-time.Hour)}}
+	a.state.Quotas = map[string]quotaSnapshot{"quota-error": {AccountID: "quota-error", QuotaError: &quotaErrorInfo{Code: "invalid_token", Message: "credential unavailable", Timestamp: now.Add(-time.Minute)}}}
 	a.state.Cooldowns = map[string][]cooldown{"cooldown": {{ModelID: "gpt-test", NextRetryAt: now.Add(time.Minute), Reason: "rate_limited"}}}
 
-	expected := map[string]string{"ready": "ready", "low": "low", "error": "error", "cooldown": "cooldown", "disabled": "disabled", "missing": "missing_auth"}
+	expected := map[string]string{"ready": "ready", "low": "low", "quota-error": "error", "stale-failure": "ready", "cooldown": "cooldown", "disabled": "disabled", "missing": "missing_auth"}
 	for _, item := range a.config.Accounts {
 		status, _ := a.accountStatusLocked(item, now)
 		if status != expected[item.ID] {
@@ -114,8 +116,12 @@ func TestDashboardStatusSeparatesQuotaAndErrors(t *testing.T) {
 	}
 
 	status, reason := a.accountStatusLocked(a.config.Accounts[2], now)
-	if status != "error" || reason != "upstream_transport_error" {
-		t.Fatalf("error status did not retain the upstream reason: %q, %q", status, reason)
+	if status != "error" || !strings.Contains(reason, "invalid_token") {
+		t.Fatalf("quota error status did not retain the sanitized code: %q, %q", status, reason)
+	}
+	status, reason = a.accountStatusLocked(a.config.Accounts[3], now)
+	if status != "ready" || reason != "Ready" {
+		t.Fatalf("stale failure status = %q/%q, want ready", status, reason)
 	}
 }
 

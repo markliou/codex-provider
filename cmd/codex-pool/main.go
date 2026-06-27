@@ -4396,9 +4396,11 @@ func (a *app) accountStatusLocked(item account, now time.Time) (string, string) 
 	if cooldowns := activeCooldowns(a.state.Cooldowns[item.ID], now); len(cooldowns) > 0 {
 		return "cooldown", cooldowns[0].Reason
 	}
-	if health := a.state.Health[item.ID]; health.ConsecutiveFailure > 0 {
-		return "error", health.LastFailureReason
-	}
+	// Last failure is diagnostic history, not an availability gate after its
+	// cooldown expires. Routing only excludes active cooldowns, missing auth, and
+	// quota/auth metadata errors; keeping a stale ConsecutiveFailure as "error"
+	// made healthy Pro fallback slots look permanently unavailable in the public
+	// dashboard until they happened to receive another success.
 	quotaSnapshot := a.state.Quotas[item.ID]
 	if quotaSnapshot.QuotaError != nil {
 		reason := "Quota refresh failed"

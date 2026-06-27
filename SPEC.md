@@ -517,6 +517,8 @@ not in account-level cooldown
 not in model-level cooldown for requested model
 ```
 
+Dashboard availability must mirror the same active routing gates. Historical health fields such as `LastFailureReason` and `ConsecutiveFailure` are diagnostic after their cooldown expires; they must not keep a slot labeled unavailable when auth, quota metadata, pool membership, model filters, and cooldown state are otherwise eligible.
+
 ---
 
 ## 7. Account Lifecycle
