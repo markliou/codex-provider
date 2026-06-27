@@ -2847,6 +2847,46 @@ func TestFailoverAfterRateLimit(t *testing.T) {
 	}
 }
 
+func TestUpstreamFailureAfterSelectionDoesNotReturnNoEligible503(t *testing.T) {
+	proHits := 0
+	pro := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proHits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer pro.Close()
+
+	a := testApp(t, []account{
+		{ID: "team-empty", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "http://127.0.0.1:1"},
+		{ID: "pro-only", AuthType: "codex_device_auth", AccountID: "upstream-pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: pro.URL},
+	})
+	a.preserveProQuota = true
+	a.state.Quotas["team-empty"] = quotaSnapshot{AccountID: "team-empty", PlanType: "team", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 0, Present: true}, Weekly: quotaWindow{Percentage: 0, Present: true}}}
+	a.state.Quotas["pro-only"] = quotaSnapshot{AccountID: "pro-only", PlanType: "pro", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 96, Present: true}, Weekly: quotaWindow{Percentage: 98, Present: true}}}
+	writeCodexDeviceAuth(t, a, "team-empty", "upstream-team", "team@example.test")
+	writeCodexDeviceAuth(t, a, "pro-only", "upstream-pro", "pro@example.test")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "single-pro-5xx")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("single eligible upstream failure returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "no eligible account") || strings.Contains(recorder.Body.String(), "all_accounts_cooling_down") {
+		t.Fatalf("upstream failure was reported as pool exhaustion: %s", recorder.Body.String())
+	}
+	if proHits != 1 {
+		t.Fatalf("pro hit count = %d, want 1", proHits)
+	}
+	if cooldowns := activeCooldowns(a.state.Cooldowns["pro-only"], time.Now().UTC()); len(cooldowns) != 0 {
+		t.Fatalf("single eligible upstream 5xx without Retry-After should not create active cooldown: %#v", cooldowns)
+	}
+	if reason := a.state.Health["pro-only"].LastFailureReason; reason != "upstream_5xx" {
+		t.Fatalf("pro failure reason = %q, want upstream_5xx", reason)
+	}
+}
+
 func TestStickySessionWithExhaustedQuotaSnapshotReselects(t *testing.T) {
 	firstHits := 0
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

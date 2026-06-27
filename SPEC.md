@@ -502,6 +502,8 @@ Optional exception: when `preserveProQuota` is enabled from the admin Console, i
 
 On upstream quota exhaustion or rate limiting (`429`), mark the account/model in cooldown and retry the next eligible account in the same request. By default, the retry budget scales with the configured account count; `CODEX_POOL_MAX_RETRY_ACCOUNTS` can cap it.
 
+If at least one upstream account has already been selected and then failed in a request, exhausting the remaining failover candidates is an upstream failure (`502 bad_gateway`), not initial pool exhaustion (`503 no eligible account`). A transient upstream `5xx` without `Retry-After` must not place the only otherwise-eligible account into cooldown, because doing so creates a self-inflicted no-eligible window for the next request instead of allowing the client to retry the sole remaining capacity.
+
 ### 6.5 Candidate account filter
 
 A selectable account must satisfy:

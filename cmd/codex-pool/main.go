@@ -60,6 +60,7 @@ const (
 	quotaRefreshTimeout       = 30 * time.Second
 	codexAuthReadAttempts     = 20
 	codexAuthReadRetryDelay   = 50 * time.Millisecond
+	upstream5xxCooldown       = 10 * time.Second
 )
 
 var errAccountAuthFailed = errors.New("account authentication failed")
@@ -694,6 +695,14 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	for attempt := 0; attempt < a.proxyAttemptLimit(); attempt++ {
 		candidate, err := a.selectAccount(stickyKey, model, excluded)
 		if err != nil {
+			if len(excluded) > 0 {
+				// At least one upstream was already selected and failed. Reporting
+				// this as "no eligible account" makes a transient upstream failure
+				// look like pool exhaustion, especially when Pro is the only real
+				// fallback after Plus/Team quota is drained.
+				writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", "all eligible upstream accounts failed")
+				return
+			}
 			writeOpenAIError(w, http.StatusServiceUnavailable, "all_accounts_cooling_down", err.Error())
 			return
 		}
@@ -730,10 +739,21 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {
 			_ = response.Body.Close()
 			excluded[candidate.ID] = true
-			wait := retryAfter(response.Header.Get("Retry-After"))
+			retryAfterHeader := response.Header.Get("Retry-After")
+			wait := retryAfter(retryAfterHeader)
 			reason := "upstream_5xx"
 			if response.StatusCode == http.StatusTooManyRequests {
 				reason = "rate_limited"
+			} else {
+				wait = retryAfterOrDefault(retryAfterHeader, upstream5xxCooldown)
+				// 5xx is transient upstream/server behavior, not proof that the
+				// account is out of capacity. If this was the only eligible upstream
+				// identity and the server did not send Retry-After, do not quarantine
+				// it and create a self-inflicted "no eligible account" window for
+				// subsequent requests.
+				if strings.TrimSpace(retryAfterHeader) == "" && !a.hasPreferredAccount(model, excluded) {
+					wait = 0
+				}
 			}
 			a.markFailure(candidate.ID, model, reason, wait)
 			continue
@@ -1809,6 +1829,13 @@ func (a *app) preferredAccountLocked(model string, excluded map[string]bool, now
 	}
 	sort.SliceStable(eligible, func(i, j int) bool { return a.preferredBeforeLocked(eligible[i], eligible[j]) })
 	return eligible[0], true
+}
+
+func (a *app) hasPreferredAccount(model string, excluded map[string]bool) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	_, ok := a.preferredAccountLocked(model, excluded, time.Now().UTC())
+	return ok
 }
 
 func (a *app) preferredBeforeLocked(left, right account) bool {
@@ -4182,11 +4209,15 @@ func redactLoginOutput(value string) string {
 }
 
 func retryAfter(value string) time.Duration {
+	return retryAfterOrDefault(value, time.Minute)
+}
+
+func retryAfterOrDefault(value string, fallback time.Duration) time.Duration {
 	seconds, err := strconv.Atoi(value)
 	if err == nil && seconds > 0 {
 		return time.Duration(seconds) * time.Second
 	}
-	return time.Minute
+	return fallback
 }
 func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 	result := make([]cooldown, 0, len(values))
