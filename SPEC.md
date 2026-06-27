@@ -502,7 +502,9 @@ Optional exception: when `preserveProQuota` is enabled from the admin Console, i
 
 On upstream quota exhaustion or rate limiting (`429`), mark the account/model in cooldown and retry the next eligible account in the same request. By default, the retry budget scales with the configured account count; `CODEX_POOL_MAX_RETRY_ACCOUNTS` can cap it.
 
-If at least one upstream account has already been selected and then failed in a request, exhausting the remaining failover candidates is an upstream failure (`502 bad_gateway`), not initial pool exhaustion (`503 no eligible account`). A transient upstream `5xx` without `Retry-After` must not place the only otherwise-eligible account into cooldown, because doing so creates a self-inflicted no-eligible window for the next request instead of allowing the client to retry the sole remaining capacity.
+If at least one upstream account has already been selected and then failed in a request, exhausting the remaining failover candidates is an upstream failure (`502 bad_gateway`), not initial pool exhaustion (`503 no eligible account`). Initial `503 no eligible account` is reserved for the strict case where no account can be selected before any upstream attempt.
+
+A transient upstream `5xx` without `Retry-After` must preserve sticky account locality for KV cache hit rate. Do not cool down or fail over the selected account on the first isolated `5xx`; return `502` for that request and let the next request retry the same sticky account. Only recent repeated `5xx` failures may cool down that account and move the sticky route to another upstream identity.
 
 ### 6.5 Candidate account filter
 

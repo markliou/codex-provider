@@ -1699,7 +1699,8 @@ func TestDuplicateUpstreamAccountsAreNotFailoverCapacity(t *testing.T) {
 	primaryHits := 0
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		primaryHits++
-		w.WriteHeader(http.StatusInternalServerError)
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer primary.Close()
 	duplicateHits := 0
@@ -2884,6 +2885,100 @@ func TestUpstreamFailureAfterSelectionDoesNotReturnNoEligible503(t *testing.T) {
 	}
 	if reason := a.state.Health["pro-only"].LastFailureReason; reason != "upstream_5xx" {
 		t.Fatalf("pro failure reason = %q, want upstream_5xx", reason)
+	}
+}
+
+func TestTransientUpstream5xxPreservesStickyAccount(t *testing.T) {
+	stickyHits := 0
+	sticky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		stickyHits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer sticky.Close()
+	backupHits := 0
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backupHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_backup","object":"response","output":[]}`))
+	}))
+	defer backup.Close()
+
+	a := testApp(t, []account{
+		{ID: "sticky", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: sticky.URL, UpstreamAPIKey: "sticky"},
+		{ID: "backup", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: backup.URL, UpstreamAPIKey: "backup"},
+	})
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:transient-5xx"] = stickySession{Key: "gpt-test:transient-5xx", ModelID: "gpt-test", AccountID: "sticky", CreatedAt: now.Add(-time.Minute), LastSuccessAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)}
+	a.state.Health["sticky"] = accountHealth{ConsecutiveFailure: upstream5xxFailoverAfter - 1, LastFailureReason: "upstream_5xx", LastFailureAt: now.Add(-upstream5xxFailureWindow - time.Second)}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "transient-5xx")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("transient 5xx returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if stickyHits != 1 || backupHits != 0 {
+		t.Fatalf("transient 5xx hits = sticky:%d backup:%d, want 1/0", stickyHits, backupHits)
+	}
+	if session := a.state.StickySessions["gpt-test:transient-5xx"]; session.AccountID != "sticky" {
+		t.Fatalf("transient 5xx changed sticky account: %#v", session)
+	}
+	if cooldowns := activeCooldowns(a.state.Cooldowns["sticky"], time.Now().UTC()); len(cooldowns) != 0 {
+		t.Fatalf("transient 5xx should not cool down sticky account: %#v", cooldowns)
+	}
+	if failures := a.state.Health["sticky"].ConsecutiveFailure; failures != 1 {
+		t.Fatalf("stale 5xx failures were not reset: got %d", failures)
+	}
+}
+
+func TestRepeatedUpstream5xxCanFailoverAfterThreshold(t *testing.T) {
+	stickyHits := 0
+	sticky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		stickyHits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer sticky.Close()
+	backupHits := 0
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backupHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_backup","object":"response","output":[]}`))
+	}))
+	defer backup.Close()
+
+	a := testApp(t, []account{
+		{ID: "sticky", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: sticky.URL, UpstreamAPIKey: "sticky"},
+		{ID: "backup", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: backup.URL, UpstreamAPIKey: "backup"},
+	})
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:repeated-5xx"] = stickySession{Key: "gpt-test:repeated-5xx", ModelID: "gpt-test", AccountID: "sticky", CreatedAt: now.Add(-time.Minute), LastSuccessAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)}
+
+	for attempt := 1; attempt <= upstream5xxFailoverAfter; attempt++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+		req.Header.Set("Authorization", "Bearer client-key")
+		req.Header.Set("X-Codex-Pool-Session", "repeated-5xx")
+		recorder := httptest.NewRecorder()
+		a.publicMux().ServeHTTP(recorder, req)
+		if attempt < upstream5xxFailoverAfter {
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("attempt %d returned %d: %s", attempt, recorder.Code, recorder.Body.String())
+			}
+			continue
+		}
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("threshold attempt returned %d: %s", recorder.Code, recorder.Body.String())
+		}
+	}
+	if stickyHits != upstream5xxFailoverAfter || backupHits != 1 {
+		t.Fatalf("repeated 5xx hits = sticky:%d backup:%d", stickyHits, backupHits)
+	}
+	if session := a.state.StickySessions["gpt-test:repeated-5xx"]; session.AccountID != "backup" || session.FailoverFrom != "sticky" {
+		t.Fatalf("repeated 5xx did not fail over sticky session: %#v", session)
+	}
+	if cooldowns := activeCooldowns(a.state.Cooldowns["sticky"], time.Now().UTC()); len(cooldowns) != 1 {
+		t.Fatalf("repeated 5xx should cool down failed sticky account: %#v", cooldowns)
 	}
 }
 

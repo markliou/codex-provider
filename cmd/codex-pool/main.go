@@ -61,6 +61,8 @@ const (
 	codexAuthReadAttempts     = 20
 	codexAuthReadRetryDelay   = 50 * time.Millisecond
 	upstream5xxCooldown       = 10 * time.Second
+	upstream5xxFailoverAfter  = 3
+	upstream5xxFailureWindow  = 2 * time.Minute
 )
 
 var errAccountAuthFailed = errors.New("account authentication failed")
@@ -738,23 +740,38 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		}
 		if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {
 			_ = response.Body.Close()
-			excluded[candidate.ID] = true
 			retryAfterHeader := response.Header.Get("Retry-After")
 			wait := retryAfter(retryAfterHeader)
 			reason := "upstream_5xx"
 			if response.StatusCode == http.StatusTooManyRequests {
 				reason = "rate_limited"
+				excluded[candidate.ID] = true
+				a.markFailure(candidate.ID, model, reason, wait)
+				continue
 			} else {
 				wait = retryAfterOrDefault(retryAfterHeader, upstream5xxCooldown)
-				// 5xx is transient upstream/server behavior, not proof that the
-				// account is out of capacity. If this was the only eligible upstream
-				// identity and the server did not send Retry-After, do not quarantine
-				// it and create a self-inflicted "no eligible account" window for
-				// subsequent requests.
-				if strings.TrimSpace(retryAfterHeader) == "" && !a.hasPreferredAccount(model, excluded) {
-					wait = 0
+				if strings.TrimSpace(retryAfterHeader) == "" {
+					// A 5xx without Retry-After is a transient upstream/server
+					// failure, not proof that the account is out of quota. Preserve
+					// sticky account locality for KV cache hit rate: do not fail over
+					// or cool down the selected account until repeated failures show
+					// it is genuinely unhealthy. This keeps a single blip from moving
+					// a hot route to a cold account.
+					consecutive := a.markFailure(candidate.ID, model, reason, 0)
+					if consecutive < upstream5xxFailoverAfter {
+						writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", "selected upstream account failed transiently")
+						return
+					}
+					excluded[candidate.ID] = true
+					if !a.hasPreferredAccount(model, excluded) {
+						writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", "selected upstream account failed repeatedly")
+						return
+					}
+					a.markCooldown(candidate.ID, model, reason, wait)
+					continue
 				}
 			}
+			excluded[candidate.ID] = true
 			a.markFailure(candidate.ID, model, reason, wait)
 			continue
 		}
@@ -2136,7 +2153,7 @@ func (a *app) proAccountLocked(item account) bool {
 	return normalizePlanType(plan) == "pro"
 }
 
-func (a *app) markFailure(accountID, model, reason string, duration time.Duration) {
+func (a *app) markFailure(accountID, model, reason string, duration time.Duration) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.state.Health == nil {
@@ -2144,6 +2161,13 @@ func (a *app) markFailure(accountID, model, reason string, duration time.Duratio
 	}
 	now := time.Now().UTC()
 	health := a.state.Health[accountID]
+	// Repeated 5xx failover is a recent-health signal, not a permanent strike
+	// counter. If an account had an old blip and then serves a hot sticky route
+	// later, one fresh 5xx must not immediately move the route and lose KV cache
+	// locality.
+	if reason == "upstream_5xx" && (health.LastFailureReason != reason || now.Sub(health.LastFailureAt) > upstream5xxFailureWindow) {
+		health.ConsecutiveFailure = 0
+	}
 	health.LastFailureAt = now
 	health.LastFailureReason = reason
 	health.ConsecutiveFailure++
@@ -2152,6 +2176,18 @@ func (a *app) markFailure(accountID, model, reason string, duration time.Duratio
 	if duration > 0 {
 		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
 	}
+	_ = a.saveLocked()
+	return health.ConsecutiveFailure
+}
+
+func (a *app) markCooldown(accountID, model, reason string, duration time.Duration) {
+	if duration <= 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now().UTC()
+	a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
 	_ = a.saveLocked()
 }
 
