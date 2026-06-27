@@ -2082,6 +2082,15 @@ func (a *app) sameIdentityQuotaHintAvailableLocked(item account, model string, n
 		if a.upstreamIdentityKeyLocked(candidate) != identity {
 			continue
 		}
+		// A duplicate slot with a persisted metadata/auth error is not evidence
+		// that the shared upstream account has usable capacity. This path is only
+		// a quota hint for the current representative; letting an errored sibling's
+		// stale manual quota keep a zero-quota representative eligible caused the
+		// router to hammer the same Team identity with 429s and occasionally return
+		// false 503s instead of moving on to Pro/other identities.
+		if a.accountMetadataErrorLocked(candidate.ID) {
+			continue
+		}
 		if available, decided := a.quotaSnapshotAvailableLocked(candidate.ID); decided && available {
 			return true
 		}

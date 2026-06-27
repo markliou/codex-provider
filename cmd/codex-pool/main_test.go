@@ -1913,6 +1913,61 @@ func TestDuplicateUpstreamHealthyCredentialCanRepresentIdentity(t *testing.T) {
 	}
 }
 
+func TestErroredDuplicateManualQuotaDoesNotKeepZeroQuotaRepresentativeEligible(t *testing.T) {
+	teamHits := 0
+	team := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		teamHits++
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer team.Close()
+	duplicateHits := 0
+	duplicate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		duplicateHits++
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer duplicate.Close()
+	proHits := 0
+	pro := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_pro_backup","object":"response","output":[]}`))
+	}))
+	defer pro.Close()
+
+	one := 1
+	a := testApp(t, []account{
+		{ID: "team-primary", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: team.URL},
+		{ID: "team-duplicate", AuthType: "codex_device_auth", AccountID: "upstream-team", PlanType: "team", Enabled: true, InPool: true, Priority: 90, RemainingQuota: &one, UpstreamBaseURL: duplicate.URL},
+		{ID: "pro-backup", AuthType: "codex_device_auth", AccountID: "upstream-pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: pro.URL},
+	})
+	a.preserveProQuota = true
+	a.state.Quotas["team-primary"] = quotaSnapshot{AccountID: "team-primary", PlanType: "team", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 0, Present: true}, Weekly: quotaWindow{Percentage: 37, Present: true}}}
+	a.state.Quotas["team-duplicate"] = quotaSnapshot{AccountID: "team-duplicate", PlanType: "team", QuotaError: &quotaErrorInfo{Code: "token_invalidated", Message: "credential unavailable", Timestamp: time.Now().UTC()}}
+	a.state.Quotas["pro-backup"] = quotaSnapshot{AccountID: "pro-backup", PlanType: "pro", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 93, Present: true}, Weekly: quotaWindow{Percentage: 99, Present: true}}}
+	writeCodexDeviceAuth(t, a, "team-primary", "upstream-team", "team@example.test")
+	writeCodexDeviceAuth(t, a, "team-duplicate", "upstream-team", "team@example.test")
+	writeCodexDeviceAuth(t, a, "pro-backup", "upstream-pro", "pro@example.test")
+
+	// An errored duplicate may still carry stale manual quota from the dashboard.
+	// That stale hint must not keep a zero-quota representative selectable; the
+	// next distinct upstream identity is the only real backup capacity.
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "errored-duplicate-quota-hint")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("errored duplicate quota hint routing returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if teamHits != 0 || duplicateHits != 0 || proHits != 1 {
+		t.Fatalf("routing hits = team:%d duplicate:%d pro:%d", teamHits, duplicateHits, proHits)
+	}
+	session := a.state.StickySessions["gpt-test:errored-duplicate-quota-hint"]
+	if session.AccountID != "pro-backup" {
+		t.Fatalf("errored duplicate quota hint sticky session = %#v", session)
+	}
+}
+
 func TestDeviceAuthZeroQuotaAccountIsNotSelected(t *testing.T) {
 	zero := 0
 	emptyHits := 0

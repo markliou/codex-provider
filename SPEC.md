@@ -944,6 +944,8 @@ The representative is chosen from currently usable local credential copies, not 
 
 Quota hints for duplicate slots participate only in representative selection for later requests. They must not allow another same-identity slot to be used as an immediate retry target within the same request after a 429, upstream 5xx, or auth failure from the representative.
 
+A duplicate slot with a persisted auth/quota metadata error must not provide quota evidence for another same-identity representative. Manual or stale quota hints from that errored slot are not reliable capacity; otherwise a zero-quota representative can remain selectable and repeatedly return 429/503 instead of falling through to Pro or another upstream identity.
+
 ---
 
 ## 10. Usage Statistics
