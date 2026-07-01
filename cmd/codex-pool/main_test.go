@@ -100,6 +100,8 @@ func TestDashboardStatusSeparatesQuotaAndErrors(t *testing.T) {
 		{ID: "stale-failure", Enabled: true, InPool: true},
 		{ID: "cooldown", Enabled: true, InPool: true},
 		{ID: "disabled", Enabled: false, InPool: true},
+		{ID: "staged", AuthType: "codex_device_auth", Enabled: false, InPool: false, PendingPoolActivation: true},
+		{ID: "standby", AuthType: "codex_device_auth", Enabled: true, InPool: false},
 		{ID: "missing", AuthType: "codex_device_auth", Enabled: true, InPool: true},
 	})
 	now := time.Now().UTC()
@@ -107,7 +109,7 @@ func TestDashboardStatusSeparatesQuotaAndErrors(t *testing.T) {
 	a.state.Quotas = map[string]quotaSnapshot{"quota-error": {AccountID: "quota-error", QuotaError: &quotaErrorInfo{Code: "invalid_token", Message: "credential unavailable", Timestamp: now.Add(-time.Minute)}}}
 	a.state.Cooldowns = map[string][]cooldown{"cooldown": {{ModelID: "gpt-test", NextRetryAt: now.Add(time.Minute), Reason: "rate_limited"}}}
 
-	expected := map[string]string{"ready": "ready", "low": "low", "quota-error": "error", "stale-failure": "ready", "cooldown": "cooldown", "disabled": "disabled", "missing": "missing_auth"}
+	expected := map[string]string{"ready": "ready", "low": "low", "quota-error": "error", "stale-failure": "ready", "cooldown": "cooldown", "disabled": "disabled", "staged": "disabled", "standby": "standby", "missing": "missing_auth"}
 	for _, item := range a.config.Accounts {
 		status, _ := a.accountStatusLocked(item, now)
 		if status != expected[item.ID] {
@@ -122,6 +124,61 @@ func TestDashboardStatusSeparatesQuotaAndErrors(t *testing.T) {
 	status, reason = a.accountStatusLocked(a.config.Accounts[3], now)
 	if status != "ready" || reason != "Ready" {
 		t.Fatalf("stale failure status = %q/%q, want ready", status, reason)
+	}
+}
+
+func TestMissingCodexAuthClassifiesWithoutRetry(t *testing.T) {
+	a := testApp(t, []account{{ID: "missing-fast", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
+	start := time.Now()
+	_, err := a.codexAuth(a.config.Accounts[0])
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("missing auth unexpectedly succeeded")
+	}
+	if !errors.Is(err, errAccountAuthFailed) || !errors.Is(err, errCodexAuthMissing) {
+		t.Fatalf("missing auth error = %v, want account auth + missing sentinels", err)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("missing auth classification took %s, want no retry delay", elapsed)
+	}
+}
+
+func TestProxyClientCancelDoesNotMarkTransportFailure(t *testing.T) {
+	reached := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case reached <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{
+		ID:              "provider",
+		AuthType:        "provider_api_key",
+		Enabled:         true,
+		InPool:          true,
+		UpstreamBaseURL: upstream.URL,
+		UpstreamAPIKey:  "provider-key",
+	}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping"}`)).WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	a.handleResponses(recorder, request)
+	select {
+	case <-reached:
+		t.Fatal("cancelled request reached upstream")
+	default:
+	}
+	if a.state.FailureCount != 0 {
+		t.Fatalf("cancelled request incremented failure count: %d", a.state.FailureCount)
+	}
+	if health := a.state.Health["provider"]; health.LastFailureReason != "" || health.ConsecutiveFailure != 0 {
+		t.Fatalf("cancelled request marked account unhealthy: %#v", health)
+	}
+	if cooldowns := a.state.Cooldowns["provider"]; len(cooldowns) != 0 {
+		t.Fatalf("cancelled request added cooldowns: %#v", cooldowns)
 	}
 }
 
@@ -304,7 +361,7 @@ func TestCliproxyCodexAuthIgnoresStoredOrganizationNameWithoutJWTOrganization(t 
 }
 
 func TestDeviceAuthLoginJobLifecycle(t *testing.T) {
-	a := testApp(t, []account{{ID: "acct-login", Label: "Login", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
+	a := testApp(t, []account{{ID: "acct-login", Label: "Login", AuthType: "codex_device_auth", Enabled: false, InPool: false, PendingPoolActivation: true}})
 	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct-login")
 	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/backend-api/wham/usage" {
@@ -352,6 +409,9 @@ EOF
 			}
 			if a.config.Accounts[0].Email != "user@example.test" || a.config.Accounts[0].AccountID != "acct-chatgpt" || a.config.Accounts[0].OrganizationName != "" {
 				t.Fatalf("account metadata not updated: %#v", a.config.Accounts[0])
+			}
+			if !a.config.Accounts[0].Enabled || !a.config.Accounts[0].InPool || a.config.Accounts[0].PendingPoolActivation {
+				t.Fatalf("login did not activate staged account: %#v", a.config.Accounts[0])
 			}
 			quota := a.state.Quotas["acct-login"].Quota
 			if quota == nil || quota.Hourly.Percentage != 90 {
@@ -494,7 +554,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page still includes %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"ACCESS", "Continue", "Password", "Add account", "Use Pro last", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown"} {
+	for _, expected := range []string{"ACCESS", "Continue", "Password", "Add account", "Use Pro last", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown", "Copy verification link", "Copy verification code"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page does not include low-key label %q", expected)
 		}
@@ -839,6 +899,37 @@ func TestAdminSettingsTogglePreserveProQuota(t *testing.T) {
 	}
 	if saved.PreserveProQuota == nil || *saved.PreserveProQuota {
 		t.Fatalf("settings update did not persist disabled preserveProQuota: %#v", saved.PreserveProQuota)
+	}
+}
+
+func TestCreateCodexDeviceAuthAccountStagesUntilLogin(t *testing.T) {
+	a := testApp(t, nil)
+	cookies, csrf := adminSession(t, a)
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts", strings.NewReader(`{"authType":"codex_device_auth","enabled":true,"inPool":true,"priority":100}`))
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	request.Header.Set("X-CSRF-Token", csrf)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("account create returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Account account `json:"account"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Account.Enabled || response.Account.InPool {
+		t.Fatalf("new device-auth account response was routable before login: %#v", response.Account)
+	}
+	if len(a.config.Accounts) != 1 {
+		t.Fatalf("configured account count = %d", len(a.config.Accounts))
+	}
+	staged := a.config.Accounts[0]
+	if staged.Enabled || staged.InPool || !staged.PendingPoolActivation {
+		t.Fatalf("new device-auth account was not staged: %#v", staged)
 	}
 }
 

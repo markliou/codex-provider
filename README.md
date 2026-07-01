@@ -55,7 +55,7 @@ The admin-port root and `/admin` serve the same control page. Public mode is vis
 
 ### Add Codex Accounts
 
-Open the control page, select `Access`, sign in, then select `Add account`. The UI does not ask for any account fields. It creates an independent Codex credential slot, starts device auth, and shows only the verification URL, user code, and a 15 minute countdown. After you complete the browser login, subscription tier, upstream account ID, email, and organization are stored as credential metadata. They are shown as secondary status information, but the slot ID remains the primary identity used by routing and management. Do not select models during onboarding; model access is discovered from the authenticated Codex credential and Codex clients can request the model they want later.
+Open the control page, select `Access`, sign in, then select `Add account`. The UI does not ask for any account fields. It creates an independent Codex credential slot, keeps that slot disabled and out of the pool while device auth is in progress, and shows only the verification URL, user code, local copy controls for those two values, and a 15 minute countdown. After you complete the browser login, Pool prepares the sidecar auth record, refreshes quota/account metadata, then enables the slot and adds it to the pool. Subscription tier, upstream account ID, email, and organization are stored as credential metadata. They are shown as secondary status information, but the slot ID remains the primary identity used by routing and management. Do not select models during onboarding; model access is discovered from the authenticated Codex credential and Codex clients can request the model they want later.
 
 The container runs Codex CLI device auth with:
 
@@ -141,7 +141,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - Public pool participation toggles on `/admin`, plus authenticated owner controls for add/remove account, device-auth login jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Duplicate`, `Disabled`, or `Standby`.
 - Codex quota refresh from `/backend-api/wham/usage`, including per-window percentages, reset times, plan-type updates, sanitized quota errors, and five-minute dashboard refresh.
 
-Codex accounts are created through the admin UI/API as empty device-auth slots, then authenticated with device auth. The UI does not ask for email, subscription tier, or model selection during onboarding; account metadata is read from the authenticated Codex token after login. A legacy provider API-key gateway path remains for testing and advanced OpenAI-compatible providers, but it is not the default runtime path.
+Codex accounts are created through the admin UI/API as empty device-auth slots, staged out of the pool, then authenticated with device auth before they become routable. The UI does not ask for email, subscription tier, or model selection during onboarding; account metadata is read from the authenticated Codex token after login. A legacy provider API-key gateway path remains for testing and advanced OpenAI-compatible providers, but it is not the default runtime path.
 
 ## Verification
 

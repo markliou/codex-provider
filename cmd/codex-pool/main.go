@@ -60,12 +60,16 @@ const (
 	quotaRefreshTimeout       = 30 * time.Second
 	codexAuthReadAttempts     = 20
 	codexAuthReadRetryDelay   = 50 * time.Millisecond
+	upstreamFirstByteTimeout  = 45 * time.Second
 	upstream5xxCooldown       = 10 * time.Second
 	upstream5xxFailoverAfter  = 3
 	upstream5xxFailureWindow  = 2 * time.Minute
 )
 
-var errAccountAuthFailed = errors.New("account authentication failed")
+var (
+	errAccountAuthFailed = errors.New("account authentication failed")
+	errCodexAuthMissing  = errors.New("codex auth missing")
+)
 
 type config struct {
 	DefaultModel     string            `json:"defaultModel"`
@@ -83,24 +87,29 @@ type account struct {
 	AccountID        string `json:"accountId,omitempty"`
 	OrganizationName string `json:"organizationName,omitempty"`
 	// Deprecated: migrated into OrganizationName at load time. Not exposed in admin APIs.
-	OrganizationNameOverride string    `json:"organizationNameOverride,omitempty"`
-	PlanType                 string    `json:"planType,omitempty"`
-	PlanLimit                string    `json:"planLimit,omitempty"`
-	PlanRank                 int       `json:"planRank,omitempty"`
-	AuthType                 string    `json:"authType"`
-	CodexHome                string    `json:"codexHome,omitempty"`
-	Enabled                  bool      `json:"enabled"`
-	InPool                   bool      `json:"inPool"`
-	Priority                 int       `json:"priority"`
-	RemainingQuota           *int      `json:"remainingQuota,omitempty"`
-	AllowedModels            []string  `json:"allowedModels,omitempty"`
-	ExcludedModels           []string  `json:"excludedModels,omitempty"`
-	UpstreamBaseURL          string    `json:"upstreamBaseUrl,omitempty"`
-	UpstreamAPIKey           string    `json:"upstreamApiKey,omitempty"`
-	WireAPI                  string    `json:"wireApi,omitempty"`
-	CreatedAt                time.Time `json:"createdAt"`
-	UpdatedAt                time.Time `json:"updatedAt"`
-	LastLoginAt              time.Time `json:"lastLoginAt,omitempty"`
+	OrganizationNameOverride string   `json:"organizationNameOverride,omitempty"`
+	PlanType                 string   `json:"planType,omitempty"`
+	PlanLimit                string   `json:"planLimit,omitempty"`
+	PlanRank                 int      `json:"planRank,omitempty"`
+	AuthType                 string   `json:"authType"`
+	CodexHome                string   `json:"codexHome,omitempty"`
+	Enabled                  bool     `json:"enabled"`
+	InPool                   bool     `json:"inPool"`
+	Priority                 int      `json:"priority"`
+	RemainingQuota           *int     `json:"remainingQuota,omitempty"`
+	AllowedModels            []string `json:"allowedModels,omitempty"`
+	ExcludedModels           []string `json:"excludedModels,omitempty"`
+	UpstreamBaseURL          string   `json:"upstreamBaseUrl,omitempty"`
+	UpstreamAPIKey           string   `json:"upstreamApiKey,omitempty"`
+	WireAPI                  string   `json:"wireApi,omitempty"`
+	// PendingPoolActivation keeps a newly-created device-auth slot disabled and
+	// out of the pool until login has produced usable auth and gateway state.
+	// Without this staging flag, empty slots can stall status/routing paths while
+	// they repeatedly classify missing auth under the global state lock.
+	PendingPoolActivation bool      `json:"pendingPoolActivation,omitempty"`
+	CreatedAt             time.Time `json:"createdAt"`
+	UpdatedAt             time.Time `json:"updatedAt"`
+	LastLoginAt           time.Time `json:"lastLoginAt,omitempty"`
 }
 
 type cooldown struct {
@@ -363,13 +372,26 @@ func newAppFromEnv() (*app, error) {
 		loginCancels:         map[string]context.CancelFunc{},
 		loginFailures:        map[string]loginFailure{},
 		authLocks:            map[string]*sync.Mutex{},
-		client:               &http.Client{Timeout: 5 * time.Minute},
+		client:               defaultHTTPClient(),
 		logger:               log.New(os.Stdout, "codex-pool ", log.LstdFlags|log.LUTC),
 	}
 	if err := a.load(); err != nil {
 		return nil, err
 	}
 	return a, nil
+}
+
+func defaultHTTPClient() *http.Client {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Client{Timeout: 5 * time.Minute}
+	}
+	transport := base.Clone()
+	// Keep the overall request window long enough for streaming generations, but
+	// bound first-byte wait per selected account so one stalled sidecar/upstream
+	// cannot hold routing for minutes before Pool can fail over or return.
+	transport.ResponseHeaderTimeout = upstreamFirstByteTimeout
+	return &http.Client{Timeout: 5 * time.Minute, Transport: transport}
 }
 
 func (a *app) load() error {
@@ -715,6 +737,12 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		}
 		response, err := a.forward(r.Context(), candidate, endpoint, outBody, r.Header.Get("Accept"))
 		if err != nil {
+			if requestContextFinished(r.Context(), err) {
+				// The caller timed out or disconnected. Stop immediately and avoid
+				// marking the selected account unhealthy; no upstream failure was
+				// confirmed, and persisting one makes later unrelated requests slower.
+				return
+			}
 			excluded[candidate.ID] = true
 			// A revoked or invalid device-auth credential must not end the user
 			// request while other upstream accounts are eligible. Mark it
@@ -792,6 +820,10 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		return
 	}
 	writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", "all eligible upstream accounts failed")
+}
+
+func requestContextFinished(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (a *app) prepareUpstreamRequest(candidate account, body []byte, chat bool) (string, []byte, bool, error) {
@@ -1389,6 +1421,15 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		input.AllowedModels = nil
 		input.ExcludedModels = nil
 		input.CodexHome = a.accountCodexHome(input.ID)
+		if input.Enabled || input.InPool {
+			// A device-auth slot is not routable until Codex CLI has written
+			// auth.json and the sidecar/quota state has been prepared. Stage new
+			// slots even when callers request immediate pool membership; otherwise
+			// empty auth directories can stall dashboard and routing lock paths.
+			input.PendingPoolActivation = input.Enabled && input.InPool
+			input.Enabled = false
+			input.InPool = false
+		}
 	} else if strings.TrimSpace(input.UpstreamBaseURL) == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "upstreamBaseUrl is required for provider API key accounts")
 		return
@@ -2793,12 +2834,14 @@ func (a *app) readCodexAuthFile(item account) (codexAuthFile, error) {
 			return auth, nil
 		}
 		lastErr = err
+		if errors.Is(err, errCodexAuthMissing) {
+			return codexAuthFile{}, err
+		}
 		if attempt+1 < codexAuthReadAttempts {
 			// The Codex CLI and the sidecar can rewrite auth.json while requests
-			// are selecting accounts. Treat a short missing/invalid read as a
-			// file-write race, not proof that every credential disappeared; a
-			// false missing-auth decision here surfaces as "no eligible account"
-			// even though the next read succeeds.
+			// are selecting accounts. Retry invalid or incomplete content as a
+			// file-write race, but do not retry a file that is simply absent:
+			// empty onboarding slots are expected and must classify quickly.
 			time.Sleep(codexAuthReadRetryDelay)
 		}
 	}
@@ -2808,7 +2851,10 @@ func (a *app) readCodexAuthFile(item account) (codexAuthFile, error) {
 func readCodexAuthFileOnce(path, accountID string) (codexAuthFile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return codexAuthFile{}, fmt.Errorf("codex auth is missing for account %s", accountID)
+		if errors.Is(err, os.ErrNotExist) {
+			return codexAuthFile{}, fmt.Errorf("codex auth is missing for account %s: %w", accountID, errCodexAuthMissing)
+		}
+		return codexAuthFile{}, fmt.Errorf("read codex auth for account %s: %w", accountID, err)
 	}
 	var auth codexAuthFile
 	if err := json.Unmarshal(data, &auth); err != nil {
@@ -4006,6 +4052,7 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome strin
 	}
 	refreshQuotaAccountID := ""
 	continueLogin := false
+	activateAfterFinalize := false
 	sidecarAccount := account{}
 	syncSidecar := false
 	a.mu.Lock()
@@ -4020,6 +4067,7 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome strin
 		continueLogin = true
 		if item := a.accountLocked(accountID); item != nil {
 			if auth, err := a.codexAuth(*item); err == nil {
+				activateAfterFinalize = item.PendingPoolActivation
 				if auth.Email != "" {
 					item.Email = auth.Email
 				}
@@ -4068,7 +4116,24 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome strin
 		a.finishLoginJob(jobID, "cancelled", verificationURL, userCode, "Codex device auth login cancelled")
 		return
 	}
+	if activateAfterFinalize {
+		a.activatePendingDeviceAuthAccount(accountID)
+	}
 	a.finishLoginJob(jobID, "completed", verificationURL, userCode, "Codex device auth login completed")
+}
+
+func (a *app) activatePendingDeviceAuthAccount(accountID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	item := a.accountLocked(accountID)
+	if item == nil || !item.PendingPoolActivation {
+		return
+	}
+	item.Enabled = true
+	item.InPool = true
+	item.PendingPoolActivation = false
+	item.UpdatedAt = time.Now().UTC()
+	_ = a.saveLocked()
 }
 
 func (a *app) loginJobStatus(jobID string) string {
@@ -4446,13 +4511,17 @@ func (a *app) accountStatusLocked(item account, now time.Time) (string, string) 
 	if !item.Enabled {
 		return "disabled", "Account is disabled"
 	}
+	if !item.InPool {
+		return "standby", "Account is not in the pool"
+	}
 	if isCodexDeviceAuth(item) {
+		// Disabled/out-of-pool device-auth slots must be cheap to render. Only
+		// read auth.json for accounts that can actually participate in routing;
+		// staging slots otherwise serialize dashboard/status requests behind
+		// repeated missing-auth retries while the global state lock is held.
 		if _, err := a.codexAuth(item); err != nil {
 			return "missing_auth", "Device auth login is required"
 		}
-	}
-	if !item.InPool {
-		return "standby", "Account is not in the pool"
 	}
 	// Check duplicate identity before cooldown/quota so the operator sees the
 	// structural reason this slot is not routable. The primary slot owns the

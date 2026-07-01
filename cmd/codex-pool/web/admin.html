@@ -97,8 +97,14 @@
     <div class="device-auth-panel">
       <div class="dialog-heading"><div><div class="eyebrow">CODEX SIGN-IN</div><h2>Codex <span id="device-auth-countdown" class="device-auth-countdown">15:00</span></h2></div><button id="close-device-auth-button" class="button quiet" type="button">Close</button></div>
       <div class="device-auth-grid">
-        <div class="device-auth-row"><span class="device-auth-label">Verification link</span><a id="device-auth-url" class="device-auth-value" target="_blank" rel="noreferrer"></a></div>
-        <div class="device-auth-row"><span class="device-auth-label">Verification code</span><code id="device-auth-code" class="device-auth-code"></code></div>
+        <div class="device-auth-row">
+          <div class="device-auth-row-heading"><span class="device-auth-label">Verification link</span><button class="copy-button" type="button" data-copy-target="device-auth-url" data-copy-label="Copy" aria-label="Copy verification link" disabled>Copy</button></div>
+          <a id="device-auth-url" class="device-auth-value" target="_blank" rel="noreferrer"></a>
+        </div>
+        <div class="device-auth-row">
+          <div class="device-auth-row-heading"><span class="device-auth-label">Verification code</span><button class="copy-button" type="button" data-copy-target="device-auth-code" data-copy-label="Copy" aria-label="Copy verification code" disabled>Copy</button></div>
+          <code id="device-auth-code" class="device-auth-code"></code>
+        </div>
       </div>
     </div>
   </dialog>

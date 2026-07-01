@@ -186,7 +186,7 @@ For a device-auth account, Pool writes a separate CLIProxy auth record under `/d
 
 The sidecar owns refreshes of its copied OAuth credential. Pool must read the sidecar copy for quota polling and must not concurrently refresh the original Codex CLI auth file. Sidecar auth records, its internal API key, and generated config are runtime `/data` content and must never be committed.
 
-The original Codex `auth.json` is still read for account metadata, routing eligibility, and sidecar sync. Codex CLI or the sidecar may rewrite that file while requests are selecting accounts, so Pool must use bounded retry when a read sees missing, invalid, or incomplete auth content. A transient partial write must not make all device-auth slots look missing and produce a false `503 no eligible account` response.
+The original Codex `auth.json` is still read for account metadata, routing eligibility, and sidecar sync. Codex CLI or the sidecar may rewrite that file while requests are selecting accounts, so Pool must use bounded retry when a read sees invalid or incomplete auth content. A missing auth file for a staged or unauthenticated slot must classify quickly as unavailable instead of retrying under the global state lock; a transient partial write must not make all device-auth slots look missing and produce a false `503 no eligible account` response.
 
 The service should warn when:
 
@@ -572,7 +572,7 @@ Request:
 {}
 ```
 
-The admin UI sends no user-entered account fields. It creates an empty Codex device-auth credential slot, immediately starts device auth, and shows only the verification URL, user code, and a 15 minute countdown. `id` and `label` are local slot identifiers and are not derived from email, plan, or upstream account metadata. `email`, `planType`, `planRank`, upstream account ID, organization, and model access are resolved after device auth from the authenticated Codex credential as metadata; routing treats an empty `allowedModels` list as no per-account model restriction.
+The admin UI sends no user-entered account fields. It creates an empty Codex device-auth credential slot, keeps it disabled and out of the pool while login is pending, immediately starts device auth, and shows only the verification URL, user code, local copy controls for those two values, and a 15 minute countdown. The slot is enabled and added to the pool only after device auth succeeds, the sidecar auth record is prepared, and quota/account metadata refresh has run. Failed or cancelled login leaves the slot disabled and out of the pool. `id` and `label` are local slot identifiers and are not derived from email, plan, or upstream account metadata. `email`, `planType`, `planRank`, upstream account ID, organization, and model access are resolved after device auth from the authenticated Codex credential as metadata; routing treats an empty `allowedModels` list as no per-account model restriction.
 
 Response:
 
@@ -584,9 +584,8 @@ Response:
     "label": "acct-org-a",
     "email": "",
     "planType": "",
-    "enabled": true,
-    "inPool": true,
-    "status": "missing_auth"
+    "enabled": false,
+    "inPool": false
   }
 }
 ```

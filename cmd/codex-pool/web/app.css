@@ -121,11 +121,16 @@ tbody tr:hover { background: #162235; }
 .device-auth-panel { padding: 23px; }
 .device-auth-grid { display: grid; gap: 12px; margin-top: 20px; }
 .device-auth-row { display: grid; gap: 7px; padding: 13px; border: 1px solid var(--line); border-radius: 6px; background: #0d1522; }
+.device-auth-row-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .device-auth-label { color: var(--muted); font-size: 11px; font-weight: 780; letter-spacing: .06em; text-transform: uppercase; }
-.device-auth-value { color: #7dd3fc; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
-.device-auth-code { color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 22px; font-weight: 780; letter-spacing: .08em; }
+.device-auth-value { min-width: 0; color: #7dd3fc; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+.device-auth-code { min-width: 0; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 22px; font-weight: 780; letter-spacing: .08em; overflow-wrap: anywhere; }
 .device-auth-countdown { display: inline-flex; margin-left: 8px; color: var(--accent-hot); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 19px; font-weight: 780; vertical-align: baseline; }
 .device-auth-countdown.expired { color: var(--red); }
+.copy-button { min-height: 26px; padding: 4px 8px; border: 1px solid #2a3a52; border-radius: 5px; color: var(--muted-strong); background: #121d2f; font-size: 11px; font-weight: 760; line-height: 1; white-space: nowrap; transition: background .16s ease, border-color .16s ease, color .16s ease; }
+.copy-button:hover:not(:disabled) { color: var(--ink); border-color: var(--accent); background: #17263d; }
+.copy-button:disabled { cursor: not-allowed; opacity: .58; }
+.copy-button.copied { color: #03121f; border-color: #7dd3fc; background: var(--accent); }
 
 @media (max-width: 1180px) { .summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }.summary-item:first-child { grid-column: span 1; } }
 @media (max-width: 880px) { .secondary-grid { grid-template-columns: 1fr; gap: 28px; } }

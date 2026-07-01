@@ -51,6 +51,60 @@
     if (serviceStatus) serviceStatus.textContent = message;
   }
 
+  function copyButtonValue(button) {
+    const target = document.getElementById(button.dataset.copyTarget || "");
+    return target?.textContent?.trim() || "";
+  }
+
+  function syncCopyButtons() {
+    $$("[data-copy-target]").forEach((button) => {
+      button.disabled = !copyButtonValue(button);
+      button.textContent = button.dataset.copyLabel || "Copy";
+      button.classList.remove("copied");
+    });
+  }
+
+  async function writeClipboardText(text) {
+    if (!text) throw new Error("Nothing to copy");
+    if (navigator.clipboard?.writeText && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    // Some self-hosted admin pages run over plain HTTP where Clipboard API is
+    // unavailable; keep this click-triggered fallback so onboarding still works.
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.top = "-1000px";
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      if (!document.execCommand("copy")) throw new Error("Copy failed");
+    } finally {
+      textarea.remove();
+    }
+  }
+
+  async function handleCopyButton(button) {
+    const value = copyButtonValue(button);
+    const label = button.dataset.copyLabel || "Copy";
+    button.disabled = true;
+    try {
+      await writeClipboardText(value);
+      button.textContent = "Copied";
+      button.classList.add("copied");
+      window.setTimeout(() => {
+        button.textContent = label;
+        button.classList.remove("copied");
+        button.disabled = !copyButtonValue(button);
+      }, 1200);
+    } catch (error) {
+      button.disabled = !copyButtonValue(button);
+      notify(error.message, true);
+    }
+  }
+
   function formatRemaining(ms) {
     const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
     const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
@@ -83,6 +137,7 @@
       url.removeAttribute("href");
     }
     code.textContent = job.userCode || "";
+    syncCopyButtons();
     startDeviceAuthCountdown(job.codeExpiresAt);
     if (!dialog.open) dialog.showModal();
   }
@@ -530,6 +585,10 @@
   $("#add-account-button").addEventListener("click", createAccountAndStartLogin);
   $("#preserve-pro-quota-switch").addEventListener("change", updatePreserveProQuota);
   $("#close-device-auth-button").addEventListener("click", () => closeDeviceAuth(true));
+  $("#device-auth-dialog").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-copy-target]");
+    if (button) handleCopyButton(button);
+  });
   $("#accounts-body").addEventListener("click", (event) => {
     const publicButton = event.target.closest("[data-public-pool-action]");
     if (publicButton) {
