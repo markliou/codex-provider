@@ -77,7 +77,10 @@
     textarea.setAttribute("readonly", "");
     textarea.style.position = "fixed";
     textarea.style.top = "-1000px";
-    document.body.appendChild(textarea);
+    // While a modal <dialog> is open everything outside it is inert, so the
+    // textarea must live inside the dialog or select()/copy silently fails.
+    const host = document.querySelector("dialog[open]") || document.body;
+    host.appendChild(textarea);
     textarea.select();
     try {
       if (!document.execCommand("copy")) throw new Error("Copy failed");
@@ -100,7 +103,13 @@
         button.disabled = !copyButtonValue(button);
       }, 1200);
     } catch (error) {
-      button.disabled = !copyButtonValue(button);
+      // #service-status sits behind the modal dialog, so surface the failure
+      // on the button itself where the user can actually see it.
+      button.textContent = "Copy failed";
+      window.setTimeout(() => {
+        button.textContent = label;
+        button.disabled = !copyButtonValue(button);
+      }, 1200);
       notify(error.message, true);
     }
   }
