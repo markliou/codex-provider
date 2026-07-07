@@ -12,7 +12,9 @@ dirty_suffix=""
 # dirty suffix so local rebuilds from uncommitted fixes are visibly distinct
 # from clean commits instead of looking like an already-pushed release.
 if ! git diff --quiet || ! git diff --cached --quiet; then
-  dirty_suffix="-dirty"
+  # Include the build time so consecutive dirty rebuilds from the same commit
+  # are distinguishable on the dashboard instead of showing an unchanged version.
+  dirty_suffix="-dirty.$(date -u +%m%d%H%M)"
 fi
 
 image="${CODEX_POOL_IMAGE:-codex-pool:local}"

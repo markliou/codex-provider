@@ -320,7 +320,14 @@
   function quotaMarkup(value, quota, quotaError, usageUpdatedAt) {
     const refreshError = quotaError ? `<span class="quota-error" title="${escapeHTML(quotaError.message)}">Quota update unavailable</span>` : "";
     if (quota) {
-      const windows = [quotaWindowMarkup("5h", quota.hourly), quotaWindowMarkup("Week", quota.weekly)].filter(Boolean).join("");
+      // The 5h row shows what is usable right now: routing takes the minimum
+      // of both windows, so a full 5h window on an empty weekly account still
+      // means 0% usable, and recovery waits on the weekly reset.
+      let hourly = quota.hourly;
+      if (hourly && hourly.present && quota.weekly && quota.weekly.present && quotaPercent(quota.weekly.percentage) < quotaPercent(hourly.percentage)) {
+        hourly = { ...hourly, percentage: quota.weekly.percentage, resetAt: quota.weekly.resetAt };
+      }
+      const windows = [quotaWindowMarkup("5h", hourly), quotaWindowMarkup("Week", quota.weekly)].filter(Boolean).join("");
       const updated = usageUpdatedAt && usageUpdatedAt !== "0001-01-01T00:00:00Z" ? `<div class="quota-updated">Updated ${escapeHTML(displayTime(usageUpdatedAt))}</div>` : "";
       return `<div class="quota quota-detailed">${windows || '<span class="quota-unknown">Quota unavailable</span>'}${updated}${refreshError}</div>`;
     }
