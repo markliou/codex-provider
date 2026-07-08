@@ -68,7 +68,7 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
 .button.quiet { color: var(--muted-strong); background: transparent; border-color: transparent; }
 .full { width: 100%; margin-top: 21px; }
 .page-heading, .section-heading, .dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.page-heading { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid rgba(56, 189, 248, .22); }
+.page-heading { position: sticky; top: 62px; z-index: 9; margin-bottom: 24px; padding: 10px 0 16px; border-bottom: 1px solid rgba(56, 189, 248, .22); background: rgba(8, 13, 20, .92); backdrop-filter: blur(18px); }
 .page-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; flex-wrap: wrap; }
 .switch-row { display: inline-flex; align-items: center; gap: 9px; margin: 0; color: var(--muted-strong); font-size: 13px; font-weight: 700; cursor: pointer; }
 .switch-row input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
