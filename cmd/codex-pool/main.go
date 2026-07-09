@@ -258,6 +258,7 @@ type app struct {
 	loginFailures        map[string]loginFailure
 	authLocks            map[string]*sync.Mutex
 	client               *http.Client
+	streamClient         *http.Client
 	logger               *log.Logger
 }
 
@@ -373,6 +374,7 @@ func newAppFromEnv() (*app, error) {
 		loginFailures:        map[string]loginFailure{},
 		authLocks:            map[string]*sync.Mutex{},
 		client:               defaultHTTPClient(),
+		streamClient:         streamingHTTPClient(),
 		logger:               log.New(os.Stdout, "codex-pool ", log.LstdFlags|log.LUTC),
 	}
 	if err := a.load(); err != nil {
@@ -387,11 +389,25 @@ func defaultHTTPClient() *http.Client {
 		return &http.Client{Timeout: 5 * time.Minute}
 	}
 	transport := base.Clone()
-	// Keep the overall request window long enough for streaming generations, but
-	// bound first-byte wait per selected account so one stalled sidecar/upstream
+	// Bound first-byte wait per selected account so one stalled sidecar/upstream
 	// cannot hold routing for minutes before Pool can fail over or return.
 	transport.ResponseHeaderTimeout = upstreamFirstByteTimeout
 	return &http.Client{Timeout: 5 * time.Minute, Transport: transport}
+}
+
+// streamingHTTPClient must not carry an overall timeout: http.Client.Timeout
+// covers reading the whole body, so it cuts live SSE generations mid-stream
+// (heavy reasoning models regularly run past five minutes, and the client then
+// loops on "reconnecting" retries). First-byte wait stays bounded through the
+// transport, and a disconnected client still cancels via the request context.
+func streamingHTTPClient() *http.Client {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Client{}
+	}
+	transport := base.Clone()
+	transport.ResponseHeaderTimeout = upstreamFirstByteTimeout
+	return &http.Client{Transport: transport}
 }
 
 func (a *app) load() error {
@@ -920,7 +936,7 @@ func (a *app) forward(ctx context.Context, candidate account, endpoint string, b
 			req.Header.Set("X-OpenAI-Fedramp", "true")
 		}
 	}
-	return a.client.Do(req)
+	return a.streamClient.Do(req)
 }
 
 func upstreamAuthFailureStatus(status int) bool {
