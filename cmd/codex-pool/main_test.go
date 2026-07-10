@@ -1367,6 +1367,77 @@ func TestPreserveProQuotaModeUsesProWhenNonProCoolingDown(t *testing.T) {
 	}
 }
 
+func TestTransientQuotaRefreshErrorDoesNotBlockProFailover(t *testing.T) {
+	plusHits := 0
+	plus := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		plusHits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer plus.Close()
+	proHits := 0
+	pro := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_pro_fallback","object":"response","output":[]}`))
+	}))
+	defer pro.Close()
+
+	a := testApp(t, []account{
+		{ID: "plus", PlanType: "plus", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: plus.URL, UpstreamAPIKey: "plus"},
+		{ID: "pro", PlanType: "pro", PlanLimit: "20x", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: pro.URL, UpstreamAPIKey: "pro"},
+	})
+	a.preserveProQuota = true
+	a.state.Quotas["plus"] = quotaSnapshot{AccountID: "plus", PlanType: "plus", Quota: &accountQuota{Hourly: quotaWindow{Percentage: 0, Present: true}, Weekly: quotaWindow{Percentage: 80, Present: true}}}
+	a.state.Quotas["pro"] = quotaSnapshot{
+		AccountID: "pro",
+		PlanType:  "pro",
+		Quota:     &accountQuota{Hourly: quotaWindow{Percentage: 98, Present: true}, Weekly: quotaWindow{Percentage: 100, Present: true}},
+		QuotaError: &quotaErrorInfo{
+			Code:      "upstream_status",
+			Message:   "quota API returned status 500",
+			Timestamp: time.Now().UTC(),
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "plus-to-pro-after-quota-poll-500")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("transient quota error caused failover response %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if plusHits != 0 || proHits != 1 {
+		t.Fatalf("plus-to-pro routing hits = plus:%d pro:%d, want 0/1", plusHits, proHits)
+	}
+	if session := a.state.StickySessions["gpt-test:plus-to-pro-after-quota-poll-500"]; session.AccountID != "pro" {
+		t.Fatalf("plus-to-pro sticky session = %#v", session)
+	}
+	if status, reason := a.accountStatusLocked(a.config.Accounts[1], time.Now().UTC()); status != "ready" {
+		t.Fatalf("transient quota error made Pro dashboard unavailable: %q, %q", status, reason)
+	}
+}
+
+func TestExplicitQuotaAuthErrorStillBlocksRouting(t *testing.T) {
+	a := testApp(t, []account{{
+		ID: "pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 100,
+		UpstreamBaseURL: "https://pro.example.test", UpstreamAPIKey: "pro",
+	}})
+	a.state.Quotas["pro"] = quotaSnapshot{
+		AccountID: "pro",
+		PlanType:  "pro",
+		Quota:     &accountQuota{Hourly: quotaWindow{Percentage: 98, Present: true}},
+		QuotaError: &quotaErrorInfo{
+			Code:      "invalid_token",
+			Message:   "credential unavailable",
+			Timestamp: time.Now().UTC(),
+		},
+	}
+	if _, err := a.selectAccount("gpt-test:auth-error", "gpt-test", map[string]bool{}); err == nil {
+		t.Fatal("explicit quota auth error did not block routing")
+	}
+}
+
 func TestResponsesProxyUsesCodexDeviceAuth(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/backend-api/responses" {

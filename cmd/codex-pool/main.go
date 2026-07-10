@@ -2045,7 +2045,25 @@ func (a *app) duplicateUpstreamAccountPrimaryLocked(item account, now time.Time)
 }
 
 func (a *app) accountMetadataErrorLocked(accountID string) bool {
-	return a.state.Quotas[accountID].QuotaError != nil
+	return quotaErrorBlocksRouting(a.state.Quotas[accountID].QuotaError)
+}
+
+func quotaErrorBlocksRouting(info *quotaErrorInfo) bool {
+	if info == nil {
+		return false
+	}
+	// Quota polling is advisory and uses a different upstream path from inference.
+	// A transient usage API 5xx, timeout, or decode failure must not remove a
+	// healthy Pro fallback and turn a non-Pro-to-Pro transition into a false 503.
+	// Only errors that explicitly prove the credential is unusable may gate
+	// routing; the proxy path will still quarantine a credential if inference
+	// itself later returns 401/403.
+	switch sanitizedErrorCode(info.Code) {
+	case "account_auth_failed", "invalid_token", "token_invalidated", "token_revoked", "unauthorized", "forbidden":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *app) hasUsableAuthLocked(item account) bool {
@@ -2127,7 +2145,7 @@ func (a *app) usableLocked(item account, model string, now time.Time) bool {
 
 func (a *app) quotaAvailableLocked(item account, model string, now time.Time) bool {
 	snapshot := a.state.Quotas[item.ID]
-	if snapshot.QuotaError != nil {
+	if quotaErrorBlocksRouting(snapshot.QuotaError) {
 		return false
 	}
 	if snapshot.Quota != nil {
@@ -2147,7 +2165,7 @@ func (a *app) quotaAvailableLocked(item account, model string, now time.Time) bo
 
 func (a *app) quotaSnapshotAvailableLocked(accountID string) (bool, bool) {
 	snapshot := a.state.Quotas[accountID]
-	if snapshot.QuotaError != nil {
+	if quotaErrorBlocksRouting(snapshot.QuotaError) {
 		return false, true
 	}
 	if snapshot.Quota != nil {
@@ -3620,7 +3638,11 @@ func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaS
 		if ctx.Err() != nil {
 			return quotaSnapshot{}, errors.New("quota refresh cancelled")
 		}
-		a.saveQuotaError(accountID, "token_refresh_failed", "refresh codex token failed")
+		code := "token_refresh_unavailable"
+		if errors.Is(err, errAccountAuthFailed) {
+			code = "account_auth_failed"
+		}
+		a.saveQuotaError(accountID, code, "refresh codex token failed")
 		return quotaSnapshot{}, errors.New("refresh codex token failed")
 	}
 	if auth.AccountID == "" {
@@ -3662,6 +3684,9 @@ func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaS
 		message := fmt.Sprintf("quota API returned status %d", response.StatusCode)
 		if code != "" {
 			message += " [" + code + "]"
+		}
+		if upstreamAuthFailureStatus(response.StatusCode) && !quotaErrorBlocksRouting(&quotaErrorInfo{Code: code}) {
+			code = "account_auth_failed"
 		}
 		a.saveQuotaError(accountID, codeOr(code, "upstream_status"), message)
 		return quotaSnapshot{}, errors.New(message)
@@ -4548,13 +4573,13 @@ func (a *app) accountStatusLocked(item account, now time.Time) (string, string) 
 	if cooldowns := activeCooldowns(a.state.Cooldowns[item.ID], now); len(cooldowns) > 0 {
 		return "cooldown", cooldowns[0].Reason
 	}
-	// Last failure is diagnostic history, not an availability gate after its
-	// cooldown expires. Routing only excludes active cooldowns, missing auth, and
-	// quota/auth metadata errors; keeping a stale ConsecutiveFailure as "error"
-	// made healthy Pro fallback slots look permanently unavailable in the public
-	// dashboard until they happened to receive another success.
+	// Last failure and transient quota polling failures are diagnostic history,
+	// not availability gates. Routing only excludes active cooldowns, missing
+	// auth, exhausted quota, and explicit credential errors; otherwise a usage API
+	// outage can hide a healthy Pro fallback and create a false 503 exactly when a
+	// non-Pro account runs out.
 	quotaSnapshot := a.state.Quotas[item.ID]
-	if quotaSnapshot.QuotaError != nil {
+	if quotaErrorBlocksRouting(quotaSnapshot.QuotaError) {
 		reason := "Quota refresh failed"
 		if quotaSnapshot.QuotaError.Code != "" {
 			reason += ": " + quotaSnapshot.QuotaError.Code
