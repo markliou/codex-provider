@@ -12,7 +12,7 @@ Before release or deployment testing, verify the implementation with Docker-only
 
 1. Run the Go test suite in a Go Docker image.
 2. Build the production image from the repository Dockerfile.
-3. Run the Codex CLI/provider integration script against a mock upstream and prove Codex can use `config.toml` with `base_url`, `env_key`, and `wire_api = "responses"`.
+3. Run the Codex CLI/provider integration script against a mock upstream and prove Codex can use `config.toml` with `base_url`, `env_key`, and `wire_api = "responses"`; the same script must run `codex app-server` `model/list` and prove the provider catalog passes the bundled Codex decoder without falling back to bundled models.
 4. Run the staged security audit and manually inspect staged changes before committing.
 
 ## 0. Purpose
@@ -326,9 +326,34 @@ Minimum shape:
       "slug": "gpt-5.5",
       "display_name": "GPT-5.5",
       "description": "GPT-5.5",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {"effort": "low", "description": "Fast responses with lighter reasoning"},
+        {"effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks"},
+        {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+        {"effort": "xhigh", "description": "Extra high reasoning depth for complex problems"}
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "base_instructions": "You are Codex, a coding agent...",
+      "supports_reasoning_summaries": true,
+      "supports_reasoning_summary_parameter": true,
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text_and_image",
+      "truncation_policy": {"mode": "tokens", "limit": 10000},
+      "supports_parallel_tool_calls": true,
+      "supports_image_detail_original": true,
       "context_length": 272000,
-      "max_context_window": 1000000,
-      "priority": 1000,
+      "context_window": 272000,
+      "max_context_window": 272000,
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "input_modalities": ["text", "image"],
       "additional_speed_tiers": [],
       "service_tiers": [],
       "availability_nux": null,
@@ -337,6 +362,8 @@ Minimum shape:
   ]
 }
 ```
+
+The response must include every non-defaulted field required by the bundled Codex client schema, even when the value is `false`, empty, or `null`. `base_instructions` must remain non-empty because remote metadata becomes authoritative after a successful refresh. Emit both `supports_reasoning_summaries` and `supports_reasoning_summary_parameter` while supported clients use both schema generations; unknown fields are ignored by the other generation.
 
 Optional hidden models must include:
 
@@ -507,6 +534,12 @@ Quota polling is advisory and must not become an inference availability gate for
 If at least one upstream account has already been selected and then failed in a request, exhausting the remaining failover candidates is an upstream failure (`502 bad_gateway`), not initial pool exhaustion (`503 no eligible account`). Initial `503 no eligible account` is reserved for the strict case where no account can be selected before any upstream attempt.
 
 A transient upstream `5xx` without `Retry-After` must preserve sticky account locality for KV cache hit rate. Do not cool down or fail over the selected account on the first isolated `5xx`; return `502` for that request and let the next request retry the same sticky account. Only recent repeated `5xx` failures may cool down that account and move the sticky route to another upstream identity.
+
+### 6.4.1 Codex model catalog compatibility
+
+When Codex requests `/v1/models` with `client_version`, return the current Codex remote-model catalog shape rather than the generic OpenAI model-list shape. Every model record must include structured `supported_reasoning_levels` entries and a `default_reasoning_level`. Legacy reasoning aliases such as `model(high)` may remain accepted as request inputs, but the Codex catalog must collapse them into one canonical base model and advertise reasoning effort as capability metadata. Missing required model fields cause Codex's model manager to retry during app-server startup and must not be allowed to destabilize unrelated MCP client initialization.
+
+The generic `/v1/models` response without `client_version` remains OpenAI-compatible and may continue exposing configured request aliases for non-Codex clients.
 
 ### 6.5 Candidate account filter
 

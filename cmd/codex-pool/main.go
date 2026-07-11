@@ -64,6 +64,10 @@ const (
 	upstream5xxCooldown       = 10 * time.Second
 	upstream5xxFailoverAfter  = 3
 	upstream5xxFailureWindow  = 2 * time.Minute
+	// Codex treats remote model metadata as authoritative for ChatGPT-backed
+	// providers. This fallback must remain non-empty or a schema-only fix would
+	// silently remove the coding-agent instructions after a successful refresh.
+	codexModelBaseInstructions = "You are Codex, a coding agent running in a terminal-based coding assistant. Inspect the workspace before acting, follow repository instructions such as AGENTS.md, use the available tools to implement and verify changes, keep the user informed, and continue until the task is genuinely handled."
 )
 
 var (
@@ -668,16 +672,157 @@ func (a *app) handleCurrentStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+type codexReasoningLevel struct {
+	Effort      string `json:"effort"`
+	Description string `json:"description"`
+}
+
+type codexTruncationPolicy struct {
+	Mode  string `json:"mode"`
+	Limit int    `json:"limit"`
+}
+
+type codexModelInfo struct {
+	ID                                string                `json:"id"`
+	Slug                              string                `json:"slug"`
+	DisplayName                       string                `json:"display_name"`
+	Description                       string                `json:"description"`
+	DefaultReasoningLevel             string                `json:"default_reasoning_level"`
+	SupportedReasoningLevels          []codexReasoningLevel `json:"supported_reasoning_levels"`
+	ShellType                         string                `json:"shell_type"`
+	Visibility                        string                `json:"visibility"`
+	SupportedInAPI                    bool                  `json:"supported_in_api"`
+	Priority                          int                   `json:"priority"`
+	AdditionalSpeedTiers              []string              `json:"additional_speed_tiers"`
+	ServiceTiers                      []any                 `json:"service_tiers"`
+	DefaultServiceTier                any                   `json:"default_service_tier"`
+	AvailabilityNUX                   any                   `json:"availability_nux"`
+	Upgrade                           any                   `json:"upgrade"`
+	BaseInstructions                  string                `json:"base_instructions"`
+	ModelMessages                     any                   `json:"model_messages"`
+	SupportsReasoningSummaries        bool                  `json:"supports_reasoning_summaries"`
+	SupportsReasoningSummaryParameter bool                  `json:"supports_reasoning_summary_parameter"`
+	DefaultReasoningSummary           string                `json:"default_reasoning_summary"`
+	SupportVerbosity                  bool                  `json:"support_verbosity"`
+	DefaultVerbosity                  string                `json:"default_verbosity"`
+	ApplyPatchToolType                string                `json:"apply_patch_tool_type"`
+	WebSearchToolType                 string                `json:"web_search_tool_type"`
+	TruncationPolicy                  codexTruncationPolicy `json:"truncation_policy"`
+	SupportsParallelToolCalls         bool                  `json:"supports_parallel_tool_calls"`
+	SupportsImageDetailOriginal       bool                  `json:"supports_image_detail_original"`
+	ContextWindow                     int                   `json:"context_window"`
+	ContextLength                     int                   `json:"context_length"`
+	MaxContextWindow                  int                   `json:"max_context_window"`
+	AutoCompactTokenLimit             any                   `json:"auto_compact_token_limit"`
+	CompHash                          any                   `json:"comp_hash"`
+	EffectiveContextWindowPercent     int                   `json:"effective_context_window_percent"`
+	ExperimentalSupportedTools        []string              `json:"experimental_supported_tools"`
+	InputModalities                   []string              `json:"input_modalities"`
+	IncludeSkillsUsageInstructions    bool                  `json:"include_skills_usage_instructions"`
+	SupportsSearchTool                bool                  `json:"supports_search_tool"`
+	UseResponsesLite                  bool                  `json:"use_responses_lite"`
+	AutoReviewModelOverride           any                   `json:"auto_review_model_override"`
+	ToolMode                          any                   `json:"tool_mode"`
+	MultiAgentVersion                 any                   `json:"multi_agent_version"`
+}
+
+func codexReasoningLevels() []codexReasoningLevel {
+	return []codexReasoningLevel{
+		{Effort: "low", Description: "Fast responses with lighter reasoning"},
+		{Effort: "medium", Description: "Balances speed and reasoning depth for everyday tasks"},
+		{Effort: "high", Description: "Greater reasoning depth for complex problems"},
+		{Effort: "xhigh", Description: "Extra high reasoning depth for complex problems"},
+	}
+}
+
+func codexCatalogReasoningDefault(tier string) string {
+	switch tier {
+	case "low", "medium", "high", "xhigh":
+		return tier
+	default:
+		return "medium"
+	}
+}
+
+func (a *app) codexModelCatalogLocked(models []string) []codexModelInfo {
+	defaultModel, defaultTier := parseModel(a.config.DefaultModel)
+	defaultTier = codexCatalogReasoningDefault(defaultTier)
+	seen := map[string]bool{}
+	items := make([]codexModelInfo, 0, len(models))
+	for _, model := range models {
+		canonical, tier := parseModel(model)
+		if tier != "" {
+			model = canonical
+		}
+		if model == "" || seen[model] {
+			continue
+		}
+		seen[model] = true
+		reasoningDefault := "medium"
+		priority := 1000
+		if model == defaultModel {
+			reasoningDefault = defaultTier
+			priority = 0
+		}
+		items = append(items, codexModelInfo{
+			ID:                                model,
+			Slug:                              model,
+			DisplayName:                       model,
+			Description:                       model,
+			DefaultReasoningLevel:             reasoningDefault,
+			SupportedReasoningLevels:          codexReasoningLevels(),
+			ShellType:                         "shell_command",
+			Visibility:                        "list",
+			SupportedInAPI:                    true,
+			Priority:                          priority,
+			AdditionalSpeedTiers:              []string{},
+			ServiceTiers:                      []any{},
+			DefaultServiceTier:                nil,
+			AvailabilityNUX:                   nil,
+			Upgrade:                           nil,
+			BaseInstructions:                  codexModelBaseInstructions,
+			ModelMessages:                     nil,
+			SupportsReasoningSummaries:        true,
+			SupportsReasoningSummaryParameter: true,
+			DefaultReasoningSummary:           "none",
+			SupportVerbosity:                  true,
+			DefaultVerbosity:                  "low",
+			ApplyPatchToolType:                "freeform",
+			WebSearchToolType:                 "text_and_image",
+			TruncationPolicy:                  codexTruncationPolicy{Mode: "tokens", Limit: 10000},
+			SupportsParallelToolCalls:         true,
+			SupportsImageDetailOriginal:       true,
+			ContextWindow:                     272000,
+			ContextLength:                     272000,
+			MaxContextWindow:                  272000,
+			AutoCompactTokenLimit:             nil,
+			CompHash:                          nil,
+			EffectiveContextWindowPercent:     95,
+			ExperimentalSupportedTools:        []string{},
+			InputModalities:                   []string{"text", "image"},
+			IncludeSkillsUsageInstructions:    false,
+			SupportsSearchTool:                false,
+			UseResponsesLite:                  false,
+			AutoReviewModelOverride:           nil,
+			ToolMode:                          nil,
+			MultiAgentVersion:                 nil,
+		})
+	}
+	return items
+}
+
 func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	models := a.modelsLocked()
 	if r.URL.Query().Get("client_version") != "" {
-		items := make([]map[string]any, 0, len(models))
-		for _, model := range models {
-			items = append(items, map[string]any{"id": model, "slug": model, "display_name": model, "description": model, "context_length": 272000, "max_context_window": 272000, "priority": 1000, "additional_speed_tiers": []any{}, "service_tiers": []any{}})
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"models": items})
+		// Codex decodes this endpoint with its remote-model schema, not the loose
+		// OpenAI model-list shape below. Keep reasoning effort as structured model
+		// capability metadata and collapse legacy `(high)`-style aliases to one
+		// canonical model. Omitting required capability fields makes the model
+		// manager retry during app-server startup and can starve unrelated MCP app
+		// initialization until it times out.
+		writeJSON(w, http.StatusOK, map[string]any{"models": a.codexModelCatalogLocked(models)})
 		return
 	}
 	items := make([]map[string]any, 0, len(models))

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -58,6 +59,124 @@ func TestDefaultModelCatalogIncludesThinkingTiers(t *testing.T) {
 			t.Fatalf("modelsLocked missing %q in:\n%s", expected, models)
 		}
 	}
+}
+
+func TestCodexModelCatalogAdvertisesReasoningCapabilities(t *testing.T) {
+	a := testApp(t, nil)
+	a.config.DefaultModel = "gpt-5.5(xhigh)"
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.142.4", nil)
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("Codex model catalog returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	// Codex 0.141.0 deserializes these fields without serde defaults. Checking
+	// raw keys keeps this test from passing when a required nullable or false
+	// field is accidentally omitted and would restart the model refresh loop.
+	var rawPayload struct {
+		Models []map[string]json.RawMessage `json:"models"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &rawPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(rawPayload.Models) == 0 {
+		t.Fatal("Codex model catalog is empty")
+	}
+	var rawModel map[string]json.RawMessage
+	for _, candidate := range rawPayload.Models {
+		var slug string
+		if err := json.Unmarshal(candidate["slug"], &slug); err == nil && slug == "gpt-5.5" {
+			rawModel = candidate
+			break
+		}
+	}
+	if rawModel == nil {
+		t.Fatal("Codex model catalog omitted gpt-5.5")
+	}
+	for _, field := range []string{
+		"slug", "display_name", "description", "supported_reasoning_levels",
+		"shell_type", "visibility", "supported_in_api", "priority",
+		"availability_nux", "upgrade", "base_instructions",
+		"supports_reasoning_summaries", "supports_reasoning_summary_parameter",
+		"support_verbosity", "default_verbosity", "apply_patch_tool_type",
+		"truncation_policy", "supports_parallel_tool_calls",
+		"experimental_supported_tools",
+	} {
+		if _, ok := rawModel[field]; !ok {
+			t.Fatalf("Codex 0.141 model metadata missing required field %q: %s", field, recorder.Body.String())
+		}
+	}
+
+	var payload struct {
+		Models []codexModelInfo `json:"models"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	var model *codexModelInfo
+	for index := range payload.Models {
+		if payload.Models[index].ID == "gpt-5.5" {
+			model = &payload.Models[index]
+			break
+		}
+	}
+	if model == nil || model.Slug != "gpt-5.5" || model.ContextWindow != 272000 || model.DefaultReasoningLevel != "xhigh" {
+		t.Fatalf("unexpected Codex model metadata: %#v", model)
+	}
+	if model.Priority != 0 {
+		t.Fatalf("default model priority = %d, want 0", model.Priority)
+	}
+	if model.ShellType != "shell_command" || model.Visibility != "list" || !model.SupportedInAPI {
+		t.Fatalf("invalid Codex model routing metadata: %#v", model)
+	}
+	if model.BaseInstructions == "" || model.ApplyPatchToolType != "freeform" || !model.SupportsParallelToolCalls {
+		t.Fatalf("invalid Codex agent capability metadata: %#v", model)
+	}
+	if !model.SupportsReasoningSummaries || !model.SupportsReasoningSummaryParameter {
+		t.Fatalf("reasoning summary compatibility fields missing: %#v", model)
+	}
+	if model.TruncationPolicy.Mode != "tokens" || model.TruncationPolicy.Limit != 10000 {
+		t.Fatalf("unexpected truncation policy: %#v", model.TruncationPolicy)
+	}
+	if len(model.InputModalities) != 2 || model.InputModalities[0] != "text" || model.InputModalities[1] != "image" {
+		t.Fatalf("unexpected input modalities: %#v", model.InputModalities)
+	}
+	if len(model.SupportedReasoningLevels) != 4 {
+		t.Fatalf("supported reasoning levels = %#v", model.SupportedReasoningLevels)
+	}
+	for index, effort := range []string{"low", "medium", "high", "xhigh"} {
+		if model.SupportedReasoningLevels[index].Effort != effort || model.SupportedReasoningLevels[index].Description == "" {
+			t.Fatalf("reasoning level %d = %#v", index, model.SupportedReasoningLevels[index])
+		}
+	}
+	if strings.Contains(recorder.Body.String(), "gpt-5.5(xhigh)") {
+		t.Fatal("Codex model catalog exposed legacy reasoning suffix")
+	}
+
+	genericReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	genericReq.Header.Set("Authorization", "Bearer client-key")
+	genericRecorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(genericRecorder, genericReq)
+	if !strings.Contains(genericRecorder.Body.String(), "gpt-5.5(xhigh)") {
+		t.Fatal("generic model list lost legacy reasoning alias compatibility")
+	}
+}
+
+func TestCodexModelCatalogNormalizesUnsupportedDefaultReasoningTier(t *testing.T) {
+	a := testApp(t, nil)
+	a.config.DefaultModel = "gpt-5.5(max)"
+	models := a.codexModelCatalogLocked(a.modelsLocked())
+	for _, model := range models {
+		if model.Slug == "gpt-5.5" {
+			if model.DefaultReasoningLevel != "medium" {
+				t.Fatalf("unsupported catalog default = %q, want medium", model.DefaultReasoningLevel)
+			}
+			return
+		}
+	}
+	t.Fatal("Codex model catalog omitted gpt-5.5")
 }
 
 func TestDefaultModelEnvOverridesPersistedConfig(t *testing.T) {
@@ -1435,6 +1554,149 @@ func TestExplicitQuotaAuthErrorStillBlocksRouting(t *testing.T) {
 	}
 	if _, err := a.selectAccount("gpt-test:auth-error", "gpt-test", map[string]bool{}); err == nil {
 		t.Fatal("explicit quota auth error did not block routing")
+	}
+}
+
+func TestResponsesProxyPreservesLargeMCPToolPayloadAndStreamingEvents(t *testing.T) {
+	const toolCount = 320
+	longToolName := "mcp__apps_runtime__workspace_agents__upsert_agent_application_configuration_with_extended_name"
+	round := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		round++
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		tools, _ := payload["tools"].([]any)
+		if len(tools) != toolCount {
+			t.Fatalf("forwarded tools = %d, want %d", len(tools), toolCount)
+		}
+		first, _ := tools[0].(map[string]any)
+		function, _ := first["function"].(map[string]any)
+		if function["name"] != longToolName {
+			t.Fatalf("long MCP tool name changed: %#v", function["name"])
+		}
+		parameters, _ := function["parameters"].(map[string]any)
+		properties, _ := parameters["properties"].(map[string]any)
+		config, _ := properties["configuration"].(map[string]any)
+		if config["description"] != strings.Repeat("schema-detail-", 200) {
+			t.Fatal("large MCP JSON Schema was truncated or changed")
+		}
+		if round == 2 {
+			if payload["previous_response_id"] != "resp_mcp_large" {
+				t.Fatalf("previous response id changed: %#v", payload["previous_response_id"])
+			}
+			input, _ := payload["input"].([]any)
+			if len(input) != 1 {
+				t.Fatalf("second-round input = %#v", payload["input"])
+			}
+			output, _ := input[0].(map[string]any)
+			if output["type"] != "function_call_output" || output["call_id"] != "call_mcp_long_1" || output["output"] != `{"saved":true}` {
+				t.Fatalf("function call output changed: %#v", output)
+			}
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		if round == 1 {
+			_, _ = io.WriteString(w, "event: response.output_item.added\n")
+			_, _ = io.WriteString(w, `data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_mcp_long_1","name":"`+longToolName+`","arguments":"{\\"enabled\\":true}"}}`+"\n\n")
+		} else {
+			_, _ = io.WriteString(w, "event: response.output_text.delta\n")
+			_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"saved"}`+"\n\n")
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		_, _ = io.WriteString(w, "event: response.completed\n")
+		responseID := "resp_mcp_large"
+		inputTokens := 4096
+		cachedTokens := 3072
+		if round == 2 {
+			responseID = "resp_mcp_large_2"
+			inputTokens = 5120
+			cachedTokens = 4096
+		}
+		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"usage\":{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d}}}}\n\n", responseID, inputTokens, cachedTokens)
+	}))
+	defer upstream.Close()
+
+	a := testApp(t, []account{{
+		ID: "provider", Enabled: true, InPool: true, Priority: 100,
+		UpstreamBaseURL: upstream.URL, UpstreamAPIKey: "provider-key",
+	}})
+	tools := make([]map[string]any, 0, toolCount)
+	for index := 0; index < toolCount; index++ {
+		name := fmt.Sprintf("mcp__apps_runtime__tool_%03d", index)
+		if index == 0 {
+			name = longToolName
+		}
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": name,
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"configuration": map[string]any{"type": "string", "description": strings.Repeat("schema-detail-", 200)},
+					},
+				},
+			},
+		})
+	}
+	proxy := func(payload map[string]any) string {
+		t.Helper()
+		body, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+		req.Header.Set("Authorization", "Bearer client-key")
+		recorder := httptest.NewRecorder()
+		a.publicMux().ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("large MCP proxy returned %d: %s", recorder.Code, recorder.Body.String())
+		}
+		return recorder.Body.String()
+	}
+
+	responseBody := proxy(map[string]any{"model": "gpt-test", "input": "hello", "stream": true, "tools": tools})
+	for _, expected := range []string{longToolName, "call_mcp_long_1", "response.output_item.added", "response.completed"} {
+		if !strings.Contains(responseBody, expected) {
+			t.Fatalf("streaming response lost %q: %s", expected, responseBody)
+		}
+	}
+	secondResponse := proxy(map[string]any{
+		"model":                "gpt-test",
+		"previous_response_id": "resp_mcp_large",
+		"input": []map[string]any{{
+			"type":    "function_call_output",
+			"call_id": "call_mcp_long_1",
+			"output":  `{"saved":true}`,
+		}},
+		"stream": true,
+		"tools":  tools,
+	})
+	for _, expected := range []string{"response.output_text.delta", "saved", "resp_mcp_large_2", "response.completed"} {
+		if !strings.Contains(secondResponse, expected) {
+			t.Fatalf("second streaming round lost %q: %s", expected, secondResponse)
+		}
+	}
+	if round != 2 {
+		t.Fatalf("upstream rounds = %d, want 2", round)
+	}
+	if stat := a.state.PromptCache["provider:gpt-test"]; stat.InputTokens != 9216 || stat.CachedTokens != 7168 || stat.RequestCount != 2 {
+		t.Fatalf("streaming usage was not recorded: %#v", stat)
+	}
+}
+
+func TestCopyStreamingProxyResponseFlushesSSE(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	info := copyStreamingProxyResponse(recorder, strings.NewReader("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_flushed\"}}\n\n"))
+	if !recorder.Flushed {
+		t.Fatal("SSE proxy buffered the response without flushing")
+	}
+	if info.ResponseID != "resp_flushed" {
+		t.Fatalf("streaming response id = %q", info.ResponseID)
 	}
 }
 

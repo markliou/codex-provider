@@ -49,18 +49,17 @@ for (let i = 0; i < 60; i += 1) {
 }
 const fail = (message) => { throw new Error(message); };
 const apiRootNoKey = await fetch("http://codex-pool:8317/");
-if (apiRootNoKey.status !== 401) fail(`public API root without key status ${apiRootNoKey.status}`);
+if (apiRootNoKey.status !== 404) fail(`public API root without key status ${apiRootNoKey.status}`);
 const apiRoot = await fetch("http://codex-pool:8317/", { headers: { Authorization: "Bearer '"$CLIENT_KEY"'" } });
-if (apiRoot.status !== 200) fail(`public API root with key status ${apiRoot.status}`);
-const apiRootBody = await apiRoot.text();
-if (!apiRootBody.includes("codex-pool") || !apiRootBody.includes("/v1")) fail(`public API root body ${apiRootBody}`);
+if (apiRoot.status !== 404) fail(`public API root with key status ${apiRoot.status}`);
 const healthNoKey = await fetch("http://codex-pool:8317/healthz");
 if (healthNoKey.status !== 401) fail(`public health without key status ${healthNoKey.status}`);
 const health = await fetch("http://codex-pool:8317/healthz", { headers: { Authorization: "Bearer '"$CLIENT_KEY"'" } });
 if (health.status !== 200) fail(`public health with key status ${health.status}`);
 const adminRoot = await fetch("http://codex-pool:8318/", { redirect: "manual" });
-if (adminRoot.status !== 302) fail(`admin root status ${adminRoot.status}`);
-if (adminRoot.headers.get("location") !== "/admin") fail(`admin root location ${adminRoot.headers.get("location")}`);
+if (adminRoot.status !== 200) fail(`admin root status ${adminRoot.status}`);
+const adminRootBody = await adminRoot.text();
+if (!adminRootBody.includes(`id="dashboard-view"`) || !adminRootBody.includes(`id="login-view"`)) fail("admin root did not serve dashboard shell");
 const publicResp = await fetch("http://codex-pool:8318/admin/api/public-dashboard");
 if (publicResp.status !== 200) fail(`public dashboard status ${publicResp.status}`);
 const unauth = await fetch("http://codex-pool:8318/admin/api/accounts");
@@ -89,4 +88,43 @@ CODEX_HOME=/tmp/codex-home codex exec --skip-git-repo-check --ephemeral --sandbo
 
 printf "%s\n" "$CODEX_OUTPUT"
 printf "%s\n" "$CODEX_OUTPUT" | grep -F "CODEX_PROVIDER_CONFIG_TOML_OK" >/dev/null
+
+# model/list must pass through the bundled Codex decoder and surface gpt-test,
+# which does not exist in its fallback catalog. A loose JSON-only check would
+# miss required fields and allow the startup refresh loop to regress.
+set +e
+APP_SERVER_OUTPUT=$(docker run --rm --network "$NETWORK" --entrypoint sh -e CODEX_POOL_API_KEY="$CLIENT_KEY" codex-pool:local -lc '
+set -eu
+mkdir -p /tmp/codex-app-home
+cat >/tmp/codex-app-home/config.toml <<EOF
+model = "gpt-test"
+model_provider = "codex-pool"
+
+[model_providers.codex-pool]
+name = "Codex Pool app-server integration test"
+base_url = "http://codex-pool:8317/v1"
+wire_api = "responses"
+auth = { command = "/bin/echo", args = ["$CODEX_POOL_API_KEY"] }
+EOF
+{
+  printf "%s\n" '\''{"method":"initialize","id":0,"params":{"clientInfo":{"name":"codex_pool_integration","title":"Codex Pool Integration","version":"1.0.0"}}}'\''
+  printf "%s\n" '\''{"method":"initialized","params":{}}'\''
+  printf "%s\n" '\''{"method":"model/list","id":1,"params":{}}'\''
+  sleep 8
+} | CODEX_HOME=/tmp/codex-app-home timeout 10 codex app-server 2>&1
+')
+APP_SERVER_STATUS=$?
+set -e
+
+printf "%s\n" "$APP_SERVER_OUTPUT"
+if [ "$APP_SERVER_STATUS" -ne 0 ] && [ "$APP_SERVER_STATUS" -ne 124 ]; then
+  printf "%s\n" "Codex app-server exited with status $APP_SERVER_STATUS." >&2
+  exit "$APP_SERVER_STATUS"
+fi
+printf "%s\n" "$APP_SERVER_OUTPUT" | grep -F '"id":1' >/dev/null
+printf "%s\n" "$APP_SERVER_OUTPUT" | grep -F '"model":"gpt-test"' >/dev/null
+if printf "%s\n" "$APP_SERVER_OUTPUT" | grep -F "failed to decode models response" >/dev/null; then
+  printf "%s\n" "Codex app-server rejected the provider model catalog." >&2
+  exit 1
+fi
 printf "%s\n" "Codex config.toml integration passed."
