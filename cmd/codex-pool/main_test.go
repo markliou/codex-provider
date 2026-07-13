@@ -28,11 +28,15 @@ func testApp(t *testing.T, accounts []account) *app {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Most pre-existing tests assert the rollback strategy's strict account
+	// ordering. Keep the shared fixture in failover mode; balanced-routing tests
+	// opt in explicitly so their assertions cover the new contract instead of
+	// accidentally rewriting unrelated priority/failover coverage.
 	return &app{
 		config:  config{DefaultModel: "gpt-test", ModelAliases: map[string]string{"alias": "gpt-test"}, Accounts: accounts},
 		state:   state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, ThreadBindings: map[string]threadBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}},
 		dataDir: dir, apiKeys: [][]byte{[]byte("client-key")}, adminUser: "admin", adminHash: []byte(hash),
-		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, promptCacheKeyMode: "auto", publicDashboard: true, codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second}, streamClient: &http.Client{Timeout: time.Second},
+		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, routingStrategy: routingStrategyFailover, promptCacheKeyMode: "auto", publicDashboard: true, codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second}, streamClient: &http.Client{Timeout: time.Second},
 	}
 }
 
@@ -725,7 +729,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page still includes %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"ACCESS", "Continue", "Password", "Add account", "Use Pro last", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown", "Copy verification link", "Copy verification code"} {
+	for _, expected := range []string{"ACCESS", "Continue", "Password", "Add account", "Use Pro last", "Balanced sticky", "routing-strategy-pill", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown", "Copy verification link", "Copy verification code"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page does not include low-key label %q", expected)
 		}
@@ -769,12 +773,15 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if !strings.Contains(jsRecorder.Body.String(), "preserveProQuota") {
 		t.Fatal("admin JS does not render the Pro quota preservation switch")
 	}
+	if !strings.Contains(jsRecorder.Body.String(), "sticky_balanced") || !strings.Contains(jsRecorder.Body.String(), "activeRouteCount") {
+		t.Fatal("admin JS does not expose balanced routing state and per-account active routes")
+	}
 	for _, expected := range []string{"parentAffinityHitCount", "parentAffinityFallbackCount", "lineageFailoverCount", "win.subagent"} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS omitted subagent cache metric %q", expected)
 		}
 	}
-	for _, expected := range []string{"displayResetCountdown", "quotaTrackMarkup", "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
+	for _, expected := range []string{"displayResetCountdown", "quotaTone", "quotaTrackMarkup", `"critical"`, `"watch"`, "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS does not render clear quota state %q", expected)
 		}
@@ -785,8 +792,19 @@ func TestAdminDashboardAssets(t *testing.T) {
 	cssRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/app.css", nil)
 	cssRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(cssRecorder, cssRequest)
-	if !strings.Contains(cssRecorder.Body.String(), "::-webkit-progress-value") || !strings.Contains(cssRecorder.Body.String(), "background: #0f172a") || !strings.Contains(cssRecorder.Body.String(), "border: 1px solid #334155") {
+	if !strings.Contains(cssRecorder.Body.String(), "::-webkit-progress-value") || !strings.Contains(cssRecorder.Body.String(), "background: #171020") || !strings.Contains(cssRecorder.Body.String(), "border: 1px solid #4b3c60") {
 		t.Fatal("admin CSS does not provide a visible unfilled quota track")
+	}
+	for _, expected := range []string{".quota-track.watch", ".quota-track.low", ".quota-track.critical", ".quota-track.empty", "#f3c969", "#ff8a6b", "#ff4f6d"} {
+		if !strings.Contains(cssRecorder.Body.String(), expected) {
+			t.Fatalf("admin CSS does not preserve the warm-to-red quota warning ramp %q", expected)
+		}
+	}
+	logoRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/logo.svg", nil)
+	logoRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(logoRecorder, logoRequest)
+	if logoRecorder.Code != http.StatusOK || !strings.Contains(logoRecorder.Body.String(), "Balanced sticky routes") || !strings.Contains(logoRecorder.Body.String(), "#54d6b0") {
+		t.Fatal("admin logo does not communicate balanced account routing")
 	}
 }
 
@@ -1912,6 +1930,155 @@ func TestStickySessionTTLRefreshesOnSuccess(t *testing.T) {
 	refreshed := a.state.StickySessions["gpt-test:session"]
 	if !refreshed.ExpiresAt.After(previousExpiry) {
 		t.Fatalf("sticky session expiry was not refreshed: before=%s after=%s", previousExpiry, refreshed.ExpiresAt)
+	}
+}
+
+func TestStickyBalancedDistributesNewSessionsDeterministically(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "account-a", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test", UpstreamAPIKey: "a"},
+		{ID: "account-b", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test", UpstreamAPIKey: "b"},
+		{ID: "account-c", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://c.example.test", UpstreamAPIKey: "c"},
+	})
+	a.routingStrategy = routingStrategyBalanced
+	counts := map[string]int{}
+	const sessions = 3000
+	for index := 0; index < sessions; index++ {
+		stickyKey := fmt.Sprintf("gpt-test:thread:balanced-%d", index)
+		first, err := a.selectAccount(stickyKey, "gpt-test", map[string]bool{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The first request has not succeeded yet, so no sticky binding exists.
+		// A concurrent first turn for the same session must still choose the same
+		// account instead of racing a mutable round-robin/least-loaded cursor.
+		second, err := a.selectAccount(stickyKey, "gpt-test", map[string]bool{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if second.ID != first.ID {
+			t.Fatalf("unbound session %q changed account from %q to %q", stickyKey, first.ID, second.ID)
+		}
+		counts[first.ID]++
+	}
+	for _, id := range []string{"account-a", "account-b", "account-c"} {
+		got := counts[id]
+		if got < 850 || got > 1150 {
+			t.Fatalf("balanced assignments = %#v; %s received %d of %d", counts, id, got, sessions)
+		}
+	}
+}
+
+func TestStickyBalancedKeepsExistingRoutesAndUsesPriorityTiers(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "sticky-low", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://low.example.test", UpstreamAPIKey: "low"},
+		{ID: "primary-a", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test", UpstreamAPIKey: "a"},
+		{ID: "primary-b", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test", UpstreamAPIKey: "b"},
+	})
+	a.routingStrategy = routingStrategyBalanced
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:existing"] = stickySession{Key: "gpt-test:existing", ModelID: "gpt-test", AccountID: "sticky-low", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+
+	existing, err := a.selectAccount("gpt-test:existing", "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing.ID != "sticky-low" {
+		t.Fatalf("balanced strategy moved existing sticky route to %q", existing.ID)
+	}
+
+	for index := 0; index < 100; index++ {
+		selected, err := a.selectAccount(fmt.Sprintf("gpt-test:new-%d", index), "gpt-test", map[string]bool{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if selected.ID == "sticky-low" {
+			t.Fatal("balanced strategy bypassed the highest priority capacity tier")
+		}
+	}
+}
+
+func TestStickyBalancedReranksAfterFailoverExclusion(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "account-a", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test", UpstreamAPIKey: "a"},
+		{ID: "account-b", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test", UpstreamAPIKey: "b"},
+		{ID: "account-c", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://c.example.test", UpstreamAPIKey: "c"},
+	})
+	a.routingStrategy = routingStrategyBalanced
+	stickyKey := "gpt-test:thread:failover"
+	first, err := a.selectAccount(stickyKey, "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := a.selectAccount(stickyKey, "gpt-test", map[string]bool{first.ID: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("excluded account %q was selected again", first.ID)
+	}
+	again, err := a.selectAccount(stickyKey, "gpt-test", map[string]bool{first.ID: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != second.ID {
+		t.Fatalf("failover rerank changed from %q to %q", second.ID, again.ID)
+	}
+}
+
+func TestStickyBalancedCountsDuplicateUpstreamIdentityOnce(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "shared-primary", AuthType: "codex_device_auth", AccountID: "upstream-shared", Enabled: true, InPool: true, Priority: 100},
+		{ID: "shared-duplicate", AuthType: "codex_device_auth", AccountID: "upstream-shared", Enabled: true, InPool: true, Priority: 100},
+		{ID: "independent", AuthType: "codex_device_auth", AccountID: "upstream-independent", Enabled: true, InPool: true, Priority: 100},
+	})
+	writeCodexDeviceAuth(t, a, "shared-primary", "upstream-shared", "shared@example.test")
+	writeCodexDeviceAuth(t, a, "shared-duplicate", "upstream-shared", "shared@example.test")
+	writeCodexDeviceAuth(t, a, "independent", "upstream-independent", "independent@example.test")
+	a.routingStrategy = routingStrategyBalanced
+
+	counts := map[string]int{}
+	const sessions = 2000
+	for index := 0; index < sessions; index++ {
+		selected, err := a.selectAccount(fmt.Sprintf("gpt-test:duplicate-balance-%d", index), "gpt-test", map[string]bool{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[selected.ID]++
+	}
+	if counts["shared-primary"] > 0 && counts["shared-duplicate"] > 0 {
+		t.Fatalf("both local copies of one upstream identity received balanced routes: %#v", counts)
+	}
+	sharedCount := counts["shared-primary"] + counts["shared-duplicate"]
+	if sharedCount < 850 || sharedCount > 1150 || counts["independent"] < 850 || counts["independent"] > 1150 {
+		t.Fatalf("duplicate identity created artificial capacity: assignments = %#v", counts)
+	}
+}
+
+func TestStickyBalancedPreserveProQuotaFormsPreferredTierBeforePriority(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "plus-a", PlanType: "plus", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://a.example.test", UpstreamAPIKey: "a"},
+		{ID: "plus-b", PlanType: "plus", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://b.example.test", UpstreamAPIKey: "b"},
+		{ID: "pro-high-priority", PlanType: "pro", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://pro.example.test", UpstreamAPIKey: "pro"},
+	})
+	a.routingStrategy = routingStrategyBalanced
+	a.preserveProQuota = true
+
+	counts := map[string]int{}
+	const sessions = 1000
+	for index := 0; index < sessions; index++ {
+		selected, err := a.selectAccount(fmt.Sprintf("gpt-test:preserve-pro-%d", index), "gpt-test", map[string]bool{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[selected.ID]++
+	}
+	if counts["pro-high-priority"] != 0 {
+		t.Fatalf("balanced preserve-Pro routing selected Pro %d times", counts["pro-high-priority"])
+	}
+	for _, id := range []string{"plus-a", "plus-b"} {
+		if got := counts[id]; got < 400 || got > 600 {
+			t.Fatalf("non-Pro preferred tier was not balanced: assignments = %#v", counts)
+		}
 	}
 }
 
@@ -3552,6 +3719,31 @@ func TestPromptCacheRetentionFromEnv(t *testing.T) {
 	t.Setenv("CODEX_POOL_PROMPT_CACHE_RETENTION", "forever")
 	if _, err := promptCacheRetentionFromEnv(); err == nil {
 		t.Fatal("expected error for invalid retention value")
+	}
+}
+
+func TestRoutingStrategyFromEnv(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  string
+	}{
+		{"", routingStrategyBalanced},
+		{"sticky_balanced", routingStrategyBalanced},
+		{"  STICKY_BALANCED ", routingStrategyBalanced},
+		{"sticky_failover", routingStrategyFailover},
+	} {
+		t.Setenv("CODEX_POOL_ROUTING_STRATEGY", tc.value)
+		got, err := routingStrategyFromEnv()
+		if err != nil {
+			t.Fatalf("routingStrategyFromEnv(%q) error: %v", tc.value, err)
+		}
+		if got != tc.want {
+			t.Fatalf("routingStrategyFromEnv(%q) = %q, want %q", tc.value, got, tc.want)
+		}
+	}
+	t.Setenv("CODEX_POOL_ROUTING_STRATEGY", "round_robin")
+	if _, err := routingStrategyFromEnv(); err == nil {
+		t.Fatal("expected error for unsupported routing strategy")
 	}
 }
 

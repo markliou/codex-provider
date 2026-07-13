@@ -34,7 +34,7 @@ Primary goals:
    - image generation/edit relay compatibility
    - optional Claude/Gemini/Ollama bridge endpoints if implemented
    - account health, usage stats, quota/cooldown display, and model list behavior through admin APIs
-6. Default routing must be sticky failover, not round-robin, to preserve prompt-cache locality.
+6. Default routing must balance new sticky sessions across healthy accounts without round-robining individual requests or moving existing sessions.
 
 This is not a multi-tenant product. Assume one trusted owner/operator.
 
@@ -159,7 +159,7 @@ docker run -d \
 | `CODEX_POOL_CODEX_BASE_URL` | no | `https://chatgpt.com/backend-api` | Codex/ChatGPT backend base URL used for quota reads and the legacy direct gateway. |
 | `CODEX_POOL_CODEX_USAGE_URL` | no | `CODEX_POOL_CODEX_BASE_URL + /wham/usage` | Optional quota endpoint override for tests or compatible backends. |
 | `CODEX_POOL_CODEX_GATEWAY_MODE` | no | `sidecar` | `sidecar` routes device-auth inference through the bundled loopback-only CLIProxyAPI executor. `direct` is a compatibility/test override. |
-| `CODEX_POOL_ROUTING_STRATEGY` | no | `sticky_failover` | Routing strategy. |
+| `CODEX_POOL_ROUTING_STRATEGY` | no | `sticky_balanced` | `sticky_balanced` deterministically distributes new sessions across the highest-priority eligible account tier. `sticky_failover` preserves the legacy behavior that sends new sessions to the first preferred account. |
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_MODE` | no | `auto` | `auto` injects a hashed `prompt_cache_key` when the client omitted one. `off`/`passthrough` leave the request unchanged. |
@@ -479,12 +479,41 @@ deep(high)    -> gpt-5.5 + reasoning.effort=high
 Default must be:
 
 ```text
-sticky_failover
+sticky_balanced
 ```
 
-Do not round-robin by default.
+Do not round-robin individual requests.
 
-Reason: prompt-cache locality is important. Requests for the same Codex thread or fallback project/session/model identity should continue using the same account until that account becomes unavailable or enters cooldown.
+Reason: both quota distribution and prompt-cache locality are important. New
+Codex sessions should be spread across healthy accounts so one credential does
+not exhaust early and force several long-running sessions to restart cold on a
+different account. Requests for the same Codex thread or fallback
+project/session/model identity must continue using the same account until that
+account becomes unavailable or enters cooldown.
+
+For an unbound route, `sticky_balanced` must use a deterministic rendezvous-style
+score derived from `(sticky key, upstream account identity)`. This is session
+balancing, not mutable request round-robin:
+
+1. Concurrent first requests for the same sticky key choose the same account
+   even before the first successful response persists a binding.
+2. Different sticky keys distribute statistically across the eligible accounts.
+3. Existing TTL-live sticky bindings remain authoritative and are never
+   rebalanced merely because another account becomes available.
+4. Selection balances only within the highest-priority eligible tier, preserving
+   explicitly configured lower-priority standby accounts.
+5. When `preserveProQuota` is enabled, eligible non-Pro accounts form the
+   preferred tier before the priority comparison.
+6. Duplicate local slots for one upstream identity remain one balancing target.
+   The hash identity must use the upstream identity when known so changing its
+   healthy local representative does not create artificial capacity.
+7. Failover excludes the failed upstream identity and deterministically chooses
+   the next eligible candidate; success then persists the replacement sticky
+   binding through the normal path.
+
+`sticky_failover` remains an operator rollback mode. It preserves the former
+strict priority/ID ordering for new sessions while retaining the same sticky,
+quota, cooldown, duplicate-identity, parent-affinity, and failover contracts.
 
 Sticky bindings have an idle TTL controlled by `CODEX_POOL_SESSION_AFFINITY_TTL_MS`. A successful request refreshes the binding expiry. Expired bindings are pruned and the next request selects a fresh account.
 
@@ -677,6 +706,7 @@ Notes:
 - `remainingQuota` is an integer routing hint. Treat it as a percentage or normalized score, not an exact token count.
 - Actual consumed tokens are tracked in usage stats.
 - Absolute remaining Codex token quota may not be available from upstream. Display both quota-window percentages and token usage counters.
+- Quota progress colors are an operational warning scale: healthy capacity uses the cool Jade/Wasabi range, then becomes amber, Persimmon, and finally red as remaining capacity approaches zero. Do not use one neutral color for all values or make a near-zero bar appear healthy.
 - Admin API account responses must not expose full email addresses, upstream account IDs, upstream URLs, API keys, `codexHome`, or auth file paths. A device-auth credential slot is the primary local identity. Email, plan, upstream account ID, and organization values are descriptive credential metadata; browser-facing account labels may use masked email for recognition, but routing, storage, and management actions must use the local credential slot ID.
 
 ### 7.2 Add account
@@ -1236,7 +1266,7 @@ Response:
       "imageGenerationMode": "enabled",
       "gatewayMode": "sidecar",
       "upstreamProxyUrl": null,
-      "routingStrategy": "sticky_failover",
+      "routingStrategy": "sticky_balanced",
       "preserveProQuota": false,
       "customRoutingRules": [],
       "accountModelRules": [],
@@ -1532,7 +1562,7 @@ Internally support a Cockpit-like manifest shape for config export/import.
     }
   ],
   "excludedModels": [],
-  "routingStrategy": "sticky_failover",
+  "routingStrategy": "sticky_balanced",
   "customRoutingRules": [
     {
       "accountId": "acct-org-a",
@@ -1773,13 +1803,15 @@ The implementation is acceptable when:
 19. Explicit `lineage`, `project`, and `user` policies generate deterministic hashed/bucketed keys.
 20. MultiAgent `fork_turns` schema, arguments, and Codex-assembled child history pass through unchanged.
 21. Thread/lineage bindings are TTL-pruned and main/subagent cache and affinity metrics are observable.
+22. Unbound session keys distribute across equal-priority healthy accounts, while concurrent first requests for one key select the same account before persistence.
+23. Existing sticky sessions never move solely for balancing, and `sticky_failover` remains available as an immediate rollback mode.
 
 ---
 
 ## 20. Important Behavioral Notes
 
 1. Do not treat OAuth access-token expiration as quota exhaustion.
-2. Do not round-robin healthy accounts by default.
+2. Balance new sessions, never individual requests; existing sticky sessions must not move solely for utilization balancing.
 3. Do not fail back existing sessions automatically after cooldown expires.
 4. Do not block live `/v1` requests while refreshing quota for all accounts.
 5. Do not expose absolute remaining token quota unless upstream provides it reliably.

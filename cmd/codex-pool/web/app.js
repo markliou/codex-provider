@@ -286,9 +286,18 @@
 
   function renderSettings(serviceState) {
     const preserveSwitch = $("#preserve-pro-quota-switch");
-    if (!preserveSwitch) return;
-    preserveSwitch.checked = Boolean(serviceState?.preserveProQuota);
-    preserveSwitch.disabled = false;
+    if (preserveSwitch) {
+      preserveSwitch.checked = Boolean(serviceState?.preserveProQuota);
+      preserveSwitch.disabled = false;
+    }
+    const routingPill = $("#routing-strategy-pill");
+    if (routingPill) {
+      const balanced = serviceState?.routingStrategy === "sticky_balanced";
+      routingPill.textContent = balanced ? "Balanced sticky" : "Priority failover";
+      routingPill.title = balanced
+        ? "New sessions are distributed deterministically; active sessions stay on their assigned account."
+        : "New sessions prefer the highest-priority account and use others only for failover.";
+    }
   }
 
   function displayUnixTime(value) {
@@ -314,9 +323,20 @@
     return Number.isFinite(percentage) ? Math.min(100, Math.max(0, percentage)) : 0;
   }
 
+  function quotaTone(remaining) {
+    // Product signal: quota bars must become progressively warmer as remaining
+    // capacity approaches zero. Do not collapse this to one decorative gradient;
+    // low and critical windows need to read as increasingly urgent at a glance.
+    if (remaining <= 0) return "empty";
+    if (remaining <= 5) return "critical";
+    if (remaining <= 20) return "low";
+    if (remaining <= 40) return "watch";
+    return "healthy";
+  }
+
   function quotaTrackMarkup(value, label) {
     const remaining = quotaPercent(value);
-    const tone = remaining <= 0 ? "empty" : remaining <= 20 ? "low" : "";
+    const tone = quotaTone(remaining);
     return `<progress class="quota-track ${tone}" value="${remaining}" max="100" aria-label="${escapeHTML(label)} quota remaining">${remaining}%</progress>`;
   }
 
@@ -381,6 +401,8 @@
       const health = healthByID.get(account.id) || { status: "standby", statusReason: "No health data" };
       const activity = health.status === "error" ? health.lastFailureAt : health.lastSuccessAt;
       const route = account.inPool ? "In pool" : "Out of pool";
+      const activeRoutes = Number(health.activeRouteCount) || 0;
+      const routeCount = activeRoutes === 1 ? "1 active route" : `${activeRoutes} active routes`;
       const displayName = account.displayName || account.label || account.id || "Credential";
       const metadata = accountMetadataLine(account, false);
       const actions = actionButton("delete", account.id, "Remove", "danger");
@@ -388,7 +410,7 @@
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt)}</td>
-        <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)}</div></td>
+        <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)} · ${escapeHTML(routeCount)}</div></td>
         <td>${cacheHitMarkup(health, account.id)}</td>
         <td><div class="activity">${displayTime(activity)}${health.consecutiveFailure ? `<br>${health.consecutiveFailure} consecutive failure${health.consecutiveFailure === 1 ? "" : "s"}` : ""}</div></td>
         <td><div class="row-actions">${actions}</div></td>
@@ -468,7 +490,7 @@
       renderCacheWindow(serviceState.promptCacheWindow);
       renderAccounts(state.data.accounts, healthByID);
       renderSticky(state.data.sessions, state.data.accounts);
-      $("#service-status").textContent = "Service online";
+      $("#service-status").textContent = serviceState.routingStrategy === "sticky_balanced" ? "Service online · balanced" : "Service online · failover";
     } catch (error) {
       if (!silent) notify(error.message, true);
       $("#service-status").textContent = "Service unavailable";

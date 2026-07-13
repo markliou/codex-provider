@@ -32,6 +32,7 @@ docker run -d \
   -e CODEX_POOL_API_KEY='replace-with-a-long-random-client-key' \
   -e CODEX_POOL_ADMIN_PASSWORD_HASH='pbkdf2-sha256:...' \
   -e CODEX_POOL_DEFAULT_MODEL='gpt-5.5(xhigh)' \
+  -e CODEX_POOL_ROUTING_STRATEGY='sticky_balanced' \
   -e CODEX_POOL_SESSION_AFFINITY_TTL_MS=86400000 \
   -e CODEX_POOL_ADMIN_ADDR='0.0.0.0:8318' \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
@@ -76,6 +77,15 @@ For every selected account, Pool writes an isolated CLIProxy auth record under `
 Quota is read from the authenticated Codex/ChatGPT backend after login and then refreshed every five minutes. The dashboard shows both short-window and weekly remaining percentages with reset times when upstream provides them. The optional `CODEX_POOL_CODEX_USAGE_URL` override exists for tests or backend compatibility; normal deployments use `CODEX_POOL_CODEX_BASE_URL + /wham/usage`.
 
 ### Subagent Routing and Prompt Cache Locality
+
+New main sessions use deterministic sticky balancing by default. Equal-priority
+healthy accounts receive different session keys statistically evenly, while
+concurrent first requests for the same key select the same account even before
+the first success persists the route. Existing sessions are never moved merely
+to equalize utilization. Set
+`CODEX_POOL_ROUTING_STRATEGY=sticky_failover` to restore the legacy behavior
+that sends new sessions to the highest-priority account until it becomes
+ineligible.
 
 For current Codex traffic, Pool extracts `thread_id`, `parent_thread_id`, lineage, and subagent fields from `client_metadata` (including `x-codex-turn-metadata`), recognized compatibility headers, and top-level fallbacks. A main thread, child, and sibling each receive an independent `<model>:thread:<thread-id>` sticky route. A bound `previous_response_id` takes precedence so each continuation remains on the account that produced that response even when client metadata changes between versions.
 
@@ -147,7 +157,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - `POST /v1/responses` and `/v1/responses/compact`, with streaming passthrough.
 - `POST /v1/chat/completions`, including translation to a Responses upstream.
 - Model aliases and `(thinking-tier)` suffix translation.
-- Thread-aware sticky failover with idle TTL, soft parent-account affinity, independent prompt-cache-key policy, per-model cooldowns, optional Pro-quota preservation, response-id continuation binding, and JSON persistence in `/data`. When an upstream account returns `429` or repeated server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
+- Thread-aware sticky balancing and failover with idle TTL, soft parent-account affinity, independent prompt-cache-key policy, per-model cooldowns, optional Pro-quota preservation, response-id continuation binding, and JSON persistence in `/data`. New sessions distribute across equal-priority healthy accounts; when an upstream account returns `429` or repeated server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
 - Bundled, loopback-only CLIProxyAPI sidecar for Codex device-auth requests. Pool pins each request to the selected account through a sidecar model prefix, while the sidecar owns OAuth refreshes.
 - Public pool participation toggles on `/admin`, plus authenticated owner controls for add/remove account, device-auth login jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Duplicate`, `Disabled`, or `Standby`.
 - Codex quota refresh from `/backend-api/wham/usage`, including per-window percentages, reset times, plan-type updates, sanitized quota errors, and five-minute dashboard refresh.

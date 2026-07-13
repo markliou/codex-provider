@@ -46,6 +46,8 @@ const (
 	sessionLifetime           = 12 * time.Hour
 	sessionAffinityTTLDefault = 24 * time.Hour
 	accountActiveWindow       = 60 * time.Second
+	routingStrategyBalanced   = "sticky_balanced"
+	routingStrategyFailover   = "sticky_failover"
 	// promptCacheMinTokens is OpenAI's minimum prompt size for caching to engage;
 	// requests below it can never cache, so they are excluded from cold-start
 	// accounting.
@@ -276,6 +278,7 @@ type app struct {
 	sessionKey           []byte
 	sessionAffinityTTL   time.Duration
 	maxRetryAccounts     int
+	routingStrategy      string
 	promptCacheKeyMode   string
 	promptCacheKeyScope  string
 	promptCacheKeyPolicy string
@@ -348,6 +351,10 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
+	routingStrategy, err := routingStrategyFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	codexGatewayMode, err := codexGatewayModeFromEnv()
 	if err != nil {
 		return nil, err
@@ -397,6 +404,7 @@ func newAppFromEnv() (*app, error) {
 		sessionKey:           key,
 		sessionAffinityTTL:   sessionAffinityTTL,
 		maxRetryAccounts:     maxRetryAccounts,
+		routingStrategy:      routingStrategy,
 		promptCacheKeyMode:   promptCacheKeyMode,
 		promptCacheKeyScope:  promptCacheKeyScope,
 		promptCacheKeyPolicy: promptCacheKeyPolicy,
@@ -1568,7 +1576,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -2131,7 +2139,7 @@ func (a *app) selectAccountWithPreference(stickyKey, model, preferredParentAccou
 			stickyChanged = true
 		} else if item := a.accountLocked(existing.AccountID); item != nil && a.usableLocked(*item, model, now) {
 			if a.preserveProQuota && a.proAccountLocked(*item) {
-				if replacement, ok := a.preferredAccountLocked(model, excluded, now); ok && replacement.ID != item.ID && !a.proAccountLocked(replacement) {
+				if replacement, ok := a.preferredAccountForStickyLocked(stickyKey, model, excluded, now); ok && replacement.ID != item.ID && !a.proAccountLocked(replacement) {
 					return replacement, nil
 				}
 			}
@@ -2153,12 +2161,12 @@ func (a *app) selectAccountWithPreference(stickyKey, model, preferredParentAccou
 			if !a.preserveProQuota || !a.proAccountLocked(*parent) {
 				return *parent, nil
 			}
-			if replacement, ok := a.preferredAccountLocked(model, excluded, now); !ok || a.proAccountLocked(replacement) {
+			if replacement, ok := a.preferredAccountForStickyLocked(stickyKey, model, excluded, now); !ok || a.proAccountLocked(replacement) {
 				return *parent, nil
 			}
 		}
 	}
-	selected, ok := a.preferredAccountLocked(model, excluded, now)
+	selected, ok := a.preferredAccountForStickyLocked(stickyKey, model, excluded, now)
 	if !ok {
 		return account{}, errors.New("no eligible account is available for the requested model")
 	}
@@ -2180,6 +2188,15 @@ func (a *app) selectableAccountLocked(item account, model string, excluded map[s
 }
 
 func (a *app) preferredAccountLocked(model string, excluded map[string]bool, now time.Time) (account, bool) {
+	eligible := a.eligibleAccountsLocked(model, excluded, now)
+	if len(eligible) == 0 {
+		return account{}, false
+	}
+	sort.SliceStable(eligible, func(i, j int) bool { return a.preferredBeforeLocked(eligible[i], eligible[j]) })
+	return eligible[0], true
+}
+
+func (a *app) eligibleAccountsLocked(model string, excluded map[string]bool, now time.Time) []account {
 	eligible := make([]account, 0)
 	// `excluded` is per user request. If one local slot failed, any other slot
 	// with the same upstream identity must be excluded too; otherwise a single
@@ -2198,11 +2215,87 @@ func (a *app) preferredAccountLocked(model string, excluded map[string]bool, now
 		}
 		eligible = append(eligible, item)
 	}
+	return eligible
+}
+
+// preferredAccountForStickyLocked assigns only an unbound route. Existing
+// sticky routes and parent affinity are resolved before this function. In the
+// balanced strategy the route key, not arrival order or completed-route counts,
+// chooses the account. That deterministic choice prevents simultaneous cold
+// starts from stampeding one "least loaded" account and guarantees concurrent
+// first turns for the same session select the same credential before a success
+// has had time to persist the sticky binding.
+func (a *app) preferredAccountForStickyLocked(stickyKey, model string, excluded map[string]bool, now time.Time) (account, bool) {
+	eligible := a.eligibleAccountsLocked(model, excluded, now)
 	if len(eligible) == 0 {
 		return account{}, false
 	}
-	sort.SliceStable(eligible, func(i, j int) bool { return a.preferredBeforeLocked(eligible[i], eligible[j]) })
-	return eligible[0], true
+	if a.effectiveRoutingStrategy() == routingStrategyFailover {
+		sort.SliceStable(eligible, func(i, j int) bool { return a.preferredBeforeLocked(eligible[i], eligible[j]) })
+		return eligible[0], true
+	}
+
+	// Preserve the existing priority contract as capacity tiers, then balance
+	// sessions only across the best eligible tier. Newly-created accounts all use
+	// the same priority, so normal pools distribute evenly; operators who
+	// intentionally configured a lower priority still retain a standby tier.
+	if a.preserveProQuota {
+		hasNonPro := false
+		for _, item := range eligible {
+			if !a.proAccountLocked(item) {
+				hasNonPro = true
+				break
+			}
+		}
+		if hasNonPro {
+			filtered := eligible[:0]
+			for _, item := range eligible {
+				if !a.proAccountLocked(item) {
+					filtered = append(filtered, item)
+				}
+			}
+			eligible = filtered
+		}
+	}
+	highestPriority := eligible[0].Priority
+	for _, item := range eligible[1:] {
+		if item.Priority > highestPriority {
+			highestPriority = item.Priority
+		}
+	}
+	tier := eligible[:0]
+	for _, item := range eligible {
+		if item.Priority == highestPriority {
+			tier = append(tier, item)
+		}
+	}
+
+	selected := tier[0]
+	selectedScore := a.stickyBalanceScore(stickyKey, selected)
+	for _, item := range tier[1:] {
+		score := a.stickyBalanceScore(stickyKey, item)
+		comparison := bytes.Compare(score[:], selectedScore[:])
+		if comparison > 0 || (comparison == 0 && item.ID < selected.ID) {
+			selected = item
+			selectedScore = score
+		}
+	}
+	return selected, true
+}
+
+func (a *app) stickyBalanceScore(stickyKey string, item account) [sha256.Size]byte {
+	identity := a.upstreamIdentityKeyLocked(item)
+	if identity == "" {
+		identity = "slot:" + item.ID
+	}
+	return sha256.Sum256([]byte(stickyKey + "\x00" + identity))
+}
+
+func (a *app) effectiveRoutingStrategy() string {
+	if a.routingStrategy == routingStrategyFailover {
+		return routingStrategyFailover
+	}
+	return routingStrategyBalanced
 }
 
 func (a *app) hasPreferredAccount(model string, excluded map[string]bool) bool {
@@ -5219,7 +5312,17 @@ func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]an
 	health := a.state.Health[item.ID]
 	quota := a.state.Quotas[item.ID]
 	cacheInput, cacheCached, cacheRequests := a.promptCacheStatsForAccountLocked(item.ID)
-	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "cacheInputTokens": cacheInput, "cacheCachedTokens": cacheCached, "cacheRequestCount": cacheRequests, "cacheWindow": a.promptCacheWindowForAccountLocked(item.ID), "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
+	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "activeRouteCount": a.activeRouteCountLocked(item.ID, now), "cacheInputTokens": cacheInput, "cacheCachedTokens": cacheCached, "cacheRequestCount": cacheRequests, "cacheWindow": a.promptCacheWindowForAccountLocked(item.ID), "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
+}
+
+func (a *app) activeRouteCountLocked(accountID string, now time.Time) int {
+	count := 0
+	for _, route := range a.state.StickySessions {
+		if route.AccountID == accountID && !a.stickySessionExpiredLocked(route, now) {
+			count++
+		}
+	}
+	return count
 }
 
 func (a *app) currentAccountStatusLocked(item account, index int, now time.Time) map[string]any {
@@ -5961,6 +6064,16 @@ func promptCacheRetentionFromEnv() (string, error) {
 		return value, nil
 	default:
 		return "", errors.New("CODEX_POOL_PROMPT_CACHE_RETENTION must be empty, passthrough, 24h, or in_memory")
+	}
+}
+
+func routingStrategyFromEnv() (string, error) {
+	value := strings.ToLower(strings.TrimSpace(envOr("CODEX_POOL_ROUTING_STRATEGY", routingStrategyBalanced)))
+	switch value {
+	case routingStrategyBalanced, routingStrategyFailover:
+		return value, nil
+	default:
+		return "", errors.New("CODEX_POOL_ROUTING_STRATEGY must be sticky_balanced or sticky_failover")
 	}
 }
 
