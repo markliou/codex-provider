@@ -49,7 +49,8 @@ const (
 	// promptCacheMinTokens is OpenAI's minimum prompt size for caching to engage;
 	// requests below it can never cache, so they are excluded from cold-start
 	// accounting.
-	promptCacheMinTokens = 1024
+	promptCacheMinTokens    = 1024
+	maxRequestIdentityValue = 512
 	// promptCacheBucketsDefault spreads a coarse (project/user) prompt cache key
 	// across a few buckets so a hot scope stays under OpenAI's ~15 RPM per
 	// (prefix + prompt_cache_key) limit while still sharing the static prefix
@@ -169,17 +170,47 @@ type responseBinding struct {
 	ExpiresAt  time.Time `json:"expiresAt"`
 }
 
+type requestIdentity struct {
+	SessionID      string `json:"sessionId,omitempty"`
+	ThreadID       string `json:"threadId,omitempty"`
+	ParentThreadID string `json:"parentThreadId,omitempty"`
+	ForkedFromID   string `json:"forkedFromThreadId,omitempty"`
+	LineageRootID  string `json:"lineageRootId,omitempty"`
+	SubagentKind   string `json:"subagentKind,omitempty"`
+	ThreadSource   string `json:"threadSource,omitempty"`
+	IsSubagent     bool   `json:"isSubagent"`
+}
+
+type threadBinding struct {
+	ThreadID       string    `json:"threadId"`
+	SessionID      string    `json:"sessionId,omitempty"`
+	ParentThreadID string    `json:"parentThreadId,omitempty"`
+	LineageRootID  string    `json:"lineageRootId"`
+	SubagentKind   string    `json:"subagentKind,omitempty"`
+	ModelID        string    `json:"modelId"`
+	AccountID      string    `json:"accountId"`
+	StickyKey      string    `json:"stickyKey"`
+	PromptCacheKey string    `json:"promptCacheKey,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
+	LastSuccessAt  time.Time `json:"lastSuccessAt"`
+	ExpiresAt      time.Time `json:"expiresAt"`
+}
+
 type promptCacheStat struct {
 	AccountID    string `json:"accountId"`
 	ModelID      string `json:"modelId"`
+	AgentKind    string `json:"agentKind,omitempty"`
 	RequestCount uint64 `json:"requestCount"`
 	InputTokens  uint64 `json:"inputTokens"`
 	CachedTokens uint64 `json:"cachedTokens"`
 	// ColdRequestCount counts cache-eligible requests (input >= 1024 tokens)
 	// that returned zero cached tokens, i.e. a cold start. It quantifies why a
 	// hit rate is low: new conversations, failover hand-offs, or 15 RPM overflow.
-	ColdRequestCount uint64    `json:"coldRequestCount"`
-	UpdatedAt        time.Time `json:"updatedAt"`
+	ColdRequestCount            uint64    `json:"coldRequestCount"`
+	ParentAffinityHitCount      uint64    `json:"parentAffinityHitCount,omitempty"`
+	ParentAffinityFallbackCount uint64    `json:"parentAffinityFallbackCount,omitempty"`
+	LineageFailoverCount        uint64    `json:"lineageFailoverCount,omitempty"`
+	UpdatedAt                   time.Time `json:"updatedAt"`
 }
 
 type accountHealth struct {
@@ -213,6 +244,7 @@ type loginFailure struct {
 type state struct {
 	StickySessions   map[string]stickySession   `json:"stickySessions"`
 	ResponseBindings map[string]responseBinding `json:"responseBindings,omitempty"`
+	ThreadBindings   map[string]threadBinding   `json:"threadBindings,omitempty"`
 	Cooldowns        map[string][]cooldown      `json:"cooldowns"`
 	Health           map[string]accountHealth   `json:"health"`
 	Quotas           map[string]quotaSnapshot   `json:"quotas,omitempty"`
@@ -246,6 +278,7 @@ type app struct {
 	maxRetryAccounts     int
 	promptCacheKeyMode   string
 	promptCacheKeyScope  string
+	promptCacheKeyPolicy string
 	promptCacheBuckets   int
 	promptCacheRetention string
 	preserveProQuota     bool
@@ -327,6 +360,10 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
+	promptCacheKeyPolicy, err := promptCacheKeyPolicyFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	promptCacheBuckets, err := promptCacheBucketsFromEnv()
 	if err != nil {
 		return nil, err
@@ -362,6 +399,7 @@ func newAppFromEnv() (*app, error) {
 		maxRetryAccounts:     maxRetryAccounts,
 		promptCacheKeyMode:   promptCacheKeyMode,
 		promptCacheKeyScope:  promptCacheKeyScope,
+		promptCacheKeyPolicy: promptCacheKeyPolicy,
 		promptCacheBuckets:   promptCacheBuckets,
 		promptCacheRetention: promptCacheRetention,
 		preserveProQuota:     preserveProQuota,
@@ -419,7 +457,7 @@ func (a *app) load() error {
 		return fmt.Errorf("create data directory: %w", err)
 	}
 	a.config = config{DefaultModel: envOr("CODEX_POOL_DEFAULT_MODEL", "gpt-5.5(xhigh)"), ModelAliases: map[string]string{}}
-	a.state = state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}}
+	a.state = state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, ThreadBindings: map[string]threadBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}}
 	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &a.config); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read config: %w", err)
 	}
@@ -443,6 +481,9 @@ func (a *app) load() error {
 	}
 	if a.state.ResponseBindings == nil {
 		a.state.ResponseBindings = map[string]responseBinding{}
+	}
+	if a.state.ThreadBindings == nil {
+		a.state.ThreadBindings = map[string]threadBinding{}
 	}
 	if a.state.Cooldowns == nil {
 		a.state.Cooldowns = map[string][]cooldown{}
@@ -875,10 +916,9 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "unable to encode request")
 		return
 	}
-	stickyKey := route.StickyKey
 	excluded := map[string]bool{}
 	for attempt := 0; attempt < a.proxyAttemptLimit(); attempt++ {
-		candidate, err := a.selectAccount(stickyKey, model, excluded)
+		candidate, err := a.selectAccountForRoute(route, model, excluded)
 		if err != nil {
 			if len(excluded) > 0 {
 				// At least one upstream was already selected and failed. Reporting
@@ -896,7 +936,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", err.Error())
 			return
 		}
-		response, err := a.forward(r.Context(), candidate, endpoint, outBody, r.Header.Get("Accept"))
+		response, err := a.forward(r.Context(), candidate, endpoint, outBody, r.Header)
 		if err != nil {
 			if requestContextFinished(r.Context(), err) {
 				// The caller timed out or disconnected. Stop immediately and avoid
@@ -977,7 +1017,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			a.markFailure(candidate.ID, model, "upstream_response_error", 30*time.Second)
 			return
 		}
-		a.markSuccess(stickyKey, model, candidate.ID, info)
+		a.markSuccess(route, model, candidate.ID, info)
 		return
 	}
 	writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", "all eligible upstream accounts failed")
@@ -1046,15 +1086,24 @@ func (a *app) prepareUpstreamRequest(candidate account, body []byte, chat bool) 
 	return endpoint, outbound, convertResponse, nil
 }
 
-func (a *app) forward(ctx context.Context, candidate account, endpoint string, body []byte, accept string) (*http.Response, error) {
+var codexMetadataHeaderAllowlist = []string{
+	"X-Codex-Parent-Thread-ID",
+	"X-OpenAI-Subagent",
+	"X-Codex-Turn-Metadata",
+	"X-Codex-Window-ID",
+	"X-Codex-Installation-ID",
+}
+
+func (a *app) forward(ctx context.Context, candidate account, endpoint string, body []byte, inbound http.Header) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if accept != "" {
+	if accept := inbound.Get("Accept"); accept != "" {
 		req.Header.Set("Accept", accept)
 	}
+	forwardCodexMetadataHeaders(req.Header, inbound)
 	if a.usesCliproxySidecar(candidate) {
 		if err := a.syncCliproxyAuth(candidate, false); err != nil {
 			return nil, err
@@ -1082,6 +1131,14 @@ func (a *app) forward(ctx context.Context, candidate account, endpoint string, b
 		}
 	}
 	return a.streamClient.Do(req)
+}
+
+func forwardCodexMetadataHeaders(outbound, inbound http.Header) {
+	for _, name := range codexMetadataHeaderAllowlist {
+		if value := strings.TrimSpace(inbound.Get(name)); value != "" {
+			outbound.Set(name, value)
+		}
+	}
 }
 
 func upstreamAuthFailureStatus(status int) bool {
@@ -1457,7 +1514,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": "sticky_failover", "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -1707,6 +1764,11 @@ func (a *app) handleStickySessionDelete(w http.ResponseWriter, r *http.Request) 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.state.StickySessions, key)
+	for bindingKey, binding := range a.state.ThreadBindings {
+		if binding.StickyKey == key {
+			delete(a.state.ThreadBindings, bindingKey)
+		}
+	}
 	if err := a.saveLocked(); err != nil {
 		writeOpenAIError(w, 500, "storage_error", "unable to persist state")
 		return
@@ -1994,6 +2056,14 @@ func (a *app) modelsLocked() []string {
 }
 
 func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (account, error) {
+	return a.selectAccountWithPreference(stickyKey, model, "", excluded)
+}
+
+func (a *app) selectAccountForRoute(route routingDecision, model string, excluded map[string]bool) (account, error) {
+	return a.selectAccountWithPreference(route.StickyKey, model, route.PreferredParentAccountID, excluded)
+}
+
+func (a *app) selectAccountWithPreference(stickyKey, model, preferredParentAccountID string, excluded map[string]bool) (account, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
@@ -2017,11 +2087,39 @@ func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (
 	if stickyChanged {
 		_ = a.saveLocked()
 	}
+	// Parent affinity applies only while assigning an unbound child thread. It
+	// must stay a soft preference behind every normal eligibility, duplicate-
+	// identity, cooldown, and Pro-preservation gate; turning this into a hard pin
+	// would let an unhealthy parent account block or weaken normal failover.
+	if preferredParentAccountID != "" {
+		if parent := a.accountLocked(preferredParentAccountID); parent != nil && a.selectableAccountLocked(*parent, model, excluded, now) {
+			if !a.preserveProQuota || !a.proAccountLocked(*parent) {
+				return *parent, nil
+			}
+			if replacement, ok := a.preferredAccountLocked(model, excluded, now); !ok || a.proAccountLocked(replacement) {
+				return *parent, nil
+			}
+		}
+	}
 	selected, ok := a.preferredAccountLocked(model, excluded, now)
 	if !ok {
 		return account{}, errors.New("no eligible account is available for the requested model")
 	}
 	return selected, nil
+}
+
+func (a *app) selectableAccountLocked(item account, model string, excluded map[string]bool, now time.Time) bool {
+	if excluded[item.ID] || !a.usableLocked(item, model, now) {
+		return false
+	}
+	identity := a.upstreamIdentityKeyLocked(item)
+	if identity != "" && a.excludedUpstreamIdentitiesLocked(excluded)[identity] {
+		return false
+	}
+	if primaryID := a.primaryUpstreamAccountIDLocked(item, model, now); primaryID != "" && primaryID != item.ID {
+		return false
+	}
+	return true
 }
 
 func (a *app) preferredAccountLocked(model string, excluded map[string]bool, now time.Time) (account, bool) {
@@ -2436,10 +2534,11 @@ func (a *app) markAccountAuthFailure(accountID, model, reason string) {
 	_ = a.saveLocked()
 }
 
-func (a *app) markSuccess(key, model, accountID string, info proxyResponseInfo) {
+func (a *app) markSuccess(route routingDecision, model, accountID string, info proxyResponseInfo) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
+	key := route.StickyKey
 	if a.state.Health == nil {
 		a.state.Health = map[string]accountHealth{}
 	}
@@ -2453,33 +2552,85 @@ func (a *app) markSuccess(key, model, accountID string, info proxyResponseInfo) 
 		failoverFrom = prior.AccountID
 	}
 	a.state.StickySessions[key] = stickySession{Key: key, ModelID: model, AccountID: accountID, CreatedAt: chooseTime(prior.CreatedAt, now), LastSuccessAt: now, ExpiresAt: now.Add(a.stickyTTL()), FailoverFrom: failoverFrom}
+	lineageFailover := route.Identity.IsSubagent && prior.AccountID != "" && prior.AccountID != accountID
+	if route.Identity.ThreadID != "" {
+		if a.state.ThreadBindings == nil {
+			a.state.ThreadBindings = map[string]threadBinding{}
+		}
+		bindingKey := threadBindingStateKey(model, route.Identity.ThreadID)
+		priorBinding := a.state.ThreadBindings[bindingKey]
+		if route.Identity.IsSubagent && priorBinding.AccountID != "" && priorBinding.AccountID != accountID {
+			lineageFailover = true
+		}
+		lineageRootID := route.Identity.LineageRootID
+		if lineageRootID == "" {
+			lineageRootID = route.Identity.ThreadID
+		}
+		a.state.ThreadBindings[bindingKey] = threadBinding{
+			ThreadID:       route.Identity.ThreadID,
+			SessionID:      route.Identity.SessionID,
+			ParentThreadID: identityParentID(route.Identity),
+			LineageRootID:  lineageRootID,
+			SubagentKind:   route.Identity.SubagentKind,
+			ModelID:        model,
+			AccountID:      accountID,
+			StickyKey:      key,
+			PromptCacheKey: route.UpstreamPromptCacheKey,
+			CreatedAt:      chooseTime(priorBinding.CreatedAt, now),
+			LastSuccessAt:  now,
+			ExpiresAt:      now.Add(a.stickyTTL()),
+		}
+	}
 	if info.ResponseID != "" {
 		if a.state.ResponseBindings == nil {
 			a.state.ResponseBindings = map[string]responseBinding{}
 		}
 		a.state.ResponseBindings[info.ResponseID] = responseBinding{ResponseID: info.ResponseID, StickyKey: key, ModelID: model, AccountID: accountID, CreatedAt: now, ExpiresAt: now.Add(a.stickyTTL())}
 	}
-	if info.Usage.Present {
-		a.recordPromptCacheUsageLocked(accountID, model, info.Usage, now)
+	parentAffinityHit := route.ParentAffinityAttempted && route.PreferredParentAccountID != "" && route.PreferredParentAccountID == accountID
+	parentAffinityFallback := route.ParentAffinityAttempted && !parentAffinityHit
+	if route.ParentAffinityAttempted && route.PreferredParentAccountID != "" && route.PreferredParentAccountID != accountID {
+		lineageFailover = true
 	}
+	a.recordPromptCacheResultLocked(accountID, model, route.Identity, info.Usage, parentAffinityHit, parentAffinityFallback, lineageFailover, now)
 	a.state.RequestCount++
 	a.state.SuccessCount++
 	_ = a.saveLocked()
 }
 
 func (a *app) recordPromptCacheUsageLocked(accountID, model string, usage promptCacheUsage, now time.Time) {
+	a.recordPromptCacheResultLocked(accountID, model, requestIdentity{}, usage, false, false, false, now)
+}
+
+func (a *app) recordPromptCacheResultLocked(accountID, model string, identity requestIdentity, usage promptCacheUsage, parentAffinityHit, parentAffinityFallback, lineageFailover bool, now time.Time) {
 	if a.state.PromptCache == nil {
 		a.state.PromptCache = map[string]promptCacheStat{}
 	}
-	key := accountID + ":" + model
+	agentKind := "main"
+	if identity.IsSubagent {
+		agentKind = "subagent"
+	}
+	key := accountID + ":" + model + ":" + agentKind
 	stat := a.state.PromptCache[key]
 	stat.AccountID = accountID
 	stat.ModelID = model
+	stat.AgentKind = agentKind
 	stat.RequestCount++
-	stat.InputTokens += usage.InputTokens
-	stat.CachedTokens += usage.CachedTokens
-	if usage.InputTokens >= promptCacheMinTokens && usage.CachedTokens == 0 {
+	if usage.Present {
+		stat.InputTokens += usage.InputTokens
+		stat.CachedTokens += usage.CachedTokens
+	}
+	if usage.Present && usage.InputTokens >= promptCacheMinTokens && usage.CachedTokens == 0 {
 		stat.ColdRequestCount++
+	}
+	if parentAffinityHit {
+		stat.ParentAffinityHitCount++
+	}
+	if parentAffinityFallback {
+		stat.ParentAffinityFallbackCount++
+	}
+	if lineageFailover {
+		stat.LineageFailoverCount++
 	}
 	stat.UpdatedAt = now
 	a.state.PromptCache[key] = stat
@@ -2558,6 +2709,12 @@ func (a *app) pruneExpiredRuntimeStateLocked(now time.Time) bool {
 			changed = true
 		}
 	}
+	for id, binding := range a.state.ThreadBindings {
+		if !binding.ExpiresAt.After(now) {
+			delete(a.state.ThreadBindings, id)
+			changed = true
+		}
+	}
 	return changed
 }
 
@@ -2609,6 +2766,11 @@ func (a *app) clearStickyForAccountLocked(id string) {
 	for key, item := range a.state.ResponseBindings {
 		if item.AccountID == id {
 			delete(a.state.ResponseBindings, key)
+		}
+	}
+	for key, item := range a.state.ThreadBindings {
+		if item.AccountID == id {
+			delete(a.state.ThreadBindings, key)
 		}
 	}
 }
@@ -2696,12 +2858,50 @@ func currentStatusStickyKey(r *http.Request, model string) (string, string) {
 }
 
 type routingDecision struct {
-	StickyKey      string
-	PromptCacheKey string
-	Source         string
+	StickyKey                string
+	UpstreamPromptCacheKey   string
+	Source                   string
+	SourceValue              string
+	Identity                 requestIdentity
+	ClientPromptCacheKey     string
+	PreferredParentAccountID string
+	ParentAffinityAttempted  bool
 }
 
+// routingDecision deliberately keeps account affinity and the upstream prompt
+// cache key separate. Codex main/child threads need independent sticky routes,
+// while an operator may explicitly group their backend cache keys; a bound
+// previous_response_id remains authoritative across client metadata skew.
 func (a *app) routingDecision(r *http.Request, payload map[string]any, model, apiKey string) routingDecision {
+	identity := requestIdentityFrom(r, payload)
+	identity, parentAccountID, parentFound := a.resolveRequestIdentity(identity, model)
+	clientPromptCacheKey := stringValue(payload["prompt_cache_key"])
+	finish := func(route routingDecision) routingDecision {
+		route.Identity = identity
+		route.ClientPromptCacheKey = clientPromptCacheKey
+		route.PreferredParentAccountID = parentAccountID
+		route.ParentAffinityAttempted = identity.IsSubagent && identityParentID(identity) != "" && !a.liveStickySession(route.StickyKey)
+		if !parentFound {
+			route.PreferredParentAccountID = ""
+		}
+		route.UpstreamPromptCacheKey = a.upstreamPromptCacheKey(r, model, apiKey, route)
+		return route
+	}
+	if previousResponseID := stringValue(payload["previous_response_id"]); previousResponseID != "" {
+		if binding, found := a.responseBinding(previousResponseID, model); found {
+			// The response chain is stronger evidence than version-skewed turn
+			// metadata. Recover the bound thread identity so success does not
+			// create a second, incorrect thread binding for the same continuation.
+			if boundIdentity, ok := a.requestIdentityForSticky(binding.StickyKey, model); ok {
+				identity, parentAccountID, parentFound = a.resolveRequestIdentity(boundIdentity, model)
+			}
+			return finish(routingDecision{StickyKey: binding.StickyKey, Source: "previous_response_id", SourceValue: binding.StickyKey})
+		}
+	}
+	if identity.ThreadID != "" {
+		stickyKey := model + ":thread:" + identity.ThreadID
+		return finish(routingDecision{StickyKey: stickyKey, Source: "thread_id", SourceValue: identity.ThreadID})
+	}
 	for _, item := range []struct {
 		value  string
 		source string
@@ -2711,34 +2911,185 @@ func (a *app) routingDecision(r *http.Request, payload map[string]any, model, ap
 	} {
 		if value := strings.TrimSpace(item.value); value != "" {
 			stickyKey := model + ":" + value
-			return routingDecision{StickyKey: stickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, item.source, value, stickyKey), Source: item.source}
+			return finish(routingDecision{StickyKey: stickyKey, Source: item.source, SourceValue: value})
 		}
 	}
-	if value, ok := payload["prompt_cache_key"].(string); ok && strings.TrimSpace(value) != "" {
-		value = strings.TrimSpace(value)
-		return routingDecision{StickyKey: model + ":" + value, Source: "prompt_cache_key"}
+	if clientPromptCacheKey != "" {
+		return finish(routingDecision{StickyKey: model + ":" + clientPromptCacheKey, Source: "prompt_cache_key", SourceValue: clientPromptCacheKey})
 	}
 	if value := conversationID(payload); value != "" {
 		stickyKey := model + ":" + value
-		return routingDecision{StickyKey: stickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, "conversation", value, stickyKey), Source: "conversation"}
+		return finish(routingDecision{StickyKey: stickyKey, Source: "conversation", SourceValue: value})
 	}
-	for _, name := range []string{"session_id", "conversation_id", "thread_id"} {
-		if value, ok := payload[name].(string); ok && strings.TrimSpace(value) != "" {
-			value = strings.TrimSpace(value)
+	for _, name := range []string{"session_id", "conversation_id"} {
+		if value := stringValue(payload[name]); value != "" {
 			stickyKey := model + ":" + value
-			return routingDecision{StickyKey: stickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, name, value, stickyKey), Source: name}
+			return finish(routingDecision{StickyKey: stickyKey, Source: name, SourceValue: value})
 		}
 	}
-	if previousResponseID, ok := payload["previous_response_id"].(string); ok && strings.TrimSpace(previousResponseID) != "" {
-		previousResponseID = strings.TrimSpace(previousResponseID)
-		if binding, found := a.responseBinding(previousResponseID, model); found {
-			return routingDecision{StickyKey: binding.StickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, "previous_response_id", binding.StickyKey, binding.StickyKey), Source: "previous_response_id"}
-		}
+	if previousResponseID := stringValue(payload["previous_response_id"]); previousResponseID != "" {
 		value := "previous:" + shortHash([]byte(previousResponseID))
 		stickyKey := model + ":" + value
-		return routingDecision{StickyKey: stickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, "previous_response_id", value, stickyKey), Source: "previous_response_id"}
+		return finish(routingDecision{StickyKey: stickyKey, Source: "previous_response_id", SourceValue: value})
 	}
-	return a.fallbackRoutingDecision(r, payload, model, apiKey)
+	return finish(a.fallbackRoutingDecision(payload, model, apiKey))
+}
+
+// requestIdentityFrom accepts multiple Codex metadata generations. Canonical
+// turn metadata wins over flat client metadata, compatibility headers, and
+// top-level fallbacks; malformed JSON is ignored so version skew cannot reject
+// an otherwise valid Responses request.
+func requestIdentityFrom(r *http.Request, payload map[string]any) requestIdentity {
+	var identity requestIdentity
+	clientMetadata := metadataObject(payload["client_metadata"])
+	mergeRequestIdentity(&identity, metadataObject(firstMetadataValue(clientMetadata, "x-codex-turn-metadata", "x_codex_turn_metadata")))
+	mergeRequestIdentity(&identity, clientMetadata)
+	mergeRequestIdentity(&identity, metadataObject(r.Header.Get("X-Codex-Turn-Metadata")))
+	mergeRequestIdentity(&identity, map[string]any{
+		"session_id":            r.Header.Get("X-Codex-Session-ID"),
+		"thread_id":             r.Header.Get("X-Codex-Thread-ID"),
+		"parent_thread_id":      r.Header.Get("X-Codex-Parent-Thread-ID"),
+		"forked_from_thread_id": r.Header.Get("X-Codex-Forked-From-Thread-ID"),
+		"lineage_root_id":       r.Header.Get("X-Codex-Lineage-Root-ID"),
+		"subagent_kind":         r.Header.Get("X-OpenAI-Subagent"),
+		"thread_source":         r.Header.Get("X-Codex-Thread-Source"),
+	})
+	mergeRequestIdentity(&identity, payload)
+	if identity.ParentThreadID == "" {
+		identity.ParentThreadID = identity.ForkedFromID
+	}
+	identity.IsSubagent = identity.ParentThreadID != "" || identity.ForkedFromID != "" || identity.SubagentKind != "" || strings.Contains(strings.ToLower(identity.ThreadSource), "subagent")
+	return identity
+}
+
+func mergeRequestIdentity(identity *requestIdentity, values map[string]any) {
+	if len(values) == 0 {
+		return
+	}
+	setIdentityValue(&identity.SessionID, metadataString(values, "session_id", "sessionId"))
+	setIdentityValue(&identity.ThreadID, metadataString(values, "thread_id", "threadId"))
+	setIdentityValue(&identity.ParentThreadID, metadataString(values, "parent_thread_id", "parentThreadId", "x-codex-parent-thread-id"))
+	setIdentityValue(&identity.ForkedFromID, metadataString(values, "forked_from_thread_id", "forkedFromThreadId"))
+	setIdentityValue(&identity.LineageRootID, metadataString(values, "lineage_root_id", "lineageRootId"))
+	setIdentityValue(&identity.SubagentKind, metadataString(values, "subagent_kind", "subagentKind", "x-openai-subagent"))
+	setIdentityValue(&identity.ThreadSource, metadataString(values, "thread_source", "threadSource"))
+}
+
+func setIdentityValue(target *string, value string) {
+	if *target == "" && value != "" {
+		*target = value
+	}
+}
+
+func metadataObject(value any) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return typed
+	case string:
+		var decoded map[string]any
+		if json.Unmarshal([]byte(typed), &decoded) == nil {
+			return decoded
+		}
+	}
+	return nil
+}
+
+func firstMetadataValue(values map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := values[key]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func metadataString(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := values[key]; ok {
+			if normalized := requestIdentityString(value); normalized != "" {
+				return normalized
+			}
+		}
+	}
+	return ""
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func requestIdentityString(value any) string {
+	text := stringValue(value)
+	if len(text) > maxRequestIdentityValue {
+		text = text[:maxRequestIdentityValue]
+	}
+	return text
+}
+
+func identityParentID(identity requestIdentity) string {
+	if identity.ParentThreadID != "" {
+		return identity.ParentThreadID
+	}
+	return identity.ForkedFromID
+}
+
+func threadBindingStateKey(model, threadID string) string {
+	return model + ":" + threadID
+}
+
+func (a *app) resolveRequestIdentity(identity requestIdentity, model string) (requestIdentity, string, bool) {
+	parentID := identityParentID(identity)
+	now := time.Now().UTC()
+	a.mu.RLock()
+	parent, parentFound := a.state.ThreadBindings[threadBindingStateKey(model, parentID)]
+	parentFound = parentFound && parent.ExpiresAt.After(now)
+	a.mu.RUnlock()
+	if identity.LineageRootID == "" {
+		switch {
+		case parentFound && parent.LineageRootID != "":
+			identity.LineageRootID = parent.LineageRootID
+		case parentFound:
+			identity.LineageRootID = parent.ThreadID
+		case parentID != "":
+			identity.LineageRootID = parentID
+		case identity.ThreadID != "":
+			identity.LineageRootID = identity.ThreadID
+		}
+	}
+	if parentFound {
+		return identity, parent.AccountID, true
+	}
+	return identity, "", false
+}
+
+func (a *app) requestIdentityForSticky(stickyKey, model string) (requestIdentity, bool) {
+	now := time.Now().UTC()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, binding := range a.state.ThreadBindings {
+		if binding.ModelID != model || binding.StickyKey != stickyKey || !binding.ExpiresAt.After(now) {
+			continue
+		}
+		identity := requestIdentity{
+			SessionID:      binding.SessionID,
+			ThreadID:       binding.ThreadID,
+			ParentThreadID: binding.ParentThreadID,
+			LineageRootID:  binding.LineageRootID,
+			SubagentKind:   binding.SubagentKind,
+		}
+		identity.IsSubagent = identity.ParentThreadID != "" || identity.SubagentKind != ""
+		return identity, true
+	}
+	return requestIdentity{}, false
+}
+
+func (a *app) liveStickySession(stickyKey string) bool {
+	now := time.Now().UTC()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	binding, found := a.state.StickySessions[stickyKey]
+	return found && !a.stickySessionExpiredLocked(binding, now)
 }
 
 // scopedPromptCacheKey builds the prompt_cache_key. The default "auto" (and the
@@ -2810,13 +3161,48 @@ func (a *app) responseBinding(responseID, model string) (responseBinding, bool) 
 	return binding, true
 }
 
-func (a *app) fallbackRoutingDecision(r *http.Request, payload map[string]any, model, apiKey string) routingDecision {
+func (a *app) fallbackRoutingDecision(payload map[string]any, model, apiKey string) routingDecision {
 	prefix := normalizedPromptPrefix(payload)
 	keyMaterial := append([]byte(apiKeyFingerprint(apiKey)+":"+model+":"), prefix...)
 	value := shortHash(keyMaterial)
 	stickyID := "prompt:" + value
 	stickyKey := model + ":" + stickyID
-	return routingDecision{StickyKey: stickyKey, PromptCacheKey: a.scopedPromptCacheKey(r, model, apiKey, "prompt", value, stickyKey), Source: "prompt"}
+	return routingDecision{StickyKey: stickyKey, Source: "prompt", SourceValue: value}
+}
+
+func (a *app) upstreamPromptCacheKey(r *http.Request, model, apiKey string, route routingDecision) string {
+	policy := a.promptCacheKeyPolicy
+	if policy == "" {
+		policy = "preserve"
+	}
+	bucket := promptCacheBucketIndex(route.StickyKey, a.promptCacheBuckets)
+	switch policy {
+	case "lineage":
+		root := route.Identity.LineageRootID
+		if root == "" {
+			root = route.Identity.ThreadID
+		}
+		if root == "" {
+			root = route.StickyKey
+		}
+		return promptCacheKeyHash(model, "lineage", fmt.Sprintf("%s#%d", root, bucket))
+	case "project":
+		project := strings.TrimSpace(r.Header.Get("X-Codex-Pool-Project"))
+		if project == "" {
+			project = "user:" + apiKeyFingerprint(apiKey)
+		}
+		return promptCacheKeyHash(model, "project", fmt.Sprintf("%s#%d", project, bucket))
+	case "user":
+		return promptCacheKeyHash(model, "user", fmt.Sprintf("%s#%d", apiKeyFingerprint(apiKey), bucket))
+	default:
+		if route.ClientPromptCacheKey != "" {
+			return route.ClientPromptCacheKey
+		}
+		if !a.autoPromptCacheKeyEnabled() {
+			return ""
+		}
+		return a.scopedPromptCacheKey(r, model, apiKey, route.Source, route.SourceValue, route.StickyKey)
+	}
 }
 
 func (a *app) applyPromptCacheControls(payload map[string]any, route routingDecision) {
@@ -2825,14 +3211,20 @@ func (a *app) applyPromptCacheControls(payload map[string]any, route routingDeci
 			payload["prompt_cache_retention"] = a.promptCacheRetention
 		}
 	}
-	if !a.autoPromptCacheKeyEnabled() {
-		return
+	policy := a.promptCacheKeyPolicy
+	// Preserve is the compatibility default: an existing Codex thread key must
+	// not be rewritten. Only an explicit lineage/project/user policy may replace
+	// a client key, independently of the legacy missing-key auto-injection mode.
+	if policy == "" || policy == "preserve" {
+		if !a.autoPromptCacheKeyEnabled() {
+			return
+		}
+		if _, exists := payload["prompt_cache_key"]; exists {
+			return
+		}
 	}
-	if _, exists := payload["prompt_cache_key"]; exists {
-		return
-	}
-	if route.PromptCacheKey != "" {
-		payload["prompt_cache_key"] = route.PromptCacheKey
+	if route.UpstreamPromptCacheKey != "" {
+		payload["prompt_cache_key"] = route.UpstreamPromptCacheKey
 	}
 }
 
@@ -4591,17 +4983,42 @@ func (a *app) promptCacheWindowForAccountLocked(accountID string) map[string]any
 // accountID aggregates every account.
 func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Time) map[string]any {
 	var input, cached, requests, cold uint64
+	var parentAffinityHits, parentAffinityFallbacks, lineageFailovers uint64
+	agents := map[string]map[string]uint64{
+		"main":     {"inputTokens": 0, "cachedTokens": 0, "requestCount": 0, "coldRequestCount": 0},
+		"subagent": {"inputTokens": 0, "cachedTokens": 0, "requestCount": 0, "coldRequestCount": 0},
+	}
 	for key, stat := range a.state.PromptCache {
 		if accountID != "" && stat.AccountID != accountID {
 			continue
 		}
 		base := a.state.PromptCacheBaseline[key]
-		input += subSat(stat.InputTokens, base.InputTokens)
-		cached += subSat(stat.CachedTokens, base.CachedTokens)
-		requests += subSat(stat.RequestCount, base.RequestCount)
-		cold += subSat(stat.ColdRequestCount, base.ColdRequestCount)
+		inputDelta := subSat(stat.InputTokens, base.InputTokens)
+		cachedDelta := subSat(stat.CachedTokens, base.CachedTokens)
+		requestDelta := subSat(stat.RequestCount, base.RequestCount)
+		coldDelta := subSat(stat.ColdRequestCount, base.ColdRequestCount)
+		input += inputDelta
+		cached += cachedDelta
+		requests += requestDelta
+		cold += coldDelta
+		parentAffinityHits += subSat(stat.ParentAffinityHitCount, base.ParentAffinityHitCount)
+		parentAffinityFallbacks += subSat(stat.ParentAffinityFallbackCount, base.ParentAffinityFallbackCount)
+		lineageFailovers += subSat(stat.LineageFailoverCount, base.LineageFailoverCount)
+		agentKind := stat.AgentKind
+		if agentKind != "subagent" {
+			agentKind = "main"
+		}
+		agents[agentKind]["inputTokens"] += inputDelta
+		agents[agentKind]["cachedTokens"] += cachedDelta
+		agents[agentKind]["requestCount"] += requestDelta
+		agents[agentKind]["coldRequestCount"] += coldDelta
 	}
-	return map[string]any{"inputTokens": input, "cachedTokens": cached, "requestCount": requests, "coldRequestCount": cold, "resetAt": resetAt}
+	return map[string]any{
+		"inputTokens": input, "cachedTokens": cached, "requestCount": requests, "coldRequestCount": cold,
+		"main": agents["main"], "subagent": agents["subagent"],
+		"parentAffinityHitCount": parentAffinityHits, "parentAffinityFallbackCount": parentAffinityFallbacks,
+		"lineageFailoverCount": lineageFailovers, "resetAt": resetAt,
+	}
 }
 
 // subSat is a saturating subtraction; a baseline can briefly exceed the live
@@ -5352,6 +5769,16 @@ func promptCacheKeyScopeFromEnv() (string, error) {
 		return scope, nil
 	default:
 		return "", errors.New("CODEX_POOL_PROMPT_CACHE_KEY_SCOPE must be auto, conversation, project, or user")
+	}
+}
+
+func promptCacheKeyPolicyFromEnv() (string, error) {
+	policy := strings.ToLower(strings.TrimSpace(envOr("CODEX_POOL_PROMPT_CACHE_KEY_POLICY", "preserve")))
+	switch policy {
+	case "preserve", "lineage", "project", "user":
+		return policy, nil
+	default:
+		return "", errors.New("CODEX_POOL_PROMPT_CACHE_KEY_POLICY must be preserve, lineage, project, or user")
 	}
 }
 

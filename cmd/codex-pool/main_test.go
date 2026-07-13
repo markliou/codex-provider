@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -29,7 +30,7 @@ func testApp(t *testing.T, accounts []account) *app {
 	}
 	return &app{
 		config:  config{DefaultModel: "gpt-test", ModelAliases: map[string]string{"alias": "gpt-test"}, Accounts: accounts},
-		state:   state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}},
+		state:   state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, ThreadBindings: map[string]threadBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}},
 		dataDir: dir, apiKeys: [][]byte{[]byte("client-key")}, adminUser: "admin", adminHash: []byte(hash),
 		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, promptCacheKeyMode: "auto", publicDashboard: true, codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second}, streamClient: &http.Client{Timeout: time.Second},
 	}
@@ -683,6 +684,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page still exposes internal label %q", forbidden)
 		}
 	}
+	for _, expected := range []string{"cache-window-main", "cache-window-subagent", "cache-window-affinity", "cache-window-lineage-failover"} {
+		if !strings.Contains(recorder.Body.String(), expected) {
+			t.Fatalf("admin page omitted subagent cache metric %q", expected)
+		}
+	}
 	jsRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
 	jsRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(jsRecorder, jsRequest)
@@ -711,6 +717,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 	}
 	if !strings.Contains(jsRecorder.Body.String(), "preserveProQuota") {
 		t.Fatal("admin JS does not render the Pro quota preservation switch")
+	}
+	for _, expected := range []string{"parentAffinityHitCount", "parentAffinityFallbackCount", "lineageFailoverCount", "win.subagent"} {
+		if !strings.Contains(jsRecorder.Body.String(), expected) {
+			t.Fatalf("admin JS omitted subagent cache metric %q", expected)
+		}
 	}
 	for _, expected := range []string{"displayResetCountdown", "quotaTrackMarkup", "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
@@ -1251,7 +1262,7 @@ func TestResponsesProxyInjectsPromptCacheControlsAndTracksUsage(t *testing.T) {
 	if binding := a.state.ResponseBindings["resp_cache"]; binding.AccountID != "one" || binding.StickyKey != "gpt-test:repo-main" {
 		t.Fatalf("response binding was not recorded: %#v", binding)
 	}
-	stat := a.state.PromptCache["one:gpt-test"]
+	stat := a.state.PromptCache["one:gpt-test:main"]
 	if stat.RequestCount != 1 || stat.InputTokens != 2006 || stat.CachedTokens != 1920 {
 		t.Fatalf("prompt cache stats not recorded: %#v", stat)
 	}
@@ -1318,6 +1329,298 @@ func TestPreviousResponseIDRoutesToOriginalAccount(t *testing.T) {
 	}
 	if selected.ID != "low" {
 		t.Fatalf("previous_response_id selected %q, want low", selected.ID)
+	}
+}
+
+func TestRequestIdentityParsesCodexMetadataPrecedenceAndMalformedFallback(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("X-Codex-Turn-Metadata", `{"thread_id":"header-thread","parent_thread_id":"header-parent"}`)
+	req.Header.Set("X-Codex-Parent-Thread-ID", "direct-parent")
+	req.Header.Set("X-OpenAI-Subagent", "collab_spawn")
+	payload := map[string]any{
+		"thread_id":        "top-thread",
+		"parent_thread_id": "top-parent",
+		"client_metadata": map[string]any{
+			"thread_id":             "flat-thread",
+			"session_id":            "flat-session",
+			"x-codex-turn-metadata": `{"thread_id":"canonical-thread","parent_thread_id":"canonical-parent","forked_from_thread_id":"fork-source","subagent_kind":"thread_spawn"}`,
+		},
+	}
+	identity := requestIdentityFrom(req, payload)
+	if identity.ThreadID != "canonical-thread" || identity.ParentThreadID != "canonical-parent" || identity.SessionID != "flat-session" {
+		t.Fatalf("metadata precedence produced %#v", identity)
+	}
+	if identity.ForkedFromID != "fork-source" || identity.SubagentKind != "thread_spawn" || !identity.IsSubagent {
+		t.Fatalf("subagent metadata missing: %#v", identity)
+	}
+
+	malformed := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	malformed.Header.Set("X-Codex-Turn-Metadata", "{not-json")
+	identity = requestIdentityFrom(malformed, map[string]any{"thread_id": "fallback-thread", "input": "unchanged"})
+	if identity.ThreadID != "fallback-thread" || identity.IsSubagent {
+		t.Fatalf("malformed metadata did not fall back safely: %#v", identity)
+	}
+
+	compatibility := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	compatibility.Header.Set("X-Codex-Thread-ID", "header-child")
+	compatibility.Header.Set("X-Codex-Parent-Thread-ID", "header-parent")
+	compatibility.Header.Set("X-OpenAI-Subagent", "collab_spawn")
+	identity = requestIdentityFrom(compatibility, map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": "{malformed", "session_id": "flat-session"}})
+	if identity.ThreadID != "header-child" || identity.ParentThreadID != "header-parent" || identity.SessionID != "flat-session" || !identity.IsSubagent {
+		t.Fatalf("compatibility headers or malformed nested fallback produced %#v", identity)
+	}
+}
+
+func TestCodexThreadsKeepIndependentStickyAndPreviousResponseChains(t *testing.T) {
+	a := testApp(t, nil)
+	now := time.Now().UTC()
+	a.state.ThreadBindings[threadBindingStateKey("gpt-test", "child")] = threadBinding{ThreadID: "child", ParentThreadID: "main", LineageRootID: "main", SubagentKind: "thread_spawn", ModelID: "gpt-test", AccountID: "one", StickyKey: "gpt-test:thread:child", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+	a.state.ResponseBindings["resp-child"] = responseBinding{ResponseID: "resp-child", StickyKey: "gpt-test:thread:child", ModelID: "gpt-test", AccountID: "one", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+	request := func(metadata string, extra map[string]any) routingDecision {
+		payload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": metadata}, "prompt_cache_key": "client-thread-key"}
+		for key, value := range extra {
+			payload[key] = value
+		}
+		return a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), payload, "gpt-test", "client-key")
+	}
+	mainRoute := request(`{"thread_id":"main"}`, nil)
+	childRoute := request(`{"thread_id":"child","parent_thread_id":"main","subagent_kind":"thread_spawn"}`, nil)
+	siblingRoute := request(`{"thread_id":"sibling","parent_thread_id":"main","subagent_kind":"thread_spawn"}`, nil)
+	continued := request(`{"thread_id":"wrong-version-skew-id"}`, map[string]any{"previous_response_id": "resp-child"})
+	if mainRoute.StickyKey == childRoute.StickyKey || childRoute.StickyKey == siblingRoute.StickyKey || mainRoute.StickyKey == siblingRoute.StickyKey {
+		t.Fatalf("thread routes collapsed: main=%q child=%q sibling=%q", mainRoute.StickyKey, childRoute.StickyKey, siblingRoute.StickyKey)
+	}
+	if continued.StickyKey != "gpt-test:thread:child" || continued.Identity.ThreadID != "child" {
+		t.Fatalf("previous_response_id lost child chain: %#v", continued)
+	}
+	a.markSuccess(continued, "gpt-test", "one", proxyResponseInfo{ResponseID: "resp-child-next"})
+	if _, exists := a.state.ThreadBindings[threadBindingStateKey("gpt-test", "wrong-version-skew-id")]; exists {
+		t.Fatal("version-skewed metadata created a second thread binding for a bound response chain")
+	}
+	if mainRoute.UpstreamPromptCacheKey != "client-thread-key" || childRoute.UpstreamPromptCacheKey != "client-thread-key" {
+		t.Fatalf("preserve policy changed client cache key: main=%q child=%q", mainRoute.UpstreamPromptCacheKey, childRoute.UpstreamPromptCacheKey)
+	}
+}
+
+func TestChildSoftPrefersEligibleParentAndNestedLineageRoot(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "parent-account", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://parent.example.test", UpstreamAPIKey: "parent"},
+		{ID: "pool-first", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://first.example.test", UpstreamAPIKey: "first"},
+	})
+	now := time.Now().UTC()
+	a.state.ThreadBindings[threadBindingStateKey("gpt-test", "root-thread")] = threadBinding{ThreadID: "root-thread", LineageRootID: "root-thread", ModelID: "gpt-test", AccountID: "parent-account", StickyKey: "gpt-test:thread:root-thread", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+	childPayload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": `{"thread_id":"child-thread","parent_thread_id":"root-thread","subagent_kind":"thread_spawn"}`}, "prompt_cache_key": "child-key"}
+	childRoute := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), childPayload, "gpt-test", "client-key")
+	selected, err := a.selectAccountForRoute(childRoute, "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "parent-account" || childRoute.Identity.LineageRootID != "root-thread" {
+		t.Fatalf("child affinity/lineage = selected %q route %#v", selected.ID, childRoute)
+	}
+	a.markSuccess(childRoute, "gpt-test", selected.ID, proxyResponseInfo{})
+	continuedChild := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), childPayload, "gpt-test", "client-key")
+	if continuedChild.ParentAffinityAttempted {
+		t.Fatal("parent affinity was counted again after the child acquired its own sticky binding")
+	}
+	a.markSuccess(continuedChild, "gpt-test", selected.ID, proxyResponseInfo{})
+	if got := a.state.PromptCache["parent-account:gpt-test:subagent"].ParentAffinityHitCount; got != 1 {
+		t.Fatalf("parent affinity hit count = %d, want only the initial child assignment", got)
+	}
+
+	nestedPayload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": `{"thread_id":"nested-thread","parent_thread_id":"child-thread","subagent_kind":"thread_spawn"}`}, "prompt_cache_key": "nested-key"}
+	nestedRoute := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), nestedPayload, "gpt-test", "client-key")
+	if nestedRoute.Identity.LineageRootID != "root-thread" || nestedRoute.PreferredParentAccountID != "parent-account" {
+		t.Fatalf("nested lineage was not inherited: %#v", nestedRoute)
+	}
+	if nestedRoute.StickyKey == childRoute.StickyKey {
+		t.Fatalf("nested child reused parent sticky key %q", nestedRoute.StickyKey)
+	}
+}
+
+func TestChildTemporaryLineageRootCorrectsWhenParentAppears(t *testing.T) {
+	a := testApp(t, []account{{ID: "account", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://account.example.test", UpstreamAPIKey: "key"}})
+	payload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": `{"thread_id":"child","parent_thread_id":"parent","subagent_kind":"thread_spawn"}`}}
+	request := func() routingDecision {
+		return a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), payload, "gpt-test", "client-key")
+	}
+
+	initial := request()
+	if initial.Identity.LineageRootID != "parent" {
+		t.Fatalf("temporary lineage root = %q, want immediate parent", initial.Identity.LineageRootID)
+	}
+	a.markSuccess(initial, "gpt-test", "account", proxyResponseInfo{})
+
+	now := time.Now().UTC()
+	a.state.ThreadBindings[threadBindingStateKey("gpt-test", "parent")] = threadBinding{ThreadID: "parent", ParentThreadID: "root", LineageRootID: "root", ModelID: "gpt-test", AccountID: "account", StickyKey: "gpt-test:thread:parent", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+	corrected := request()
+	if corrected.Identity.LineageRootID != "root" {
+		t.Fatalf("corrected lineage root = %q, want root", corrected.Identity.LineageRootID)
+	}
+	a.markSuccess(corrected, "gpt-test", "account", proxyResponseInfo{})
+	if got := a.state.ThreadBindings[threadBindingStateKey("gpt-test", "child")].LineageRootID; got != "root" {
+		t.Fatalf("persisted corrected lineage root = %q", got)
+	}
+}
+
+func TestIneligibleParentFallsBackWithoutBypassingSafeguards(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*app)
+	}{
+		{name: "disabled", configure: func(a *app) {
+			a.config.Accounts[0].Enabled = false
+		}},
+		{name: "out of pool", configure: func(a *app) {
+			a.config.Accounts[0].InPool = false
+		}},
+		{name: "missing provider auth", configure: func(a *app) {
+			a.config.Accounts[0].UpstreamBaseURL = ""
+		}},
+		{name: "model incompatible", configure: func(a *app) {
+			a.config.Accounts[0].AllowedModels = []string{"other-model"}
+		}},
+		{name: "quota exhausted", configure: func(a *app) {
+			zero := 0
+			a.config.Accounts[0].RemainingQuota = &zero
+		}},
+		{name: "cooldown", configure: func(a *app) {
+			a.state.Cooldowns["parent-account"] = []cooldown{{ModelID: "gpt-test", NextRetryAt: time.Now().Add(time.Hour), Reason: "rate_limited"}}
+		}},
+		{name: "pro preservation", configure: func(a *app) {
+			a.preserveProQuota = true
+			a.config.Accounts[0].PlanType = "pro"
+			a.config.Accounts[1].PlanType = "plus"
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := testApp(t, []account{
+				{ID: "parent-account", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://parent.example.test", UpstreamAPIKey: "parent"},
+				{ID: "fallback", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://fallback.example.test", UpstreamAPIKey: "fallback"},
+			})
+			now := time.Now().UTC()
+			a.state.ThreadBindings[threadBindingStateKey("gpt-test", "parent")] = threadBinding{ThreadID: "parent", LineageRootID: "parent", ModelID: "gpt-test", AccountID: "parent-account", StickyKey: "gpt-test:thread:parent", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+			tc.configure(a)
+			route := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": `{"thread_id":"child","parent_thread_id":"parent","subagent_kind":"thread_spawn"}`}}, "gpt-test", "client-key")
+			selected, err := a.selectAccountForRoute(route, "gpt-test", map[string]bool{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if selected.ID != "fallback" {
+				t.Fatalf("ineligible parent selected %q", selected.ID)
+			}
+		})
+	}
+}
+
+func TestChildAffinityDoesNotBypassDuplicateIdentityRepresentative(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "parent-slot", AccountID: "shared-upstream", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10},
+		{ID: "representative-slot", AccountID: "shared-upstream", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
+	})
+	writeCodexDeviceAuth(t, a, "parent-slot", "shared-upstream", "shared@example.test")
+	writeCodexDeviceAuth(t, a, "representative-slot", "shared-upstream", "shared@example.test")
+	now := time.Now().UTC()
+	a.state.ThreadBindings[threadBindingStateKey("gpt-test", "parent")] = threadBinding{ThreadID: "parent", LineageRootID: "parent", ModelID: "gpt-test", AccountID: "parent-slot", StickyKey: "gpt-test:thread:parent", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+	route := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": `{"thread_id":"child","parent_thread_id":"parent","subagent_kind":"thread_spawn"}`}}, "gpt-test", "client-key")
+	selected, err := a.selectAccountForRoute(route, "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "representative-slot" {
+		t.Fatalf("child affinity selected duplicate non-representative %q", selected.ID)
+	}
+}
+
+func TestPromptCacheKeyPoliciesSeparateRoutingFromUpstreamKey(t *testing.T) {
+	request := func(a *app, threadID, parentID, project, apiKey, clientKey string) routingDecision {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		req.Header.Set("X-Codex-Pool-Project", project)
+		metadata := fmt.Sprintf(`{"thread_id":%q,"parent_thread_id":%q,"subagent_kind":"thread_spawn"}`, threadID, parentID)
+		payload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": metadata}, "prompt_cache_key": clientKey}
+		return a.routingDecision(req, payload, "gpt-test", apiKey)
+	}
+
+	a := testApp(t, nil)
+	a.promptCacheBuckets = 1
+	preserve := request(a, "child-a", "root", "repo", "client-key", "native-codex-key")
+	if preserve.UpstreamPromptCacheKey != "native-codex-key" {
+		t.Fatalf("preserve policy changed client key: %#v", preserve)
+	}
+	longNativeKey := strings.Repeat("native-", 100)
+	if got := request(a, "child-long", "root", "repo", "client-key", longNativeKey).UpstreamPromptCacheKey; got != longNativeKey {
+		t.Fatalf("preserve policy truncated a long client key: got %d bytes, want %d", len(got), len(longNativeKey))
+	}
+
+	for _, policy := range []string{"lineage", "project", "user"} {
+		t.Run(policy, func(t *testing.T) {
+			a := testApp(t, nil)
+			a.promptCacheKeyPolicy = policy
+			a.promptCacheBuckets = 1
+			first := request(a, "child-a", "root", "repo", "client-key", "native-a")
+			second := request(a, "child-b", "root", "repo", "client-key", "native-b")
+			if first.StickyKey == second.StickyKey {
+				t.Fatalf("%s policy collapsed sticky keys: %#v %#v", policy, first, second)
+			}
+			if first.UpstreamPromptCacheKey == "native-a" || !strings.HasPrefix(first.UpstreamPromptCacheKey, "cp_") {
+				t.Fatalf("%s policy did not explicitly override/hash client key: %#v", policy, first)
+			}
+			if first.UpstreamPromptCacheKey != second.UpstreamPromptCacheKey {
+				t.Fatalf("%s policy was not deterministic for shared scope: %q vs %q", policy, first.UpstreamPromptCacheKey, second.UpstreamPromptCacheKey)
+			}
+		})
+	}
+}
+
+func TestPromptCacheKeyPolicyControlsPayloadOverride(t *testing.T) {
+	request := func(a *app, payload map[string]any) routingDecision {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		req.Header.Set("X-Codex-Pool-Project", "repo")
+		return a.routingDecision(req, payload, "gpt-test", "client-key")
+	}
+
+	preserve := testApp(t, nil)
+	preserve.promptCacheKeyMode = "passthrough"
+	preservePayload := map[string]any{
+		"client_metadata":  map[string]any{"x-codex-turn-metadata": `{"thread_id":"child","parent_thread_id":"root","subagent_kind":"thread_spawn"}`},
+		"prompt_cache_key": "native-codex-key",
+	}
+	preserve.applyPromptCacheControls(preservePayload, request(preserve, preservePayload))
+	if got := preservePayload["prompt_cache_key"]; got != "native-codex-key" {
+		t.Fatalf("preserve policy rewrote client key to %#v", got)
+	}
+
+	explicit := testApp(t, nil)
+	explicit.promptCacheKeyMode = "passthrough"
+	explicit.promptCacheKeyPolicy = "lineage"
+	explicit.promptCacheBuckets = 1
+	explicitPayload := map[string]any{
+		"client_metadata":  map[string]any{"x-codex-turn-metadata": `{"thread_id":"child","parent_thread_id":"root","subagent_kind":"thread_spawn"}`},
+		"prompt_cache_key": "native-codex-key",
+	}
+	explicitRoute := request(explicit, explicitPayload)
+	explicit.applyPromptCacheControls(explicitPayload, explicitRoute)
+	if got := explicitPayload["prompt_cache_key"]; got != explicitRoute.UpstreamPromptCacheKey || got == "native-codex-key" {
+		t.Fatalf("explicit lineage policy did not override payload key: got %#v route %#v", got, explicitRoute)
+	}
+}
+
+func TestThreadBindingsAndResponsesAreTTLPruned(t *testing.T) {
+	a := testApp(t, nil)
+	now := time.Now().UTC()
+	a.state.StickySessions["expired"] = stickySession{Key: "expired", ExpiresAt: now.Add(-time.Minute)}
+	a.state.ResponseBindings["expired"] = responseBinding{ResponseID: "expired", ExpiresAt: now.Add(-time.Minute)}
+	a.state.ThreadBindings["expired"] = threadBinding{ThreadID: "expired", ExpiresAt: now.Add(-time.Minute)}
+	a.state.ThreadBindings["active"] = threadBinding{ThreadID: "active", ExpiresAt: now.Add(time.Hour)}
+	if !a.pruneExpiredRuntimeStateLocked(now) {
+		t.Fatal("expired runtime state was not reported as pruned")
+	}
+	if _, ok := a.state.ThreadBindings["expired"]; ok {
+		t.Fatal("expired thread binding was retained")
+	}
+	if _, ok := a.state.ThreadBindings["active"]; !ok {
+		t.Fatal("active thread binding was pruned")
 	}
 }
 
@@ -1433,7 +1736,7 @@ func TestStickySessionTTLRefreshesOnSuccess(t *testing.T) {
 	if selected.ID != "one" {
 		t.Fatalf("active sticky session selected %q, want one", selected.ID)
 	}
-	a.markSuccess("gpt-test:session", "gpt-test", "one", proxyResponseInfo{})
+	a.markSuccess(routingDecision{StickyKey: "gpt-test:session"}, "gpt-test", "one", proxyResponseInfo{})
 	refreshed := a.state.StickySessions["gpt-test:session"]
 	if !refreshed.ExpiresAt.After(previousExpiry) {
 		t.Fatalf("sticky session expiry was not refreshed: before=%s after=%s", previousExpiry, refreshed.ExpiresAt)
@@ -1464,7 +1767,7 @@ func TestPreserveProQuotaModeMovesStickySessionBackToNonPro(t *testing.T) {
 	if selected.ID != "plus" {
 		t.Fatalf("preserve mode selected %q, want plus", selected.ID)
 	}
-	a.markSuccess("gpt-test:session", "gpt-test", selected.ID, proxyResponseInfo{})
+	a.markSuccess(routingDecision{StickyKey: "gpt-test:session"}, "gpt-test", selected.ID, proxyResponseInfo{})
 	if session := a.state.StickySessions["gpt-test:session"]; session.AccountID != "plus" || session.FailoverFrom != "pro" {
 		t.Fatalf("preserve mode did not rewrite sticky session from pro to plus: %#v", session)
 	}
@@ -1684,7 +1987,7 @@ func TestResponsesProxyPreservesLargeMCPToolPayloadAndStreamingEvents(t *testing
 	if round != 2 {
 		t.Fatalf("upstream rounds = %d, want 2", round)
 	}
-	if stat := a.state.PromptCache["provider:gpt-test"]; stat.InputTokens != 9216 || stat.CachedTokens != 7168 || stat.RequestCount != 2 {
+	if stat := a.state.PromptCache["provider:gpt-test:main"]; stat.InputTokens != 9216 || stat.CachedTokens != 7168 || stat.RequestCount != 2 {
 		t.Fatalf("streaming usage was not recorded: %#v", stat)
 	}
 }
@@ -1698,6 +2001,143 @@ func TestCopyStreamingProxyResponseFlushesSSE(t *testing.T) {
 	if info.ResponseID != "resp_flushed" {
 		t.Fatalf("streaming response id = %q", info.ResponseID)
 	}
+}
+
+func TestResponsesProxyPreservesSpawnAgentForkTurnsSchemaArgumentsAndHistory(t *testing.T) {
+	spawnTool := map[string]any{
+		"type":        "function",
+		"name":        "spawn_agent",
+		"description": "Spawn a child agent",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"message":    map[string]any{"type": "string"},
+				"task_name":  map[string]any{"type": "string"},
+				"fork_turns": map[string]any{"type": "string", "description": "none, all, or a positive integer string"},
+			},
+			"required":             []any{"message", "task_name"},
+			"additionalProperties": false,
+		},
+	}
+	childHistory := []any{
+		map[string]any{"role": "developer", "content": "shared instructions"},
+		map[string]any{"role": "user", "content": "parent turn one"},
+		map[string]any{"role": "assistant", "content": "parent answer one"},
+		map[string]any{"role": "user", "content": "child task"},
+	}
+	canonical := func(value any) any {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded any
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		return decoded
+	}
+	expectedTools := canonical([]any{spawnTool})
+	expectedHistory := canonical(childHistory)
+
+	cases := []struct {
+		name   string
+		args   string
+		stream bool
+	}{
+		{name: "none streamed", args: `{"message":"child","task_name":"child_none","fork_turns":"none"}`, stream: true},
+		{name: "last n nonstreamed", args: `{"message":"child","task_name":"child_three","fork_turns":"3"}`},
+		{name: "all streamed", args: `{"message":"child","task_name":"child_all","fork_turns":"all"}`, stream: true},
+		{name: "omitted nonstreamed", args: `{"message":"child","task_name":"child_default"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var payload map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(payload["tools"], expectedTools) {
+					t.Fatalf("spawn_agent schema changed:\n got %#v\nwant %#v", payload["tools"], expectedTools)
+				}
+				if !reflect.DeepEqual(payload["input"], expectedHistory) {
+					t.Fatalf("child history changed:\n got %#v\nwant %#v", payload["input"], expectedHistory)
+				}
+				item := map[string]any{"type": "function_call", "call_id": "call_spawn", "name": "spawn_agent", "arguments": tc.args}
+				if tc.stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					writeTestSSE(t, w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "item": item})
+					writeTestSSE(t, w, "response.completed", map[string]any{"type": "response.completed", "response": map[string]any{"id": "resp_spawn", "output": []any{item}}})
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"id": "resp_spawn", "object": "response", "output": []any{item}})
+			}))
+			defer upstream.Close()
+
+			a := testApp(t, []account{{ID: "provider", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL + "/v1", UpstreamAPIKey: "provider-key"}})
+			body, err := json.Marshal(map[string]any{
+				"model": "gpt-test", "input": childHistory, "tools": []any{spawnTool}, "stream": tc.stream,
+				"prompt_cache_key": "native-thread-key",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+			req.Header.Set("Authorization", "Bearer client-key")
+			recorder := httptest.NewRecorder()
+			a.publicMux().ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+			}
+			if got := responseFunctionCallArguments(t, recorder.Body.String(), tc.stream); got != tc.args {
+				t.Fatalf("fork_turns arguments changed:\n got %s\nwant %s", got, tc.args)
+			}
+		})
+	}
+}
+
+func writeTestSSE(t *testing.T, w http.ResponseWriter, event string, payload any) {
+	t.Helper()
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, encoded)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func responseFunctionCallArguments(t *testing.T, body string, stream bool) string {
+	t.Helper()
+	if !stream {
+		var response struct {
+			Output []struct {
+				Arguments string `json:"arguments"`
+			} `json:"output"`
+		}
+		if err := json.Unmarshal([]byte(body), &response); err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Output) == 0 {
+			t.Fatalf("response omitted function call: %s", body)
+		}
+		return response.Output[0].Arguments
+	}
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var event struct {
+			Item struct {
+				Arguments string `json:"arguments"`
+			} `json:"item"`
+		}
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event) == nil && event.Item.Arguments != "" {
+			return event.Item.Arguments
+		}
+	}
+	t.Fatalf("stream omitted function call arguments: %s", body)
+	return ""
 }
 
 func TestResponsesProxyUsesCodexDeviceAuth(t *testing.T) {
@@ -1760,6 +2200,50 @@ func TestResponsesProxyAddsCodexMetadataHeaders(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
 	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestResponsesProxyForwardsOnlyCodexMetadataHeaderAllowlist(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for name, want := range map[string]string{
+			"X-Codex-Parent-Thread-ID": "parent-thread",
+			"X-OpenAI-Subagent":        "collab_spawn",
+			"X-Codex-Turn-Metadata":    `{"thread_id":"child-thread"}`,
+			"X-Codex-Window-ID":        "window-a",
+			"X-Codex-Installation-ID":  "installation-a",
+		} {
+			if got := r.Header.Get(name); got != want {
+				t.Fatalf("%s = %q, want %q", name, got, want)
+			}
+		}
+		if r.Header.Get("Authorization") != "Bearer upstream-key" {
+			t.Fatalf("client authorization leaked or upstream auth missing: %q", r.Header.Get("Authorization"))
+		}
+		for _, forbidden := range []string{"Cookie", "X-Unrelated-Client-Header", "X-Codex-Thread-ID"} {
+			if got := r.Header.Get(forbidden); got != "" {
+				t.Fatalf("non-allowlisted header %s leaked upstream: %q", forbidden, got)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_headers","object":"response","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	a := testApp(t, []account{{ID: "provider", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL + "/v1", UpstreamAPIKey: "upstream-key"}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Cookie", "client-cookie")
+	req.Header.Set("X-Unrelated-Client-Header", "do-not-forward")
+	req.Header.Set("X-Codex-Thread-ID", "child-thread")
+	req.Header.Set("X-Codex-Parent-Thread-ID", "parent-thread")
+	req.Header.Set("X-OpenAI-Subagent", "collab_spawn")
+	req.Header.Set("X-Codex-Turn-Metadata", `{"thread_id":"child-thread"}`)
+	req.Header.Set("X-Codex-Window-ID", "window-a")
+	req.Header.Set("X-Codex-Installation-ID", "installation-a")
 	recorder := httptest.NewRecorder()
 	a.publicMux().ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {
@@ -2655,7 +3139,7 @@ func TestPromptCacheColdStartAndResetWindow(t *testing.T) {
 	rec(1500, 0)    // cold start (eligible, no cache)
 	rec(500, 0)     // sub-1024: not cache-eligible, must not count as cold
 
-	stat := a.state.PromptCache["acct:gpt-test"]
+	stat := a.state.PromptCache["acct:gpt-test:main"]
 	if stat.ColdRequestCount != 1 {
 		t.Fatalf("cold request count = %d, want 1", stat.ColdRequestCount)
 	}
@@ -2679,8 +3163,34 @@ func TestPromptCacheColdStartAndResetWindow(t *testing.T) {
 		t.Fatalf("post-reset window = %#v", win)
 	}
 	// Lifetime totals are preserved across the reset.
-	if lifetime := a.state.PromptCache["acct:gpt-test"]; lifetime.RequestCount != 5 || lifetime.ColdRequestCount != 2 {
+	if lifetime := a.state.PromptCache["acct:gpt-test:main"]; lifetime.RequestCount != 5 || lifetime.ColdRequestCount != 2 {
 		t.Fatalf("lifetime totals not preserved: %#v", lifetime)
+	}
+}
+
+func TestPromptCacheMetricsSeparateMainSubagentAndAffinity(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct", Enabled: true, InPool: true}})
+	now := time.Now().UTC()
+	a.recordPromptCacheResultLocked("acct", "gpt-test", requestIdentity{ThreadID: "main"}, promptCacheUsage{InputTokens: 2000, CachedTokens: 1500, Present: true}, false, false, false, now)
+	a.recordPromptCacheResultLocked("acct", "gpt-test", requestIdentity{ThreadID: "child", ParentThreadID: "main", LineageRootID: "main", IsSubagent: true}, promptCacheUsage{InputTokens: 3000, CachedTokens: 0, Present: true}, true, false, false, now)
+	a.recordPromptCacheResultLocked("acct", "gpt-test", requestIdentity{ThreadID: "sibling", ParentThreadID: "main", LineageRootID: "main", IsSubagent: true}, promptCacheUsage{InputTokens: 4000, CachedTokens: 2000, Present: true}, false, true, true, now)
+
+	main := a.state.PromptCache["acct:gpt-test:main"]
+	subagent := a.state.PromptCache["acct:gpt-test:subagent"]
+	if main.RequestCount != 1 || main.InputTokens != 2000 || main.CachedTokens != 1500 {
+		t.Fatalf("main metrics = %#v", main)
+	}
+	if subagent.RequestCount != 2 || subagent.InputTokens != 7000 || subagent.CachedTokens != 2000 || subagent.ColdRequestCount != 1 {
+		t.Fatalf("subagent metrics = %#v", subagent)
+	}
+	if subagent.ParentAffinityHitCount != 1 || subagent.ParentAffinityFallbackCount != 1 || subagent.LineageFailoverCount != 1 {
+		t.Fatalf("affinity metrics = %#v", subagent)
+	}
+	window := a.promptCacheWindowLocked()
+	mainWindow := window["main"].(map[string]uint64)
+	subagentWindow := window["subagent"].(map[string]uint64)
+	if mainWindow["requestCount"] != 1 || subagentWindow["requestCount"] != 2 || window["parentAffinityHitCount"].(uint64) != 1 || window["parentAffinityFallbackCount"].(uint64) != 1 || window["lineageFailoverCount"].(uint64) != 1 {
+		t.Fatalf("agent cache window = %#v", window)
 	}
 }
 
@@ -2753,17 +3263,17 @@ func TestScopedPromptCacheKeyGroupsByProject(t *testing.T) {
 	b := mk("sess-3", "repo-y")
 	// Same project, different conversations share one cache key (buckets=1) so
 	// they reuse the static prefix, while routing stays per-conversation.
-	if a1.PromptCacheKey == "" || a1.PromptCacheKey != a2.PromptCacheKey {
-		t.Fatalf("same-project conversations did not share cache key: %q vs %q", a1.PromptCacheKey, a2.PromptCacheKey)
+	if a1.UpstreamPromptCacheKey == "" || a1.UpstreamPromptCacheKey != a2.UpstreamPromptCacheKey {
+		t.Fatalf("same-project conversations did not share cache key: %q vs %q", a1.UpstreamPromptCacheKey, a2.UpstreamPromptCacheKey)
 	}
 	if a1.StickyKey == a2.StickyKey {
 		t.Fatalf("conversations collapsed to a single sticky route: %q", a1.StickyKey)
 	}
-	if a1.PromptCacheKey == b.PromptCacheKey {
-		t.Fatalf("different projects shared a cache key: %q", a1.PromptCacheKey)
+	if a1.UpstreamPromptCacheKey == b.UpstreamPromptCacheKey {
+		t.Fatalf("different projects shared a cache key: %q", a1.UpstreamPromptCacheKey)
 	}
-	if !strings.HasPrefix(a1.PromptCacheKey, "cp_") || strings.Contains(a1.PromptCacheKey, "repo-x") {
-		t.Fatalf("cache key leaked raw data or was malformed: %q", a1.PromptCacheKey)
+	if !strings.HasPrefix(a1.UpstreamPromptCacheKey, "cp_") || strings.Contains(a1.UpstreamPromptCacheKey, "repo-x") {
+		t.Fatalf("cache key leaked raw data or was malformed: %q", a1.UpstreamPromptCacheKey)
 	}
 }
 
@@ -2771,7 +3281,7 @@ func TestScopedPromptCacheKeyConversationScopeUnchanged(t *testing.T) {
 	a := testApp(t, nil) // testApp leaves scope empty == conversation behavior
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	req.Header.Set("X-Codex-Pool-Project", "repo-x")
-	got := a.routingDecision(req, map[string]any{"input": "x"}, "gpt-test", "client-key").PromptCacheKey
+	got := a.routingDecision(req, map[string]any{"input": "x"}, "gpt-test", "client-key").UpstreamPromptCacheKey
 	want := promptCacheKeyHash("gpt-test", "project", "repo-x")
 	if got != want {
 		t.Fatalf("conversation-scope cache key = %q, want historical %q", got, want)
@@ -2809,6 +3319,23 @@ func TestPromptCacheKeyScopeFromEnv(t *testing.T) {
 	t.Setenv("CODEX_POOL_PROMPT_CACHE_KEY_SCOPE", "bogus")
 	if _, err := promptCacheKeyScopeFromEnv(); err == nil {
 		t.Fatal("expected error for invalid scope")
+	}
+}
+
+func TestPromptCacheKeyPolicyFromEnv(t *testing.T) {
+	for _, env := range []string{"", "preserve", "lineage", "project", "user", "  LINEAGE "} {
+		t.Setenv("CODEX_POOL_PROMPT_CACHE_KEY_POLICY", env)
+		if _, err := promptCacheKeyPolicyFromEnv(); err != nil {
+			t.Fatalf("promptCacheKeyPolicyFromEnv(%q) error: %v", env, err)
+		}
+	}
+	t.Setenv("CODEX_POOL_PROMPT_CACHE_KEY_POLICY", "")
+	if got, _ := promptCacheKeyPolicyFromEnv(); got != "preserve" {
+		t.Fatalf("default policy = %q, want preserve", got)
+	}
+	t.Setenv("CODEX_POOL_PROMPT_CACHE_KEY_POLICY", "bogus")
+	if _, err := promptCacheKeyPolicyFromEnv(); err == nil {
+		t.Fatal("expected error for invalid policy")
 	}
 }
 

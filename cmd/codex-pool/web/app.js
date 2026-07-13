@@ -268,6 +268,17 @@
     $("#cache-window-hit").textContent = rate === null ? "No data" : `${(rate * 100).toFixed(1)}%`;
     $("#cache-window-cold").textContent = reqs ? `${cold} (${((cold / reqs) * 100).toFixed(1)}%)` : String(cold);
     $("#cache-window-reqs").textContent = String(reqs);
+    const agentCacheText = (agent) => {
+      const agentInput = Number(agent?.inputTokens) || 0;
+      const agentCached = Number(agent?.cachedTokens) || 0;
+      const agentRequests = Number(agent?.requestCount) || 0;
+      const agentRate = cacheHitRate(agentInput, agentCached);
+      return `${agentRate === null ? "No data" : `${(agentRate * 100).toFixed(1)}%`} · ${agentRequests} req`;
+    };
+    $("#cache-window-main").textContent = agentCacheText(win.main);
+    $("#cache-window-subagent").textContent = agentCacheText(win.subagent);
+    $("#cache-window-affinity").textContent = `${Number(win.parentAffinityHitCount) || 0} hit · ${Number(win.parentAffinityFallbackCount) || 0} fallback`;
+    $("#cache-window-lineage-failover").textContent = String(Number(win.lineageFailoverCount) || 0);
     const resetAt = win.resetAt && win.resetAt !== "0001-01-01T00:00:00Z" ? win.resetAt : null;
     $("#cache-window-since").textContent = resetAt ? `since ${displayTime(resetAt)}` : "since service start (never reset)";
     $("#cache-window-reset").hidden = state.mode !== "management";

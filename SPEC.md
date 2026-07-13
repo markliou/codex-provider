@@ -163,6 +163,7 @@ docker run -d \
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_MODE` | no | `auto` | `auto` injects a hashed `prompt_cache_key` when the client omitted one. `off`/`passthrough` leave the request unchanged. |
+| `CODEX_POOL_PROMPT_CACHE_KEY_POLICY` | no | `preserve` | Upstream-key policy independent of sticky routing. `preserve` retains a client key and uses the legacy missing-key behavior. `lineage`, `project`, and `user` explicitly replace any client key with a deterministic hashed/bucketed key for that scope. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_SCOPE` | no | `auto` | Coarseness of the injected `prompt_cache_key`. `auto` groups by `X-Codex-Pool-Project` header, else API key, else per-conversation. `project`/`user` force that grouping; `conversation` keeps the historical per-conversation key. Coarser keys let sibling conversations reuse the same static-prefix cache. |
 | `CODEX_POOL_PROMPT_CACHE_BUCKETS` | no | `4` | Number of buckets (1–256) a coarse cache key is split across, keyed by the stable per-conversation routing key, to stay under OpenAI's ~15 RPM-per-(prefix+key) cache-routing limit. Raise for hot pools; set `1` to maximize sharing. |
 | `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | `24h` | Upstream prompt cache retention. Defaults to `24h` (extended retention) to maximize cache hit rate across conversation turns. Set `passthrough` to leave requests untouched, or `in_memory` for the shorter built-in retention. |
@@ -461,21 +462,35 @@ sticky_failover
 
 Do not round-robin by default.
 
-Reason: prompt-cache locality is important. Requests for the same project/session/model should continue using the same account until that account becomes unavailable or enters cooldown.
+Reason: prompt-cache locality is important. Requests for the same Codex thread or fallback project/session/model identity should continue using the same account until that account becomes unavailable or enters cooldown.
 
 Sticky bindings have an idle TTL controlled by `CODEX_POOL_SESSION_AFFINITY_TTL_MS`. A successful request refreshes the binding expiry. Expired bindings are pruned and the next request selects a fresh account.
 
 ### 6.2 Sticky key derivation
 
-Use the first available source:
+Normalize Codex request identity from these sources, accepting both snake-case and compatible camel-case fields:
 
-1. `X-Codex-Pool-Session`
-2. `X-Codex-Pool-Project`
-3. `prompt_cache_key` from JSON body
-4. `conversation` from JSON body
-5. `session_id`, `conversation_id`, or `thread_id` from JSON body
-6. `previous_response_id` mapped to the account that produced that response id
-7. Hash of `(apiKeyId + model + normalized prompt prefix)`
+1. `client_metadata["x-codex-turn-metadata"]`
+2. flat `client_metadata`
+3. recognized compatibility headers and `X-Codex-Turn-Metadata`
+4. top-level request fields
+
+Malformed or absent metadata must be ignored rather than rejecting an otherwise valid Responses request. The routing source order is:
+
+1. a live `previous_response_id` binding;
+2. normalized Codex `thread_id`;
+3. `X-Codex-Pool-Session`;
+4. `X-Codex-Pool-Project`;
+5. client `prompt_cache_key`;
+6. `conversation`, `session_id`, or `conversation_id`;
+7. an unbound `previous_response_id` hash;
+8. hash of `(apiKeyId + model + normalized prompt prefix)`.
+
+A live response binding is authoritative so a continuation cannot move to a different thread/account because of metadata version skew. Codex thread keys use:
+
+```text
+<model>:thread:<thread-id>
+```
 
 Final sticky key format:
 
@@ -488,6 +503,46 @@ Example:
 ```text
 gpt-5.5:repo-main-worktree
 ```
+
+### 6.2.1 Parent lineage and cache-key identity
+
+Sticky routing identity, parent/child lineage, history inheritance, and the upstream cache key are separate contracts:
+
+```text
+sticky routing identity = thread_id
+parent/child relationship = parent_thread_id + lineage_root_id
+history inheritance = fork_turns, executed by Codex runtime
+backend KV/prompt-cache behavior = upstream prompt prefix + prompt_cache_key
+```
+
+On the first request for an unbound child thread, resolve the parent's TTL-live thread binding and softly prefer its account. The preference must pass the same enabled, in-pool, authentication, quota, model, cooldown, duplicate-identity, and Pro-preservation checks as normal selection. If the parent account is ineligible or fails, use normal selection and failover. Success creates a separate child sticky binding; it must never merge the child route with the parent route.
+
+Persist TTL-bounded thread bindings with thread, session, parent, lineage root, subagent kind, model, account, sticky key, upstream cache key, and activity timestamps. Reuse the sticky TTL and pruning lifecycle. Nested children inherit the known root; when only an immediate parent is known, use it as the temporary root and update the child binding after fuller parent state becomes available.
+
+`CODEX_POOL_PROMPT_CACHE_KEY_POLICY` controls only the upstream key:
+
+- `preserve`: retain a supplied client key. If absent, use `CODEX_POOL_PROMPT_CACHE_KEY_MODE` and `CODEX_POOL_PROMPT_CACHE_KEY_SCOPE` compatibility behavior.
+- `lineage`: explicitly replace the client key with a hashed lineage-root key plus bucket.
+- `project`: explicitly replace it with a hashed project key plus bucket, falling back to the user fingerprint when no project is supplied.
+- `user`: explicitly replace it with a hashed API-key/user fingerprint plus bucket.
+
+`preserve` is the compatibility default. No client key may be overwritten unless an explicit alternate policy is configured. Cache-key grouping must not alter sticky routing, lineage, or history inheritance.
+
+### 6.2.2 MultiAgent tool and metadata forwarding
+
+Pool is transparent to Codex MultiAgent V2 tool semantics. A `spawn_agent` schema containing `fork_turns` must reach upstream unchanged, and streamed or non-streamed tool-call arguments must return unchanged for `none`, positive integer strings, `all`, and omitted values. Codex decides whether to spawn and constructs the child history; Pool must not choose a fork tier, summarize history, or rewrite child input.
+
+Forward only this Codex compatibility-header allowlist when present:
+
+```text
+X-Codex-Parent-Thread-ID
+X-OpenAI-Subagent
+X-Codex-Turn-Metadata
+X-Codex-Window-ID
+X-Codex-Installation-ID
+```
+
+Do not forward client authorization, API keys, hop-by-hop headers, or unrelated client-controlled headers.
 
 ### 6.3 Failover rules
 
@@ -990,6 +1045,8 @@ A duplicate slot with a persisted auth/quota metadata error must not provide quo
 
 ## 10. Usage Statistics
 
+Prompt-cache aggregates must distinguish `main` and `subagent` traffic at account + model + agent-kind granularity. Store input tokens, cached tokens, request count, and cache-eligible cold starts for both kinds, plus parent-affinity hits, parent-affinity fallbacks, and lineage failovers. Dashboard lifetime and reset-window views must expose these values without retaining an unbounded per-request ledger.
+
 ### 10.1 Usage stats object
 
 ```json
@@ -1218,12 +1275,13 @@ Required behavior:
 1. Authenticate client API key.
 2. Parse model and thinking suffix.
 3. Resolve alias.
-4. Pick account using sticky failover.
-5. Refresh access token if expired.
-6. Send upstream request.
-7. Stream SSE if request asks for stream.
-8. Track usage and emit usage event.
-9. On quota exhaustion, mark account/model cooldown and retry next available account.
+4. Normalize Codex thread/parent identity and derive an independent sticky route and upstream cache key.
+5. Pick account using sticky failover, including soft parent affinity for a new child.
+6. Refresh access token if expired.
+7. Send the upstream request with only allowlisted Codex compatibility headers.
+8. Stream SSE if request asks for stream without rewriting tool-call arguments.
+9. Track usage, main/subagent cache metrics, thread/response bindings, and emit a usage event.
+10. On quota exhaustion, mark account/model cooldown and retry the next available account.
 
 ### 12.2 `/v1/chat/completions`
 
@@ -1679,6 +1737,12 @@ The implementation is acceptable when:
 13. Logs do not expose tokens, API keys, or auth files.
 14. Public `/v1` API is protected by configured API key.
 15. Admin UI is protected by password and defaults to loopback-only binding.
+16. Main, child, and sibling Codex threads retain distinct sticky and response chains.
+17. Eligible children softly prefer the parent account without bypassing routing safeguards.
+18. Sticky routing and upstream prompt-cache keys remain independent; `preserve` never rewrites a client key.
+19. Explicit `lineage`, `project`, and `user` policies generate deterministic hashed/bucketed keys.
+20. MultiAgent `fork_turns` schema, arguments, and Codex-assembled child history pass through unchanged.
+21. Thread/lineage bindings are TTL-pruned and main/subagent cache and affinity metrics are observable.
 
 ---
 

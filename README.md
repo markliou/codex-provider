@@ -75,17 +75,28 @@ For every selected account, Pool writes an isolated CLIProxy auth record under `
 
 Quota is read from the authenticated Codex/ChatGPT backend after login and then refreshed every five minutes. The dashboard shows both short-window and weekly remaining percentages with reset times when upstream provides them. The optional `CODEX_POOL_CODEX_USAGE_URL` override exists for tests or backend compatibility; normal deployments use `CODEX_POOL_CODEX_BASE_URL + /wham/usage`.
 
-### Prompt Cache Locality
+### Subagent Routing and Prompt Cache Locality
 
-Pool keeps requests sticky by project/session/model and automatically adds a hashed `prompt_cache_key` when the client did not provide one. The raw project or session value is not sent upstream. `prompt_cache_key` generation is controlled by `CODEX_POOL_PROMPT_CACHE_KEY_MODE=auto|off|passthrough`; `auto` is the default.
+For current Codex traffic, Pool extracts `thread_id`, `parent_thread_id`, lineage, and subagent fields from `client_metadata` (including `x-codex-turn-metadata`), recognized compatibility headers, and top-level fallbacks. A main thread, child, and sibling each receive an independent `<model>:thread:<thread-id>` sticky route. A bound `previous_response_id` takes precedence so each continuation remains on the account that produced that response even when client metadata changes between versions.
 
-`CODEX_POOL_PROMPT_CACHE_KEY_SCOPE=auto|conversation|project|user` controls how coarse that key is. Because the router already concentrates new conversations onto the same account, a coarse key lets sibling conversations reuse the same static prefix (system prompt + tools) cache instead of each starting cold. `auto` (default) groups by the `X-Codex-Pool-Project` header when present, else by the API key (user), else falls back to per-conversation; `conversation` keeps the historical per-conversation key. To stay under OpenAI's ~15 RPM-per-(prefix+key) cache-routing limit, a coarse key is split across `CODEX_POOL_PROMPT_CACHE_BUCKETS` buckets (default `4`, range 1–256) using the stable per-conversation routing key. Raise the bucket count if the dashboard shows a hot account with a low cache hit rate; lower it (toward 1) to maximize sharing on low-traffic pools.
+The first request for a child softly prefers the eligible account currently bound to its parent. Quota, authentication, cooldown, duplicate-identity, model access, Pro preservation, and failover checks remain authoritative. Thread and response bindings use the normal sticky TTL and are pruned; nested children inherit the known lineage root without merging thread histories.
 
-`CODEX_POOL_PROMPT_CACHE_RETENTION` defaults to `24h` (extended retention) so prompt (KV) caches survive the idle gaps between conversation turns, which is the biggest lever for cache hit rate. Set it to `passthrough` to leave requests untouched and keep upstream organization data-retention defaults in control, or to `in_memory` for the shorter built-in retention.
+Codex MultiAgent V2 owns history inheritance. Pool preserves the upstream `spawn_agent` schema and returned tool-call arguments, including `fork_turns=none`, a positive integer string, `all`, or an omitted value. Pool does not choose a fork mode, rewrite `fork_turns`, or merge parent and child histories.
 
-The dashboard shows the cache hit rate per account (`cachedTokens / inputTokens`, taken from upstream usage) and an all-time aggregate. Because the all-time number moves slowly, there is also a "since reset" window — hit rate, cold-start count (cache-eligible requests that returned zero cached tokens), and request count over fresh traffic only. Use the **Reset window** control (management mode) right after changing a cache setting to measure its real effect; the lifetime totals are preserved across resets.
+These identities are deliberately separate:
 
-Successful responses update aggregate prompt-cache counters in the admin state from upstream `usage` fields, including input tokens and cached tokens. Response IDs are also bound to the selected account for the sticky TTL so follow-up `previous_response_id` requests stay on the original account.
+```text
+Sticky account route = Codex thread_id
+Parent/child lineage = parent_thread_id + lineage_root_id
+History inheritance = fork_turns, executed by Codex
+Backend KV/prompt cache = upstream behavior for prompt_cache_key + prompt prefix
+```
+
+`CODEX_POOL_PROMPT_CACHE_KEY_POLICY=preserve|lineage|project|user` controls only the upstream key. `preserve` is the default and retains a client-provided Codex key. `lineage`, `project`, and `user` are explicit opt-ins that replace it with a deterministic hashed key split across `CODEX_POOL_PROMPT_CACHE_BUCKETS` buckets. They do not change sticky routing or child history.
+
+Under `preserve`, `CODEX_POOL_PROMPT_CACHE_KEY_MODE=auto|off|passthrough` and `CODEX_POOL_PROMPT_CACHE_KEY_SCOPE=auto|conversation|project|user` still govern missing-key injection for non-Codex or compatible clients. `auto` hashes the selected scope; raw project, session, and API-key values are not sent upstream. `CODEX_POOL_PROMPT_CACHE_RETENTION` defaults to `24h`; use `passthrough` to leave retention untouched or `in_memory` for the shorter upstream mode.
+
+The dashboard separates main and subagent input/cached tokens, request counts, and cold starts, and reports parent-affinity hits/fallbacks plus lineage failovers. The **Reset window** control starts a fresh comparison window without deleting lifetime totals.
 
 ### Duplicate Upstream Accounts
 
@@ -136,7 +147,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - `POST /v1/responses` and `/v1/responses/compact`, with streaming passthrough.
 - `POST /v1/chat/completions`, including translation to a Responses upstream.
 - Model aliases and `(thinking-tier)` suffix translation.
-- Sticky failover routing with idle TTL, per-model cooldowns, quota-exhaustion failover, optional Pro-quota preservation, prompt-cache-key routing, response-id continuation binding, and JSON persistence in `/data`. When an upstream account returns `429` or server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
+- Thread-aware sticky failover with idle TTL, soft parent-account affinity, independent prompt-cache-key policy, per-model cooldowns, optional Pro-quota preservation, response-id continuation binding, and JSON persistence in `/data`. When an upstream account returns `429` or repeated server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
 - Bundled, loopback-only CLIProxyAPI sidecar for Codex device-auth requests. Pool pins each request to the selected account through a sidecar model prefix, while the sidecar owns OAuth refreshes.
 - Public pool participation toggles on `/admin`, plus authenticated owner controls for add/remove account, device-auth login jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Duplicate`, `Disabled`, or `Standby`.
 - Codex quota refresh from `/backend-api/wham/usage`, including per-window percentages, reset times, plan-type updates, sanitized quota errors, and five-minute dashboard refresh.
@@ -158,6 +169,7 @@ Run the Codex CLI/provider integration test with Docker as well:
 sh scripts/test/integration-codex-config.sh
 sh scripts/test/integration-cliproxy-sidecar.sh
 sh scripts/test/integration-device-auth-failover.sh
+sh scripts/test/integration-codex-subagent.sh
 ```
 
 That script builds the service and mock upstream images, starts them on an isolated Docker network, verifies public dashboard access, verifies protected management APIs, checks public API-key enforcement, then runs a real `codex exec` inside the service image with an ephemeral `CODEX_HOME/config.toml`. The test proves Codex can use:
@@ -172,6 +184,8 @@ wire_api = "responses"
 The checked-in [test config](test/codex-config.toml) uses the same provider contract.
 
 `integration-cliproxy-sidecar.sh` starts the real bundled sidecar and verifies its isolated auth conversion plus loopback-only binding. `integration-device-auth-failover.sh` runs a real `codex exec` through the Pool sidecar adapter, forces the first device-auth account to return `429`, and verifies that the request completes through the second account with a persisted cooldown and sticky binding.
+
+`integration-codex-subagent.sh` runs a real Codex MultiAgent V2 session, forces the parent to fail over, returns a `spawn_agent` call from the mock model, and verifies the child's independent sticky binding, parent-account affinity, native cache key, response chain, lineage state, and metrics.
 
 ## Local Build
 
