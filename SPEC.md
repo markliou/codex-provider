@@ -374,6 +374,25 @@ Optional hidden models must include:
 }
 ```
 
+#### 5.2.1 Built-in Codex model lineup
+
+The advertised catalog must always include the current Codex model lineup in addition to the configured default model, per-account `allowedModels`, and aliases. As of July 2026 that lineup, in picker order, is:
+
+```text
+gpt-5.6-sol
+gpt-5.6-terra
+gpt-5.6-luna
+gpt-5.5
+gpt-5.4
+gpt-5.4-mini
+gpt-5.3-codex-spark
+gpt-5.2-codex
+```
+
+This keeps a stock Codex client from falling back to bundled model metadata (with its startup warning and conflicting-tool behavior, see 6.4.2) when the user selects a current model this pool was not explicitly configured for. Advertising a model is not an access grant: per-account model filters and upstream plan enforcement still apply (`gpt-5.3-codex-spark` is Pro-only upstream). Catalog `priority` ranks the configured default model first, then the lineup above, then operator-configured extras.
+
+Reasoning levels are per model family: the `gpt-5.6` family additionally advertises `max` and `ultra`; older families must stay at `low`–`xhigh` so the client cannot submit an effort upstream rejects.
+
 ### 5.3 Thinking tier model suffix
 
 Support Cockpit-style model suffixes:
@@ -402,7 +421,10 @@ medium
 high
 xhigh
 max
+ultra
 ```
+
+`max` and `ultra` are only advertised as catalog capability for the `gpt-5.6` family, but remain accepted as request-input suffixes for any model; upstream is the authority on whether the effort is valid.
 
 For Codex/OpenAI Responses requests, translate suffix into nested `reasoning.effort`:
 
@@ -595,6 +617,14 @@ A transient upstream `5xx` without `Retry-After` must preserve sticky account lo
 When Codex requests `/v1/models` with `client_version`, return the current Codex remote-model catalog shape rather than the generic OpenAI model-list shape. Every model record must include structured `supported_reasoning_levels` entries and a `default_reasoning_level`. Legacy reasoning aliases such as `model(high)` may remain accepted as request inputs, but the Codex catalog must collapse them into one canonical base model and advertise reasoning effort as capability metadata. Missing required model fields cause Codex's model manager to retry during app-server startup and must not be allowed to destabilize unrelated MCP client initialization.
 
 The generic `/v1/models` response without `client_version` remains OpenAI-compatible and may continue exposing configured request aliases for non-Codex clients.
+
+### 6.4.2 Hosted tool namespace conflicts
+
+The ChatGPT Codex backend reserves the `image_gen` tool namespace implicitly: for current models it attaches its hosted image generation twin server-side even when the request declares no hosted tool. A Codex client running experimental features (multi-agent, image generation) or bundled fallback metadata can declare a client-side twin — verified against the live backend (2026-07), a `namespace` tool named `image_gen` inside an `additional_tools` input item is flattened upstream to `image_gen.imagegen` and the whole request is rejected with `Invalid Value: 'tools'. Function 'image_gen.imagegen' conflicts with a hosted tool in the same request.`
+
+Before forwarding, the pool must drop client-declared tools whose name equals, or is namespaced under, a reserved namespace. Reserved namespaces are `image_gen` always, plus the namespace of any hosted tool declared in the same request (`image_generation`/`image_gen` reserves `image_gen`; `web_search`/`web_search_preview` reserves `web_search` — a bare `web_search` function without the hosted twin must pass through). Filtering must cover both places Codex declares tools — the top-level `tools` array and `additional_tools` items inside `input` (Codex 0.144+) — and both shapes: flat `function`/`custom` tools and `namespace` tools whose flattened `namespace.function` names collide. Hosted tools themselves are kept because upstream owns the namespace either way. Non-tool input items must pass through unmodified.
+
+This sanitization is a compatibility guard for client behavior the end user cannot fix; it is not a substitute for catalog coverage (5.2.1), which keeps well-behaved clients from attaching conflicting tools in the first place.
 
 ### 6.5 Candidate account filter
 

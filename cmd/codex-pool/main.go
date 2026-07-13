@@ -767,6 +767,27 @@ type codexModelInfo struct {
 	MultiAgentVersion                 any                   `json:"multi_agent_version"`
 }
 
+// defaultCodexModelSlugs is the current Codex model lineup (July 2026),
+// ordered the way the picker should rank them. These are merged into the
+// advertised catalog so a stock Codex client can select any current model
+// without its requested model falling off this pool's catalog. A model that
+// is missing here still works as a request input, but the client then runs
+// on bundled fallback metadata, which prints a startup warning and can attach
+// conflicting tools (see dropHostedToolConflicts). Advertising a model is not
+// an access grant: per-account allowedModels/excludedModels still gate
+// routing, and upstream still enforces plan access (for example
+// gpt-5.3-codex-spark is Pro-only).
+var defaultCodexModelSlugs = []string{
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
+	"gpt-5.5",
+	"gpt-5.4",
+	"gpt-5.4-mini",
+	"gpt-5.3-codex-spark",
+	"gpt-5.2-codex",
+}
+
 func codexReasoningLevels() []codexReasoningLevel {
 	return []codexReasoningLevel{
 		{Effort: "low", Description: "Fast responses with lighter reasoning"},
@@ -776,18 +797,47 @@ func codexReasoningLevels() []codexReasoningLevel {
 	}
 }
 
-func codexCatalogReasoningDefault(tier string) string {
-	switch tier {
-	case "low", "medium", "high", "xhigh":
-		return tier
-	default:
-		return "medium"
+// codexReasoningLevelsForModel returns the reasoning levels a model may
+// advertise. Only the gpt-5.6 family documents `max` and `ultra`; advertising
+// them on older models would let the client submit an effort upstream rejects,
+// so the extended tiers stay gated to that family.
+func codexReasoningLevelsForModel(model string) []codexReasoningLevel {
+	levels := codexReasoningLevels()
+	if strings.HasPrefix(model, "gpt-5.6") {
+		levels = append(levels,
+			codexReasoningLevel{Effort: "max", Description: "Maximum reasoning depth for the hardest problems"},
+			codexReasoningLevel{Effort: "ultra", Description: "Deepest reasoning for ambiguous, high-value work"},
+		)
 	}
+	return levels
+}
+
+func codexCatalogReasoningDefault(tier string, levels []codexReasoningLevel) string {
+	for _, level := range levels {
+		if level.Effort == tier {
+			return tier
+		}
+	}
+	return "medium"
+}
+
+// codexCatalogPriority ranks catalog entries: the configured default model
+// first, then the built-in lineup in defaultCodexModelSlugs order, then any
+// operator-configured extras.
+func codexCatalogPriority(model, defaultModel string) int {
+	if model == defaultModel {
+		return 0
+	}
+	for index, slug := range defaultCodexModelSlugs {
+		if slug == model {
+			return index + 1
+		}
+	}
+	return 1000
 }
 
 func (a *app) codexModelCatalogLocked(models []string) []codexModelInfo {
 	defaultModel, defaultTier := parseModel(a.config.DefaultModel)
-	defaultTier = codexCatalogReasoningDefault(defaultTier)
 	seen := map[string]bool{}
 	items := make([]codexModelInfo, 0, len(models))
 	for _, model := range models {
@@ -799,11 +849,11 @@ func (a *app) codexModelCatalogLocked(models []string) []codexModelInfo {
 			continue
 		}
 		seen[model] = true
+		levels := codexReasoningLevelsForModel(model)
 		reasoningDefault := "medium"
-		priority := 1000
+		priority := codexCatalogPriority(model, defaultModel)
 		if model == defaultModel {
-			reasoningDefault = defaultTier
-			priority = 0
+			reasoningDefault = codexCatalogReasoningDefault(defaultTier, levels)
 		}
 		items = append(items, codexModelInfo{
 			ID:                                model,
@@ -811,7 +861,7 @@ func (a *app) codexModelCatalogLocked(models []string) []codexModelInfo {
 			DisplayName:                       model,
 			Description:                       model,
 			DefaultReasoningLevel:             reasoningDefault,
-			SupportedReasoningLevels:          codexReasoningLevels(),
+			SupportedReasoningLevels:          levels,
 			ShellType:                         "shell_command",
 			Visibility:                        "list",
 			SupportedInAPI:                    true,
@@ -849,6 +899,9 @@ func (a *app) codexModelCatalogLocked(models []string) []codexModelInfo {
 			MultiAgentVersion:                 nil,
 		})
 	}
+	sort.SliceStable(items, func(left, right int) bool {
+		return items[left].Priority < items[right].Priority
+	})
 	return items
 }
 
@@ -909,6 +962,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	if !chat && tier != "" && tier != "none" {
 		payload["reasoning"] = map[string]any{"effort": tier}
 	}
+	dropHostedToolConflicts(payload)
 	route := a.routingDecision(r, payload, model, requestAPIKey(r))
 	a.applyPromptCacheControls(payload, route)
 	updatedBody, err := json.Marshal(payload)
@@ -2033,9 +2087,12 @@ func (a *app) modelsLocked() []string {
 	set := map[string]bool{a.config.DefaultModel: true}
 	if base, _ := parseModel(a.config.DefaultModel); base != "" {
 		set[base] = true
-		for _, tier := range []string{"low", "medium", "high", "xhigh"} {
-			set[fmt.Sprintf("%s(%s)", base, tier)] = true
+		for _, level := range codexReasoningLevelsForModel(base) {
+			set[fmt.Sprintf("%s(%s)", base, level.Effort)] = true
 		}
+	}
+	for _, slug := range defaultCodexModelSlugs {
+		set[slug] = true
 	}
 	for _, account := range a.config.Accounts {
 		for _, model := range account.AllowedModels {
@@ -2815,7 +2872,7 @@ func parseModel(value string) (string, string) {
 	if start > 0 && end == len(value)-1 {
 		tier := value[start+1 : end]
 		switch tier {
-		case "none", "auto", "minimal", "low", "medium", "high", "xhigh", "max":
+		case "none", "auto", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
 			return value[:start], tier
 		}
 	}
@@ -3244,6 +3301,101 @@ func conversationID(payload map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// hostedToolNamespaces maps hosted Responses tool types to the tool namespace
+// the ChatGPT backend reserves for them when such a tool is declared in the
+// same request.
+var hostedToolNamespaces = map[string]string{
+	"image_generation":   "image_gen",
+	"image_gen":          "image_gen",
+	"web_search":         "web_search",
+	"web_search_preview": "web_search",
+}
+
+// alwaysReservedToolNamespaces are namespaces the ChatGPT Codex backend owns
+// implicitly: the hosted twin is attached server-side for current models even
+// when the request declares no hosted tool, so a client-declared twin always
+// fails with "Function 'image_gen.imagegen' conflicts with a hosted tool in
+// the same request". Verified against the live backend (2026-07): declaring a
+// `namespace` tool named `image_gen` under an `additional_tools` input item
+// reproduces that exact 400 with no hosted tool anywhere in the request.
+var alwaysReservedToolNamespaces = []string{
+	// TODO(upstream): DELETE the "image_gen" entry (and this comment) once
+	// OpenAI fixes the Codex client/hosted collision tracked in
+	// https://github.com/openai/codex/issues/28464 — their stated plan is to
+	// retire the hosted image tool in favor of the standalone client
+	// extension, at which point this reservation would silently strip a
+	// then-legitimate client tool and disable image generation through the
+	// pool. How to verify the fix shipped: POST /v1/responses upstream with an
+	// `additional_tools` input item declaring {"type":"namespace","name":
+	// "image_gen","tools":[{"type":"function","name":"imagegen",...}]}. While
+	// the bug exists this returns 400 "Function 'image_gen.imagegen' conflicts
+	// with a hosted tool in the same request"; once it is accepted, remove
+	// this entry, update SPEC.md 6.4.2, and keep the hosted-pair dedupe below.
+	"image_gen",
+}
+
+// dropHostedToolConflicts removes client-declared tools whose name lives in a
+// namespace the upstream backend reserves — either implicitly (see
+// alwaysReservedToolNamespaces) or because the same request also declares the
+// hosted tool. Codex clients declare tools in two places: the top-level
+// `tools` array and, since Codex 0.144, `additional_tools` items inside
+// `input`; namespaced tools arrive as `{"type":"namespace","name":...}` and
+// upstream flattens their functions into `namespace.function` names. Both
+// locations and both shapes must be filtered, and the hosted capability is
+// kept because upstream owns the namespace either way. Do not simplify this
+// into forwarding tools verbatim: the conflict is generated by the Codex
+// client's experimental feature set (for example multi-agent/image
+// generation), not by user configuration, so the pool must stay tolerant.
+func dropHostedToolConflicts(payload map[string]any) {
+	reserved := map[string]bool{}
+	for _, namespace := range alwaysReservedToolNamespaces {
+		reserved[namespace] = true
+	}
+	topTools, _ := payload["tools"].([]any)
+	for _, raw := range topTools {
+		tool, _ := raw.(map[string]any)
+		toolType, _ := tool["type"].(string)
+		if namespace, hosted := hostedToolNamespaces[toolType]; hosted {
+			reserved[namespace] = true
+		}
+	}
+	if filtered, changed := filterReservedTools(topTools, reserved); changed {
+		payload["tools"] = filtered
+	}
+	input, _ := payload["input"].([]any)
+	for _, raw := range input {
+		item, _ := raw.(map[string]any)
+		if itemType, _ := item["type"].(string); itemType != "additional_tools" {
+			continue
+		}
+		if tools, ok := item["tools"].([]any); ok {
+			if filtered, changed := filterReservedTools(tools, reserved); changed {
+				item["tools"] = filtered
+			}
+		}
+	}
+}
+
+func filterReservedTools(tools []any, reserved map[string]bool) ([]any, bool) {
+	if len(tools) == 0 {
+		return tools, false
+	}
+	filtered := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		toolType, _ := tool["type"].(string)
+		if _, hosted := hostedToolNamespaces[toolType]; !hosted {
+			name, _ := tool["name"].(string)
+			namespace, _, hasNamespace := strings.Cut(name, ".")
+			if reserved[name] || (hasNamespace && reserved[namespace]) {
+				continue
+			}
+		}
+		filtered = append(filtered, raw)
+	}
+	return filtered, len(filtered) != len(tools)
 }
 
 func normalizedPromptPrefix(payload map[string]any) []byte {

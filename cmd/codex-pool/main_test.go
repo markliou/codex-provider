@@ -40,6 +40,8 @@ func TestParseModel(t *testing.T) {
 	cases := []struct{ input, model, tier string }{
 		{"gpt-5.4(high)", "gpt-5.4", "high"},
 		{"gpt-5.4(none)", "gpt-5.4", "none"},
+		{"gpt-5.6-sol(ultra)", "gpt-5.6-sol", "ultra"},
+		{"gpt-5.6-sol(max)", "gpt-5.6-sol", "max"},
 		{"gpt-5.4(unknown)", "gpt-5.4(unknown)", ""},
 		{"gpt-5.4", "gpt-5.4", ""},
 	}
@@ -178,6 +180,55 @@ func TestCodexModelCatalogNormalizesUnsupportedDefaultReasoningTier(t *testing.T
 		}
 	}
 	t.Fatal("Codex model catalog omitted gpt-5.5")
+}
+
+func TestCodexModelCatalogIncludesCurrentCodexLineup(t *testing.T) {
+	a := testApp(t, nil)
+	a.config.DefaultModel = "gpt-5.5(xhigh)"
+	models := a.codexModelCatalogLocked(a.modelsLocked())
+	bySlug := map[string]codexModelInfo{}
+	for _, model := range models {
+		bySlug[model.Slug] = model
+	}
+	for _, slug := range defaultCodexModelSlugs {
+		if _, ok := bySlug[slug]; !ok {
+			t.Fatalf("catalog missing built-in Codex model %q", slug)
+		}
+	}
+	if models[0].Slug != "gpt-5.5" || models[0].Priority != 0 {
+		t.Fatalf("default model must rank first: %#v", models[0])
+	}
+	if bySlug["gpt-5.6-sol"].Priority >= bySlug["gpt-5.2-codex"].Priority {
+		t.Fatalf("built-in lineup order was not reflected in priority: sol=%d legacy=%d",
+			bySlug["gpt-5.6-sol"].Priority, bySlug["gpt-5.2-codex"].Priority)
+	}
+	sol := bySlug["gpt-5.6-sol"]
+	efforts := make([]string, 0, len(sol.SupportedReasoningLevels))
+	for _, level := range sol.SupportedReasoningLevels {
+		efforts = append(efforts, level.Effort)
+	}
+	if strings.Join(efforts, ",") != "low,medium,high,xhigh,max,ultra" {
+		t.Fatalf("gpt-5.6 reasoning levels = %v", efforts)
+	}
+	older := bySlug["gpt-5.5"]
+	if len(older.SupportedReasoningLevels) != 4 {
+		t.Fatalf("pre-5.6 models must not advertise max/ultra: %#v", older.SupportedReasoningLevels)
+	}
+}
+
+func TestCodexModelCatalogKeepsExtendedDefaultReasoningTierOn56(t *testing.T) {
+	a := testApp(t, nil)
+	a.config.DefaultModel = "gpt-5.6-sol(ultra)"
+	models := a.codexModelCatalogLocked(a.modelsLocked())
+	if models[0].Slug != "gpt-5.6-sol" || models[0].DefaultReasoningLevel != "ultra" {
+		t.Fatalf("gpt-5.6 default reasoning tier was not preserved: %#v", models[0])
+	}
+	aliases := strings.Join(a.modelsLocked(), "\n")
+	for _, expected := range []string{"gpt-5.6-sol(max)", "gpt-5.6-sol(ultra)"} {
+		if !strings.Contains(aliases, expected) {
+			t.Fatalf("generic model list missing %q in:\n%s", expected, aliases)
+		}
+	}
 }
 
 func TestDefaultModelEnvOverridesPersistedConfig(t *testing.T) {
@@ -1227,6 +1278,127 @@ func TestResponsesProxyTranslatesModelAndUsesStickySession(t *testing.T) {
 	}
 	if session := a.state.StickySessions["gpt-test:session-a"]; session.ExpiresAt.IsZero() || time.Until(session.ExpiresAt) < 23*time.Hour {
 		t.Fatalf("sticky session expiry was not refreshed: %#v", session)
+	}
+}
+
+func TestResponsesProxyDropsFunctionToolsConflictingWithHostedTools(t *testing.T) {
+	var sawTools []any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		sawTools, _ = body["tools"].([]any)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_tools","object":"response","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "one", Enabled: true, InPool: true, UpstreamBaseURL: upstream.URL + "/v1", UpstreamAPIKey: "upstream-key", Priority: 100}})
+	request := `{"model":"gpt-test","input":"hello","tools":[` +
+		`{"type":"image_generation"},` +
+		`{"type":"function","name":"image_gen.imagegen","parameters":{}},` +
+		`{"type":"function","name":"shell","parameters":{}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(request))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(sawTools) != 2 {
+		t.Fatalf("expected hosted tool plus unrelated function, got %#v", sawTools)
+	}
+	first, _ := sawTools[0].(map[string]any)
+	second, _ := sawTools[1].(map[string]any)
+	if first["type"] != "image_generation" {
+		t.Fatalf("hosted tool was not preserved: %#v", sawTools)
+	}
+	if second["name"] != "shell" {
+		t.Fatalf("unrelated function tool was not preserved: %#v", sawTools)
+	}
+}
+
+func TestDropHostedToolConflicts(t *testing.T) {
+	imageFunction := map[string]any{"type": "function", "name": "image_gen.imagegen"}
+	shellFunction := map[string]any{"type": "function", "name": "shell"}
+
+	// image_gen is implicitly hosted upstream, so the twin must be dropped
+	// even when the request declares no hosted tool at all.
+	implicit := map[string]any{"tools": []any{imageFunction, shellFunction}}
+	dropHostedToolConflicts(implicit)
+	if tools, _ := implicit["tools"].([]any); len(tools) != 1 {
+		t.Fatalf("implicitly reserved image_gen twin was not dropped: %#v", implicit["tools"])
+	}
+
+	hosted := map[string]any{"tools": []any{
+		map[string]any{"type": "web_search_preview"},
+		map[string]any{"type": "function", "name": "web_search"},
+		map[string]any{"type": "function", "name": "web_search.search"},
+		shellFunction,
+	}}
+	dropHostedToolConflicts(hosted)
+	tools, _ := hosted["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("expected hosted web search plus shell, got %#v", tools)
+	}
+	if kept, _ := tools[1].(map[string]any); kept["name"] != "shell" {
+		t.Fatalf("wrong function tool survived: %#v", tools)
+	}
+
+	// web_search is only reserved when the hosted tool is present, so a bare
+	// function named web_search must pass through untouched.
+	bareSearch := map[string]any{"tools": []any{map[string]any{"type": "function", "name": "web_search"}}}
+	dropHostedToolConflicts(bareSearch)
+	if tools, _ := bareSearch["tools"].([]any); len(tools) != 1 {
+		t.Fatalf("web_search function must survive without a hosted twin: %#v", bareSearch["tools"])
+	}
+
+	missing := map[string]any{"input": "hello"}
+	dropHostedToolConflicts(missing)
+	if _, exists := missing["tools"]; exists {
+		t.Fatalf("tools must not be created when absent: %#v", missing)
+	}
+}
+
+func TestDropHostedToolConflictsFiltersAdditionalToolsItems(t *testing.T) {
+	// Codex 0.144+ declares tools in an additional_tools input item, and
+	// experimental features (multi-agent/image generation) ship image_gen as a
+	// namespace tool that upstream flattens to image_gen.imagegen. This is the
+	// exact shape the live backend rejected during verification.
+	payload := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "additional_tools",
+				"role": "developer",
+				"tools": []any{
+					map[string]any{"type": "custom", "name": "exec"},
+					map[string]any{"type": "namespace", "name": "image_gen", "tools": []any{
+						map[string]any{"type": "function", "name": "imagegen"},
+					}},
+					map[string]any{"type": "namespace", "name": "collaboration", "tools": []any{
+						map[string]any{"type": "function", "name": "spawn_agent"},
+					}},
+					map[string]any{"type": "function", "name": "image_gen.imagegen"},
+				},
+			},
+			map[string]any{"type": "message", "role": "user", "content": "hello"},
+		},
+	}
+	dropHostedToolConflicts(payload)
+	input := payload["input"].([]any)
+	item := input[0].(map[string]any)
+	tools := item["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("expected exec and collaboration to survive, got %#v", tools)
+	}
+	if first, _ := tools[0].(map[string]any); first["name"] != "exec" {
+		t.Fatalf("exec tool was dropped: %#v", tools)
+	}
+	if second, _ := tools[1].(map[string]any); second["name"] != "collaboration" {
+		t.Fatalf("collaboration namespace was dropped: %#v", tools)
+	}
+	if message, _ := input[1].(map[string]any); message["type"] != "message" {
+		t.Fatalf("non-tool input items must pass through: %#v", input[1])
 	}
 }
 
