@@ -1162,6 +1162,13 @@ this request-level event list because traffic timing, account selection, and
 failover correlation are management diagnostics. This bounded event list is
 operational correlation data, not a durable token ledger.
 
+Dashboard metric provenance is a presentation contract. Raw usage values
+reported by OpenAI/upstream (cache-read and cache-write tokens), counters
+observed by Pool (requests, affinity, and failovers), and rates calculated by
+Pool must be grouped and labeled separately. Color may reinforce the
+distinction but must not be the only source indicator. An absent upstream
+cache-write field must render as unavailable (`—`) rather than zero.
+
 ### 10.1 Usage stats object
 
 ```json
@@ -1657,18 +1664,31 @@ Account
 Status
 Quota
 Routing / Pool
-Main cache (requests)
-Subagent cache (requests)
+Main cache
+Subagent cache
 Affinity
 Failovers
 Last activity (management mode)
 Actions
 ```
 
-Main and subagent cache cells must show token read hit rate, request count,
-cached/input tokens, cache-write tokens or `—` when unavailable, and cold
-count. Affinity is the compact `hit/fallback` count. Failovers is the total
-successful routing-failover count.
+Main and subagent cache cells must show the calculated token read hit rate,
+then separate OpenAI usage rows for cached/input tokens and
+cache-write/cache-write-input tokens, with a Pool-calculated ratio on each
+row. Cache-write values and ratio must be `—` when unavailable. Request and
+cold counts belong in the diagnostic tooltip rather than the visible cell so
+adjacent Affinity and Failovers columns cannot truncate them. Affinity is the
+compact Pool-observed
+`hit/fallback` count. Failovers is the total Pool-observed successful
+routing-failover count.
+
+The pool-wide cache window must show the total request count plus total
+cache-read and cache-write tokens since reset. It must group and visibly label
+OpenAI usage values, Pool-observed counters, and Pool-calculated read/write,
+request-hit, and cold rates as distinct sources. The cold count is
+Pool-observed; its rate is calculated and must not share one mixed-source
+value. Main/subagent rates in this top summary must not append per-kind request
+counts; the request total is the single pool-wide Requests metric.
 
 The management-only recent routing/cache table must show time, agent kind,
 masked account label, routing outcome, cache read, cache write, and input

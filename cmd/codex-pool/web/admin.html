@@ -57,16 +57,37 @@
         <section id="summary-grid" class="summary-grid" aria-label="Pool summary"></section>
 
         <section id="cache-window" class="cache-window" aria-label="Cache hit rate since reset" hidden>
-          <div class="cache-window-stats">
-            <div class="cache-window-stat"><div class="eyebrow">Token read hit</div><span id="cache-window-hit" class="cache-window-value">—</span></div>
-            <div class="cache-window-stat"><div class="eyebrow">Request hit</div><span id="cache-window-request-hit" class="cache-window-value">—</span></div>
-            <div class="cache-window-stat"><div class="eyebrow">Cache writes</div><span id="cache-window-write" class="cache-window-value">—</span></div>
-            <div class="cache-window-stat"><div class="eyebrow">Cold eligible</div><span id="cache-window-cold" class="cache-window-value">—</span></div>
-            <div class="cache-window-stat"><div class="eyebrow">Requests (since reset)</div><span id="cache-window-reqs" class="cache-window-value">—</span></div>
-            <div class="cache-window-stat"><div class="eyebrow">Main cache</div><span id="cache-window-main" class="cache-window-value">—</span></div>
-            <div class="cache-window-stat"><div class="eyebrow">Subagent cache</div><span id="cache-window-subagent" class="cache-window-value">—</span></div>
-            <div class="cache-window-stat"><div class="eyebrow">Parent affinity</div><span id="cache-window-affinity" class="cache-window-value">—</span></div>
-            <div class="cache-window-stat"><div class="eyebrow">Lineage failovers</div><span id="cache-window-lineage-failover" class="cache-window-value">—</span></div>
+          <!-- Provenance is part of the dashboard contract: upstream usage,
+               locally observed counters, and derived rates must not look like
+               interchangeable measurements. -->
+          <div class="cache-window-groups">
+            <div class="metric-source-group upstream">
+              <div class="metric-source-heading"><span class="metric-source-chip upstream">OPENAI</span><span>Usage values</span></div>
+              <div class="cache-window-stats">
+                <div class="cache-window-stat"><div class="eyebrow">Cache read tokens</div><span id="cache-window-read" class="cache-window-value">—</span></div>
+                <div class="cache-window-stat"><div class="eyebrow">Cache write tokens</div><span id="cache-window-write" class="cache-window-value">—</span></div>
+              </div>
+            </div>
+            <div class="metric-source-group observed">
+              <div class="metric-source-heading"><span class="metric-source-chip observed">POOL</span><span>Observed counters</span></div>
+              <div class="cache-window-stats">
+                <div class="cache-window-stat"><div class="eyebrow">Requests</div><span id="cache-window-reqs" class="cache-window-value">—</span></div>
+                <div class="cache-window-stat"><div class="eyebrow">Cold requests</div><span id="cache-window-cold-count" class="cache-window-value">—</span></div>
+                <div class="cache-window-stat"><div class="eyebrow">Parent affinity</div><span id="cache-window-affinity" class="cache-window-value">—</span></div>
+                <div class="cache-window-stat"><div class="eyebrow">Lineage failovers</div><span id="cache-window-lineage-failover" class="cache-window-value">—</span></div>
+              </div>
+            </div>
+            <div class="metric-source-group calculated">
+              <div class="metric-source-heading"><span class="metric-source-chip calculated">CALC</span><span>Derived rates</span></div>
+              <div class="cache-window-stats">
+                <div class="cache-window-stat"><div class="eyebrow">Cache read ratio</div><span id="cache-window-hit" class="cache-window-value">—</span></div>
+                <div class="cache-window-stat"><div class="eyebrow">Cache write ratio</div><span id="cache-window-write-rate" class="cache-window-value">—</span></div>
+                <div class="cache-window-stat"><div class="eyebrow">Request hit ratio</div><span id="cache-window-request-hit" class="cache-window-value">—</span></div>
+                <div class="cache-window-stat"><div class="eyebrow">Cold rate</div><span id="cache-window-cold" class="cache-window-value">—</span></div>
+                <div class="cache-window-stat"><div class="eyebrow">Main read ratio</div><span id="cache-window-main" class="cache-window-value">—</span></div>
+                <div class="cache-window-stat"><div class="eyebrow">Subagent read ratio</div><span id="cache-window-subagent" class="cache-window-value">—</span></div>
+              </div>
+            </div>
           </div>
           <div class="cache-window-controls">
             <span id="cache-window-since" class="muted"></span>

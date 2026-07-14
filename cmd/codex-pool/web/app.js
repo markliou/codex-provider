@@ -19,9 +19,10 @@
     if (total <= 0) return null;
     return Math.max(0, Math.min(1, (Number(cached) || 0) / total));
   };
-  // Per-account main/subagent cache cell. The write observation count is kept
-  // separate from total requests: an omitted upstream cache_write_tokens field
-  // is unavailable data, not a confirmed zero.
+  // Per-account cells intentionally separate calculated hit rate from OpenAI
+  // usage fields. Do not put request/cold counters back into the visible cell:
+  // they made the table unreadable and blurred upstream versus Pool provenance.
+  // They remain available in the tooltip for diagnosis.
   const cacheHitMarkup = (obj, agentKind, resetId) => {
     const win = obj.cacheWindow || {};
     const agent = win[agentKind] || {};
@@ -29,15 +30,26 @@
     const cached = Number(agent.cachedTokens) || 0;
     const reqs = Number(agent.requestCount) || 0;
     const cold = Number(agent.coldRequestCount) || 0;
+    const usageObserved = Number(agent.usageObservedRequestCount) || 0;
     const writeObserved = Number(agent.cacheWriteObservedRequestCount) || 0;
     const writeTokens = Number(agent.cacheWriteTokens) || 0;
-    const rate = cacheHitRate(input, cached);
-    const resetBtn = resetId ? ` <button class="cache-reset-btn" type="button" data-cache-reset="${escapeHTML(resetId)}" title="Recalculate this account's hit rate (reset its window)">↺</button>` : "";
-    if (rate === null) return `<div class="cache-hit"><span class="cache-empty">No data (${reqs})</span>${resetBtn}<span class="cache-detail">write: ${writeObserved ? formatTokens(writeTokens) : "—"} · cold: ${cold}</span></div>`;
-    const pct = Math.round(rate * 100);
-    const tone = rate >= 0.6 ? "good" : rate >= 0.3 ? "fair" : "poor";
-    const detail = `read: ${formatTokens(cached)} / ${formatTokens(input)} · write: ${writeObserved ? formatTokens(writeTokens) : "—"} · cold: ${cold}`;
-    return `<div class="cache-hit" title="${escapeHTML(detail)}"><span class="cache-rate ${tone}">${pct}% <small>(${reqs})</small>${resetBtn}</span><span class="cache-detail">${detail}</span></div>`;
+    const writeInput = Number(agent.cacheWriteInputTokens) || 0;
+    const readRate = cacheHitRate(input, cached);
+    const writeRate = writeObserved ? cacheHitRate(writeInput, writeTokens) : null;
+    const resetBtn = resetId ? `<button class="cache-reset-btn" type="button" data-cache-reset="${escapeHTML(resetId)}" title="Recalculate this account's hit rate (reset its window)">↺</button>` : "";
+    const readText = usageObserved || input > 0 ? `${formatTokens(cached)} / ${formatTokens(input)}` : "—";
+    const writeText = writeObserved ? `${formatTokens(writeTokens)} / ${formatTokens(writeInput)}` : "—";
+    const readRatioMarkup = readRate === null
+      ? '<span class="cache-empty">—</span>'
+      : `<span class="cache-rate ${readRate >= 0.6 ? "good" : readRate >= 0.3 ? "fair" : "poor"}">${Math.round(readRate * 100)}%</span>`;
+    const writeRatioMarkup = writeRate === null
+      ? '<span class="cache-empty">—</span>'
+      : `<span class="cache-derived-rate">${(writeRate * 100).toFixed(1)}%</span>`;
+    const detail = `Pool calculated: read ratio ${readRate === null ? "unavailable" : `${Math.round(readRate * 100)}%`}, write ratio ${writeRate === null ? "unavailable" : `${(writeRate * 100).toFixed(1)}%`}. OpenAI usage: read ${readText}, write ${writeText}. Pool observed: ${reqs} requests, ${cold} cold eligible.`;
+    return `<div class="cache-hit" title="${escapeHTML(detail)}">
+      <span class="cache-token-row"><span class="cache-token-label">Read</span><span class="cache-token-value">${readText}</span><span class="cache-ratio-cell">${readRatioMarkup}${resetBtn}</span></span>
+      <span class="cache-token-row"><span class="cache-token-label">Write</span><span class="cache-token-value">${writeText}</span><span class="cache-ratio-cell">${writeRatioMarkup}</span></span>
+    </div>`;
   };
   const formatTokens = (value) => {
     const n = Number(value) || 0;
@@ -254,9 +266,9 @@
     $("#summary-grid").innerHTML = items.map(([label, value, tone]) => `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${value}</span></div>`).join("");
   }
 
-  // Renders the "since reset" cache window. This isolates fresh traffic from the
-  // slow-moving all-time total so the effect of tuning (retention, cache scope)
-  // is visible. The reset control is management-only; public view is read-only.
+  // Renders the "since reset" cache window. Source groups are deliberate:
+  // OpenAI usage values, Pool-observed counters, and Pool-calculated rates must
+  // stay visually distinct so operators do not compare unlike measurements.
   function renderCacheWindow(win) {
     const section = $("#cache-window");
     if (!section) return;
@@ -273,17 +285,20 @@
     const writeTokens = Number(win.cacheWriteTokens) || 0;
     const writeInput = Number(win.cacheWriteInputTokens) || 0;
     const rate = cacheHitRate(input, cached);
+    const writeRate = writeObserved ? cacheHitRate(writeInput, writeTokens) : null;
+    $("#cache-window-read").textContent = usageObserved ? formatTokens(cached) : "—";
     $("#cache-window-hit").textContent = rate === null ? "No data" : `${(rate * 100).toFixed(1)}%`;
+    $("#cache-window-write-rate").textContent = writeRate === null ? "—" : `${(writeRate * 100).toFixed(1)}%`;
     $("#cache-window-request-hit").textContent = usageObserved ? `${((cacheHits / usageObserved) * 100).toFixed(1)}%` : "No data";
-    $("#cache-window-write").textContent = writeObserved ? `${formatTokens(writeTokens)} · ${writeInput ? `${((writeTokens / writeInput) * 100).toFixed(1)}%` : "rate —"}` : "—";
-    $("#cache-window-cold").textContent = cacheEligible ? `${cold} (${((cold / cacheEligible) * 100).toFixed(1)}%)` : String(cold);
+    $("#cache-window-write").textContent = writeObserved ? formatTokens(writeTokens) : "—";
+    $("#cache-window-cold-count").textContent = String(cold);
+    $("#cache-window-cold").textContent = cacheEligible ? `${((cold / cacheEligible) * 100).toFixed(1)}%` : "No data";
     $("#cache-window-reqs").textContent = String(reqs);
     const agentCacheText = (agent) => {
       const agentInput = Number(agent?.inputTokens) || 0;
       const agentCached = Number(agent?.cachedTokens) || 0;
-      const agentRequests = Number(agent?.requestCount) || 0;
       const agentRate = cacheHitRate(agentInput, agentCached);
-      return `${agentRate === null ? "No data" : `${(agentRate * 100).toFixed(1)}%`} · ${agentRequests} req`;
+      return agentRate === null ? "No data" : `${(agentRate * 100).toFixed(1)}%`;
     };
     $("#cache-window-main").textContent = agentCacheText(win.main);
     $("#cache-window-subagent").textContent = agentCacheText(win.subagent);
@@ -387,6 +402,9 @@
     return `<button class="button ${tone}" type="button" data-account-action="${action}" data-account-id="${escapeHTML(id)}">${label}</button>`;
   }
 
+  const cacheColumnHeader = (label) => `<span class="column-heading">${label}<small><span class="column-origin upstream">OPENAI</span><span class="column-origin calculated">CALC</span></small></span>`;
+  const poolColumnHeader = (label) => `<span class="column-heading">${label}<small><span class="column-origin observed">POOL</span></small></span>`;
+
   function accountMetadataLine(account, includeID = false) {
     const metadata = account.credentialMetadata || account;
     const parts = [];
@@ -400,7 +418,7 @@
   }
 
   function renderAccounts(accounts, healthByID) {
-    $("#accounts-head").innerHTML = '<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th class="cache-column">Main cache (reqs)</th><th class="cache-column">Subagent cache (reqs)</th><th class="routing-count-column">Affinity</th><th class="routing-count-column">Failovers</th><th>Last activity</th><th>Action</th></tr>';
+    $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity")}</th><th class="routing-count-column">${poolColumnHeader("Failovers")}</th><th>Last activity</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} configured`;
     const body = $("#accounts-body");
     if (!accounts.length) {
@@ -436,7 +454,7 @@
   }
 
   function renderPublicAccounts(accounts) {
-    $("#accounts-head").innerHTML = '<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th class="cache-column">Main cache (reqs)</th><th class="cache-column">Subagent cache (reqs)</th><th class="routing-count-column">Affinity</th><th class="routing-count-column">Failovers</th><th>Action</th></tr>';
+    $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity")}</th><th class="routing-count-column">${poolColumnHeader("Failovers")}</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} visible`;
     const body = $("#accounts-body");
     if (!accounts.length) {

@@ -741,7 +741,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page still exposes internal label %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"cache-window-main", "cache-window-subagent", "cache-window-affinity", "cache-window-lineage-failover", "cache-window-request-hit", "cache-window-write", "routing-cache-events", "routing-cache-body"} {
+	for _, expected := range []string{"cache-window-main", "cache-window-subagent", "cache-window-affinity", "cache-window-lineage-failover", "cache-window-request-hit", "cache-window-read", "cache-window-write", "cache-window-write-rate", "cache-window-cold-count", "metric-source-chip upstream", "metric-source-chip observed", "metric-source-chip calculated", "OPENAI", "POOL", "CALC", "routing-cache-events", "routing-cache-body"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page omitted subagent cache metric %q", expected)
 		}
@@ -778,9 +778,14 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if !strings.Contains(jsRecorder.Body.String(), "sticky_balanced") || !strings.Contains(jsRecorder.Body.String(), "activeRouteCount") {
 		t.Fatal("admin JS does not expose balanced routing state and per-account active routes")
 	}
-	for _, expected := range []string{"parentAffinityHitCount", "parentAffinityFallbackCount", "lineageFailoverCount", "routingFailoverCount", "cacheWriteObservedRequestCount", "win.subagent", "renderRoutingCacheEvents", "Main cache (reqs)", "Subagent cache (reqs)", "Rate-limit failover"} {
+	for _, expected := range []string{"parentAffinityHitCount", "parentAffinityFallbackCount", "lineageFailoverCount", "routingFailoverCount", "cacheWriteObservedRequestCount", "cacheWriteInputTokens", "usageObservedRequestCount", "win.subagent", "renderRoutingCacheEvents", `cacheColumnHeader("Main cache")`, `cacheColumnHeader("Subagent cache")`, "cache-token-row", "cache-derived-rate", "Rate-limit failover"} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS omitted subagent cache metric %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"Main cache (reqs)", "Subagent cache (reqs)", "<small>(${reqs})</small>", "cache-detail", "metric-origin-mini"} {
+		if strings.Contains(jsRecorder.Body.String(), forbidden) {
+			t.Fatalf("admin JS still uses crowded cache-cell markup %q", forbidden)
 		}
 	}
 	for _, expected := range []string{"displayResetCountdown", "quotaTone", "quotaTrackMarkup", `"critical"`, `"watch"`, "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
@@ -802,7 +807,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin CSS does not preserve the warm-to-red quota warning ramp %q", expected)
 		}
 	}
-	for _, expected := range []string{".cache-column", ".routing-count-column", ".routing-cache-table", ".event-cache.hit", ".event-cache.cold"} {
+	for _, expected := range []string{".cache-column", ".routing-count-column", ".cache-window-groups", ".metric-source-chip.upstream", ".metric-source-chip.observed", ".metric-source-chip.calculated", ".cache-token-row", ".cache-token-value", ".routing-cache-table", ".event-cache.hit", ".event-cache.cold"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS omitted compact cache/routing layout %q", expected)
 		}
