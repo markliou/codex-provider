@@ -106,24 +106,24 @@ Backend KV/prompt cache = upstream behavior for prompt_cache_key + prompt prefix
 
 Under `preserve`, `CODEX_POOL_PROMPT_CACHE_KEY_MODE=auto|off|passthrough` and `CODEX_POOL_PROMPT_CACHE_KEY_SCOPE=auto|conversation|project|user` still govern missing-key injection for non-Codex or compatible clients. `auto` hashes the selected scope; raw project, session, and API-key values are not sent upstream. `CODEX_POOL_PROMPT_CACHE_RETENTION` defaults to `24h`; use `passthrough` to leave retention untouched or `in_memory` for the shorter upstream mode.
 
-The dashboard separates main and subagent cache observations and labels metric
-provenance explicitly. **OPENAI** values are raw usage fields returned upstream:
-total cache-read tokens and cache-write tokens. **POOL** values are locally
-observed request, parent-affinity, and failover counters. **CALC** values are
-derived locally: **Token read hit** is `cached_tokens / input_tokens`;
-**Cache write ratio** is `cache_write_tokens / cache_write_input_tokens` only
-across requests where OpenAI actually returned the write field; **Request hit**
+The dashboard separates main and subagent cache observations. Its top cache
+summary focuses on **POOL**-observed request, cold-request, and lineage-failover
+counters plus actionable **CALC** rates derived from upstream usage:
+**Token read hit** is `cached_tokens / input_tokens`; **Request hit**
 is the share of usage-observed requests with non-zero cached tokens; and
 **Cold rate** is the share of cache-eligible requests (at least 1,024 input
 tokens) with zero cached tokens. An omitted upstream cache-write field is
-displayed as `—`, not interpreted as zero.
+still retained as unavailable data internally, not interpreted as zero.
 
-Per-account main/subagent cells keep the calculated hit rate separate from two
-compact OpenAI usage rows (`Read cached / input` and `Write written / input`);
-each row also shows its Pool-calculated ratio. Request and cold counters remain
-available in the cell tooltip instead of crowding the table.
-Parent-affinity hits/fallbacks and routing failovers remain visible in their
-Pool columns. The **Reset window** control starts a fresh comparison window
+Per-account main/subagent cells use one green treatment and no source badges.
+They show only the actionable `Read cached / input` row and its calculated
+ratio. Cache-write telemetry remains collected internally but is not displayed,
+because automatic prompt caching can work even when upstream reports zero write
+tokens. Request and cold counters remain available in the cell tooltip instead
+of crowding the table.
+Each account exposes one compact **Affinity/Fallback** Pool column as
+`hit/fallback`; per-account routing-failover totals are retained internally but
+not displayed. The **Reset window** control starts a fresh comparison window
 without deleting lifetime totals.
 
 The management-only **Recent routing & cache** panel correlates successful

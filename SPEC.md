@@ -1162,12 +1162,14 @@ this request-level event list because traffic timing, account selection, and
 failover correlation are management diagnostics. This bounded event list is
 operational correlation data, not a durable token ledger.
 
-Dashboard metric provenance is a presentation contract. Raw usage values
-reported by OpenAI/upstream (cache-read and cache-write tokens), counters
-observed by Pool (requests, affinity, and failovers), and rates calculated by
-Pool must be grouped and labeled separately. Color may reinforce the
-distinction but must not be the only source indicator. An absent upstream
-cache-write field must render as unavailable (`—`) rather than zero.
+Dashboard metric presentation is a product contract. The top cache window
+shows Pool-observed counters and actionable calculated read/request/cold rates
+as separate labeled groups. It does not display cache-write telemetry because
+automatic prompt caching can work when the compatible upstream write field is
+zero or unavailable. Per-account cache cells are source-neutral and use one
+green treatment for their cache-read token values and ratio. The backend must
+continue preserving an absent upstream cache-write field as unavailable rather
+than a confirmed zero.
 
 ### 10.1 Usage stats object
 
@@ -1666,32 +1668,33 @@ Quota
 Routing / Pool
 Main cache
 Subagent cache
-Affinity
-Failovers
+Affinity/Fallback
 Last activity (management mode)
 Actions
 ```
 
-Main and subagent cache cells must show the calculated token read hit rate,
-then separate OpenAI usage rows for cached/input tokens and
-cache-write/cache-write-input tokens, with a Pool-calculated ratio on each
-row. Cache-write values and ratio must be `—` when unavailable. Request and
-cold counts belong in the diagnostic tooltip rather than the visible cell so
-adjacent Affinity and Failovers columns cannot truncate them. Affinity is the
-compact Pool-observed
-`hit/fallback` count. Failovers is the total Pool-observed successful
-routing-failover count.
+Main and subagent cache cells must show one Read row for cached/input tokens
+with a calculated ratio. The column headers must not show OPENAI/CALC badges,
+and the available token value and ratio use the same green treatment.
+Cache-write telemetry must not appear in the account table, top cache summary,
+or recent-routing table. Request and cold counts belong in the diagnostic
+tooltip rather than the visible cell. Affinity/Fallback is the compact
+Pool-observed `hit/fallback` count. Per-account routing-failover totals remain
+available in backend state but must not appear as a separate account-table
+column.
 
-The pool-wide cache window must show the total request count plus total
-cache-read and cache-write tokens since reset. It must group and visibly label
-OpenAI usage values, Pool-observed counters, and Pool-calculated read/write,
-request-hit, and cold rates as distinct sources. The cold count is
-Pool-observed; its rate is calculated and must not share one mixed-source
-value. Main/subagent rates in this top summary must not append per-kind request
-counts; the request total is the single pool-wide Requests metric.
+The pool-wide cache window must show the total request count since reset and
+must group and visibly label Pool-observed counters separately from calculated
+read, request-hit, and cold rates. It must not show an upstream raw-token group
+or a cache-write rate. The Pool group must not duplicate the per-account
+parent-affinity hit/fallback metric; it shows Requests, Cold requests, and
+Lineage failovers. The cold count is Pool-observed; its rate is calculated and
+must not share one mixed-source value. Main/subagent rates in this top summary
+must not append per-kind request counts; the request total is the single
+pool-wide Requests metric.
 
 The management-only recent routing/cache table must show time, agent kind,
-masked account label, routing outcome, cache read, cache write, and input
+masked account label, routing outcome, cache read, and input
 tokens. It may expose domain-separated identifier hashes in authenticated UI
 affordances, but never raw identifiers or account IDs. Public mode must neither
 render nor receive request-level routing/cache events.

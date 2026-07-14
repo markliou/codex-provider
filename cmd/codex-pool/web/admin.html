@@ -57,23 +57,16 @@
         <section id="summary-grid" class="summary-grid" aria-label="Pool summary"></section>
 
         <section id="cache-window" class="cache-window" aria-label="Cache hit rate since reset" hidden>
-          <!-- Provenance is part of the dashboard contract: upstream usage,
-               locally observed counters, and derived rates must not look like
-               interchangeable measurements. -->
+          <!-- Keep the top window focused on operational counters and derived
+               rates. Raw cache token totals were removed because repeating an
+               upstream source group beside derived rates made the summary harder to
+               interpret without changing any underlying metric collection. -->
           <div class="cache-window-groups">
-            <div class="metric-source-group upstream">
-              <div class="metric-source-heading"><span class="metric-source-chip upstream">OPENAI</span><span>Usage values</span></div>
-              <div class="cache-window-stats">
-                <div class="cache-window-stat"><div class="eyebrow">Cache read tokens</div><span id="cache-window-read" class="cache-window-value">—</span></div>
-                <div class="cache-window-stat"><div class="eyebrow">Cache write tokens</div><span id="cache-window-write" class="cache-window-value">—</span></div>
-              </div>
-            </div>
             <div class="metric-source-group observed">
               <div class="metric-source-heading"><span class="metric-source-chip observed">POOL</span><span>Observed counters</span></div>
               <div class="cache-window-stats">
                 <div class="cache-window-stat"><div class="eyebrow">Requests</div><span id="cache-window-reqs" class="cache-window-value">—</span></div>
                 <div class="cache-window-stat"><div class="eyebrow">Cold requests</div><span id="cache-window-cold-count" class="cache-window-value">—</span></div>
-                <div class="cache-window-stat"><div class="eyebrow">Parent affinity</div><span id="cache-window-affinity" class="cache-window-value">—</span></div>
                 <div class="cache-window-stat"><div class="eyebrow">Lineage failovers</div><span id="cache-window-lineage-failover" class="cache-window-value">—</span></div>
               </div>
             </div>
@@ -81,7 +74,6 @@
               <div class="metric-source-heading"><span class="metric-source-chip calculated">CALC</span><span>Derived rates</span></div>
               <div class="cache-window-stats">
                 <div class="cache-window-stat"><div class="eyebrow">Cache read ratio</div><span id="cache-window-hit" class="cache-window-value">—</span></div>
-                <div class="cache-window-stat"><div class="eyebrow">Cache write ratio</div><span id="cache-window-write-rate" class="cache-window-value">—</span></div>
                 <div class="cache-window-stat"><div class="eyebrow">Request hit ratio</div><span id="cache-window-request-hit" class="cache-window-value">—</span></div>
                 <div class="cache-window-stat"><div class="eyebrow">Cold rate</div><span id="cache-window-cold" class="cache-window-value">—</span></div>
                 <div class="cache-window-stat"><div class="eyebrow">Main read ratio</div><span id="cache-window-main" class="cache-window-value">—</span></div>
@@ -115,7 +107,7 @@
           </div>
           <div class="table-wrap routing-cache-wrap">
             <table class="routing-cache-table">
-              <thead><tr><th>Time</th><th>Agent</th><th>Account</th><th>Routing outcome</th><th>Cache read</th><th>Cache write</th><th>Input</th></tr></thead>
+              <thead><tr><th>Time</th><th>Agent</th><th>Account</th><th>Routing outcome</th><th>Cache read</th><th>Input</th></tr></thead>
               <tbody id="routing-cache-body"></tbody>
             </table>
           </div>

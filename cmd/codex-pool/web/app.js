@@ -19,10 +19,10 @@
     if (total <= 0) return null;
     return Math.max(0, Math.min(1, (Number(cached) || 0) / total));
   };
-  // Per-account cells intentionally separate calculated hit rate from OpenAI
-  // usage fields. Do not put request/cold counters back into the visible cell:
-  // they made the table unreadable and blurred upstream versus Pool provenance.
-  // They remain available in the tooltip for diagnosis.
+  // Per-account cells intentionally expose only cache reads. Automatic prompt
+  // caching can work without meaningful cache-write telemetry, so restoring a
+  // Write row would invite operators to treat upstream zeroes as cache health.
+  // Request diagnostics remain available in the tooltip.
   const cacheHitMarkup = (obj, agentKind, resetId) => {
     const win = obj.cacheWindow || {};
     const agent = win[agentKind] || {};
@@ -31,24 +31,15 @@
     const reqs = Number(agent.requestCount) || 0;
     const cold = Number(agent.coldRequestCount) || 0;
     const usageObserved = Number(agent.usageObservedRequestCount) || 0;
-    const writeObserved = Number(agent.cacheWriteObservedRequestCount) || 0;
-    const writeTokens = Number(agent.cacheWriteTokens) || 0;
-    const writeInput = Number(agent.cacheWriteInputTokens) || 0;
     const readRate = cacheHitRate(input, cached);
-    const writeRate = writeObserved ? cacheHitRate(writeInput, writeTokens) : null;
     const resetBtn = resetId ? `<button class="cache-reset-btn" type="button" data-cache-reset="${escapeHTML(resetId)}" title="Recalculate this account's hit rate (reset its window)">↺</button>` : "";
     const readText = usageObserved || input > 0 ? `${formatTokens(cached)} / ${formatTokens(input)}` : "—";
-    const writeText = writeObserved ? `${formatTokens(writeTokens)} / ${formatTokens(writeInput)}` : "—";
     const readRatioMarkup = readRate === null
       ? '<span class="cache-empty">—</span>'
-      : `<span class="cache-rate ${readRate >= 0.6 ? "good" : readRate >= 0.3 ? "fair" : "poor"}">${Math.round(readRate * 100)}%</span>`;
-    const writeRatioMarkup = writeRate === null
-      ? '<span class="cache-empty">—</span>'
-      : `<span class="cache-derived-rate">${(writeRate * 100).toFixed(1)}%</span>`;
-    const detail = `Pool calculated: read ratio ${readRate === null ? "unavailable" : `${Math.round(readRate * 100)}%`}, write ratio ${writeRate === null ? "unavailable" : `${(writeRate * 100).toFixed(1)}%`}. OpenAI usage: read ${readText}, write ${writeText}. Pool observed: ${reqs} requests, ${cold} cold eligible.`;
+      : `<span class="cache-rate">${Math.round(readRate * 100)}%</span>`;
+    const detail = `Cache read ratio ${readRate === null ? "unavailable" : `${Math.round(readRate * 100)}%`}. Token usage: ${readText}. Pool observed: ${reqs} requests, ${cold} cold eligible.`;
     return `<div class="cache-hit" title="${escapeHTML(detail)}">
       <span class="cache-token-row"><span class="cache-token-label">Read</span><span class="cache-token-value">${readText}</span><span class="cache-ratio-cell">${readRatioMarkup}${resetBtn}</span></span>
-      <span class="cache-token-row"><span class="cache-token-label">Write</span><span class="cache-token-value">${writeText}</span><span class="cache-ratio-cell">${writeRatioMarkup}</span></span>
     </div>`;
   };
   const formatTokens = (value) => {
@@ -266,9 +257,10 @@
     $("#summary-grid").innerHTML = items.map(([label, value, tone]) => `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${value}</span></div>`).join("");
   }
 
-  // Renders the "since reset" cache window. Source groups are deliberate:
-  // OpenAI usage values, Pool-observed counters, and Pool-calculated rates must
-  // stay visually distinct so operators do not compare unlike measurements.
+  // The top "since reset" window deliberately exposes read effectiveness, not
+  // cache-write telemetry. The backend still collects compatible write fields
+  // for diagnostics, but automatic caching makes their zeroes operationally
+  // ambiguous and unsuitable for the main dashboard.
   function renderCacheWindow(win) {
     const section = $("#cache-window");
     if (!section) return;
@@ -281,16 +273,9 @@
     const cacheEligible = Number(win.cacheEligibleRequestCount) || 0;
     const usageObserved = Number(win.usageObservedRequestCount) || 0;
     const cacheHits = Number(win.cacheHitRequestCount) || 0;
-    const writeObserved = Number(win.cacheWriteObservedRequestCount) || 0;
-    const writeTokens = Number(win.cacheWriteTokens) || 0;
-    const writeInput = Number(win.cacheWriteInputTokens) || 0;
     const rate = cacheHitRate(input, cached);
-    const writeRate = writeObserved ? cacheHitRate(writeInput, writeTokens) : null;
-    $("#cache-window-read").textContent = usageObserved ? formatTokens(cached) : "—";
     $("#cache-window-hit").textContent = rate === null ? "No data" : `${(rate * 100).toFixed(1)}%`;
-    $("#cache-window-write-rate").textContent = writeRate === null ? "—" : `${(writeRate * 100).toFixed(1)}%`;
     $("#cache-window-request-hit").textContent = usageObserved ? `${((cacheHits / usageObserved) * 100).toFixed(1)}%` : "No data";
-    $("#cache-window-write").textContent = writeObserved ? formatTokens(writeTokens) : "—";
     $("#cache-window-cold-count").textContent = String(cold);
     $("#cache-window-cold").textContent = cacheEligible ? `${((cold / cacheEligible) * 100).toFixed(1)}%` : "No data";
     $("#cache-window-reqs").textContent = String(reqs);
@@ -302,7 +287,6 @@
     };
     $("#cache-window-main").textContent = agentCacheText(win.main);
     $("#cache-window-subagent").textContent = agentCacheText(win.subagent);
-    $("#cache-window-affinity").textContent = `${Number(win.parentAffinityHitCount) || 0} hit · ${Number(win.parentAffinityFallbackCount) || 0} fallback`;
     $("#cache-window-lineage-failover").textContent = String(Number(win.lineageFailoverCount) || 0);
     const resetAt = win.resetAt && win.resetAt !== "0001-01-01T00:00:00Z" ? win.resetAt : null;
     $("#cache-window-since").textContent = resetAt ? `since ${displayTime(resetAt)}` : "since service start (never reset)";
@@ -402,7 +386,9 @@
     return `<button class="button ${tone}" type="button" data-account-action="${action}" data-account-id="${escapeHTML(id)}">${label}</button>`;
   }
 
-  const cacheColumnHeader = (label) => `<span class="column-heading">${label}<small><span class="column-origin upstream">OPENAI</span><span class="column-origin calculated">CALC</span></small></span>`;
+  // Cache headers stay intentionally source-neutral; only the actionable Read
+  // ratio is presented inside each account cell.
+  const cacheColumnHeader = (label) => `<span class="column-heading">${label}</span>`;
   const poolColumnHeader = (label) => `<span class="column-heading">${label}<small><span class="column-origin observed">POOL</span></small></span>`;
 
   function accountMetadataLine(account, includeID = false) {
@@ -418,11 +404,11 @@
   }
 
   function renderAccounts(accounts, healthByID) {
-    $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity")}</th><th class="routing-count-column">${poolColumnHeader("Failovers")}</th><th>Last activity</th><th>Action</th></tr>`;
+    $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity/Fallback")}</th><th>Last activity</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} configured`;
     const body = $("#accounts-body");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="10"><div class="empty-state">No accounts configured</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="9"><div class="empty-state">No accounts configured</div></td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
@@ -437,7 +423,6 @@
       const cacheWindow = health.cacheWindow || {};
       const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
-      const failovers = Number(cacheWindow.routingFailoverCount) || 0;
       return `<tr data-account-row="${escapeHTML(account.id)}">
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
@@ -446,7 +431,6 @@
         <td class="cache-column">${cacheHitMarkup(health, "main", account.id)}</td>
         <td class="cache-column">${cacheHitMarkup(health, "subagent")}</td>
         <td class="routing-count-column" title="${affinityHits} parent-affinity hits, ${affinityFallbacks} fallbacks">${affinityHits}/${affinityFallbacks}</td>
-        <td class="routing-count-column" title="${failovers} routing failovers">${failovers}</td>
         <td><div class="activity">${displayTime(activity)}${health.consecutiveFailure ? `<br>${health.consecutiveFailure} consecutive failure${health.consecutiveFailure === 1 ? "" : "s"}` : ""}</div></td>
         <td><div class="row-actions">${actions}</div></td>
       </tr>`;
@@ -454,11 +438,11 @@
   }
 
   function renderPublicAccounts(accounts) {
-    $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity")}</th><th class="routing-count-column">${poolColumnHeader("Failovers")}</th><th>Action</th></tr>`;
+    $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity/Fallback")}</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} visible`;
     const body = $("#accounts-body");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="9"><div class="empty-state">No accounts available</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="8"><div class="empty-state">No accounts available</div></td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
@@ -473,7 +457,6 @@
       const cacheWindow = account.cacheWindow || {};
       const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
-      const failovers = Number(cacheWindow.routingFailoverCount) || 0;
       return `<tr>
       <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
       <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span>${activeBadge(account.active)}</div></td>
@@ -482,7 +465,6 @@
       <td class="cache-column">${cacheHitMarkup(account, "main")}</td>
       <td class="cache-column">${cacheHitMarkup(account, "subagent")}</td>
       <td class="routing-count-column" title="${affinityHits} parent-affinity hits, ${affinityFallbacks} fallbacks">${affinityHits}/${affinityFallbacks}</td>
-      <td class="routing-count-column" title="${failovers} routing failovers">${failovers}</td>
       <td><div class="row-actions">${action}</div></td>
     </tr>`;
     }).join("");
@@ -505,16 +487,13 @@
     $("#routing-cache-count").textContent = rows.length === 1 ? "1 recent request" : `${rows.length} recent requests`;
     const body = $("#routing-cache-body");
     if (!rows.length) {
-      body.innerHTML = '<tr><td colspan="7"><div class="empty-state">No recent cache observations</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="6"><div class="empty-state">No recent cache observations</div></td></tr>';
       return;
     }
     body.innerHTML = rows.map((event) => {
       const read = event.usageObserved && event.cacheReadRate !== null && event.cacheReadRate !== undefined
         ? `${(Number(event.cacheReadRate) * 100).toFixed(1)}% · ${formatTokens(event.cachedTokens)}`
         : "—";
-      const write = event.cacheWriteTokens === null || event.cacheWriteTokens === undefined
-        ? "—"
-        : `${formatTokens(event.cacheWriteTokens)}${event.cacheWriteRate === null || event.cacheWriteRate === undefined ? "" : ` · ${(Number(event.cacheWriteRate) * 100).toFixed(1)}%`}`;
       const failover = event.failoverFromAccountLabel ? `<span class="event-secondary">from ${escapeHTML(event.failoverFromAccountLabel)}</span>` : "";
       const identifiers = [
         event.requestIdHash ? `request ${event.requestIdHash}` : "",
@@ -528,7 +507,6 @@
         <td>${escapeHTML(event.accountLabel || "Credential")}</td>
         <td><span class="routing-outcome">${escapeHTML(routingOutcomeLabel(event.routingOutcome))}</span>${failover}<span class="event-secondary">${escapeHTML(event.routingSource || "fallback")}</span></td>
         <td class="event-cache ${cacheTone}">${escapeHTML(read)}</td>
-        <td class="event-cache">${escapeHTML(write)}</td>
         <td>${event.usageObserved ? escapeHTML(formatTokens(event.inputTokens)) : "—"}</td>
       </tr>`;
     }).join("");
