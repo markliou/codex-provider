@@ -24,10 +24,15 @@ type mockServer struct {
 	events              []map[string]any
 	spawnIssued         bool
 	subagentIntegration bool
+	routingCacheMode    bool
+	routingPrimaryHits  int
 }
 
 func main() {
-	server := &mockServer{subagentIntegration: os.Getenv("CODEX_MOCK_SUBAGENT_INTEGRATION") == "true"}
+	server := &mockServer{
+		subagentIntegration: os.Getenv("CODEX_MOCK_SUBAGENT_INTEGRATION") == "true",
+		routingCacheMode:    os.Getenv("CODEX_MOCK_ROUTING_CACHE_INTEGRATION") == "true",
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -58,6 +63,10 @@ func (s *mockServer) handleResponse(w http.ResponseWriter, r *http.Request) {
 		s.handleSubagentIntegrationResponse(w, r, request)
 		return
 	}
+	if s.routingCacheMode {
+		s.handleRoutingCacheResponse(w, r, request)
+		return
+	}
 	if r.Header.Get("Authorization") != "Bearer upstream-test-key" {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"message": "missing upstream credential"}})
 		return
@@ -74,6 +83,65 @@ func (s *mockServer) handleResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeStreamingResponse(w, model, response, responseText)
+}
+
+func (s *mockServer) handleRoutingCacheResponse(w http.ResponseWriter, r *http.Request, request map[string]any) {
+	account := ""
+	switch r.Header.Get("Authorization") {
+	case "Bearer routing-primary-key":
+		account = "primary"
+	case "Bearer routing-secondary-key":
+		account = "secondary"
+	default:
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"message": "missing routing-cache test credential"}})
+		return
+	}
+
+	s.mu.Lock()
+	status := http.StatusOK
+	if account == "primary" {
+		s.routingPrimaryHits++
+		if s.routingPrimaryHits == 3 {
+			status = http.StatusTooManyRequests
+		}
+	}
+	s.events = append(s.events, map[string]any{"kind": "routing-cache", "account": account, "status": status})
+	s.last = request
+	hit := s.routingPrimaryHits
+	s.mu.Unlock()
+
+	if status == http.StatusTooManyRequests {
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(status)
+		return
+	}
+
+	inputTokens := 2400
+	cachedTokens := 0
+	cacheWriteTokens := 1800
+	responseID := "resp_routing_secondary"
+	if account == "primary" {
+		inputTokens = 2000
+		cacheWriteTokens = 400
+		responseID = "resp_routing_primary_1"
+		if hit == 2 {
+			cachedTokens = 1500
+			cacheWriteTokens = 100
+			responseID = "resp_routing_primary_2"
+		}
+	}
+	model, _ := request["model"].(string)
+	response := completedResponseWithID(responseID, model, "ROUTING_CACHE_OK")
+	response["usage"] = map[string]any{
+		"input_tokens": inputTokens,
+		"input_tokens_details": map[string]any{
+			"cached_tokens":      cachedTokens,
+			"cache_write_tokens": cacheWriteTokens,
+		},
+		"output_tokens": 1,
+		"total_tokens":  inputTokens + 1,
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *mockServer) handleSubagentIntegrationResponse(w http.ResponseWriter, r *http.Request, request map[string]any) {

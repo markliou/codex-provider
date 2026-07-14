@@ -53,6 +53,13 @@ const (
 	// accounting.
 	promptCacheMinTokens    = 1024
 	maxRequestIdentityValue = 512
+	// Request-level routing/cache diagnostics are intentionally a short rolling
+	// window, not a durable token ledger. Keep both limits even if one is later
+	// made configurable: count bounds busy pools while TTL removes stale events
+	// after traffic stops.
+	routingCacheEventLimit     = 500
+	routingCacheEventViewLimit = 50
+	routingCacheEventTTL       = 24 * time.Hour
 	// promptCacheBucketsDefault spreads a coarse (project/user) prompt cache key
 	// across a few buckets so a hot scope stays under OpenAI's ~15 RPM per
 	// (prefix + prompt_cache_key) limit while still sharing the static prefix
@@ -199,12 +206,18 @@ type threadBinding struct {
 }
 
 type promptCacheStat struct {
-	AccountID    string `json:"accountId"`
-	ModelID      string `json:"modelId"`
-	AgentKind    string `json:"agentKind,omitempty"`
-	RequestCount uint64 `json:"requestCount"`
-	InputTokens  uint64 `json:"inputTokens"`
-	CachedTokens uint64 `json:"cachedTokens"`
+	AccountID                      string `json:"accountId"`
+	ModelID                        string `json:"modelId"`
+	AgentKind                      string `json:"agentKind,omitempty"`
+	RequestCount                   uint64 `json:"requestCount"`
+	UsageObservedRequestCount      uint64 `json:"usageObservedRequestCount"`
+	InputTokens                    uint64 `json:"inputTokens"`
+	CachedTokens                   uint64 `json:"cachedTokens"`
+	CacheWriteTokens               uint64 `json:"cacheWriteTokens"`
+	CacheWriteInputTokens          uint64 `json:"cacheWriteInputTokens"`
+	CacheWriteObservedRequestCount uint64 `json:"cacheWriteObservedRequestCount"`
+	CacheHitRequestCount           uint64 `json:"cacheHitRequestCount"`
+	CacheEligibleRequestCount      uint64 `json:"cacheEligibleRequestCount"`
 	// ColdRequestCount counts cache-eligible requests (input >= 1024 tokens)
 	// that returned zero cached tokens, i.e. a cold start. It quantifies why a
 	// hit rate is low: new conversations, failover hand-offs, or 15 RPM overflow.
@@ -212,7 +225,39 @@ type promptCacheStat struct {
 	ParentAffinityHitCount      uint64    `json:"parentAffinityHitCount,omitempty"`
 	ParentAffinityFallbackCount uint64    `json:"parentAffinityFallbackCount,omitempty"`
 	LineageFailoverCount        uint64    `json:"lineageFailoverCount,omitempty"`
+	RoutingFailoverCount        uint64    `json:"routingFailoverCount,omitempty"`
 	UpdatedAt                   time.Time `json:"updatedAt"`
+}
+
+// routingCacheEvent contains only bounded operational metadata. Raw thread,
+// sticky, prompt-cache, response, and request identifiers are hashed before the
+// event is persisted; prompt bodies, tool arguments, credentials, emails, and
+// upstream account identities must never be added here.
+type routingCacheEvent struct {
+	Timestamp             time.Time `json:"timestamp"`
+	RequestIDHash         string    `json:"requestIdHash,omitempty"`
+	ResponseIDHash        string    `json:"responseIdHash,omitempty"`
+	ModelID               string    `json:"modelId"`
+	AccountID             string    `json:"accountId"`
+	AgentKind             string    `json:"agentKind"`
+	ThreadIDHash          string    `json:"threadIdHash,omitempty"`
+	LineageRootIDHash     string    `json:"lineageRootIdHash,omitempty"`
+	StickyKeyHash         string    `json:"stickyKeyHash,omitempty"`
+	PromptCacheKeyHash    string    `json:"promptCacheKeyHash,omitempty"`
+	RoutingOutcome        string    `json:"routingOutcome"`
+	RoutingSource         string    `json:"routingSource"`
+	ParentAffinity        string    `json:"parentAffinity"`
+	FailoverFromAccountID string    `json:"failoverFromAccountId,omitempty"`
+	UsageObserved         bool      `json:"usageObserved"`
+	InputTokens           uint64    `json:"inputTokens"`
+	CachedTokens          uint64    `json:"cachedTokens"`
+	CacheWriteTokens      *uint64   `json:"cacheWriteTokens,omitempty"`
+	UncachedInputTokens   uint64    `json:"uncachedInputTokens"`
+	CacheReadRate         *float64  `json:"cacheReadRate,omitempty"`
+	CacheWriteRate        *float64  `json:"cacheWriteRate,omitempty"`
+	CacheReuseBalance     *int64    `json:"cacheReuseBalance,omitempty"`
+	CacheHit              bool      `json:"cacheHit"`
+	ColdCacheEligible     bool      `json:"coldCacheEligible"`
 }
 
 type accountHealth struct {
@@ -260,6 +305,7 @@ type state struct {
 	// PromptCacheResetAtByAccount records per-account window resets so a single
 	// account's hit rate can be recalculated independently of the pool-wide reset.
 	PromptCacheResetAtByAccount map[string]time.Time `json:"promptCacheResetAtByAccount,omitempty"`
+	RoutingCacheEvents          []routingCacheEvent  `json:"routingCacheEvents,omitempty"`
 	RequestCount                uint64               `json:"requestCount"`
 	SuccessCount                uint64               `json:"successCount"`
 	FailureCount                uint64               `json:"failureCount"`
@@ -978,6 +1024,9 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "unable to encode request")
 		return
 	}
+	requestID := requestOperationalID(r)
+	failoverFromAccountID := ""
+	failoverOutcome := ""
 	excluded := map[string]bool{}
 	for attempt := 0; attempt < a.proxyAttemptLimit(); attempt++ {
 		candidate, err := a.selectAccountForRoute(route, model, excluded)
@@ -1012,9 +1061,13 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			// unavailable and continue; selectAccount also suppresses any local
 			// duplicate slot for the same upstream identity during this attempt.
 			if errors.Is(err, errAccountAuthFailed) {
+				failoverFromAccountID = candidate.ID
+				failoverOutcome = "auth_failover"
 				a.markAccountAuthFailure(candidate.ID, model, "account_auth_failed")
 				continue
 			}
+			failoverFromAccountID = candidate.ID
+			failoverOutcome = "transport_failover"
 			a.markFailure(candidate.ID, model, "upstream_transport_error", 30*time.Second)
 			continue
 		}
@@ -1026,6 +1079,8 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			// transient capacity. Keep the error body out of persisted state and
 			// route to a different upstream account if one exists.
 			reason := codeOr(extractUpstreamErrorCode(body), "account_auth_failed")
+			failoverFromAccountID = candidate.ID
+			failoverOutcome = "auth_failover"
 			a.markAccountAuthFailure(candidate.ID, model, reason)
 			continue
 		}
@@ -1037,6 +1092,8 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			if response.StatusCode == http.StatusTooManyRequests {
 				reason = "rate_limited"
 				excluded[candidate.ID] = true
+				failoverFromAccountID = candidate.ID
+				failoverOutcome = "rate_limit_failover"
 				a.markFailure(candidate.ID, model, reason, wait)
 				continue
 			} else {
@@ -1058,11 +1115,15 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 						writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", "selected upstream account failed repeatedly")
 						return
 					}
+					failoverFromAccountID = candidate.ID
+					failoverOutcome = "repeated_5xx_failover"
 					a.markCooldown(candidate.ID, model, reason, wait)
 					continue
 				}
 			}
 			excluded[candidate.ID] = true
+			failoverFromAccountID = candidate.ID
+			failoverOutcome = "repeated_5xx_failover"
 			a.markFailure(candidate.ID, model, reason, wait)
 			continue
 		}
@@ -1079,6 +1140,9 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			a.markFailure(candidate.ID, model, "upstream_response_error", 30*time.Second)
 			return
 		}
+		info.RequestID = requestID
+		info.FailoverFromAccountID = failoverFromAccountID
+		info.FailoverOutcome = failoverOutcome
 		a.markSuccess(route, model, candidate.ID, info)
 		return
 	}
@@ -1087,6 +1151,15 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 
 func requestContextFinished(ctx context.Context, err error) bool {
 	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func requestOperationalID(r *http.Request) string {
+	for _, name := range []string{"X-Request-Id", "X-Codex-Request-Id"} {
+		if value := strings.TrimSpace(r.Header.Get(name)); value != "" {
+			return value
+		}
+	}
+	return randomID()
 }
 
 func (a *app) prepareUpstreamRequest(candidate account, body []byte, chat bool) (string, []byte, bool, error) {
@@ -1246,14 +1319,18 @@ func withCliproxyAccountModel(body []byte, accountID string) ([]byte, error) {
 }
 
 type promptCacheUsage struct {
-	InputTokens  uint64
-	CachedTokens uint64
-	Present      bool
+	InputTokens      uint64
+	CachedTokens     uint64
+	CacheWriteTokens *uint64
+	Present          bool
 }
 
 type proxyResponseInfo struct {
-	ResponseID string
-	Usage      promptCacheUsage
+	ResponseID            string
+	Usage                 promptCacheUsage
+	RequestID             string
+	FailoverFromAccountID string
+	FailoverOutcome       string
 }
 
 func (a *app) writeChatFromResponse(w http.ResponseWriter, response *http.Response, model string) (proxyResponseInfo, bool) {
@@ -1405,6 +1482,13 @@ func (info *proxyResponseInfo) merge(next proxyResponseInfo) {
 		info.ResponseID = next.ResponseID
 	}
 	if next.Usage.Present {
+		// A streaming gateway may report cache-write usage on an intermediate
+		// event and omit the field from the final summary. Once observed, retain
+		// that explicit value; absence in a later event must not turn it into a
+		// confirmed zero or erase the observation.
+		if next.Usage.CacheWriteTokens == nil && info.Usage.CacheWriteTokens != nil {
+			next.Usage.CacheWriteTokens = info.Usage.CacheWriteTokens
+		}
 		info.Usage = next.Usage
 	}
 }
@@ -1447,17 +1531,41 @@ func promptCacheUsageFromPayload(payload map[string]any) promptCacheUsage {
 	}
 	var cachedTokens uint64
 	var cachedOK bool
+	var cacheWriteTokens uint64
+	var cacheWriteOK bool
 	for _, name := range []string{"input_tokens_details", "prompt_tokens_details"} {
 		details, _ := usage[name].(map[string]any)
 		if details == nil {
 			continue
 		}
-		cachedTokens, cachedOK = uint64Field(details, "cached_tokens")
-		if cachedOK {
-			break
+		if !cachedOK {
+			cachedTokens, cachedOK = firstUint64Field(details, "cached_tokens", "cache_read_tokens", "cache_read_input_tokens")
+		}
+		if !cacheWriteOK {
+			cacheWriteTokens, cacheWriteOK = firstUint64Field(details, "cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens", "cache_write_input_tokens")
 		}
 	}
-	return promptCacheUsage{InputTokens: inputTokens, CachedTokens: cachedTokens, Present: inputOK || cachedOK}
+	if !cachedOK {
+		cachedTokens, cachedOK = firstUint64Field(usage, "cached_tokens", "cache_read_tokens", "cache_read_input_tokens")
+	}
+	if !cacheWriteOK {
+		cacheWriteTokens, cacheWriteOK = firstUint64Field(usage, "cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens", "cache_write_input_tokens")
+	}
+	var cacheWrite *uint64
+	if cacheWriteOK {
+		value := cacheWriteTokens
+		cacheWrite = &value
+	}
+	return promptCacheUsage{InputTokens: inputTokens, CachedTokens: cachedTokens, CacheWriteTokens: cacheWrite, Present: inputOK || cachedOK || cacheWriteOK}
+}
+
+func firstUint64Field(values map[string]any, names ...string) (uint64, bool) {
+	for _, name := range names {
+		if value, ok := uint64Field(values, name); ok {
+			return value, true
+		}
+	}
+	return 0, false
 }
 
 func uint64Field(values map[string]any, name string) (uint64, bool) {
@@ -1576,7 +1684,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -1594,6 +1702,9 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 	for index, item := range a.config.Accounts {
 		accounts = append(accounts, a.publicDashboardAccountLocked(item, index, now))
 	}
+	// Request-level routing events reveal traffic timing and switching patterns.
+	// Keep them behind the authenticated state API; the public dashboard contract
+	// allows aggregate health/cache status but explicitly forbids traffic detail.
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked()}})
 }
 
@@ -2742,7 +2853,9 @@ func (a *app) markSuccess(route routingDecision, model, accountID string, info p
 	if route.ParentAffinityAttempted && route.PreferredParentAccountID != "" && route.PreferredParentAccountID != accountID {
 		lineageFailover = true
 	}
-	a.recordPromptCacheResultLocked(accountID, model, route.Identity, info.Usage, parentAffinityHit, parentAffinityFallback, lineageFailover, now)
+	routingOutcome, failoverFromAccountID := a.routingOutcomeLocked(route, model, accountID, prior, info, parentAffinityHit, parentAffinityFallback, now)
+	a.recordPromptCacheResultWithRoutingLocked(accountID, model, route.Identity, info.Usage, parentAffinityHit, parentAffinityFallback, lineageFailover, routingOutcome, now)
+	a.appendRoutingCacheEventLocked(route, model, accountID, failoverFromAccountID, routingOutcome, info, now)
 	a.state.RequestCount++
 	a.state.SuccessCount++
 	_ = a.saveLocked()
@@ -2753,6 +2866,10 @@ func (a *app) recordPromptCacheUsageLocked(accountID, model string, usage prompt
 }
 
 func (a *app) recordPromptCacheResultLocked(accountID, model string, identity requestIdentity, usage promptCacheUsage, parentAffinityHit, parentAffinityFallback, lineageFailover bool, now time.Time) {
+	a.recordPromptCacheResultWithRoutingLocked(accountID, model, identity, usage, parentAffinityHit, parentAffinityFallback, lineageFailover, "", now)
+}
+
+func (a *app) recordPromptCacheResultWithRoutingLocked(accountID, model string, identity requestIdentity, usage promptCacheUsage, parentAffinityHit, parentAffinityFallback, lineageFailover bool, routingOutcome string, now time.Time) {
 	if a.state.PromptCache == nil {
 		a.state.PromptCache = map[string]promptCacheStat{}
 	}
@@ -2767,8 +2884,20 @@ func (a *app) recordPromptCacheResultLocked(accountID, model string, identity re
 	stat.AgentKind = agentKind
 	stat.RequestCount++
 	if usage.Present {
+		stat.UsageObservedRequestCount++
 		stat.InputTokens += usage.InputTokens
 		stat.CachedTokens += usage.CachedTokens
+		if usage.CachedTokens > 0 {
+			stat.CacheHitRequestCount++
+		}
+		if usage.InputTokens >= promptCacheMinTokens {
+			stat.CacheEligibleRequestCount++
+		}
+		if usage.CacheWriteTokens != nil {
+			stat.CacheWriteTokens += *usage.CacheWriteTokens
+			stat.CacheWriteInputTokens += usage.InputTokens
+			stat.CacheWriteObservedRequestCount++
+		}
 	}
 	if usage.Present && usage.InputTokens >= promptCacheMinTokens && usage.CachedTokens == 0 {
 		stat.ColdRequestCount++
@@ -2782,8 +2911,175 @@ func (a *app) recordPromptCacheResultLocked(accountID, model string, identity re
 	if lineageFailover {
 		stat.LineageFailoverCount++
 	}
+	if strings.HasSuffix(routingOutcome, "_failover") {
+		stat.RoutingFailoverCount++
+	}
 	stat.UpdatedAt = now
 	a.state.PromptCache[key] = stat
+}
+
+func (a *app) routingOutcomeLocked(route routingDecision, model, accountID string, prior stickySession, info proxyResponseInfo, parentAffinityHit, parentAffinityFallback bool, now time.Time) (string, string) {
+	if outcome := normalizedRoutingOutcome(info.FailoverOutcome); outcome != "" {
+		return outcome, info.FailoverFromAccountID
+	}
+	if prior.AccountID != "" && prior.AccountID != accountID {
+		if outcome := a.persistedFailoverOutcomeLocked(prior.AccountID, model, now); outcome != "" {
+			return outcome, prior.AccountID
+		}
+	}
+	if parentAffinityHit {
+		return "parent_affinity", ""
+	}
+	if parentAffinityFallback {
+		return "parent_affinity_fallback", ""
+	}
+	if prior.AccountID != "" && prior.AccountID == accountID {
+		return "sticky_reuse", ""
+	}
+	return "new_route_assignment", ""
+}
+
+func normalizedRoutingOutcome(value string) string {
+	switch value {
+	case "sticky_reuse", "new_route_assignment", "parent_affinity", "parent_affinity_fallback", "quota_failover", "rate_limit_failover", "auth_failover", "transport_failover", "repeated_5xx_failover":
+		return value
+	default:
+		return ""
+	}
+}
+
+func (a *app) persistedFailoverOutcomeLocked(accountID, model string, now time.Time) string {
+	item := a.accountLocked(accountID)
+	if item == nil {
+		return "auth_failover"
+	}
+	snapshot := a.state.Quotas[accountID]
+	if quotaErrorBlocksRouting(snapshot.QuotaError) {
+		return "auth_failover"
+	}
+	if snapshot.Quota != nil && remainingQuotaHint(*snapshot.Quota) <= 0 {
+		return "quota_failover"
+	}
+	if available, decided := manualQuotaAvailable(*item); decided && !available {
+		return "quota_failover"
+	}
+	for _, cd := range a.state.Cooldowns[accountID] {
+		if cd.ModelID != model || !cd.NextRetryAt.After(now) {
+			continue
+		}
+		switch sanitizedErrorCode(cd.Reason) {
+		case "rate_limited":
+			return "rate_limit_failover"
+		case "account_auth_failed", "invalid_token", "token_invalidated", "token_revoked", "unauthorized", "forbidden":
+			return "auth_failover"
+		case "upstream_transport_error":
+			return "transport_failover"
+		case "upstream_5xx":
+			return "repeated_5xx_failover"
+		}
+	}
+	return ""
+}
+
+func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accountID, failoverFromAccountID, routingOutcome string, info proxyResponseInfo, now time.Time) {
+	usage := info.Usage
+	agentKind := "main"
+	if route.Identity.IsSubagent {
+		agentKind = "subagent"
+	}
+	parentAffinity := "not_attempted"
+	if route.ParentAffinityAttempted {
+		parentAffinity = "fallback"
+		if route.PreferredParentAccountID != "" && route.PreferredParentAccountID == accountID {
+			parentAffinity = "hit"
+		}
+	}
+	var readRate *float64
+	if usage.Present && usage.InputTokens > 0 {
+		value := float64(usage.CachedTokens) / float64(usage.InputTokens)
+		readRate = &value
+	}
+	var writeRate *float64
+	var reuseBalance *int64
+	if usage.CacheWriteTokens != nil {
+		if usage.InputTokens > 0 {
+			value := float64(*usage.CacheWriteTokens) / float64(usage.InputTokens)
+			writeRate = &value
+		}
+		value := tokenBalance(usage.CachedTokens, *usage.CacheWriteTokens)
+		reuseBalance = &value
+	}
+	event := routingCacheEvent{
+		Timestamp:             now,
+		RequestIDHash:         operationalIdentifierHash("request", info.RequestID),
+		ResponseIDHash:        operationalIdentifierHash("response", info.ResponseID),
+		ModelID:               model,
+		AccountID:             accountID,
+		AgentKind:             agentKind,
+		ThreadIDHash:          operationalIdentifierHash("thread", route.Identity.ThreadID),
+		LineageRootIDHash:     operationalIdentifierHash("lineage", route.Identity.LineageRootID),
+		StickyKeyHash:         operationalIdentifierHash("sticky", route.StickyKey),
+		PromptCacheKeyHash:    operationalIdentifierHash("prompt-cache", route.UpstreamPromptCacheKey),
+		RoutingOutcome:        routingOutcome,
+		RoutingSource:         routingEventSource(route.Source),
+		ParentAffinity:        parentAffinity,
+		FailoverFromAccountID: failoverFromAccountID,
+		UsageObserved:         usage.Present,
+		InputTokens:           usage.InputTokens,
+		CachedTokens:          usage.CachedTokens,
+		CacheWriteTokens:      usage.CacheWriteTokens,
+		UncachedInputTokens:   subSat(usage.InputTokens, usage.CachedTokens),
+		CacheReadRate:         readRate,
+		CacheWriteRate:        writeRate,
+		CacheReuseBalance:     reuseBalance,
+		CacheHit:              usage.Present && usage.CachedTokens > 0,
+		ColdCacheEligible:     usage.Present && usage.InputTokens >= promptCacheMinTokens && usage.CachedTokens == 0,
+	}
+	a.pruneRoutingCacheEventsLocked(now)
+	a.state.RoutingCacheEvents = append(a.state.RoutingCacheEvents, event)
+	if extra := len(a.state.RoutingCacheEvents) - routingCacheEventLimit; extra > 0 {
+		a.state.RoutingCacheEvents = append([]routingCacheEvent(nil), a.state.RoutingCacheEvents[extra:]...)
+	}
+}
+
+func operationalIdentifierHash(kind, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return shortHash([]byte(kind + "\x00" + value))
+}
+
+func routingEventSource(source string) string {
+	// Internal fallback routing historically calls its prompt-prefix hash source
+	// "prompt". Diagnostics expose the product-level "fallback" name instead;
+	// do not rename the internal source because cache-key compatibility logic
+	// also consumes it.
+	if source == "prompt" {
+		return "fallback"
+	}
+	switch source {
+	case "previous_response_id", "thread_id", "session", "project", "prompt_cache_key", "conversation", "session_id", "conversation_id":
+		return source
+	default:
+		return "fallback"
+	}
+}
+
+func tokenBalance(cached, written uint64) int64 {
+	const maxInt64 = uint64(1<<63 - 1)
+	if cached >= written {
+		delta := cached - written
+		if delta > maxInt64 {
+			return int64(maxInt64)
+		}
+		return int64(delta)
+	}
+	delta := written - cached
+	if delta > maxInt64 {
+		return -int64(maxInt64)
+	}
+	return -int64(delta)
 }
 
 func deletePromptCacheForAccount(values map[string]promptCacheStat, accountID string) {
@@ -2865,7 +3161,29 @@ func (a *app) pruneExpiredRuntimeStateLocked(now time.Time) bool {
 			changed = true
 		}
 	}
+	if a.pruneRoutingCacheEventsLocked(now) {
+		changed = true
+	}
 	return changed
+}
+
+func (a *app) pruneRoutingCacheEventsLocked(now time.Time) bool {
+	if len(a.state.RoutingCacheEvents) == 0 {
+		return false
+	}
+	cutoff := now.Add(-routingCacheEventTTL)
+	first := 0
+	for first < len(a.state.RoutingCacheEvents) && a.state.RoutingCacheEvents[first].Timestamp.Before(cutoff) {
+		first++
+	}
+	if remaining := len(a.state.RoutingCacheEvents) - first; remaining > routingCacheEventLimit {
+		first += remaining - routingCacheEventLimit
+	}
+	if first == 0 {
+		return false
+	}
+	a.state.RoutingCacheEvents = append([]routingCacheEvent(nil), a.state.RoutingCacheEvents[first:]...)
+	return true
 }
 
 func (a *app) latestStickySessionLocked(model string, now time.Time) (stickySession, bool) {
@@ -2922,6 +3240,15 @@ func (a *app) clearStickyForAccountLocked(id string) {
 		if item.AccountID == id {
 			delete(a.state.ThreadBindings, key)
 		}
+	}
+	if len(a.state.RoutingCacheEvents) > 0 {
+		filtered := a.state.RoutingCacheEvents[:0]
+		for _, event := range a.state.RoutingCacheEvents {
+			if event.AccountID != id && event.FailoverFromAccountID != id {
+				filtered = append(filtered, event)
+			}
+		}
+		a.state.RoutingCacheEvents = append([]routingCacheEvent(nil), filtered...)
 	}
 }
 
@@ -5190,6 +5517,51 @@ func accountActiveLocked(health accountHealth, now time.Time) bool {
 	return !health.LastSuccessAt.IsZero() && now.Sub(health.LastSuccessAt) < accountActiveWindow
 }
 
+// routingCacheEventViewsLocked is the only browser-facing representation of
+// request-level events. It deliberately omits local/upstream account IDs and
+// exposes only masked display labels plus domain-separated hashes, so adding the
+// diagnostics panel cannot become a side channel for credentials or raw Codex
+// thread/cache identifiers.
+func (a *app) routingCacheEventViewsLocked(now time.Time) []map[string]any {
+	cutoff := now.Add(-routingCacheEventTTL)
+	capacity := min(len(a.state.RoutingCacheEvents), routingCacheEventViewLimit)
+	result := make([]map[string]any, 0, capacity)
+	for index := len(a.state.RoutingCacheEvents) - 1; index >= 0; index-- {
+		event := a.state.RoutingCacheEvents[index]
+		if event.Timestamp.Before(cutoff) {
+			continue
+		}
+		accountLabel := "Credential"
+		if item, accountIndex := a.accountWithIndexLocked(event.AccountID); item != nil {
+			accountLabel = publicCredentialDisplayName(*item, accountIndex)
+		}
+		failoverFromLabel := ""
+		if item, accountIndex := a.accountWithIndexLocked(event.FailoverFromAccountID); item != nil {
+			failoverFromLabel = publicCredentialDisplayName(*item, accountIndex)
+		}
+		result = append(result, map[string]any{
+			"timestamp": event.Timestamp, "requestIdHash": event.RequestIDHash, "responseIdHash": event.ResponseIDHash,
+			"modelId": event.ModelID, "accountLabel": accountLabel, "accountRef": operationalIdentifierHash("account", event.AccountID),
+			"agentKind": event.AgentKind, "threadIdHash": event.ThreadIDHash, "lineageRootIdHash": event.LineageRootIDHash,
+			"stickyKeyHash": event.StickyKeyHash, "promptCacheKeyHash": event.PromptCacheKeyHash,
+			"routingOutcome": event.RoutingOutcome, "routingSource": event.RoutingSource, "parentAffinity": event.ParentAffinity,
+			"failoverFromAccountLabel": failoverFromLabel, "failoverFromAccountRef": operationalIdentifierHash("account", event.FailoverFromAccountID),
+			"usageObserved": event.UsageObserved, "inputTokens": event.InputTokens, "cachedTokens": event.CachedTokens,
+			"cacheWriteTokens": event.CacheWriteTokens, "uncachedInputTokens": event.UncachedInputTokens,
+			"cacheReadRate": event.CacheReadRate, "cacheWriteRate": event.CacheWriteRate, "cacheReuseBalance": event.CacheReuseBalance,
+			"cacheHit": event.CacheHit, "coldCacheEligible": event.ColdCacheEligible,
+		})
+		// Browser APIs need a compact diagnostic view, not the full persisted
+		// rolling buffer. Keep this server-side limit even though the UI also
+		// slices defensively, otherwise a future client could pull all 500
+		// request correlations on every dashboard refresh.
+		if len(result) == routingCacheEventViewLimit {
+			break
+		}
+	}
+	return result
+}
+
 // promptCacheStatsForAccountLocked aggregates the recorded prompt-cache usage
 // across every model for one account. CachedTokens/InputTokens is the prompt
 // (KV) cache hit rate; the numbers come straight from upstream usage payloads
@@ -5227,11 +5599,21 @@ func (a *app) promptCacheWindowForAccountLocked(accountID string) map[string]any
 // promptCacheWindowFilteredLocked computes the since-baseline deltas. An empty
 // accountID aggregates every account.
 func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Time) map[string]any {
-	var input, cached, requests, cold uint64
-	var parentAffinityHits, parentAffinityFallbacks, lineageFailovers uint64
+	var input, cached, requests, usageObserved, cacheWrites, cacheWriteInput, cacheWriteObserved, cacheHits, cacheEligible, cold uint64
+	var parentAffinityHits, parentAffinityFallbacks, lineageFailovers, routingFailovers uint64
 	agents := map[string]map[string]uint64{
-		"main":     {"inputTokens": 0, "cachedTokens": 0, "requestCount": 0, "coldRequestCount": 0},
-		"subagent": {"inputTokens": 0, "cachedTokens": 0, "requestCount": 0, "coldRequestCount": 0},
+		"main": {
+			"inputTokens": 0, "cachedTokens": 0, "requestCount": 0, "usageObservedRequestCount": 0,
+			"cacheWriteTokens": 0, "cacheWriteInputTokens": 0, "cacheWriteObservedRequestCount": 0,
+			"cacheHitRequestCount": 0, "cacheEligibleRequestCount": 0, "coldRequestCount": 0,
+			"parentAffinityHitCount": 0, "parentAffinityFallbackCount": 0, "lineageFailoverCount": 0, "routingFailoverCount": 0,
+		},
+		"subagent": {
+			"inputTokens": 0, "cachedTokens": 0, "requestCount": 0, "usageObservedRequestCount": 0,
+			"cacheWriteTokens": 0, "cacheWriteInputTokens": 0, "cacheWriteObservedRequestCount": 0,
+			"cacheHitRequestCount": 0, "cacheEligibleRequestCount": 0, "coldRequestCount": 0,
+			"parentAffinityHitCount": 0, "parentAffinityFallbackCount": 0, "lineageFailoverCount": 0, "routingFailoverCount": 0,
+		},
 	}
 	for key, stat := range a.state.PromptCache {
 		if accountID != "" && stat.AccountID != accountID {
@@ -5241,14 +5623,27 @@ func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Tim
 		inputDelta := subSat(stat.InputTokens, base.InputTokens)
 		cachedDelta := subSat(stat.CachedTokens, base.CachedTokens)
 		requestDelta := subSat(stat.RequestCount, base.RequestCount)
+		usageObservedDelta := subSat(stat.UsageObservedRequestCount, base.UsageObservedRequestCount)
+		cacheWriteDelta := subSat(stat.CacheWriteTokens, base.CacheWriteTokens)
+		cacheWriteInputDelta := subSat(stat.CacheWriteInputTokens, base.CacheWriteInputTokens)
+		cacheWriteObservedDelta := subSat(stat.CacheWriteObservedRequestCount, base.CacheWriteObservedRequestCount)
+		cacheHitDelta := subSat(stat.CacheHitRequestCount, base.CacheHitRequestCount)
+		cacheEligibleDelta := subSat(stat.CacheEligibleRequestCount, base.CacheEligibleRequestCount)
 		coldDelta := subSat(stat.ColdRequestCount, base.ColdRequestCount)
 		input += inputDelta
 		cached += cachedDelta
 		requests += requestDelta
+		usageObserved += usageObservedDelta
+		cacheWrites += cacheWriteDelta
+		cacheWriteInput += cacheWriteInputDelta
+		cacheWriteObserved += cacheWriteObservedDelta
+		cacheHits += cacheHitDelta
+		cacheEligible += cacheEligibleDelta
 		cold += coldDelta
 		parentAffinityHits += subSat(stat.ParentAffinityHitCount, base.ParentAffinityHitCount)
 		parentAffinityFallbacks += subSat(stat.ParentAffinityFallbackCount, base.ParentAffinityFallbackCount)
 		lineageFailovers += subSat(stat.LineageFailoverCount, base.LineageFailoverCount)
+		routingFailovers += subSat(stat.RoutingFailoverCount, base.RoutingFailoverCount)
 		agentKind := stat.AgentKind
 		if agentKind != "subagent" {
 			agentKind = "main"
@@ -5256,13 +5651,25 @@ func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Tim
 		agents[agentKind]["inputTokens"] += inputDelta
 		agents[agentKind]["cachedTokens"] += cachedDelta
 		agents[agentKind]["requestCount"] += requestDelta
+		agents[agentKind]["usageObservedRequestCount"] += usageObservedDelta
+		agents[agentKind]["cacheWriteTokens"] += cacheWriteDelta
+		agents[agentKind]["cacheWriteInputTokens"] += cacheWriteInputDelta
+		agents[agentKind]["cacheWriteObservedRequestCount"] += cacheWriteObservedDelta
+		agents[agentKind]["cacheHitRequestCount"] += cacheHitDelta
+		agents[agentKind]["cacheEligibleRequestCount"] += cacheEligibleDelta
 		agents[agentKind]["coldRequestCount"] += coldDelta
+		agents[agentKind]["parentAffinityHitCount"] += subSat(stat.ParentAffinityHitCount, base.ParentAffinityHitCount)
+		agents[agentKind]["parentAffinityFallbackCount"] += subSat(stat.ParentAffinityFallbackCount, base.ParentAffinityFallbackCount)
+		agents[agentKind]["lineageFailoverCount"] += subSat(stat.LineageFailoverCount, base.LineageFailoverCount)
+		agents[agentKind]["routingFailoverCount"] += subSat(stat.RoutingFailoverCount, base.RoutingFailoverCount)
 	}
 	return map[string]any{
-		"inputTokens": input, "cachedTokens": cached, "requestCount": requests, "coldRequestCount": cold,
+		"inputTokens": input, "cachedTokens": cached, "requestCount": requests, "usageObservedRequestCount": usageObserved,
+		"cacheWriteTokens": cacheWrites, "cacheWriteInputTokens": cacheWriteInput, "cacheWriteObservedRequestCount": cacheWriteObserved,
+		"cacheHitRequestCount": cacheHits, "cacheEligibleRequestCount": cacheEligible, "coldRequestCount": cold,
 		"main": agents["main"], "subagent": agents["subagent"],
 		"parentAffinityHitCount": parentAffinityHits, "parentAffinityFallbackCount": parentAffinityFallbacks,
-		"lineageFailoverCount": lineageFailovers, "resetAt": resetAt,
+		"lineageFailoverCount": lineageFailovers, "routingFailoverCount": routingFailovers, "resetAt": resetAt,
 	}
 }
 

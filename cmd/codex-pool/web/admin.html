@@ -58,8 +58,10 @@
 
         <section id="cache-window" class="cache-window" aria-label="Cache hit rate since reset" hidden>
           <div class="cache-window-stats">
-            <div class="cache-window-stat"><div class="eyebrow">Cache hit (since reset)</div><span id="cache-window-hit" class="cache-window-value">—</span></div>
-            <div class="cache-window-stat"><div class="eyebrow">Cold starts (since reset)</div><span id="cache-window-cold" class="cache-window-value">—</span></div>
+            <div class="cache-window-stat"><div class="eyebrow">Token read hit</div><span id="cache-window-hit" class="cache-window-value">—</span></div>
+            <div class="cache-window-stat"><div class="eyebrow">Request hit</div><span id="cache-window-request-hit" class="cache-window-value">—</span></div>
+            <div class="cache-window-stat"><div class="eyebrow">Cache writes</div><span id="cache-window-write" class="cache-window-value">—</span></div>
+            <div class="cache-window-stat"><div class="eyebrow">Cold eligible</div><span id="cache-window-cold" class="cache-window-value">—</span></div>
             <div class="cache-window-stat"><div class="eyebrow">Requests (since reset)</div><span id="cache-window-reqs" class="cache-window-value">—</span></div>
             <div class="cache-window-stat"><div class="eyebrow">Main cache</div><span id="cache-window-main" class="cache-window-value">—</span></div>
             <div class="cache-window-stat"><div class="eyebrow">Subagent cache</div><span id="cache-window-subagent" class="cache-window-value">—</span></div>
@@ -81,6 +83,19 @@
             <table class="account-table">
               <thead id="accounts-head"><tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th>Last activity</th><th>Action</th></tr></thead>
               <tbody id="accounts-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="routing-cache-events" class="section-block routing-cache-events management-only" aria-labelledby="routing-cache-title">
+          <div class="section-heading">
+            <div><h2 id="routing-cache-title">Recent routing &amp; cache</h2><p class="muted">Bounded 24-hour diagnostics; request and route identifiers are hashed.</p></div>
+            <span id="routing-cache-count" class="muted"></span>
+          </div>
+          <div class="table-wrap routing-cache-wrap">
+            <table class="routing-cache-table">
+              <thead><tr><th>Time</th><th>Agent</th><th>Account</th><th>Routing outcome</th><th>Cache read</th><th>Cache write</th><th>Input</th></tr></thead>
+              <tbody id="routing-cache-body"></tbody>
             </table>
           </div>
         </section>

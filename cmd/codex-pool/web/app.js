@@ -19,23 +19,25 @@
     if (total <= 0) return null;
     return Math.max(0, Math.min(1, (Number(cached) || 0) / total));
   };
-  // Per-account cache hit cell. Shows the "since reset" window (which equals the
-  // all-time figure until that account is reset) so each account can be
-  // recalculated independently. Pass resetId to render a management-only reset
-  // control for that account.
-  const cacheHitMarkup = (obj, resetId) => {
+  // Per-account main/subagent cache cell. The write observation count is kept
+  // separate from total requests: an omitted upstream cache_write_tokens field
+  // is unavailable data, not a confirmed zero.
+  const cacheHitMarkup = (obj, agentKind, resetId) => {
     const win = obj.cacheWindow || {};
-    const input = win.inputTokens !== undefined ? win.inputTokens : obj.cacheInputTokens;
-    const cached = win.cachedTokens !== undefined ? win.cachedTokens : obj.cacheCachedTokens;
-    const reqs = Number(win.requestCount) || 0;
-    const cold = Number(win.coldRequestCount) || 0;
+    const agent = win[agentKind] || {};
+    const input = Number(agent.inputTokens) || 0;
+    const cached = Number(agent.cachedTokens) || 0;
+    const reqs = Number(agent.requestCount) || 0;
+    const cold = Number(agent.coldRequestCount) || 0;
+    const writeObserved = Number(agent.cacheWriteObservedRequestCount) || 0;
+    const writeTokens = Number(agent.cacheWriteTokens) || 0;
     const rate = cacheHitRate(input, cached);
     const resetBtn = resetId ? ` <button class="cache-reset-btn" type="button" data-cache-reset="${escapeHTML(resetId)}" title="Recalculate this account's hit rate (reset its window)">↺</button>` : "";
-    if (rate === null) return `<div class="cache-hit"><span class="cache-empty">No data</span>${resetBtn}</div>`;
-    const pct = (rate * 100).toFixed(1);
+    if (rate === null) return `<div class="cache-hit"><span class="cache-empty">No data (${reqs})</span>${resetBtn}<span class="cache-detail">write: ${writeObserved ? formatTokens(writeTokens) : "—"} · cold: ${cold}</span></div>`;
+    const pct = Math.round(rate * 100);
     const tone = rate >= 0.6 ? "good" : rate >= 0.3 ? "fair" : "poor";
-    const coldText = reqs ? ` · ${cold} cold` : "";
-    return `<div class="cache-hit"><span class="cache-rate ${tone}">${pct}%${resetBtn}</span><span class="cache-detail">${formatTokens(cached)} / ${formatTokens(input)} tok${coldText}</span></div>`;
+    const detail = `read: ${formatTokens(cached)} / ${formatTokens(input)} · write: ${writeObserved ? formatTokens(writeTokens) : "—"} · cold: ${cold}`;
+    return `<div class="cache-hit" title="${escapeHTML(detail)}"><span class="cache-rate ${tone}">${pct}% <small>(${reqs})</small>${resetBtn}</span><span class="cache-detail">${detail}</span></div>`;
   };
   const formatTokens = (value) => {
     const n = Number(value) || 0;
@@ -264,9 +266,17 @@
     const cached = Number(win.cachedTokens) || 0;
     const reqs = Number(win.requestCount) || 0;
     const cold = Number(win.coldRequestCount) || 0;
+    const cacheEligible = Number(win.cacheEligibleRequestCount) || 0;
+    const usageObserved = Number(win.usageObservedRequestCount) || 0;
+    const cacheHits = Number(win.cacheHitRequestCount) || 0;
+    const writeObserved = Number(win.cacheWriteObservedRequestCount) || 0;
+    const writeTokens = Number(win.cacheWriteTokens) || 0;
+    const writeInput = Number(win.cacheWriteInputTokens) || 0;
     const rate = cacheHitRate(input, cached);
     $("#cache-window-hit").textContent = rate === null ? "No data" : `${(rate * 100).toFixed(1)}%`;
-    $("#cache-window-cold").textContent = reqs ? `${cold} (${((cold / reqs) * 100).toFixed(1)}%)` : String(cold);
+    $("#cache-window-request-hit").textContent = usageObserved ? `${((cacheHits / usageObserved) * 100).toFixed(1)}%` : "No data";
+    $("#cache-window-write").textContent = writeObserved ? `${formatTokens(writeTokens)} · ${writeInput ? `${((writeTokens / writeInput) * 100).toFixed(1)}%` : "rate —"}` : "—";
+    $("#cache-window-cold").textContent = cacheEligible ? `${cold} (${((cold / cacheEligible) * 100).toFixed(1)}%)` : String(cold);
     $("#cache-window-reqs").textContent = String(reqs);
     const agentCacheText = (agent) => {
       const agentInput = Number(agent?.inputTokens) || 0;
@@ -390,11 +400,11 @@
   }
 
   function renderAccounts(accounts, healthByID) {
-    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th>Cache hit</th><th>Last activity</th><th>Action</th></tr>";
+    $("#accounts-head").innerHTML = '<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th class="cache-column">Main cache (reqs)</th><th class="cache-column">Subagent cache (reqs)</th><th class="routing-count-column">Affinity</th><th class="routing-count-column">Failovers</th><th>Last activity</th><th>Action</th></tr>';
     $("#account-count").textContent = `${accounts.length} configured`;
     const body = $("#accounts-body");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="7"><div class="empty-state">No accounts configured</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="10"><div class="empty-state">No accounts configured</div></td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
@@ -406,12 +416,19 @@
       const displayName = account.displayName || account.label || account.id || "Credential";
       const metadata = accountMetadataLine(account, false);
       const actions = actionButton("delete", account.id, "Remove", "danger");
+      const cacheWindow = health.cacheWindow || {};
+      const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
+      const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
+      const failovers = Number(cacheWindow.routingFailoverCount) || 0;
       return `<tr data-account-row="${escapeHTML(account.id)}">
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt)}</td>
         <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)} · ${escapeHTML(routeCount)}</div></td>
-        <td>${cacheHitMarkup(health, account.id)}</td>
+        <td class="cache-column">${cacheHitMarkup(health, "main", account.id)}</td>
+        <td class="cache-column">${cacheHitMarkup(health, "subagent")}</td>
+        <td class="routing-count-column" title="${affinityHits} parent-affinity hits, ${affinityFallbacks} fallbacks">${affinityHits}/${affinityFallbacks}</td>
+        <td class="routing-count-column" title="${failovers} routing failovers">${failovers}</td>
         <td><div class="activity">${displayTime(activity)}${health.consecutiveFailure ? `<br>${health.consecutiveFailure} consecutive failure${health.consecutiveFailure === 1 ? "" : "s"}` : ""}</div></td>
         <td><div class="row-actions">${actions}</div></td>
       </tr>`;
@@ -419,11 +436,11 @@
   }
 
   function renderPublicAccounts(accounts) {
-    $("#accounts-head").innerHTML = "<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th>Cache hit</th><th>Action</th></tr>";
+    $("#accounts-head").innerHTML = '<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th class="cache-column">Main cache (reqs)</th><th class="cache-column">Subagent cache (reqs)</th><th class="routing-count-column">Affinity</th><th class="routing-count-column">Failovers</th><th>Action</th></tr>';
     $("#account-count").textContent = `${accounts.length} visible`;
     const body = $("#accounts-body");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="6"><div class="empty-state">No accounts available</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="9"><div class="empty-state">No accounts available</div></td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
@@ -435,14 +452,67 @@
       const action = account.poolRef && account.poolAction
         ? `<button class="button ${account.poolAction === "pool-remove" ? "warn" : "secondary"}" type="button" data-public-pool-action="${escapeHTML(account.poolAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${escapeHTML(account.poolActionLabel || "Update")}</button>`
         : "";
+      const cacheWindow = account.cacheWindow || {};
+      const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
+      const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
+      const failovers = Number(cacheWindow.routingFailoverCount) || 0;
       return `<tr>
       <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
       <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span>${activeBadge(account.active)}</div></td>
       <td>${quota}</td>
       <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong></div></td>
-      <td>${cacheHitMarkup(account)}</td>
+      <td class="cache-column">${cacheHitMarkup(account, "main")}</td>
+      <td class="cache-column">${cacheHitMarkup(account, "subagent")}</td>
+      <td class="routing-count-column" title="${affinityHits} parent-affinity hits, ${affinityFallbacks} fallbacks">${affinityHits}/${affinityFallbacks}</td>
+      <td class="routing-count-column" title="${failovers} routing failovers">${failovers}</td>
       <td><div class="row-actions">${action}</div></td>
     </tr>`;
+    }).join("");
+  }
+
+  const routingOutcomeLabel = (value) => ({
+    sticky_reuse: "Sticky reuse",
+    new_route_assignment: "New route",
+    parent_affinity: "Parent affinity",
+    parent_affinity_fallback: "Affinity fallback",
+    quota_failover: "Quota failover",
+    rate_limit_failover: "Rate-limit failover",
+    auth_failover: "Auth failover",
+    transport_failover: "Transport failover",
+    repeated_5xx_failover: "Repeated 5xx failover",
+  }[value] || "Routing result");
+
+  function renderRoutingCacheEvents(events) {
+    const rows = Array.isArray(events) ? events.slice(0, 50) : [];
+    $("#routing-cache-count").textContent = rows.length === 1 ? "1 recent request" : `${rows.length} recent requests`;
+    const body = $("#routing-cache-body");
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="7"><div class="empty-state">No recent cache observations</div></td></tr>';
+      return;
+    }
+    body.innerHTML = rows.map((event) => {
+      const read = event.usageObserved && event.cacheReadRate !== null && event.cacheReadRate !== undefined
+        ? `${(Number(event.cacheReadRate) * 100).toFixed(1)}% · ${formatTokens(event.cachedTokens)}`
+        : "—";
+      const write = event.cacheWriteTokens === null || event.cacheWriteTokens === undefined
+        ? "—"
+        : `${formatTokens(event.cacheWriteTokens)}${event.cacheWriteRate === null || event.cacheWriteRate === undefined ? "" : ` · ${(Number(event.cacheWriteRate) * 100).toFixed(1)}%`}`;
+      const failover = event.failoverFromAccountLabel ? `<span class="event-secondary">from ${escapeHTML(event.failoverFromAccountLabel)}</span>` : "";
+      const identifiers = [
+        event.requestIdHash ? `request ${event.requestIdHash}` : "",
+        event.stickyKeyHash ? `route ${event.stickyKeyHash}` : "",
+        event.promptCacheKeyHash ? `cache ${event.promptCacheKeyHash}` : "",
+      ].filter(Boolean).join(" · ");
+      const cacheTone = event.cacheHit ? "hit" : event.coldCacheEligible ? "cold" : "";
+      return `<tr title="${escapeHTML(identifiers)}">
+        <td>${escapeHTML(new Date(event.timestamp).toLocaleTimeString())}</td>
+        <td><span class="agent-kind ${escapeHTML(event.agentKind)}">${escapeHTML(event.agentKind || "main")}</span></td>
+        <td>${escapeHTML(event.accountLabel || "Credential")}</td>
+        <td><span class="routing-outcome">${escapeHTML(routingOutcomeLabel(event.routingOutcome))}</span>${failover}<span class="event-secondary">${escapeHTML(event.routingSource || "fallback")}</span></td>
+        <td class="event-cache ${cacheTone}">${escapeHTML(read)}</td>
+        <td class="event-cache">${escapeHTML(write)}</td>
+        <td>${event.usageObserved ? escapeHTML(formatTokens(event.inputTokens)) : "—"}</td>
+      </tr>`;
     }).join("");
   }
 
@@ -489,6 +559,7 @@
       renderSummary(serviceState.summary || {});
       renderCacheWindow(serviceState.promptCacheWindow);
       renderAccounts(state.data.accounts, healthByID);
+      renderRoutingCacheEvents(serviceState.routingCacheEvents);
       renderSticky(state.data.sessions, state.data.accounts);
       $("#service-status").textContent = serviceState.routingStrategy === "sticky_balanced" ? "Service online · balanced" : "Service online · failover";
     } catch (error) {
@@ -506,6 +577,10 @@
       renderSummary(body.dashboard.summary || {}, true);
       renderCacheWindow(body.dashboard.promptCacheWindow);
       renderPublicAccounts(accounts);
+      // Clear prior authenticated request details before rendering public mode.
+      // Public status may expose aggregates, never traffic timing or per-request
+      // account/routing correlation.
+      renderRoutingCacheEvents([]);
       return true;
     } catch (error) {
       if (!silent) notify(error.message, true);

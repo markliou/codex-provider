@@ -106,7 +106,26 @@ Backend KV/prompt cache = upstream behavior for prompt_cache_key + prompt prefix
 
 Under `preserve`, `CODEX_POOL_PROMPT_CACHE_KEY_MODE=auto|off|passthrough` and `CODEX_POOL_PROMPT_CACHE_KEY_SCOPE=auto|conversation|project|user` still govern missing-key injection for non-Codex or compatible clients. `auto` hashes the selected scope; raw project, session, and API-key values are not sent upstream. `CODEX_POOL_PROMPT_CACHE_RETENTION` defaults to `24h`; use `passthrough` to leave retention untouched or `in_memory` for the shorter upstream mode.
 
-The dashboard separates main and subagent input/cached tokens, request counts, and cold starts, and reports parent-affinity hits/fallbacks plus lineage failovers. The **Reset window** control starts a fresh comparison window without deleting lifetime totals.
+The dashboard separates main and subagent cache observations. **Token read hit**
+is `cached_tokens / input_tokens`; **Request hit** is the share of
+usage-observed requests with non-zero cached tokens; **Cache writes** reports
+write tokens and `cache_write_tokens / input_tokens` only for requests where
+upstream actually supplied a write field; and **Cold eligible** is the share of
+cache-eligible requests (at least 1,024 input tokens) with zero cached tokens.
+An omitted cache-write field is displayed as `—`, not interpreted as zero.
+Per-account cells include request counts, write observations, cold starts,
+parent-affinity hits/fallbacks, and routing failovers. The **Reset window**
+control starts a fresh comparison window without deleting lifetime totals.
+
+The management-only **Recent routing & cache** panel correlates successful
+requests with their routing outcome: sticky reuse, a new route, parent
+affinity/fallback, or quota, rate-limit, authentication, transport, or
+repeated-5xx failover. The authenticated browser view shows the newest 50
+entries; the unauthenticated public dashboard receives no request-level traffic
+details. Runtime state retains at most 500 entries and drops entries older than
+24 hours. Raw request, response, thread, lineage, sticky, and prompt-cache
+identifiers are domain-separated hashes before persistence; authenticated
+browser responses omit local/upstream account IDs and use masked account labels.
 
 ### Duplicate Upstream Accounts
 
@@ -158,6 +177,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - `POST /v1/chat/completions`, including translation to a Responses upstream.
 - Model aliases and `(thinking-tier)` suffix translation.
 - Thread-aware sticky balancing and failover with idle TTL, soft parent-account affinity, independent prompt-cache-key policy, per-model cooldowns, optional Pro-quota preservation, response-id continuation binding, and JSON persistence in `/data`. New sessions distribute across equal-priority healthy accounts; when an upstream account returns `429` or repeated server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
+- Main/subagent cache-read, cache-write, request-hit, cold-start, affinity, and failover observability, plus a bounded and redacted 24-hour request correlation panel.
 - Bundled, loopback-only CLIProxyAPI sidecar for Codex device-auth requests. Pool pins each request to the selected account through a sidecar model prefix, while the sidecar owns OAuth refreshes.
 - Public pool participation toggles on `/admin`, plus authenticated owner controls for add/remove account, device-auth login jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Duplicate`, `Disabled`, or `Standby`.
 - Codex quota refresh from `/backend-api/wham/usage`, including per-window percentages, reset times, plan-type updates, sanitized quota errors, and five-minute dashboard refresh.
@@ -180,6 +200,7 @@ sh scripts/test/integration-codex-config.sh
 sh scripts/test/integration-cliproxy-sidecar.sh
 sh scripts/test/integration-device-auth-failover.sh
 sh scripts/test/integration-codex-subagent.sh
+sh scripts/test/integration-routing-cache-observability.sh
 ```
 
 That script builds the service and mock upstream images, starts them on an isolated Docker network, verifies public dashboard access, verifies protected management APIs, checks public API-key enforcement, then runs a real `codex exec` inside the service image with an ephemeral `CODEX_HOME/config.toml`. The test proves Codex can use:
@@ -196,6 +217,13 @@ The checked-in [test config](test/codex-config.toml) uses the same provider cont
 `integration-cliproxy-sidecar.sh` starts the real bundled sidecar and verifies its isolated auth conversion plus loopback-only binding. `integration-device-auth-failover.sh` runs a real `codex exec` through the Pool sidecar adapter, forces the first device-auth account to return `429`, and verifies that the request completes through the second account with a persisted cooldown and sticky binding.
 
 `integration-codex-subagent.sh` runs a real Codex MultiAgent V2 session, forces the parent to fail over, returns a `spawn_agent` call from the mock model, and verifies the child's independent sticky binding, parent-account affinity, native cache key, response chain, lineage state, and metrics.
+
+`integration-routing-cache-observability.sh` uses isolated, non-live Docker
+image tags and a mock upstream to verify new-route, sticky-reuse, and
+rate-limit-failover correlation; read/write token observations; cold-eligible
+classification; bounded persisted diagnostics; and redaction of raw route and
+account identifiers. It deliberately never retags the live
+`codex-pool:local` image.
 
 ## Local Build
 

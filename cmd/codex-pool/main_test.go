@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -739,7 +741,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page still exposes internal label %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"cache-window-main", "cache-window-subagent", "cache-window-affinity", "cache-window-lineage-failover"} {
+	for _, expected := range []string{"cache-window-main", "cache-window-subagent", "cache-window-affinity", "cache-window-lineage-failover", "cache-window-request-hit", "cache-window-write", "routing-cache-events", "routing-cache-body"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page omitted subagent cache metric %q", expected)
 		}
@@ -776,7 +778,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if !strings.Contains(jsRecorder.Body.String(), "sticky_balanced") || !strings.Contains(jsRecorder.Body.String(), "activeRouteCount") {
 		t.Fatal("admin JS does not expose balanced routing state and per-account active routes")
 	}
-	for _, expected := range []string{"parentAffinityHitCount", "parentAffinityFallbackCount", "lineageFailoverCount", "win.subagent"} {
+	for _, expected := range []string{"parentAffinityHitCount", "parentAffinityFallbackCount", "lineageFailoverCount", "routingFailoverCount", "cacheWriteObservedRequestCount", "win.subagent", "renderRoutingCacheEvents", "Main cache (reqs)", "Subagent cache (reqs)", "Rate-limit failover"} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS omitted subagent cache metric %q", expected)
 		}
@@ -798,6 +800,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 	for _, expected := range []string{".quota-track.watch", ".quota-track.low", ".quota-track.critical", ".quota-track.empty", "#f3c969", "#ff8a6b", "#ff4f6d"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS does not preserve the warm-to-red quota warning ramp %q", expected)
+		}
+	}
+	for _, expected := range []string{".cache-column", ".routing-count-column", ".routing-cache-table", ".event-cache.hit", ".event-cache.cold"} {
+		if !strings.Contains(cssRecorder.Body.String(), expected) {
+			t.Fatalf("admin CSS omitted compact cache/routing layout %q", expected)
 		}
 	}
 	logoRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/logo.svg", nil)
@@ -965,6 +972,12 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 		ID: "private-account-id", Label: "private@example.test · Plus", Email: "private@example.test", AccountID: "chatgpt-private-id", OrganizationName: "Private private@example.test", PlanType: "plus", CodexHome: "/data/accounts/private-account-id/.codex", Enabled: true, InPool: true, RemainingQuota: &quota,
 		UpstreamBaseURL: "https://upstream.example.test/v1", UpstreamAPIKey: "upstream-secret-value", AllowedModels: []string{"gpt-test"},
 	}})
+	a.state.RoutingCacheEvents = []routingCacheEvent{{
+		Timestamp:      time.Now().UTC(),
+		AccountID:      "private-account-id",
+		RoutingOutcome: "sticky_reuse",
+		InputTokens:    2048,
+	}}
 
 	publicRequest := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
 	publicRecorder := httptest.NewRecorder()
@@ -973,7 +986,7 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
 	}
 	publicBody := publicRecorder.Body.String()
-	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "Private private@example.test", "upstream.example.test", "upstream-secret-value", "gpt-test", "credentialMetadata", "statusReason", "allowedModels", "planType", "planLimit", "email"} {
+	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "Private private@example.test", "upstream.example.test", "upstream-secret-value", "gpt-test", "credentialMetadata", "statusReason", "allowedModels", "planType", "planLimit", "email", "routingCacheEvents", "sticky_reuse"} {
 		if strings.Contains(publicBody, forbidden) {
 			t.Fatalf("public dashboard exposed %q", forbidden)
 		}
@@ -1461,6 +1474,72 @@ func TestResponsesProxyInjectsPromptCacheControlsAndTracksUsage(t *testing.T) {
 	}
 }
 
+func TestRoutingCacheEventsCorrelateStickyReuseAndFailover(t *testing.T) {
+	firstHits := 0
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstHits++
+		if firstHits == 3 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"resp_primary_%d","object":"response","output":[],"usage":{"input_tokens":2000,"input_tokens_details":{"cached_tokens":%d,"cache_write_tokens":%d}}}`, firstHits, (firstHits-1)*1500, 400-(firstHits-1)*300)
+	}))
+	defer first.Close()
+
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_secondary","object":"response","output":[],"usage":{"input_tokens":2400,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":1800}}}`)
+	}))
+	defer second.Close()
+
+	a := testApp(t, []account{
+		{ID: "private-primary-id", Label: "Primary", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL, UpstreamAPIKey: "first-key"},
+		{ID: "private-secondary-id", Label: "Secondary", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: second.URL, UpstreamAPIKey: "second-key"},
+	})
+	proxy := func() {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+		req.Header.Set("Authorization", "Bearer client-key")
+		req.Header.Set("X-Codex-Pool-Session", "raw-sticky-session")
+		recorder := httptest.NewRecorder()
+		a.publicMux().ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+		}
+	}
+	proxy()
+	proxy()
+	proxy()
+
+	if len(a.state.RoutingCacheEvents) != 3 {
+		t.Fatalf("routing cache event count = %d: %#v", len(a.state.RoutingCacheEvents), a.state.RoutingCacheEvents)
+	}
+	wantOutcomes := []string{"new_route_assignment", "sticky_reuse", "rate_limit_failover"}
+	for index, want := range wantOutcomes {
+		if got := a.state.RoutingCacheEvents[index].RoutingOutcome; got != want {
+			t.Fatalf("event %d outcome = %q, want %q: %#v", index, got, want, a.state.RoutingCacheEvents[index])
+		}
+	}
+	failover := a.state.RoutingCacheEvents[2]
+	if failover.AccountID != "private-secondary-id" || failover.FailoverFromAccountID != "private-primary-id" || failover.CacheWriteTokens == nil || *failover.CacheWriteTokens != 1800 || !failover.ColdCacheEligible {
+		t.Fatalf("failover cache correlation = %#v", failover)
+	}
+	views, err := json.Marshal(a.routingCacheEventViewsLocked(time.Now().UTC()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(views, []byte("private-primary-id")) || bytes.Contains(views, []byte("private-secondary-id")) || bytes.Contains(views, []byte("raw-sticky-session")) {
+		t.Fatalf("routing cache browser view leaked identifiers: %s", views)
+	}
+	for _, label := range []string{"Primary", "Secondary"} {
+		if !bytes.Contains(views, []byte(label)) {
+			t.Fatalf("routing cache browser view omitted %q: %s", label, views)
+		}
+	}
+}
+
 func TestChatCompletionConversionPreservesPromptCacheControls(t *testing.T) {
 	a := testApp(t, nil)
 	candidate := account{ID: "one", UpstreamBaseURL: "https://upstream.example.test/v1", WireAPI: "responses"}
@@ -1617,6 +1696,9 @@ func TestChildSoftPrefersEligibleParentAndNestedLineageRoot(t *testing.T) {
 	if got := a.state.PromptCache["parent-account:gpt-test:subagent"].ParentAffinityHitCount; got != 1 {
 		t.Fatalf("parent affinity hit count = %d, want only the initial child assignment", got)
 	}
+	if len(a.state.RoutingCacheEvents) < 2 || a.state.RoutingCacheEvents[0].RoutingOutcome != "parent_affinity" || a.state.RoutingCacheEvents[1].RoutingOutcome != "sticky_reuse" {
+		t.Fatalf("child routing outcomes = %#v", a.state.RoutingCacheEvents)
+	}
 
 	nestedPayload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": `{"thread_id":"nested-thread","parent_thread_id":"child-thread","subagent_kind":"thread_spawn"}`}, "prompt_cache_key": "nested-key"}
 	nestedRoute := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), nestedPayload, "gpt-test", "client-key")
@@ -1699,6 +1781,10 @@ func TestIneligibleParentFallsBackWithoutBypassingSafeguards(t *testing.T) {
 			}
 			if selected.ID != "fallback" {
 				t.Fatalf("ineligible parent selected %q", selected.ID)
+			}
+			a.markSuccess(route, "gpt-test", selected.ID, proxyResponseInfo{})
+			if got := a.state.RoutingCacheEvents[len(a.state.RoutingCacheEvents)-1].RoutingOutcome; got != "parent_affinity_fallback" {
+				t.Fatalf("ineligible parent routing outcome = %q", got)
 			}
 		})
 	}
@@ -2253,12 +2339,14 @@ func TestResponsesProxyPreservesLargeMCPToolPayloadAndStreamingEvents(t *testing
 		responseID := "resp_mcp_large"
 		inputTokens := 4096
 		cachedTokens := 3072
+		cacheWriteTokens := 512
 		if round == 2 {
 			responseID = "resp_mcp_large_2"
 			inputTokens = 5120
 			cachedTokens = 4096
+			cacheWriteTokens = 256
 		}
-		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"usage\":{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d}}}}\n\n", responseID, inputTokens, cachedTokens)
+		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"usage\":{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d}}}}\n\n", responseID, inputTokens, cachedTokens, cacheWriteTokens)
 	}))
 	defer upstream.Close()
 
@@ -2326,7 +2414,7 @@ func TestResponsesProxyPreservesLargeMCPToolPayloadAndStreamingEvents(t *testing
 	if round != 2 {
 		t.Fatalf("upstream rounds = %d, want 2", round)
 	}
-	if stat := a.state.PromptCache["provider:gpt-test:main"]; stat.InputTokens != 9216 || stat.CachedTokens != 7168 || stat.RequestCount != 2 {
+	if stat := a.state.PromptCache["provider:gpt-test:main"]; stat.InputTokens != 9216 || stat.CachedTokens != 7168 || stat.CacheWriteTokens != 768 || stat.CacheWriteObservedRequestCount != 2 || stat.RequestCount != 2 {
 		t.Fatalf("streaming usage was not recorded: %#v", stat)
 	}
 }
@@ -2339,6 +2427,80 @@ func TestCopyStreamingProxyResponseFlushesSSE(t *testing.T) {
 	}
 	if info.ResponseID != "resp_flushed" {
 		t.Fatalf("streaming response id = %q", info.ResponseID)
+	}
+}
+
+func TestPromptCacheUsageParsesReadWriteVariantsAndAbsence(t *testing.T) {
+	nested := promptCacheUsageFromPayload(map[string]any{"usage": map[string]any{
+		"input_tokens": 4096,
+		"input_tokens_details": map[string]any{
+			"cached_tokens":      3072,
+			"cache_write_tokens": 512,
+		},
+	}})
+	if !nested.Present || nested.InputTokens != 4096 || nested.CachedTokens != 3072 || nested.CacheWriteTokens == nil || *nested.CacheWriteTokens != 512 {
+		t.Fatalf("nested cache usage = %#v", nested)
+	}
+
+	topLevel := promptCacheUsageFromPayload(map[string]any{"usage": map[string]any{
+		"prompt_tokens":               2048,
+		"cache_read_input_tokens":     1024,
+		"cache_creation_input_tokens": 0,
+	}})
+	if !topLevel.Present || topLevel.CachedTokens != 1024 || topLevel.CacheWriteTokens == nil || *topLevel.CacheWriteTokens != 0 {
+		t.Fatalf("top-level cache usage = %#v", topLevel)
+	}
+
+	absentWrite := promptCacheUsageFromPayload(map[string]any{"usage": map[string]any{
+		"input_tokens": 1024,
+		"input_tokens_details": map[string]any{
+			"cached_tokens": 768,
+		},
+	}})
+	if !absentWrite.Present || absentWrite.CacheWriteTokens != nil {
+		t.Fatalf("absent write tokens must remain unavailable: %#v", absentWrite)
+	}
+}
+
+func TestStreamingUsageMergeRetainsObservedCacheWrite(t *testing.T) {
+	writeTokens := uint64(512)
+	var info proxyResponseInfo
+	info.merge(proxyResponseInfo{Usage: promptCacheUsage{
+		InputTokens:      4096,
+		CachedTokens:     0,
+		CacheWriteTokens: &writeTokens,
+		Present:          true,
+	}})
+	info.merge(proxyResponseInfo{Usage: promptCacheUsage{
+		InputTokens:  4096,
+		CachedTokens: 3072,
+		Present:      true,
+	}})
+	if info.Usage.CacheWriteTokens == nil || *info.Usage.CacheWriteTokens != writeTokens {
+		t.Fatalf("final streaming usage erased observed write tokens: %#v", info.Usage)
+	}
+	if info.Usage.CachedTokens != 3072 {
+		t.Fatalf("final streaming usage did not retain latest read tokens: %#v", info.Usage)
+	}
+}
+
+func TestRoutingEventSourceNormalizesFallbackWithoutChangingKnownSources(t *testing.T) {
+	for input, want := range map[string]string{
+		"prompt":               "fallback",
+		"":                     "fallback",
+		"unexpected":           "fallback",
+		"previous_response_id": "previous_response_id",
+		"thread_id":            "thread_id",
+		"session":              "session",
+		"project":              "project",
+		"prompt_cache_key":     "prompt_cache_key",
+		"conversation":         "conversation",
+		"session_id":           "session_id",
+		"conversation_id":      "conversation_id",
+	} {
+		if got := routingEventSource(input); got != want {
+			t.Fatalf("routing event source %q = %q, want %q", input, got, want)
+		}
 	}
 }
 
@@ -3507,6 +3669,35 @@ func TestPromptCacheColdStartAndResetWindow(t *testing.T) {
 	}
 }
 
+func TestPromptCacheWriteAggregationAndResetWindow(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct", Enabled: true, InPool: true}})
+	now := time.Now().UTC()
+	ptr := func(value uint64) *uint64 { return &value }
+	a.recordPromptCacheUsageLocked("acct", "gpt-test", promptCacheUsage{InputTokens: 2000, CachedTokens: 1500, CacheWriteTokens: ptr(400), Present: true}, now)
+	a.recordPromptCacheUsageLocked("acct", "gpt-test", promptCacheUsage{InputTokens: 1500, CachedTokens: 0, Present: true}, now)
+	a.recordPromptCacheUsageLocked("acct", "gpt-test", promptCacheUsage{InputTokens: 1000, CachedTokens: 250, CacheWriteTokens: ptr(0), Present: true}, now)
+
+	stat := a.state.PromptCache["acct:gpt-test:main"]
+	if stat.RequestCount != 3 || stat.UsageObservedRequestCount != 3 || stat.CacheHitRequestCount != 2 || stat.CacheEligibleRequestCount != 2 || stat.ColdRequestCount != 1 {
+		t.Fatalf("cache request counters = %#v", stat)
+	}
+	if stat.CacheWriteTokens != 400 || stat.CacheWriteInputTokens != 3000 || stat.CacheWriteObservedRequestCount != 2 {
+		t.Fatalf("cache write counters = %#v", stat)
+	}
+	window := a.promptCacheWindowLocked()
+	mainWindow := window["main"].(map[string]uint64)
+	if mainWindow["cacheWriteTokens"] != 400 || mainWindow["cacheWriteInputTokens"] != 3000 || mainWindow["cacheWriteObservedRequestCount"] != 2 || mainWindow["cacheHitRequestCount"] != 2 {
+		t.Fatalf("cache write window = %#v", mainWindow)
+	}
+
+	a.resetPromptCacheWindowLocked(now)
+	a.recordPromptCacheUsageLocked("acct", "gpt-test", promptCacheUsage{InputTokens: 3000, CachedTokens: 2400, CacheWriteTokens: ptr(200), Present: true}, now.Add(time.Second))
+	window = a.promptCacheWindowLocked()
+	if window["cacheWriteTokens"].(uint64) != 200 || window["cacheWriteObservedRequestCount"].(uint64) != 1 || window["cacheHitRequestCount"].(uint64) != 1 {
+		t.Fatalf("post-reset write window = %#v", window)
+	}
+}
+
 func TestPromptCacheMetricsSeparateMainSubagentAndAffinity(t *testing.T) {
 	a := testApp(t, []account{{ID: "acct", Enabled: true, InPool: true}})
 	now := time.Now().UTC()
@@ -3530,6 +3721,70 @@ func TestPromptCacheMetricsSeparateMainSubagentAndAffinity(t *testing.T) {
 	subagentWindow := window["subagent"].(map[string]uint64)
 	if mainWindow["requestCount"] != 1 || subagentWindow["requestCount"] != 2 || window["parentAffinityHitCount"].(uint64) != 1 || window["parentAffinityFallbackCount"].(uint64) != 1 || window["lineageFailoverCount"].(uint64) != 1 {
 		t.Fatalf("agent cache window = %#v", window)
+	}
+}
+
+func TestRoutingCacheEventRedactionAndPruning(t *testing.T) {
+	a := testApp(t, []account{{ID: "private-account-id", Label: "Primary", Enabled: true, InPool: true}})
+	writeTokens := uint64(256)
+	route := routingDecision{
+		StickyKey:              "gpt-test:thread:raw-thread-id",
+		UpstreamPromptCacheKey: "raw-prompt-cache-key",
+		Source:                 "thread_id",
+		Identity: requestIdentity{
+			ThreadID:      "raw-thread-id",
+			LineageRootID: "raw-lineage-id",
+		},
+	}
+	a.markSuccess(route, "gpt-test", "private-account-id", proxyResponseInfo{
+		ResponseID: "raw-response-id",
+		RequestID:  "raw-request-id",
+		Usage: promptCacheUsage{
+			InputTokens:      2048,
+			CachedTokens:     1536,
+			CacheWriteTokens: &writeTokens,
+			Present:          true,
+		},
+	})
+	if len(a.state.RoutingCacheEvents) != 1 {
+		t.Fatalf("routing cache events = %#v", a.state.RoutingCacheEvents)
+	}
+	event := a.state.RoutingCacheEvents[0]
+	if event.RoutingOutcome != "new_route_assignment" || event.CacheReadRate == nil || *event.CacheReadRate != 0.75 || event.CacheWriteRate == nil || *event.CacheWriteRate != 0.125 || event.CacheReuseBalance == nil || *event.CacheReuseBalance != 1280 {
+		t.Fatalf("routing cache evaluation = %#v", event)
+	}
+	encoded, err := json.Marshal(a.routingCacheEventViewsLocked(time.Now().UTC()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"raw-thread-id", "raw-lineage-id", "raw-prompt-cache-key", "raw-response-id", "raw-request-id", "private-account-id"} {
+		if bytes.Contains(encoded, []byte(raw)) {
+			t.Fatalf("browser event leaked raw identifier %q: %s", raw, encoded)
+		}
+	}
+	for _, hash := range []string{event.ThreadIDHash, event.LineageRootIDHash, event.PromptCacheKeyHash, event.ResponseIDHash, event.RequestIDHash} {
+		if hash == "" {
+			t.Fatalf("browser event omitted required identifier hash: %#v", event)
+		}
+	}
+
+	now := time.Now().UTC()
+	a.state.RoutingCacheEvents = []routingCacheEvent{{Timestamp: now.Add(-routingCacheEventTTL - time.Minute)}}
+	for index := 0; index < routingCacheEventLimit+8; index++ {
+		a.state.RoutingCacheEvents = append(a.state.RoutingCacheEvents, routingCacheEvent{Timestamp: now.Add(time.Duration(index) * time.Millisecond), RequestIDHash: strconv.Itoa(index)})
+	}
+	if !a.pruneRoutingCacheEventsLocked(now) {
+		t.Fatal("routing cache event prune reported no change")
+	}
+	if len(a.state.RoutingCacheEvents) != routingCacheEventLimit || a.state.RoutingCacheEvents[0].RequestIDHash != "8" {
+		t.Fatalf("routing cache event bound = %d first=%#v", len(a.state.RoutingCacheEvents), a.state.RoutingCacheEvents[0])
+	}
+	views := a.routingCacheEventViewsLocked(now.Add(time.Minute))
+	if len(views) != routingCacheEventViewLimit {
+		t.Fatalf("browser routing cache view length = %d, want %d", len(views), routingCacheEventViewLimit)
+	}
+	if got := views[0]["requestIdHash"]; got != strconv.Itoa(routingCacheEventLimit+7) {
+		t.Fatalf("browser routing cache view is not newest-first: %#v", views[0])
 	}
 }
 

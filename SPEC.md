@@ -619,6 +619,27 @@ context_length_exceeded
 single transient timeout
 ```
 
+Every successful request must classify the final routing result as exactly one
+of:
+
+```text
+sticky_reuse
+new_route_assignment
+parent_affinity
+parent_affinity_fallback
+quota_failover
+rate_limit_failover
+auth_failover
+transport_failover
+repeated_5xx_failover
+```
+
+The first four describe selection without an upstream retry. A `*_failover`
+outcome identifies why the successful request moved away from the prior or
+failed account. Routing counters and request diagnostics must use these stable
+values so operators can distinguish healthy distribution from cache-breaking
+failover.
+
 ### 6.4 Failback behavior
 
 Do not automatically fail back existing sticky sessions when the original account cooldown expires.
@@ -1105,7 +1126,41 @@ A duplicate slot with a persisted auth/quota metadata error must not provide quo
 
 ## 10. Usage Statistics
 
-Prompt-cache aggregates must distinguish `main` and `subagent` traffic at account + model + agent-kind granularity. Store input tokens, cached tokens, request count, and cache-eligible cold starts for both kinds, plus parent-affinity hits, parent-affinity fallbacks, and lineage failovers. Dashboard lifetime and reset-window views must expose these values without retaining an unbounded per-request ledger.
+Prompt-cache aggregates must distinguish `main` and `subagent` traffic at
+account + model + agent-kind granularity. Store request count,
+usage-observed-request count, input tokens, cached tokens, cache-hit-request
+count, cache-eligible-request count, cold starts, cache-write tokens,
+cache-write input tokens, and cache-write-observed-request count for both
+kinds, plus parent-affinity hits, parent-affinity fallbacks, lineage failovers,
+and all routing failovers.
+
+Metric definitions:
+
+```text
+token read hit rate = cached tokens / input tokens
+request hit rate = cache-hit requests / usage-observed requests
+cache write rate = cache-write tokens / input tokens for write-observed requests
+cold eligible rate = cold requests / cache-eligible requests
+cache eligible = input tokens >= 1024
+```
+
+An absent upstream cache-write field is unavailable data, not a confirmed zero.
+The parser must accept nested and top-level compatible cache-read and
+cache-write field names and preserve an explicitly observed streaming write
+value if a later usage summary omits it.
+
+Dashboard lifetime and reset-window views must expose these values. For
+request-level diagnosis, persist a rolling list of successful routing/cache
+events bounded to 500 entries and 24 hours. Raw request, response, thread,
+lineage, sticky, and prompt-cache identifiers must be domain-separated hashes
+before persistence. Prompt/input content, tool arguments, credentials, email,
+and upstream account identities must never be stored in this event list. The
+authenticated management projection must omit local/upstream account IDs, use
+masked display labels plus opaque hashes, return newest first, and expose at
+most the newest 50 events. The unauthenticated public dashboard must not return
+this request-level event list because traffic timing, account selection, and
+failover correlation are management diagnostics. This bounded event list is
+operational correlation data, not a durable token ledger.
 
 ### 10.1 Usage stats object
 
@@ -1590,22 +1645,36 @@ Sections:
 
 1. Service status
 2. Account pool
-3. Account health/cooldowns
-4. Quota hints
-5. Sticky sessions in management mode
+3. Account health/cooldowns and quota hints
+4. Pool-wide cache reset window
+5. Recent routing/cache diagnostics in management mode
+6. Sticky sessions in management mode
 
 ### 16.2 Account table columns
 
 ```text
-Public label
-In Pool
+Account
 Status
-Plan
-Remaining Quota
-Last Success
-Last Error
+Quota
+Routing / Pool
+Main cache (requests)
+Subagent cache (requests)
+Affinity
+Failovers
+Last activity (management mode)
 Actions
 ```
+
+Main and subagent cache cells must show token read hit rate, request count,
+cached/input tokens, cache-write tokens or `—` when unavailable, and cold
+count. Affinity is the compact `hit/fallback` count. Failovers is the total
+successful routing-failover count.
+
+The management-only recent routing/cache table must show time, agent kind,
+masked account label, routing outcome, cache read, cache write, and input
+tokens. It may expose domain-separated identifier hashes in authenticated UI
+affordances, but never raw identifiers or account IDs. Public mode must neither
+render nor receive request-level routing/cache events.
 
 ### 16.3 Account actions
 
@@ -1805,6 +1874,9 @@ The implementation is acceptable when:
 21. Thread/lineage bindings are TTL-pruned and main/subagent cache and affinity metrics are observable.
 22. Unbound session keys distribute across equal-priority healthy accounts, while concurrent first requests for one key select the same account before persistence.
 23. Existing sticky sessions never move solely for balancing, and `sticky_failover` remains available as an immediate rollback mode.
+24. Cache observability distinguishes token-read hit rate, request-hit rate, cache-write availability/rate, and cold eligible rate; a missing write field is never treated as zero.
+25. Successful requests expose stable routing outcomes for assignment, sticky/parent reuse, and quota/rate-limit/auth/transport/repeated-5xx failover.
+26. Request-level routing/cache diagnostics are limited to 500 entries and 24 hours, persist only hashed operational identifiers, omit account IDs from authenticated browser responses, render only the newest 50 rows, and are absent from the unauthenticated public dashboard.
 
 ---
 
