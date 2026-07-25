@@ -12,7 +12,7 @@
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? "No activity" : date.toLocaleString();
   };
-  const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Out of pool", duplicate: "Duplicate", missing_auth: "Login needed" }[status] || "Unknown");
+  const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Out of pool", duplicate: "Duplicate", missing_auth: "Login needed", authenticating: "Signing in" }[status] || "Unknown");
   const activeBadge = (active) => active ? '<span class="badge active">Active</span>' : "";
   const cacheHitRate = (input, cached) => {
     const total = Number(input) || 0;
@@ -252,7 +252,7 @@
       ["Ready", summary.ready || 0, ""],
       ["Low quota", summary.low || 0, "low"],
       ["Errors", summary.error || 0, "error"],
-      ["Needs attention", summary.missing_auth || 0, "missing_auth"],
+      ["Needs attention", (summary.missing_auth || 0) + (summary.authenticating || 0), "missing_auth"],
     ];
     $("#summary-grid").innerHTML = items.map(([label, value, tone]) => `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${value}</span></div>`).join("");
   }
@@ -382,8 +382,8 @@
     return value ? value.replaceAll("_", " ") : "Codex sign-in";
   }
 
-  function actionButton(action, id, label, tone = "secondary") {
-    return `<button class="button ${tone}" type="button" data-account-action="${action}" data-account-id="${escapeHTML(id)}">${label}</button>`;
+  function actionButton(action, id, label, tone = "secondary", disabled = false) {
+    return `<button class="button ${tone}" type="button" data-account-action="${action}" data-account-id="${escapeHTML(id)}"${disabled ? " disabled" : ""}>${label}</button>`;
   }
 
   // Cache headers stay intentionally source-neutral; only the actionable Read
@@ -407,6 +407,7 @@
     $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity/Fallback")}</th><th>Last activity</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} configured`;
     const body = $("#accounts-body");
+    const activeLoginAccountId = accounts.find((account) => healthByID.get(account.id)?.loginJob)?.id || "";
     if (!accounts.length) {
       body.innerHTML = '<tr><td colspan="9"><div class="empty-state">No accounts configured</div></td></tr>';
       return;
@@ -419,7 +420,17 @@
       const routeCount = activeRoutes === 1 ? "1 active route" : `${activeRoutes} active routes`;
       const displayName = account.displayName || account.label || account.id || "Credential";
       const metadata = accountMetadataLine(account, false);
-      const actions = actionButton("delete", account.id, "Remove", "danger");
+      // Re-authentication must reuse the existing local slot. Removing and
+      // adding an account intentionally deletes its cache/affinity history, so
+      // the repair action stays beside Remove and calls the existing slot login
+      // endpoint instead of recreating credentials under a new id.
+      const signingIn = health.status === "authenticating";
+      const anotherAccountSigningIn = Boolean(activeLoginAccountId && activeLoginAccountId !== account.id);
+      const repairTone = health.status === "missing_auth" || health.status === "error" ? "primary" : "secondary";
+      const repair = account.authType === "codex_device_auth"
+        ? actionButton("login", account.id, signingIn ? "Signing in…" : anotherAccountSigningIn ? "Sign-in busy" : "Repair sign-in", repairTone, signingIn || anotherAccountSigningIn)
+        : "";
+      const actions = repair + actionButton("delete", account.id, "Remove", "danger");
       const cacheWindow = health.cacheWindow || {};
       const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
@@ -550,6 +561,7 @@
       const [stateResponse, accountsResponse, healthResponse, sessionsResponse] = await Promise.all([api("/state"), api("/accounts"), api("/accounts/health"), api("/sticky-sessions")]);
       const serviceState = stateResponse.state;
       const healthByID = new Map(healthResponse.accounts.map((item) => [item.accountId, item]));
+      const activeLoginJob = healthResponse.accounts.find((item) => item.loginJob)?.loginJob || null;
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
       renderSettings(serviceState);
       renderSummary(serviceState.summary || {});
@@ -557,6 +569,17 @@
       renderAccounts(state.data.accounts, healthByID);
       renderRoutingCacheEvents(serviceState.routingCacheEvents);
       renderSticky(state.data.sessions, state.data.accounts);
+      const addAccountButton = $("#add-account-button");
+      if (addAccountButton) addAccountButton.disabled = Boolean(activeLoginJob);
+      // Device-auth jobs are intentionally single-flight. Recover a live job
+      // after page reload so its verification URL/code is not orphaned.
+      if (activeLoginJob && !state.currentLoginJobId) {
+        state.currentLoginJobId = activeLoginJob.jobId;
+        if (activeLoginJob.status === "waiting_for_user" && (activeLoginJob.verificationUrl || activeLoginJob.userCode)) {
+          showDeviceAuth(activeLoginJob);
+        }
+        watchLoginJob(activeLoginJob.jobId);
+      }
       $("#service-status").textContent = serviceState.routingStrategy === "sticky_balanced" ? "Service online · balanced" : "Service online · failover";
     } catch (error) {
       if (!silent) notify(error.message, true);
@@ -591,6 +614,11 @@
       if (action === "delete") {
         if (!window.confirm(`Remove account ${id}?`)) return;
         await api(`/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
+      } else if (action === "login") {
+        if (!window.confirm("Repair sign-in for this slot? Sign in with the same upstream account to preserve its cache and affinity history.")) return;
+        await startDeviceAuth(id);
+        await refresh(true);
+        return;
       } else {
         await api(`/accounts/${encodeURIComponent(id)}/${action}`, { method: "POST" });
       }
@@ -659,8 +687,14 @@
         }
         if (job.status === "completed") {
           closeDeviceAuth(false);
-          notify("Sign-in completed");
-          refresh(true);
+          const completionMessage = job.historyReset
+            ? "Different or unverifiable account detected; cache and affinity history reset"
+            : job.reauthentication
+              ? "Sign-in repaired; cache and affinity history preserved"
+              : "Sign-in completed";
+          await refresh(true);
+          const serviceStatus = $("#service-status");
+          if (serviceStatus) serviceStatus.textContent = completionMessage;
           return;
         }
         if (job.status === "failed" || job.status === "cancelled") {

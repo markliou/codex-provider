@@ -81,8 +81,10 @@ const (
 )
 
 var (
-	errAccountAuthFailed = errors.New("account authentication failed")
-	errCodexAuthMissing  = errors.New("codex auth missing")
+	errAccountAuthFailed         = errors.New("account authentication failed")
+	errCodexAuthMissing          = errors.New("codex auth missing")
+	errAccountAuthRepairPending  = errors.New("sticky account sign-in repair is in progress")
+	errAnotherLoginJobInProgress = errors.New("another device-auth login is already in progress")
 )
 
 type config struct {
@@ -120,10 +122,20 @@ type account struct {
 	// out of the pool until login has produced usable auth and gateway state.
 	// Without this staging flag, empty slots can stall status/routing paths while
 	// they repeatedly classify missing auth under the global state lock.
-	PendingPoolActivation bool      `json:"pendingPoolActivation,omitempty"`
-	CreatedAt             time.Time `json:"createdAt"`
-	UpdatedAt             time.Time `json:"updatedAt"`
-	LastLoginAt           time.Time `json:"lastLoginAt,omitempty"`
+	PendingPoolActivation bool `json:"pendingPoolActivation,omitempty"`
+	// PendingAuthVerification is durable so a restart between auth.json rewrite
+	// and identity/sidecar finalization cannot make the slot routable. It is
+	// cleared only after the upstream account id has been checked and every
+	// required gateway/state write succeeds.
+	PendingAuthVerification bool `json:"pendingAuthVerification,omitempty"`
+	// PendingAuthExpectedAccountID freezes the last verified upstream identity
+	// before Codex rewrites credentials. Keep it until finalization succeeds:
+	// config.json and runtime.json are separate atomic files, so a partial save
+	// must not let a newly written account id inherit older runtime history.
+	PendingAuthExpectedAccountID string    `json:"pendingAuthExpectedAccountId,omitempty"`
+	CreatedAt                    time.Time `json:"createdAt"`
+	UpdatedAt                    time.Time `json:"updatedAt"`
+	LastLoginAt                  time.Time `json:"lastLoginAt,omitempty"`
 }
 
 type cooldown struct {
@@ -268,18 +280,20 @@ type accountHealth struct {
 }
 
 type loginJob struct {
-	ID              string    `json:"jobId"`
-	Type            string    `json:"type"`
-	Status          string    `json:"status"`
-	AccountID       string    `json:"accountId"`
-	VerificationURL string    `json:"verificationUrl,omitempty"`
-	UserCode        string    `json:"userCode,omitempty"`
-	CodeExpiresAt   time.Time `json:"codeExpiresAt,omitempty"`
-	Message         string    `json:"message,omitempty"`
-	Error           string    `json:"error,omitempty"`
-	StartedAt       time.Time `json:"startedAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
-	CompletedAt     time.Time `json:"completedAt,omitempty"`
+	ID               string    `json:"jobId"`
+	Type             string    `json:"type"`
+	Status           string    `json:"status"`
+	AccountID        string    `json:"accountId"`
+	Reauthentication bool      `json:"reauthentication,omitempty"`
+	HistoryReset     bool      `json:"historyReset,omitempty"`
+	VerificationURL  string    `json:"verificationUrl,omitempty"`
+	UserCode         string    `json:"userCode,omitempty"`
+	CodeExpiresAt    time.Time `json:"codeExpiresAt,omitempty"`
+	Message          string    `json:"message,omitempty"`
+	Error            string    `json:"error,omitempty"`
+	StartedAt        time.Time `json:"startedAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+	CompletedAt      time.Time `json:"completedAt,omitempty"`
 }
 
 type loginFailure struct {
@@ -1031,6 +1045,10 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	for attempt := 0; attempt < a.proxyAttemptLimit(); attempt++ {
 		candidate, err := a.selectAccountForRoute(route, model, excluded)
 		if err != nil {
+			if errors.Is(err, errAccountAuthRepairPending) {
+				writeOpenAIError(w, http.StatusServiceUnavailable, "account_authenticating", "the session account is completing sign-in repair; retry shortly")
+				return
+			}
 			if len(excluded) > 0 {
 				// At least one upstream was already selected and failed. Reporting
 				// this as "no eligible account" makes a transient upstream failure
@@ -1734,6 +1752,10 @@ func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) 
 		if !a.publicAccountRefMatchesLocked(item.ID, ref) {
 			continue
 		}
+		if item.PendingAuthVerification || a.accountLoginInProgressLocked(item.ID) {
+			writeOpenAIError(w, http.StatusConflict, "account_authenticating", "complete sign-in repair before changing pool participation")
+			return
+		}
 		switch action {
 		case "pool-add":
 			item.Enabled = true
@@ -1785,6 +1807,11 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		input.PlanType = ""
 		input.PlanLimit = ""
 		input.PlanRank = 0
+		// Verification markers are internal lifecycle state, never client input.
+		// Accepting them here could create a permanently blocked slot or inject an
+		// identity comparison baseline that never came from a verified login.
+		input.PendingAuthVerification = false
+		input.PendingAuthExpectedAccountID = ""
 	} else {
 		input.PlanType = normalizePlanType(input.PlanType)
 		input.PlanLimit = cleanPlanLimit(input.PlanLimit)
@@ -1975,13 +2002,28 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer a.mu.Unlock()
+	if item.PendingAuthVerification {
+		switch action {
+		case "enable", "disable", "pool-add", "pool-remove":
+			writeOpenAIError(w, http.StatusConflict, "account_authenticating", "complete sign-in repair before changing pool participation")
+			return
+		}
+	}
 	switch action {
 	case "login":
 		if !isCodexDeviceAuth(*item) {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "device auth login is only available for Codex accounts")
 			return
 		}
-		job := a.startLoginJobLocked(*item)
+		job, err := a.startLoginJobLocked(*item)
+		if err != nil {
+			if errors.Is(err, errAnotherLoginJobInProgress) {
+				writeOpenAIError(w, http.StatusConflict, "login_in_progress", err.Error())
+				return
+			}
+			writeOpenAIError(w, http.StatusInternalServerError, "storage_error", "unable to persist sign-in repair state")
+			return
+		}
 		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "job": job})
 		return
 	case "enable":
@@ -2044,13 +2086,7 @@ func (a *app) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			a.config.Accounts = append(a.config.Accounts[:i], a.config.Accounts[i+1:]...)
-			delete(a.state.Cooldowns, id)
-			delete(a.state.Health, id)
-			delete(a.state.Quotas, id)
-			deletePromptCacheForAccount(a.state.PromptCache, id)
-			deletePromptCacheForAccount(a.state.PromptCacheBaseline, id)
-			delete(a.state.PromptCacheResetAtByAccount, id)
-			a.clearStickyForAccountLocked(id)
+			a.clearAccountIdentityScopedStateLocked(id)
 			if err := a.saveLocked(); err != nil {
 				writeOpenAIError(w, 500, "storage_error", "unable to persist account")
 				return
@@ -2255,6 +2291,11 @@ func (a *app) selectAccountWithPreference(stickyKey, model, preferredParentAccou
 				}
 			}
 			return *item, nil
+		} else if item != nil && a.accountAuthVerificationPendingLocked(*item) {
+			// Do not turn a short credential repair into a cold failover for a
+			// live session. Preserve the binding and ask the client to retry;
+			// unbound sessions may still use another healthy account.
+			return account{}, errAccountAuthRepairPending
 		} else if item == nil {
 			delete(a.state.StickySessions, stickyKey)
 			stickyChanged = true
@@ -2571,6 +2612,9 @@ func quotaErrorBlocksRouting(info *quotaErrorInfo) bool {
 }
 
 func (a *app) hasUsableAuthLocked(item account) bool {
+	if a.accountAuthVerificationPendingLocked(item) {
+		return false
+	}
 	if isCodexDeviceAuth(item) {
 		_, err := a.codexAuth(item)
 		return err == nil
@@ -2626,6 +2670,13 @@ func (a *app) proxyAttemptLimit() int {
 
 func (a *app) usableLocked(item account, model string, now time.Time) bool {
 	if !item.Enabled || !item.InPool || !allowedModel(item, model) {
+		return false
+	}
+	// Re-authentication rewrites auth.json and the sidecar credential in place.
+	// Keep the slot out of selection for the whole login job without disabling
+	// it: disable/pool-remove clears sticky routes, which would throw away the KV
+	// cache locality this repair flow exists to preserve.
+	if a.accountAuthVerificationPendingLocked(item) {
 		return false
 	}
 	if primaryID := a.primaryUpstreamAccountIDLocked(item, model, now); primaryID != "" && primaryID != item.ID {
@@ -3090,6 +3141,16 @@ func deletePromptCacheForAccount(values map[string]promptCacheStat, accountID st
 	}
 }
 
+func (a *app) clearAccountIdentityScopedStateLocked(accountID string) {
+	delete(a.state.Health, accountID)
+	delete(a.state.Cooldowns, accountID)
+	delete(a.state.Quotas, accountID)
+	deletePromptCacheForAccount(a.state.PromptCache, accountID)
+	deletePromptCacheForAccount(a.state.PromptCacheBaseline, accountID)
+	delete(a.state.PromptCacheResetAtByAccount, accountID)
+	a.clearStickyForAccountLocked(accountID)
+}
+
 func (a *app) clearAccountRuntimeStateLocked(accountID string) {
 	if a.state.Health != nil {
 		health := a.state.Health[accountID]
@@ -3267,6 +3328,20 @@ func (a *app) saveLocked() error {
 		return err
 	}
 	return writeJSONAtomic(filepath.Join(a.dataDir, "state", "runtime.json"), a.state)
+}
+
+func (a *app) saveCompletedAuthVerificationLocked() error {
+	now := time.Now().UTC()
+	a.config.UpdatedAt = now
+	a.state.UpdatedAt = now
+	// Finalization intentionally reverses saveLocked's normal order. Runtime
+	// identity/history changes must reach disk before config.json clears the
+	// durable routing gate; otherwise a config-only partial write could release
+	// a new identity alongside stale cache and affinity state after restart.
+	if err := writeJSONAtomic(filepath.Join(a.dataDir, "state", "runtime.json"), a.state); err != nil {
+		return err
+	}
+	return writeJSONAtomic(filepath.Join(a.dataDir, "config.json"), a.config)
 }
 
 func loadAPIKeys() ([][]byte, error) {
@@ -5090,7 +5165,7 @@ func claimString(claims map[string]any, name string) string {
 	return ""
 }
 
-func (a *app) startLoginJobLocked(item account) loginJob {
+func (a *app) startLoginJobLocked(item account) (loginJob, error) {
 	if a.jobs == nil {
 		a.jobs = map[string]*loginJob{}
 	}
@@ -5098,34 +5173,73 @@ func (a *app) startLoginJobLocked(item account) loginJob {
 		a.loginCancels = map[string]context.CancelFunc{}
 	}
 	for _, job := range a.jobs {
-		if job.AccountID != item.ID {
+		if !loginJobActiveStatus(job.Status) {
 			continue
 		}
-		switch job.Status {
-		case "running", "waiting_for_user", "finalizing":
-			return *job
+		if job.AccountID == item.ID {
+			slot := a.accountLocked(item.ID)
+			if slot != nil && !slot.PendingAuthVerification {
+				slot.PendingAuthVerification = true
+				slot.PendingAuthExpectedAccountID = strings.TrimSpace(slot.AccountID)
+				slot.UpdatedAt = time.Now().UTC()
+				if err := a.saveLocked(); err != nil {
+					// The config write may have succeeded even when the
+					// runtime write failed. Stay blocked in memory too; the
+					// active CLI may already be rewriting auth.json.
+					return loginJob{}, fmt.Errorf("persist pending auth verification: %w", err)
+				}
+			}
+			return *job, nil
 		}
+		return loginJob{}, errAnotherLoginJobInProgress
 	}
 	home := a.accountCodexHome(item.ID)
 	jobID := fmt.Sprintf("job-login-%s-%d-%s", item.ID, time.Now().Unix(), randomID())
-	ctx, cancel := context.WithCancel(context.Background())
 	now := time.Now().UTC()
+	expectedUpstreamAccountID := strings.TrimSpace(item.AccountID)
+	if item.PendingAuthVerification {
+		// Retrying after a failed job or restart must compare against the identity
+		// captured before the first credential rewrite, not metadata that may
+		// have been partially saved by that unfinished attempt.
+		expectedUpstreamAccountID = strings.TrimSpace(item.PendingAuthExpectedAccountID)
+	}
+	reauthentication := a.accountHasPriorIdentityLocked(item)
+	slot := a.accountLocked(item.ID)
+	if slot == nil {
+		return loginJob{}, errors.New("account no longer exists")
+	}
+	if !slot.PendingAuthVerification {
+		slot.PendingAuthVerification = true
+		slot.PendingAuthExpectedAccountID = expectedUpstreamAccountID
+	}
+	slot.UpdatedAt = now
+	if err := a.saveLocked(); err != nil {
+		// Do not roll the gate back in memory: saveLocked may already have
+		// committed config.json before runtime.json failed.
+		return loginJob{}, fmt.Errorf("persist pending auth verification: %w", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	job := &loginJob{
-		ID:        jobID,
-		Type:      "account_login",
-		Status:    "running",
-		AccountID: item.ID,
-		Message:   "Starting Codex device auth login",
-		StartedAt: now,
-		UpdatedAt: now,
+		ID:               jobID,
+		Type:             "account_login",
+		Status:           "running",
+		AccountID:        item.ID,
+		Reauthentication: reauthentication,
+		Message:          "Starting Codex device auth login",
+		StartedAt:        now,
+		UpdatedAt:        now,
 	}
 	a.jobs[jobID] = job
 	a.loginCancels[jobID] = cancel
-	go a.runLoginJob(ctx, jobID, item.ID, home)
-	return *job
+	// The upstream account id is durable metadata from the prior successful
+	// login. Carry it across the asynchronous job so completion can distinguish
+	// same-account credential repair from replacing the slot with another
+	// upstream identity.
+	go a.runLoginJob(ctx, jobID, item.ID, home, expectedUpstreamAccountID, reauthentication)
+	return *job, nil
 }
 
-func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome string) {
+func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome, expectedUpstreamAccountID string, reauthentication bool) {
 	if err := os.MkdirAll(codexHome, 0o700); err != nil {
 		a.finishLoginJob(jobID, "failed", "", "", fmt.Sprintf("create CODEX_HOME: %v", err))
 		return
@@ -5188,7 +5302,7 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome strin
 	text := output.String()
 	outputMu.Unlock()
 	verificationURL, userCode := parseDeviceAuthPrompt(text)
-	if ctx.Err() != nil || a.loginJobStatus(jobID) == "cancelled" {
+	if ctx.Err() != nil || a.loginJobCancellationRequested(jobID) {
 		a.finishLoginJob(jobID, "cancelled", verificationURL, userCode, "Codex device auth login cancelled")
 		return
 	}
@@ -5203,10 +5317,12 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome strin
 	refreshQuotaAccountID := ""
 	continueLogin := false
 	activateAfterFinalize := false
+	historyReset := false
+	finalizeError := ""
 	sidecarAccount := account{}
 	syncSidecar := false
 	a.mu.Lock()
-	if job := a.jobs[jobID]; job != nil && job.Status != "cancelled" {
+	if job := a.jobs[jobID]; job != nil && !loginJobCancellationRequestedStatus(job.Status) {
 		now := time.Now().UTC()
 		job.Status = "finalizing"
 		job.Message = "Refreshing account quota"
@@ -5218,37 +5334,35 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome strin
 		if item := a.accountLocked(accountID); item != nil {
 			if auth, err := a.codexAuth(*item); err == nil {
 				activateAfterFinalize = item.PendingPoolActivation
-				if auth.Email != "" {
-					item.Email = auth.Email
+				historyReset = a.applyCompletedDeviceAuthLocked(item, auth, expectedUpstreamAccountID, reauthentication, now)
+				job.HistoryReset = historyReset
+				if err := a.saveLocked(); err != nil {
+					finalizeError = "Unable to persist authenticated account state"
+				} else {
+					refreshQuotaAccountID = accountID
+					if a.usesCliproxySidecar(*item) {
+						sidecarAccount = *item
+						syncSidecar = true
+					}
 				}
-				if auth.AccountID != "" {
-					item.AccountID = auth.AccountID
-				}
-				if auth.OrganizationName != "" {
-					item.OrganizationName = cleanOrganizationName(auth.OrganizationName)
-				}
-				if auth.PlanType != "" {
-					item.PlanType = normalizePlanType(auth.PlanType)
-					item.PlanRank = planRank(item.PlanType)
-				}
-				if auth.PlanLimit != "" {
-					item.PlanLimit = cleanPlanLimit(auth.PlanLimit)
-				}
-				a.clearAccountRuntimeStateLocked(accountID)
-				item.Label = accountDisplayName(*item)
-				item.LastLoginAt = time.Now().UTC()
-				item.UpdatedAt = item.LastLoginAt
-				_ = a.saveLocked()
-				refreshQuotaAccountID = accountID
-				if a.usesCliproxySidecar(*item) {
-					sidecarAccount = *item
-					syncSidecar = true
-				}
+			} else {
+				// A successful CLI exit is not enough to inherit identity-scoped
+				// state. If the resulting credential cannot be read and its
+				// upstream account id cannot be verified, fail closed instead
+				// of reporting that history was preserved.
+				finalizeError = "Unable to verify the authenticated account"
 			}
 		}
 	}
 	a.mu.Unlock()
-	if !continueLogin || a.loginJobStatus(jobID) == "cancelled" {
+	if finalizeError != "" {
+		a.finishLoginJob(jobID, "failed", verificationURL, userCode, finalizeError)
+		return
+	}
+	if !continueLogin || a.loginJobCancellationRequested(jobID) {
+		if a.loginJobCancellationRequested(jobID) {
+			a.finishLoginJob(jobID, "cancelled", verificationURL, userCode, "Codex device auth login cancelled")
+		}
 		return
 	}
 	if syncSidecar {
@@ -5262,28 +5376,179 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome strin
 			a.logger.Printf("quota refresh after login skipped for %s: %s", refreshQuotaAccountID, err)
 		}
 	}
-	if ctx.Err() != nil || a.loginJobStatus(jobID) == "cancelled" {
+	if ctx.Err() != nil || a.loginJobCancellationRequested(jobID) {
 		a.finishLoginJob(jobID, "cancelled", verificationURL, userCode, "Codex device auth login cancelled")
 		return
 	}
-	if activateAfterFinalize {
-		a.activatePendingDeviceAuthAccount(accountID)
-	}
-	a.finishLoginJob(jobID, "completed", verificationURL, userCode, "Codex device auth login completed")
-}
-
-func (a *app) activatePendingDeviceAuthAccount(accountID string) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	item := a.accountLocked(accountID)
-	if item == nil || !item.PendingPoolActivation {
+	if item == nil {
+		finalizeError = "Account no longer exists"
+	} else {
+		// Quota/subscription metadata can resolve a more specific workspace id
+		// than auth.json. Re-check the final durable identity before releasing
+		// the routing gate so that later metadata enrichment cannot smuggle old
+		// affinity/history across an account boundary.
+		finalIdentityReset := reauthenticationChangedUpstreamIdentity(codexAuthInfo{AccountID: item.AccountID}, expectedUpstreamAccountID, reauthentication)
+		if finalIdentityReset && !historyReset {
+			a.clearAccountIdentityScopedStateLocked(accountID)
+			historyReset = true
+			if job := a.jobs[jobID]; job != nil {
+				job.HistoryReset = true
+			}
+		}
+		item.PendingAuthVerification = false
+		item.PendingAuthExpectedAccountID = ""
+		if activateAfterFinalize {
+			item.Enabled = true
+			item.InPool = true
+			item.PendingPoolActivation = false
+		}
+		item.UpdatedAt = time.Now().UTC()
+		if err := a.saveCompletedAuthVerificationLocked(); err != nil {
+			// Keep the in-memory routing gate aligned with the durable pending
+			// marker written at job start. A storage failure must not release a
+			// credential whose identity transition was not persisted.
+			item.PendingAuthVerification = true
+			item.PendingAuthExpectedAccountID = expectedUpstreamAccountID
+			finalizeError = "Unable to persist completed sign-in repair"
+		}
+	}
+	a.mu.Unlock()
+	if finalizeError != "" {
+		a.finishLoginJob(jobID, "failed", verificationURL, userCode, finalizeError)
 		return
 	}
-	item.Enabled = true
-	item.InPool = true
-	item.PendingPoolActivation = false
-	item.UpdatedAt = time.Now().UTC()
-	_ = a.saveLocked()
+	message := "Codex device auth login completed"
+	if historyReset {
+		message = "Codex device auth login completed; account identity changed and cache/affinity history was reset"
+	}
+	a.finishLoginJob(jobID, "completed", verificationURL, userCode, message)
+}
+
+func accountHasPriorIdentity(item account) bool {
+	return strings.TrimSpace(item.AccountID) != "" ||
+		normalizeEmail(item.Email) != "" ||
+		cleanOrganizationName(item.OrganizationName) != "" ||
+		!item.LastLoginAt.IsZero()
+}
+
+func (a *app) accountHasPriorIdentityLocked(item account) bool {
+	if accountHasPriorIdentity(item) {
+		return true
+	}
+	for _, values := range []map[string]promptCacheStat{a.state.PromptCache, a.state.PromptCacheBaseline} {
+		for _, stat := range values {
+			if stat.AccountID == item.ID {
+				return true
+			}
+		}
+	}
+	for _, binding := range a.state.StickySessions {
+		if binding.AccountID == item.ID {
+			return true
+		}
+	}
+	for _, binding := range a.state.ResponseBindings {
+		if binding.AccountID == item.ID {
+			return true
+		}
+	}
+	for _, binding := range a.state.ThreadBindings {
+		if binding.AccountID == item.ID {
+			return true
+		}
+	}
+	for _, event := range a.state.RoutingCacheEvents {
+		if event.AccountID == item.ID || event.FailoverFromAccountID == item.ID {
+			return true
+		}
+	}
+	return false
+}
+
+func reauthenticationChangedUpstreamIdentity(auth codexAuthInfo, expectedUpstreamAccountID string, reauthentication bool) bool {
+	if !reauthentication {
+		return false
+	}
+	previousAccountID := strings.TrimSpace(expectedUpstreamAccountID)
+	currentAccountID := strings.TrimSpace(auth.AccountID)
+	// A repair may inherit identity-scoped metrics and routes only when the
+	// durable upstream account id is reproduced exactly. Email and display
+	// organization are intentionally not fallback identity keys: one user can
+	// access multiple ChatGPT workspaces, so an unverifiable legacy slot must
+	// reset once rather than risk crossing an account boundary.
+	return previousAccountID == "" || currentAccountID == "" || currentAccountID != previousAccountID
+}
+
+func (a *app) applyCompletedDeviceAuthLocked(item *account, auth codexAuthInfo, expectedUpstreamAccountID string, reauthentication bool, now time.Time) bool {
+	historyReset := reauthenticationChangedUpstreamIdentity(auth, expectedUpstreamAccountID, reauthentication)
+	if historyReset {
+		// Metrics and route bindings belong to an upstream identity, not merely
+		// to the reusable local credential directory. A different (or
+		// unverifiable) account must start clean or the dashboard would
+		// attribute the old account's cache/affinity history to the new one and
+		// old threads could be sent across an account boundary.
+		a.clearAccountIdentityScopedStateLocked(item.ID)
+		item.Email = normalizeEmail(auth.Email)
+		item.AccountID = strings.TrimSpace(auth.AccountID)
+		item.OrganizationName = cleanOrganizationName(auth.OrganizationName)
+		item.PlanType = normalizePlanType(auth.PlanType)
+		item.PlanLimit = cleanPlanLimit(auth.PlanLimit)
+		item.PlanRank = planRank(item.PlanType)
+	} else {
+		if auth.Email != "" {
+			item.Email = normalizeEmail(auth.Email)
+		}
+		if auth.AccountID != "" {
+			item.AccountID = strings.TrimSpace(auth.AccountID)
+		}
+		if auth.OrganizationName != "" {
+			item.OrganizationName = cleanOrganizationName(auth.OrganizationName)
+		}
+		if auth.PlanType != "" {
+			item.PlanType = normalizePlanType(auth.PlanType)
+			item.PlanRank = planRank(item.PlanType)
+		}
+		if auth.PlanLimit != "" {
+			item.PlanLimit = cleanPlanLimit(auth.PlanLimit)
+		}
+	}
+	a.clearAccountRuntimeStateLocked(item.ID)
+	item.Label = accountDisplayName(*item)
+	item.LastLoginAt = now
+	item.UpdatedAt = now
+	return historyReset
+}
+
+func (a *app) accountLoginInProgressLocked(accountID string) bool {
+	return a.activeLoginJobForAccountLocked(accountID) != nil
+}
+
+func loginJobActiveStatus(status string) bool {
+	switch status {
+	case "running", "waiting_for_user", "finalizing", "cancelling":
+		return true
+	default:
+		return false
+	}
+}
+
+func loginJobCancellationRequestedStatus(status string) bool {
+	return status == "cancelling" || status == "cancelled"
+}
+
+func (a *app) activeLoginJobForAccountLocked(accountID string) *loginJob {
+	for _, job := range a.jobs {
+		if job.AccountID == accountID && loginJobActiveStatus(job.Status) {
+			return job
+		}
+	}
+	return nil
+}
+
+func (a *app) accountAuthVerificationPendingLocked(item account) bool {
+	return item.PendingAuthVerification || a.accountLoginInProgressLocked(item.ID)
 }
 
 func (a *app) loginJobStatus(jobID string) string {
@@ -5295,6 +5560,10 @@ func (a *app) loginJobStatus(jobID string) string {
 	return ""
 }
 
+func (a *app) loginJobCancellationRequested(jobID string) bool {
+	return loginJobCancellationRequestedStatus(a.loginJobStatus(jobID))
+}
+
 func (a *app) cancelLoginJob(jobID string) (context.CancelFunc, loginJob, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -5303,14 +5572,16 @@ func (a *app) cancelLoginJob(jobID string) (context.CancelFunc, loginJob, error)
 		return nil, loginJob{}, errors.New("job not found")
 	}
 	switch job.Status {
-	case "completed", "failed", "cancelled":
+	case "completed", "failed", "cancelled", "cancelling":
 		return nil, *job, nil
 	}
 	now := time.Now().UTC()
-	job.Status = "cancelled"
-	job.Message = "Codex device auth login cancelled"
+	// Keep cancellation active until CommandContext confirms the process has
+	// exited. Marking the job terminal here would let a second Codex login start
+	// while the first process is still tearing down, violating single-flight.
+	job.Status = "cancelling"
+	job.Message = "Cancelling Codex device auth login"
 	job.Error = ""
-	job.CompletedAt = now
 	job.UpdatedAt = now
 	cancel := a.loginCancels[jobID]
 	delete(a.loginCancels, jobID)
@@ -5323,14 +5594,12 @@ func (a *app) cancelLoginJobsForAccountLocked(accountID string) {
 		if job.AccountID != accountID {
 			continue
 		}
-		switch job.Status {
-		case "completed", "failed", "cancelled":
+		if !loginJobActiveStatus(job.Status) {
 			continue
 		}
-		job.Status = "cancelled"
-		job.Message = "Codex device auth login cancelled because the account was removed"
+		job.Status = "cancelling"
+		job.Message = "Cancelling Codex device auth login because the account was removed"
 		job.Error = ""
-		job.CompletedAt = now
 		job.UpdatedAt = now
 		if cancel := a.loginCancels[jobID]; cancel != nil {
 			cancel()
@@ -5346,7 +5615,7 @@ func (a *app) updateLoginJob(jobID, status, verificationURL, userCode, message s
 	if job == nil {
 		return
 	}
-	if job.Status == "cancelled" || job.Status == "completed" || job.Status == "failed" {
+	if loginJobCancellationRequestedStatus(job.Status) || job.Status == "completed" || job.Status == "failed" {
 		return
 	}
 	now := time.Now().UTC()
@@ -5371,7 +5640,7 @@ func (a *app) finishLoginJob(jobID, status, verificationURL, userCode, message s
 	if job == nil {
 		return
 	}
-	if job.Status == "cancelled" && status != "cancelled" {
+	if loginJobCancellationRequestedStatus(job.Status) && status != "cancelled" {
 		return
 	}
 	now := time.Now().UTC()
@@ -5480,7 +5749,7 @@ func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 	return result
 }
 func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
-	summary := map[string]int{"total": len(a.config.Accounts), "ready": 0, "low": 0, "cooldown": 0, "error": 0, "missing_auth": 0, "duplicate": 0}
+	summary := map[string]int{"total": len(a.config.Accounts), "ready": 0, "low": 0, "cooldown": 0, "error": 0, "missing_auth": 0, "authenticating": 0, "duplicate": 0}
 	for _, item := range a.config.Accounts {
 		status, _ := a.accountStatusLocked(item, now)
 		if _, ok := summary[status]; ok {
@@ -5719,7 +5988,13 @@ func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]an
 	health := a.state.Health[item.ID]
 	quota := a.state.Quotas[item.ID]
 	cacheInput, cacheCached, cacheRequests := a.promptCacheStatsForAccountLocked(item.ID)
-	return map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "activeRouteCount": a.activeRouteCountLocked(item.ID, now), "cacheInputTokens": cacheInput, "cacheCachedTokens": cacheCached, "cacheRequestCount": cacheRequests, "cacheWindow": a.promptCacheWindowForAccountLocked(item.ID), "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
+	result := map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "activeRouteCount": a.activeRouteCountLocked(item.ID, now), "cacheInputTokens": cacheInput, "cacheCachedTokens": cacheCached, "cacheRequestCount": cacheRequests, "cacheWindow": a.promptCacheWindowForAccountLocked(item.ID), "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
+	if job := a.activeLoginJobForAccountLocked(item.ID); job != nil {
+		// This endpoint is management-only. Returning the active job lets a page
+		// reload recover the device URL/code instead of orphaning a live login.
+		result["loginJob"] = *job
+	}
+	return result
 }
 
 func (a *app) activeRouteCountLocked(accountID string, now time.Time) int {
@@ -5773,6 +6048,12 @@ func (a *app) currentAccountStatusLocked(item account, index int, now time.Time)
 }
 
 func (a *app) accountStatusLocked(item account, now time.Time) (string, string) {
+	if a.accountLoginInProgressLocked(item.ID) {
+		return "authenticating", "Sign-in repair is in progress"
+	}
+	if item.PendingAuthVerification {
+		return "missing_auth", "Sign-in repair must be completed before routing resumes"
+	}
 	if !item.Enabled {
 		return "disabled", "Account is disabled"
 	}
@@ -5902,6 +6183,9 @@ func publicDashboardStatus(status string) (string, string) {
 }
 
 func publicPoolLabel(item account) string {
+	if item.PendingAuthVerification {
+		return "Verification pending"
+	}
 	if !item.Enabled {
 		return "Unavailable"
 	}
@@ -5912,6 +6196,9 @@ func publicPoolLabel(item account) string {
 }
 
 func publicPoolAction(item account) string {
+	if item.PendingAuthVerification {
+		return ""
+	}
 	if item.InPool {
 		return "pool-remove"
 	}
@@ -5919,6 +6206,9 @@ func publicPoolAction(item account) string {
 }
 
 func publicPoolActionLabel(item account) string {
+	if item.PendingAuthVerification {
+		return ""
+	}
 	if item.InPool {
 		return "Leave pool"
 	}

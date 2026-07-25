@@ -773,6 +773,39 @@ Behavior:
 2. Use device-auth flow.
 3. Create a login job.
 4. Return job ID immediately.
+5. While the job is running, mark the slot `authenticating` and exclude it
+   from new request selection without disabling it, removing it from the pool,
+   or deleting its sticky, response, or thread bindings.
+   - Persist this verification gate before starting Codex. A restart, failed
+     finalization, or cancellation must leave the slot non-routable and
+     retryable as `missing_auth` until a later repair completes.
+   - Existing sticky requests for that slot return retryable HTTP `503` with
+     code `account_authenticating`; they must not cold-fail over and rewrite
+     the binding. Unbound work may continue on other eligible accounts.
+   - Pool participation changes are rejected while the gate is set.
+6. For an existing slot, compare the newly authenticated upstream account ID
+   with the durable ID from the previous successful login:
+   - freeze that previous ID when the routing gate is created and retain it
+     across retries, restarts, and partial config/runtime saves;
+   - exact match: preserve prompt-cache counters/baselines, cache/affinity
+     history, sticky/thread/response bindings, and routing diagnostics;
+   - different or missing ID: purge all identity-scoped history and bindings
+     before the slot becomes routable again.
+   - persist runtime identity/history changes before clearing the gate in
+     config, so a partial final save stays blocked rather than releasing stale
+     history under a new identity.
+7. Email and organization display names must never substitute for the upstream
+   account ID during this check. One user can access multiple ChatGPT
+   workspaces, so a legacy slot without a verifiable prior upstream ID resets
+   once on repair rather than inheriting history across an account boundary.
+8. Device-auth execution is process-wide single-flight. The management health
+   response exposes the active job so an admin-page reload can recover its
+   verification URL/code instead of orphaning a live login.
+
+This preserves Pool's local cache/affinity observations and route continuity;
+it does not copy or directly write upstream KV cache contents. Continued
+upstream cache reuse still depends on the same prompt-cache key/prefix and on
+the upstream cache remaining alive.
 
 Response:
 
@@ -1718,7 +1751,7 @@ Management mode:
 
 ```text
 Add account
-Login / Re-login
+Repair sign-in in the same credential slot
 Delete account and purge credentials
 Clear sticky session
 ```
@@ -1900,6 +1933,13 @@ The implementation is acceptable when:
 24. Cache observability distinguishes token-read hit rate, request-hit rate, cache-write availability/rate, and cold eligible rate; a missing write field is never treated as zero.
 25. Successful requests expose stable routing outcomes for assignment, sticky/parent reuse, and quota/rate-limit/auth/transport/repeated-5xx failover.
 26. Request-level routing/cache diagnostics are limited to 500 entries and 24 hours, persist only hashed operational identifiers, omit account IDs from authenticated browser responses, render only the newest 50 rows, and are absent from the unauthenticated public dashboard.
+27. Same-slot sign-in repair pauses routing without deleting affinity; an exact
+    upstream account-ID match preserves cache/affinity history and bindings,
+    while a changed or unverifiable identity purges them before reuse.
+28. The repair routing gate survives restart and every failed/cancelled
+    finalization; sticky traffic receives a retryable 503, active device-auth is
+    globally single-flight and recoverable after UI reload, and pool membership
+    cannot change until verification completes.
 
 ---
 
@@ -1915,3 +1955,5 @@ The implementation is acceptable when:
 8. Keep account credentials isolated by `CODEX_HOME` directory.
 9. Use per-account locks when refreshing credentials.
 10. Never print raw upstream error bodies if they may contain secrets.
+11. Never preserve identity-scoped history after sign-in repair unless the
+    durable upstream account ID matches exactly.

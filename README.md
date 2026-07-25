@@ -66,6 +66,29 @@ CODEX_HOME=/data/accounts/<account-id>/.codex
 
 The admin page shows the verification URL and user code. After you complete the browser login, Codex stores `auth.json` under the account's `/data/accounts/<account-id>/.codex` directory. Those credentials never belong in the Git repository or Docker image. Pool treats each completed device-auth credential as its own slot even when two slots report the same email address. Email, subscription tier, and organization fields are descriptive metadata only; they may be shown in the dashboard for recognition, but they are not used as local credential keys, routing keys, or storage paths.
 
+If a credential expires, use **Repair sign-in** on that existing row instead of
+removing and adding the account. Pool temporarily pauses new routing to the
+slot while Codex rewrites its credential, but keeps the slot and its existing
+route bindings intact. When the new credential reports the exact same upstream
+account ID, Pool preserves that slot's cache/affinity counters, reset baseline,
+sticky/thread/response bindings, and routing history. A different or missing
+upstream ID resets those identity-scoped values before the slot is used again;
+email and workspace display names are not trusted as identity substitutes.
+This can preserve the conditions for an upstream KV-cache hit, but Pool cannot
+copy or directly write the upstream KV cache.
+
+The repair marker is persisted before Codex starts rewriting credentials. An
+unfinished, failed, or cancelled repair therefore remains out of routing after
+a service restart until the operator retries and completes it successfully.
+Pool also freezes the previously verified upstream account ID for the whole
+repair, so a partial write between `config.json` and runtime state cannot make
+old history appear to belong to newly written credentials.
+Requests already bound to that slot receive retryable HTTP `503` with code
+`account_authenticating` instead of silently failing over and losing affinity.
+Only one device-auth job runs at a time; reloading the admin page recovers its
+verification URL/code, and pool participation cannot be changed while repair
+is pending.
+
 ### Bundled CLIProxy Sidecar
 
 Codex device-auth inference is relayed through the pinned CLIProxyAPI binary bundled in the same container. It listens only on `127.0.0.1:8319`; it is not published with Docker and does not add an admin page or public endpoint. `codex-pool` remains the only public API and UI service.
@@ -159,7 +182,11 @@ Do not forward the admin port directly from the Internet: the admin service does
 
 `GET /` on the admin port and `GET /admin` open the control page. Unauthenticated public pool status and join/leave controls are enabled by default; set `CODEX_POOL_PUBLIC_DASHBOARD=false` only when the public control page should be hidden. The public JSON uses an opaque per-process account reference for this toggle and returns only a partially masked email for account recognition. It never returns full email addresses, account IDs, upstream URLs, API keys, sticky sessions, traffic details, quota error codes, or upstream error bodies.
 
-Authenticate with the admin password to add accounts, remove accounts, restart device auth, and inspect or clear sticky sessions. Public and management modes use the same admin port `8318`; no additional port is required. The dashboard auto-refreshes every five minutes; use `Refresh` for an immediate status read.
+Authenticate with the admin password to add accounts, remove accounts, repair
+device auth in the same slot, and inspect or clear sticky sessions. Public and
+management modes use the same admin port `8318`; no additional port is
+required. The dashboard auto-refreshes every five minutes; use `Refresh` for
+an immediate status read.
 
 ## Codex CLI
 
@@ -188,7 +215,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - Thread-aware sticky balancing and failover with idle TTL, soft parent-account affinity, independent prompt-cache-key policy, per-model cooldowns, optional Pro-quota preservation, response-id continuation binding, and JSON persistence in `/data`. New sessions distribute across equal-priority healthy accounts; when an upstream account returns `429` or repeated server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
 - Main/subagent cache-read, cache-write, request-hit, cold-start, affinity, and failover observability, plus a bounded and redacted 24-hour request correlation panel.
 - Bundled, loopback-only CLIProxyAPI sidecar for Codex device-auth requests. Pool pins each request to the selected account through a sidecar model prefix, while the sidecar owns OAuth refreshes.
-- Public pool participation toggles on `/admin`, plus authenticated owner controls for add/remove account, device-auth login jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Duplicate`, `Disabled`, or `Standby`.
+- Public pool participation toggles on `/admin`, plus authenticated owner controls for add/remove account, same-slot device-auth repair jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Signing in`, `Duplicate`, `Disabled`, or `Standby`.
 - Codex quota refresh from `/backend-api/wham/usage`, including per-window percentages, reset times, plan-type updates, sanitized quota errors, and five-minute dashboard refresh.
 
 Codex accounts are created through the admin UI/API as empty device-auth slots, staged out of the pool, then authenticated with device auth before they become routable. The UI does not ask for email, subscription tier, or model selection during onboarding; account metadata is read from the authenticated Codex token after login. A legacy provider API-key gateway path remains for testing and advanced OpenAI-compatible providers, but it is not the default runtime path.

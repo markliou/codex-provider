@@ -570,8 +570,11 @@ EOF
 	a.state.Cooldowns["acct-login"] = []cooldown{{ModelID: "gpt-test", NextRetryAt: time.Now().Add(time.Hour), Reason: "old cooldown"}}
 	a.state.Quotas["acct-login"] = quotaSnapshot{AccountID: "acct-login", QuotaError: &quotaErrorInfo{Code: "old_error", Message: "old quota error", Timestamp: time.Now().Add(-time.Minute)}}
 	a.mu.Lock()
-	job := a.startLoginJobLocked(a.config.Accounts[0])
+	job, err := a.startLoginJobLocked(a.config.Accounts[0])
 	a.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		a.mu.RLock()
@@ -584,11 +587,17 @@ EOF
 			if current.CodeExpiresAt.IsZero() || time.Until(current.CodeExpiresAt) < 14*time.Minute {
 				t.Fatalf("job did not set a 15 minute code expiry: %#v", current)
 			}
+			if current.Reauthentication || current.HistoryReset {
+				t.Fatalf("first login was misclassified as reauthentication: %#v", current)
+			}
 			if a.config.Accounts[0].Email != "user@example.test" || a.config.Accounts[0].AccountID != "acct-chatgpt" || a.config.Accounts[0].OrganizationName != "" {
 				t.Fatalf("account metadata not updated: %#v", a.config.Accounts[0])
 			}
 			if !a.config.Accounts[0].Enabled || !a.config.Accounts[0].InPool || a.config.Accounts[0].PendingPoolActivation {
 				t.Fatalf("login did not activate staged account: %#v", a.config.Accounts[0])
+			}
+			if a.config.Accounts[0].PendingAuthVerification || a.config.Accounts[0].PendingAuthExpectedAccountID != "" {
+				t.Fatalf("completed login did not release the durable routing gate: %#v", a.config.Accounts[0])
 			}
 			quota := a.state.Quotas["acct-login"].Quota
 			if quota == nil || quota.Hourly.Percentage != 90 {
@@ -627,11 +636,363 @@ func TestDeviceAuthLoginDoesNotStartDuplicateJob(t *testing.T) {
 	existing := &loginJob{ID: "job-existing", AccountID: "acct-login", Status: "waiting_for_user"}
 	a.mu.Lock()
 	a.jobs[existing.ID] = existing
-	job := a.startLoginJobLocked(a.config.Accounts[0])
+	job, err := a.startLoginJobLocked(a.config.Accounts[0])
 	a.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if job.ID != existing.ID {
 		t.Fatalf("duplicate login created job %q, want existing %q", job.ID, existing.ID)
 	}
+}
+
+func TestDeviceAuthLoginIsGlobalSingleFlight(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "acct-one", AuthType: "codex_device_auth", Enabled: true, InPool: true},
+		{ID: "acct-two", AuthType: "codex_device_auth", Enabled: true, InPool: true},
+	})
+	existing := &loginJob{ID: "job-existing", AccountID: "acct-one", Status: "waiting_for_user"}
+	a.jobs[existing.ID] = existing
+
+	a.mu.Lock()
+	_, err := a.startLoginJobLocked(a.config.Accounts[1])
+	a.mu.Unlock()
+
+	if !errors.Is(err, errAnotherLoginJobInProgress) {
+		t.Fatalf("second account login error = %v, want global single-flight conflict", err)
+	}
+	if a.config.Accounts[1].PendingAuthVerification {
+		t.Fatalf("rejected second login changed its durable routing gate: %#v", a.config.Accounts[1])
+	}
+
+	existing.Status = "cancelling"
+	a.mu.Lock()
+	_, err = a.startLoginJobLocked(a.config.Accounts[1])
+	a.mu.Unlock()
+	if !errors.Is(err, errAnotherLoginJobInProgress) {
+		t.Fatalf("second login during process cancellation error = %v, want global single-flight conflict", err)
+	}
+}
+
+func TestDeviceAuthLoginStartSaveFailureStaysBlocked(t *testing.T) {
+	a := testApp(t, []account{{
+		ID:        "acct-login",
+		AccountID: "upstream-one",
+		AuthType:  "codex_device_auth",
+		Enabled:   true,
+		InPool:    true,
+	}})
+	if err := os.Mkdir(filepath.Join(a.dataDir, "state", "runtime.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	a.mu.Lock()
+	_, err := a.startLoginJobLocked(a.config.Accounts[0])
+	a.mu.Unlock()
+
+	if err == nil {
+		t.Fatal("login start unexpectedly succeeded when runtime state could not be written")
+	}
+	if !a.config.Accounts[0].PendingAuthVerification || a.config.Accounts[0].PendingAuthExpectedAccountID != "upstream-one" {
+		t.Fatalf("partial start save released the in-memory routing gate: %#v", a.config.Accounts[0])
+	}
+	if len(a.jobs) != 0 {
+		t.Fatalf("login process started after pending state save failed: %#v", a.jobs)
+	}
+	var persisted config
+	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.Accounts) != 1 || !persisted.Accounts[0].PendingAuthVerification || persisted.Accounts[0].PendingAuthExpectedAccountID != "upstream-one" {
+		t.Fatalf("config-only partial save did not stay fail-closed: %#v", persisted.Accounts)
+	}
+}
+
+func TestCompletedAuthVerificationSaveWritesRuntimeBeforeGateConfig(t *testing.T) {
+	a := testApp(t, []account{{
+		ID:                           "acct-login",
+		AccountID:                    "upstream-two",
+		AuthType:                     "codex_device_auth",
+		Enabled:                      true,
+		InPool:                       true,
+		PendingAuthVerification:      false,
+		PendingAuthExpectedAccountID: "",
+	}})
+	a.state.RequestCount = 73
+	if err := os.Mkdir(filepath.Join(a.dataDir, "config.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.saveCompletedAuthVerificationLocked(); err == nil {
+		t.Fatal("completed verification save unexpectedly wrote over a config directory")
+	}
+	var persisted state
+	if err := readJSON(filepath.Join(a.dataDir, "state", "runtime.json"), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.RequestCount != 73 {
+		t.Fatalf("runtime state was not persisted before the gate config write: %#v", persisted)
+	}
+}
+
+func TestDeviceAuthLoginFailsClosedWhenIdentityCannotBeVerified(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{{
+		ID:          "acct-login",
+		AccountID:   "upstream-one",
+		Email:       "old@example.test",
+		AuthType:    "codex_device_auth",
+		Enabled:     true,
+		InPool:      true,
+		LastLoginAt: now.Add(-time.Hour),
+	}})
+	seedDeviceAuthIdentityHistory(a, "acct-login", now)
+	bin := t.TempDir()
+	script := `#!/bin/sh
+set -eu
+mkdir -p "$CODEX_HOME"
+printf '%s\n' 'Open https://auth.openai.com/activate' 'ABCD-EFGH'
+rm -f "$CODEX_HOME/auth.json"
+`
+	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	a.mu.Lock()
+	job, err := a.startLoginJobLocked(a.config.Accounts[0])
+	a.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.RLock()
+		current := *a.jobs[job.ID]
+		a.mu.RUnlock()
+		if current.Status == "failed" {
+			if !current.Reauthentication || current.HistoryReset || !strings.Contains(current.Error, "verify") {
+				t.Fatalf("unverifiable login result = %#v", current)
+			}
+			if len(a.state.PromptCache) != 1 || len(a.state.StickySessions) != 1 || len(a.state.ThreadBindings) != 1 {
+				t.Fatalf("failed verification mutated prior history: cache=%#v sticky=%#v threads=%#v", a.state.PromptCache, a.state.StickySessions, a.state.ThreadBindings)
+			}
+			if !a.config.Accounts[0].PendingAuthVerification || a.config.Accounts[0].PendingAuthExpectedAccountID != "upstream-one" {
+				t.Fatalf("failed verification released the durable routing gate: %#v", a.config.Accounts[0])
+			}
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	t.Fatalf("unverifiable login did not fail closed: %#v", a.jobs[job.ID])
+}
+
+func TestDeviceAuthLoginSidecarFailureKeepsAccountBlocked(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{{
+		ID:          "acct-login",
+		AccountID:   "upstream-one",
+		AuthType:    "codex_device_auth",
+		Enabled:     true,
+		InPool:      true,
+		LastLoginAt: now.Add(-time.Hour),
+	}})
+	a.codexGatewayMode = "cliproxy"
+	seedDeviceAuthIdentityHistory(a, "acct-login", now)
+	if err := os.WriteFile(filepath.Join(a.dataDir, "cliproxy"), []byte("block directory creation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	script := `#!/bin/sh
+set -eu
+mkdir -p "$CODEX_HOME"
+printf '%s\n' 'Open https://auth.openai.com/activate' 'ABCD-EFGH'
+cat > "$CODEX_HOME/auth.json" <<EOF
+{"auth_mode":"chatgpt","tokens":{"id_token":"` + fakeJWTClaims(map[string]any{"email": "same@example.test", "https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "upstream-one"}}) + `","access_token":"<access-token>","refresh_token":"<refresh-token>"}}
+EOF
+`
+	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	a.mu.Lock()
+	job, err := a.startLoginJobLocked(a.config.Accounts[0])
+	a.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.RLock()
+		current := *a.jobs[job.ID]
+		a.mu.RUnlock()
+		if current.Status == "failed" {
+			if current.HistoryReset || !strings.Contains(current.Error, "gateway") {
+				t.Fatalf("sidecar failure result = %#v", current)
+			}
+			if !a.config.Accounts[0].PendingAuthVerification || a.config.Accounts[0].PendingAuthExpectedAccountID != "upstream-one" {
+				t.Fatalf("sidecar failure released the durable routing gate: %#v", a.config.Accounts[0])
+			}
+			if len(a.state.PromptCache) != 1 || len(a.state.StickySessions) != 1 {
+				t.Fatalf("same-account sidecar failure discarded history: cache=%#v sticky=%#v", a.state.PromptCache, a.state.StickySessions)
+			}
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	t.Fatalf("sidecar failure did not finish the login job: %#v", a.jobs[job.ID])
+}
+
+func TestDeviceAuthLoginSameIdentityPreservesHistory(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{{
+		ID:          "acct-login",
+		AccountID:   "upstream-one",
+		Email:       "old@example.test",
+		AuthType:    "codex_device_auth",
+		Enabled:     true,
+		InPool:      true,
+		LastLoginAt: now.Add(-time.Hour),
+	}})
+	seedDeviceAuthIdentityHistory(a, "acct-login", now)
+	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/wham/usage" {
+			t.Fatalf("unexpected quota path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":60}}}`))
+	}))
+	defer usage.Close()
+	a.codexBaseURL = usage.URL + "/backend-api"
+
+	bin := t.TempDir()
+	script := `#!/bin/sh
+set -eu
+mkdir -p "$CODEX_HOME"
+printf '%s\n' 'Open https://auth.openai.com/activate' 'ABCD-EFGH'
+cat > "$CODEX_HOME/auth.json" <<EOF
+{"auth_mode":"chatgpt","tokens":{"id_token":"` + fakeJWTClaims(map[string]any{"email": "new@example.test", "https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "upstream-one", "chatgpt_account_name": "Personal Account", "chatgpt_plan_type": "plus"}}) + `","access_token":"<access-token>","refresh_token":"<refresh-token>"}}
+EOF
+`
+	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	a.mu.Lock()
+	job, err := a.startLoginJobLocked(a.config.Accounts[0])
+	a.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.RLock()
+		current := *a.jobs[job.ID]
+		a.mu.RUnlock()
+		if current.Status == "completed" {
+			if !current.Reauthentication || current.HistoryReset {
+				t.Fatalf("same-account repair result = %#v", current)
+			}
+			if item := a.config.Accounts[0]; item.AccountID != "upstream-one" || item.PendingAuthVerification || item.PendingAuthExpectedAccountID != "" {
+				t.Fatalf("same-account repair did not release its durable gate: %#v", item)
+			}
+			if len(a.state.PromptCache) != 1 || len(a.state.StickySessions) != 1 || len(a.state.ResponseBindings) != 1 || len(a.state.ThreadBindings) != 1 || len(a.state.RoutingCacheEvents) != 1 {
+				t.Fatalf("same-account repair discarded history: cache=%#v sticky=%#v responses=%#v threads=%#v events=%#v", a.state.PromptCache, a.state.StickySessions, a.state.ResponseBindings, a.state.ThreadBindings, a.state.RoutingCacheEvents)
+			}
+			return
+		}
+		if current.Status == "failed" || current.Status == "cancelled" {
+			t.Fatalf("same-account repair did not complete: %#v", current)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	t.Fatalf("same-account repair timed out: %#v", a.jobs[job.ID])
+}
+
+func TestDeviceAuthLoginRechecksIdentityAfterQuotaMetadata(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{{
+		ID:          "acct-login",
+		AccountID:   "upstream-one",
+		Email:       "old@example.test",
+		AuthType:    "codex_device_auth",
+		Enabled:     true,
+		InPool:      true,
+		LastLoginAt: now.Add(-time.Hour),
+	}})
+	seedDeviceAuthIdentityHistory(a, "acct-login", now)
+	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/backend-api/wham/usage":
+			_, _ = w.Write([]byte(`{"plan_type":"team","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":60}}}`))
+		case "/backend-api/accounts/check/v4-2023-04-27":
+			_, _ = w.Write([]byte(`{"accounts":{"upstream-two":{"account":{"account_id":"upstream-two","workspace_name":"Different Workspace","plan_type":"team"},"entitlement":{"subscription_plan":"chatgptteamplan"}}},"account_ordering":["upstream-two"]}`))
+		case "/backend-api/subscriptions":
+			_, _ = w.Write([]byte(`{"subscription_plan":"chatgptteamplan"}`))
+		default:
+			t.Fatalf("unexpected quota metadata path %s", r.URL.Path)
+		}
+	}))
+	defer usage.Close()
+	a.codexBaseURL = usage.URL + "/backend-api"
+
+	bin := t.TempDir()
+	script := `#!/bin/sh
+set -eu
+mkdir -p "$CODEX_HOME"
+printf '%s\n' 'Open https://auth.openai.com/activate' 'ABCD-EFGH'
+cat > "$CODEX_HOME/auth.json" <<EOF
+{"auth_mode":"chatgpt","tokens":{"id_token":"` + fakeJWTClaims(map[string]any{"email": "new@example.test", "https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "upstream-one", "chatgpt_plan_type": "team"}}) + `","access_token":"<access-token>","refresh_token":"<refresh-token>"}}
+EOF
+`
+	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	a.mu.Lock()
+	job, err := a.startLoginJobLocked(a.config.Accounts[0])
+	a.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.RLock()
+		current := *a.jobs[job.ID]
+		a.mu.RUnlock()
+		if current.Status == "completed" {
+			if !current.Reauthentication || !current.HistoryReset {
+				t.Fatalf("metadata identity change was not reported: %#v", current)
+			}
+			if item := a.config.Accounts[0]; item.AccountID != "upstream-two" || item.PendingAuthVerification || item.PendingAuthExpectedAccountID != "" {
+				t.Fatalf("metadata identity change was not finalized safely: %#v", item)
+			}
+			if len(a.state.PromptCache) != 0 || len(a.state.StickySessions) != 0 || len(a.state.ResponseBindings) != 0 || len(a.state.ThreadBindings) != 0 || len(a.state.RoutingCacheEvents) != 0 {
+				t.Fatalf("late identity change retained prior history: cache=%#v sticky=%#v responses=%#v threads=%#v events=%#v", a.state.PromptCache, a.state.StickySessions, a.state.ResponseBindings, a.state.ThreadBindings, a.state.RoutingCacheEvents)
+			}
+			if _, ok := a.state.Quotas["acct-login"]; ok {
+				t.Fatalf("late identity change retained a quota snapshot: %#v", a.state.Quotas["acct-login"])
+			}
+			return
+		}
+		if current.Status == "failed" || current.Status == "cancelled" {
+			t.Fatalf("metadata identity recheck did not complete: %#v", current)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	t.Fatalf("metadata identity recheck timed out: %#v", a.jobs[job.ID])
 }
 
 func TestDeviceAuthLoginJobCancel(t *testing.T) {
@@ -649,8 +1010,11 @@ while true; do sleep 1; done
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	a.mu.Lock()
-	job := a.startLoginJobLocked(a.config.Accounts[0])
+	job, err := a.startLoginJobLocked(a.config.Accounts[0])
 	a.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -684,6 +1048,9 @@ while true; do sleep 1; done
 			if current.Error != "" {
 				t.Fatalf("cancelled job retained error: %#v", current)
 			}
+			if !a.config.Accounts[0].PendingAuthVerification {
+				t.Fatalf("cancelled login released the durable routing gate: %#v", a.config.Accounts[0])
+			}
 			return
 		}
 		time.Sleep(25 * time.Millisecond)
@@ -691,6 +1058,278 @@ while true; do sleep 1; done
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	t.Fatalf("login job was not cancelled: %#v", a.jobs[job.ID])
+}
+
+func seedDeviceAuthIdentityHistory(a *app, accountID string, now time.Time) {
+	cacheKey := accountID + ":gpt-test:subagent"
+	stat := promptCacheStat{
+		AccountID:                      accountID,
+		ModelID:                        "gpt-test",
+		AgentKind:                      "subagent",
+		RequestCount:                   8,
+		InputTokens:                    12_000,
+		CachedTokens:                   9_000,
+		ParentAffinityHitCount:         4,
+		ParentAffinityFallbackCount:    1,
+		LineageFailoverCount:           2,
+		CacheWriteObservedRequestCount: 3,
+	}
+	a.state.PromptCache[cacheKey] = stat
+	a.state.PromptCacheBaseline = map[string]promptCacheStat{cacheKey: stat}
+	a.state.PromptCacheResetAtByAccount = map[string]time.Time{accountID: now.Add(-time.Hour)}
+	a.state.StickySessions["gpt-test:thread:root"] = stickySession{Key: "gpt-test:thread:root", ModelID: "gpt-test", AccountID: accountID, CreatedAt: now.Add(-time.Hour), LastSuccessAt: now.Add(-time.Minute)}
+	a.state.ResponseBindings["resp-old"] = responseBinding{ResponseID: "resp-old", StickyKey: "gpt-test:thread:root", ModelID: "gpt-test", AccountID: accountID, CreatedAt: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour)}
+	a.state.ThreadBindings["thread-old"] = threadBinding{ThreadID: "thread-old", LineageRootID: "thread-old", ModelID: "gpt-test", AccountID: accountID, StickyKey: "gpt-test:thread:root", CreatedAt: now.Add(-time.Hour), LastSuccessAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)}
+	a.state.RoutingCacheEvents = []routingCacheEvent{{Timestamp: now.Add(-time.Minute), ModelID: "gpt-test", AccountID: accountID, AgentKind: "subagent", RoutingOutcome: "sticky_reuse"}}
+	a.state.Health[accountID] = accountHealth{LastFailureReason: "invalid_token", ConsecutiveFailure: 2}
+	a.state.Cooldowns[accountID] = []cooldown{{ModelID: "gpt-test", NextRetryAt: now.Add(time.Hour), Reason: "auth_failed"}}
+	a.state.Quotas[accountID] = quotaSnapshot{AccountID: accountID, Quota: &accountQuota{Hourly: quotaWindow{Present: true, Percentage: 72}}, QuotaError: &quotaErrorInfo{Code: "invalid_token", Message: "expired", Timestamp: now.Add(-time.Minute)}}
+}
+
+func TestAccountHasPriorIdentityRecognizesLegacyRoutingHistory(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{{ID: "legacy-slot", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
+	seedDeviceAuthIdentityHistory(a, "legacy-slot", now)
+	if !a.accountHasPriorIdentityLocked(a.config.Accounts[0]) {
+		t.Fatal("legacy slot with identity-scoped history was misclassified as a first login")
+	}
+}
+
+func TestCompletedDeviceAuthSameIdentityPreservesCacheAffinityAndRoutes(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{{
+		ID:               "slot-one",
+		Label:            "Old label",
+		Email:            "old@example.test",
+		AccountID:        "upstream-one",
+		OrganizationName: "Old workspace",
+		PlanType:         "plus",
+		AuthType:         "codex_device_auth",
+		Enabled:          true,
+		InPool:           true,
+		LastLoginAt:      now.Add(-24 * time.Hour),
+	}})
+	seedDeviceAuthIdentityHistory(a, "slot-one", now)
+	resetAt := a.state.PromptCacheResetAtByAccount["slot-one"]
+
+	reset := a.applyCompletedDeviceAuthLocked(&a.config.Accounts[0], codexAuthInfo{
+		AccountID:        "upstream-one",
+		Email:            "new@example.test",
+		OrganizationName: "Renamed workspace",
+		PlanType:         "pro",
+		PlanLimit:        "pro",
+	}, "upstream-one", true, now)
+
+	if reset {
+		t.Fatal("same upstream account reset identity-scoped history")
+	}
+	cache := a.state.PromptCache["slot-one:gpt-test:subagent"]
+	if cache.ParentAffinityHitCount != 4 || cache.ParentAffinityFallbackCount != 1 || cache.LineageFailoverCount != 2 || cache.CachedTokens != 9_000 {
+		t.Fatalf("same-account cache/affinity history changed: %#v", cache)
+	}
+	if got := a.state.PromptCacheBaseline["slot-one:gpt-test:subagent"]; got.RequestCount != 8 {
+		t.Fatalf("same-account cache baseline changed: %#v", got)
+	}
+	if got := a.state.PromptCacheResetAtByAccount["slot-one"]; !got.Equal(resetAt) {
+		t.Fatalf("same-account reset window changed from %s to %s", resetAt, got)
+	}
+	if len(a.state.StickySessions) != 1 || len(a.state.ResponseBindings) != 1 || len(a.state.ThreadBindings) != 1 || len(a.state.RoutingCacheEvents) != 1 {
+		t.Fatalf("same-account routes were cleared: sticky=%#v responses=%#v threads=%#v events=%#v", a.state.StickySessions, a.state.ResponseBindings, a.state.ThreadBindings, a.state.RoutingCacheEvents)
+	}
+	if health := a.state.Health["slot-one"]; health.ConsecutiveFailure != 0 || health.LastFailureReason != "" {
+		t.Fatalf("reauthentication did not clear transient health error: %#v", health)
+	}
+	if len(a.state.Cooldowns["slot-one"]) != 0 {
+		t.Fatalf("reauthentication did not clear transient cooldown: %#v", a.state.Cooldowns["slot-one"])
+	}
+	if quota := a.state.Quotas["slot-one"]; quota.Quota == nil || quota.Quota.Hourly.Percentage != 72 || quota.QuotaError != nil {
+		t.Fatalf("reauthentication did not preserve quota snapshot while clearing its error: %#v", quota)
+	}
+	if item := a.config.Accounts[0]; item.AccountID != "upstream-one" || item.Email != "new@example.test" || item.OrganizationName != "Renamed workspace" || item.PlanType != "pro" || !item.LastLoginAt.Equal(now) {
+		t.Fatalf("same-account metadata was not refreshed: %#v", item)
+	}
+}
+
+func TestCompletedDeviceAuthChangedOrUnverifiableIdentityResetsHistory(t *testing.T) {
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		name       string
+		expectedID string
+		currentID  string
+	}{
+		{name: "changed", expectedID: "upstream-one", currentID: "upstream-two"},
+		{name: "missing current id", expectedID: "upstream-one", currentID: ""},
+		{name: "legacy identity cannot be verified", expectedID: "", currentID: "upstream-one"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := testApp(t, []account{{
+				ID:          "slot-one",
+				Email:       "old@example.test",
+				AccountID:   tc.expectedID,
+				AuthType:    "codex_device_auth",
+				Enabled:     true,
+				InPool:      true,
+				LastLoginAt: now.Add(-24 * time.Hour),
+			}})
+			seedDeviceAuthIdentityHistory(a, "slot-one", now)
+
+			reset := a.applyCompletedDeviceAuthLocked(&a.config.Accounts[0], codexAuthInfo{
+				AccountID: tc.currentID,
+				Email:     "new@example.test",
+				PlanType:  "plus",
+			}, tc.expectedID, true, now)
+
+			if !reset {
+				t.Fatal("different or unverifiable upstream identity inherited old history")
+			}
+			if len(a.state.PromptCache) != 0 || len(a.state.PromptCacheBaseline) != 0 || len(a.state.PromptCacheResetAtByAccount) != 0 {
+				t.Fatalf("identity change retained cache history: cache=%#v baseline=%#v reset=%#v", a.state.PromptCache, a.state.PromptCacheBaseline, a.state.PromptCacheResetAtByAccount)
+			}
+			if len(a.state.StickySessions) != 0 || len(a.state.ResponseBindings) != 0 || len(a.state.ThreadBindings) != 0 || len(a.state.RoutingCacheEvents) != 0 {
+				t.Fatalf("identity change retained routes: sticky=%#v responses=%#v threads=%#v events=%#v", a.state.StickySessions, a.state.ResponseBindings, a.state.ThreadBindings, a.state.RoutingCacheEvents)
+			}
+			if _, ok := a.state.Quotas["slot-one"]; ok {
+				t.Fatalf("identity change retained old quota: %#v", a.state.Quotas["slot-one"])
+			}
+			if a.config.Accounts[0].AccountID != tc.currentID {
+				t.Fatalf("new upstream identity not stored: %#v", a.config.Accounts[0])
+			}
+		})
+	}
+}
+
+func TestDeviceAuthLoginInProgressPausesRoutingWithoutClearingAffinity(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{{ID: "slot-one", AccountID: "upstream-one", AuthType: "codex_device_auth", Enabled: true, InPool: true, LastLoginAt: now.Add(-time.Hour)}})
+	a.state.StickySessions["gpt-test:thread:root"] = stickySession{Key: "gpt-test:thread:root", ModelID: "gpt-test", AccountID: "slot-one", CreatedAt: now.Add(-time.Hour), LastSuccessAt: now.Add(-time.Minute)}
+	a.jobs["job-login"] = &loginJob{ID: "job-login", AccountID: "slot-one", Status: "waiting_for_user", Reauthentication: true}
+
+	if a.hasUsableAuthLocked(a.config.Accounts[0]) {
+		t.Fatal("account remained auth-eligible while its credential file was being rewritten")
+	}
+	if a.usableLocked(a.config.Accounts[0], "gpt-test", now) {
+		t.Fatal("account remained routable while sign-in repair was active")
+	}
+	if status, reason := a.accountStatusLocked(a.config.Accounts[0], now); status != "authenticating" || !strings.Contains(reason, "repair") {
+		t.Fatalf("active repair status = %q/%q", status, reason)
+	}
+	if summary := a.dashboardSummaryLocked(now); summary["authenticating"] != 1 {
+		t.Fatalf("dashboard did not count active repair: %#v", summary)
+	}
+	if len(a.state.StickySessions) != 1 {
+		t.Fatalf("routing pause cleared sticky affinity: %#v", a.state.StickySessions)
+	}
+	health := a.accountHealthItemLocked(a.config.Accounts[0], now)
+	recoveredJob, ok := health["loginJob"].(loginJob)
+	if !ok || recoveredJob.ID != "job-login" || recoveredJob.Status != "waiting_for_user" || !recoveredJob.Reauthentication {
+		t.Fatalf("management health did not expose the active login job: %#v", health["loginJob"])
+	}
+}
+
+func TestPersistedAuthVerificationGateSurvivesRestart(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{{
+		ID:                           "slot-one",
+		AccountID:                    "upstream-one",
+		AuthType:                     "codex_device_auth",
+		Enabled:                      true,
+		InPool:                       true,
+		PendingAuthVerification:      true,
+		PendingAuthExpectedAccountID: "upstream-one",
+		LastLoginAt:                  now.Add(-time.Hour),
+	}})
+	writeCodexDeviceAuth(t, a, "slot-one", "upstream-one", "same@example.test")
+	if err := a.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	var persisted config
+	data, err := os.ReadFile(filepath.Join(a.dataDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	a.config = persisted
+	a.jobs = map[string]*loginJob{}
+
+	if !a.config.Accounts[0].PendingAuthVerification || a.config.Accounts[0].PendingAuthExpectedAccountID != "upstream-one" {
+		t.Fatalf("pending repair marker was not persisted: %#v", a.config.Accounts[0])
+	}
+	if a.hasUsableAuthLocked(a.config.Accounts[0]) || a.usableLocked(a.config.Accounts[0], "gpt-test", now) {
+		t.Fatal("restart released an unfinished sign-in repair into routing")
+	}
+	if status, reason := a.accountStatusLocked(a.config.Accounts[0], now); status != "missing_auth" || !strings.Contains(reason, "completed") {
+		t.Fatalf("persisted repair status = %q/%q", status, reason)
+	}
+	if action := publicPoolAction(a.config.Accounts[0]); action != "" {
+		t.Fatalf("public dashboard exposed pool action %q during persisted repair", action)
+	}
+	if label := publicPoolLabel(a.config.Accounts[0]); label != "Verification pending" {
+		t.Fatalf("public pool label = %q, want verification pending", label)
+	}
+}
+
+func TestStickySessionWaitsForAuthRepairInsteadOfFailingOver(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{
+		{ID: "slot-one", AccountID: "upstream-one", AuthType: "codex_device_auth", Enabled: true, InPool: true, PendingAuthVerification: true, LastLoginAt: now.Add(-time.Hour)},
+		{ID: "slot-two", AccountID: "upstream-two", AuthType: "codex_device_auth", Enabled: true, InPool: true, LastLoginAt: now.Add(-time.Hour)},
+	})
+	writeCodexDeviceAuth(t, a, "slot-one", "upstream-one", "one@example.test")
+	writeCodexDeviceAuth(t, a, "slot-two", "upstream-two", "two@example.test")
+	key := "gpt-test:thread:root"
+	original := stickySession{Key: key, ModelID: "gpt-test", AccountID: "slot-one", CreatedAt: now.Add(-time.Hour), LastSuccessAt: now.Add(-time.Minute)}
+	a.state.StickySessions[key] = original
+
+	selected, err := a.selectAccountForRoute(routingDecision{StickyKey: key}, "gpt-test", map[string]bool{})
+	if !errors.Is(err, errAccountAuthRepairPending) {
+		t.Fatalf("sticky repair selection = %#v, %v; want retryable repair error", selected, err)
+	}
+	if got := a.state.StickySessions[key]; got.AccountID != original.AccountID || !got.LastSuccessAt.Equal(original.LastSuccessAt) {
+		t.Fatalf("repair rewrote sticky affinity to fallback: before=%#v after=%#v", original, got)
+	}
+}
+
+func TestPoolParticipationCannotChangeDuringAuthRepair(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{{
+		ID:                      "slot-one",
+		AccountID:               "upstream-one",
+		AuthType:                "codex_device_auth",
+		Enabled:                 true,
+		InPool:                  true,
+		PendingAuthVerification: true,
+		LastLoginAt:             now.Add(-time.Hour),
+	}})
+	key := "gpt-test:thread:root"
+	a.state.StickySessions[key] = stickySession{Key: key, ModelID: "gpt-test", AccountID: "slot-one", CreatedAt: now.Add(-time.Hour), LastSuccessAt: now.Add(-time.Minute)}
+	ref := a.publicAccountRefLocked("slot-one")
+
+	publicRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/"+ref+"/pool-remove", nil)
+	publicRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(publicRecorder, publicRequest)
+	if publicRecorder.Code != http.StatusConflict {
+		t.Fatalf("public pool-remove during repair returned %d: %s", publicRecorder.Code, publicRecorder.Body.String())
+	}
+
+	cookies, csrf := adminSession(t, a)
+	managementRequest := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/slot-one/pool-remove", nil)
+	for _, cookie := range cookies {
+		managementRequest.AddCookie(cookie)
+	}
+	managementRequest.Header.Set("X-CSRF-Token", csrf)
+	managementRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(managementRecorder, managementRequest)
+	if managementRecorder.Code != http.StatusConflict {
+		t.Fatalf("management pool-remove during repair returned %d: %s", managementRecorder.Code, managementRecorder.Body.String())
+	}
+	if !a.config.Accounts[0].InPool {
+		t.Fatalf("repair conflict changed pool participation: %#v", a.config.Accounts[0])
+	}
+	if got := a.state.StickySessions[key]; got.AccountID != "slot-one" {
+		t.Fatalf("repair conflict cleared or rewrote sticky route: %#v", got)
+	}
 }
 
 func TestAdminDashboardAssets(t *testing.T) {
@@ -768,8 +1407,13 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS still exposes internal label %q", forbidden)
 		}
 	}
-	if strings.Contains(jsRecorder.Body.String(), `actionButton("login"`) || strings.Contains(jsRecorder.Body.String(), `data-account-action="login"`) {
-		t.Fatal("admin JS still renders a per-account login action")
+	if !strings.Contains(jsRecorder.Body.String(), `actionButton("login"`) || !strings.Contains(jsRecorder.Body.String(), "Repair sign-in") || !strings.Contains(jsRecorder.Body.String(), "history preserved") || !strings.Contains(jsRecorder.Body.String(), "Sign-in busy") {
+		t.Fatal("admin JS does not render same-slot sign-in repair")
+	}
+	for _, expected := range []string{"loginJob", "activeLoginJob", "state.currentLoginJobId = activeLoginJob.jobId"} {
+		if !strings.Contains(jsRecorder.Body.String(), expected) {
+			t.Fatalf("admin JS cannot recover an active login after reload: missing %q", expected)
+		}
 	}
 	if !strings.Contains(jsRecorder.Body.String(), "codeExpiresAt") {
 		t.Fatal("admin JS does not render the device-auth expiry countdown")
@@ -804,12 +1448,22 @@ func TestAdminDashboardAssets(t *testing.T) {
 	cssRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/app.css", nil)
 	cssRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(cssRecorder, cssRequest)
-	if !strings.Contains(cssRecorder.Body.String(), "::-webkit-progress-value") || !strings.Contains(cssRecorder.Body.String(), "background: #171020") || !strings.Contains(cssRecorder.Body.String(), "border: 1px solid #4b3c60") {
+	if !strings.Contains(cssRecorder.Body.String(), "::-webkit-progress-value") || !strings.Contains(cssRecorder.Body.String(), "background: #08131f") || !strings.Contains(cssRecorder.Body.String(), "border: 1px solid #34506c") {
 		t.Fatal("admin CSS does not provide a visible unfilled quota track")
 	}
-	for _, expected := range []string{".quota-track.watch", ".quota-track.low", ".quota-track.critical", ".quota-track.empty", "#f3c969", "#ff8a6b", "#ff4f6d"} {
+	for _, expected := range []string{".quota-track.watch", ".quota-track.low", ".quota-track.critical", ".quota-track.empty", "#f4c46d", "#ff8a6b", "#ff4f6d"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS does not preserve the warm-to-red quota warning ramp %q", expected)
+		}
+	}
+	for _, expected := range []string{"#07111f", "#5dd6ff", "#ffb454"} {
+		if !strings.Contains(cssRecorder.Body.String(), expected) {
+			t.Fatalf("admin CSS omitted refreshed navy/cyan/amber theme color %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"#0f0b16", "#302440", "#1b1526"} {
+		if strings.Contains(cssRecorder.Body.String(), forbidden) {
+			t.Fatalf("admin CSS retained legacy purple theme color %q", forbidden)
 		}
 	}
 	for _, expected := range []string{".cache-column", ".routing-count-column", ".cache-window-groups", ".metric-source-chip.observed", ".metric-source-chip.calculated", ".cache-token-row", ".cache-rate { color: var(--green)", ".cache-token-value { color: var(--green)", ".routing-cache-table", ".event-cache.hit", ".event-cache.cold"} {
@@ -825,7 +1479,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 	logoRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/logo.svg", nil)
 	logoRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(logoRecorder, logoRequest)
-	if logoRecorder.Code != http.StatusOK || !strings.Contains(logoRecorder.Body.String(), "Balanced sticky routes") || !strings.Contains(logoRecorder.Body.String(), "#54d6b0") {
+	if logoRecorder.Code != http.StatusOK || !strings.Contains(logoRecorder.Body.String(), "Balanced sticky routes") || !strings.Contains(logoRecorder.Body.String(), "#61ddcf") || !strings.Contains(logoRecorder.Body.String(), "#ffb454") {
 		t.Fatal("admin logo does not communicate balanced account routing")
 	}
 }
@@ -1132,7 +1786,7 @@ func TestAdminSettingsTogglePreserveProQuota(t *testing.T) {
 func TestCreateCodexDeviceAuthAccountStagesUntilLogin(t *testing.T) {
 	a := testApp(t, nil)
 	cookies, csrf := adminSession(t, a)
-	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts", strings.NewReader(`{"authType":"codex_device_auth","enabled":true,"inPool":true,"priority":100}`))
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts", strings.NewReader(`{"authType":"codex_device_auth","enabled":true,"inPool":true,"priority":100,"pendingAuthVerification":true,"pendingAuthExpectedAccountId":"untrusted-upstream"}`))
 	for _, cookie := range cookies {
 		request.AddCookie(cookie)
 	}
@@ -1155,7 +1809,7 @@ func TestCreateCodexDeviceAuthAccountStagesUntilLogin(t *testing.T) {
 		t.Fatalf("configured account count = %d", len(a.config.Accounts))
 	}
 	staged := a.config.Accounts[0]
-	if staged.Enabled || staged.InPool || !staged.PendingPoolActivation {
+	if staged.Enabled || staged.InPool || !staged.PendingPoolActivation || staged.PendingAuthVerification || staged.PendingAuthExpectedAccountID != "" {
 		t.Fatalf("new device-auth account was not staged: %#v", staged)
 	}
 }
