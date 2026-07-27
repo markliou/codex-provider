@@ -1856,10 +1856,11 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 	for index, item := range a.config.Accounts {
 		accounts = append(accounts, a.publicDashboardAccountLocked(item, index, now))
 	}
-	// Request-level routing events reveal traffic timing and switching patterns.
-	// Keep them behind the authenticated state API; the public dashboard contract
-	// allows aggregate health/cache status but explicitly forbids traffic detail.
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked()}})
+	// The default page intentionally shows pool-wide throughput so the owner can
+	// monitor normal traffic without entering management mode. Keep this limited
+	// to aggregate rolling windows: per-account throughput, raw buckets, model
+	// attribution, and request-level routing events remain management-only.
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now)}})
 }
 
 func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) {

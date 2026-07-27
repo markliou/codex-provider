@@ -56,10 +56,10 @@
 
         <section id="summary-grid" class="summary-grid" aria-label="Pool summary"></section>
 
-        <!-- Throughput reveals live traffic timing and volume, so it stays
-             management-only even though the public page may show aggregate
-             cache effectiveness. -->
-        <section id="throughput-panel" class="throughput-panel management-only" aria-labelledby="throughput-title">
+        <!-- Pool-wide throughput belongs on the default status page for routine
+             monitoring. Per-account attribution and request-level diagnostics
+             remain management-only and must not be added to this shared panel. -->
+        <section id="throughput-panel" class="throughput-panel" aria-labelledby="throughput-title">
           <div class="throughput-heading">
             <div>
               <div class="eyebrow">LIVE FLOW</div>

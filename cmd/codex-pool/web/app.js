@@ -658,11 +658,12 @@
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
       const accounts = body.dashboard.accounts || [];
       renderSummary(body.dashboard.summary || {}, true);
+      renderThroughput(body.dashboard.throughput);
       renderCacheWindow(body.dashboard.promptCacheWindow);
       renderPublicAccounts(accounts);
       // Clear prior authenticated request details before rendering public mode.
-      // Public status may expose aggregates, never traffic timing or per-request
-      // account/routing correlation.
+      // Public status exposes pool-wide rolling throughput, but never per-request
+      // or per-account routing/traffic correlation.
       renderRoutingCacheEvents([]);
       return true;
     } catch (error) {

@@ -1387,8 +1387,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 	}
 	for _, expected := range []string{"throughput-panel", "throughput-active", "throughput-windows", "LIVE FLOW", "Throughput"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
-			t.Fatalf("admin page omitted management throughput surface %q", expected)
+			t.Fatalf("admin page omitted shared throughput surface %q", expected)
 		}
+	}
+	if strings.Contains(recorder.Body.String(), `class="throughput-panel management-only"`) {
+		t.Fatal("admin page still hides pool throughput from public mode")
 	}
 	for _, forbidden := range []string{`id="cache-window-read"`, `id="cache-window-write"`, "cache-window-write-rate", `id="cache-window-affinity"`, ">Cache write<", ">Parent affinity<", "metric-source-chip upstream", "metric-source-group upstream", "OPENAI"} {
 		if strings.Contains(recorder.Body.String(), forbidden) {
@@ -1437,7 +1440,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS omitted subagent cache metric %q", expected)
 		}
 	}
-	for _, expected := range []string{"renderThroughput", "accountThroughputMarkup", "requestsPerMinute", "outputTokensPerSecond", "p95LatencyMs", "Throughput (5m)"} {
+	for _, expected := range []string{"renderThroughput", "renderThroughput(body.dashboard.throughput)", "accountThroughputMarkup", "requestsPerMinute", "outputTokensPerSecond", "p95LatencyMs", "Throughput (5m)"} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS omitted throughput behavior %q", expected)
 		}
@@ -1677,13 +1680,32 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
 	}
 	publicBody := publicRecorder.Body.String()
-	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "Private private@example.test", "upstream.example.test", "upstream-secret-value", "gpt-test", "credentialMetadata", "statusReason", "allowedModels", "planType", "planLimit", "email", "routingCacheEvents", "sticky_reuse", "throughput", "throughputBuckets"} {
+	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "Private private@example.test", "upstream.example.test", "upstream-secret-value", "gpt-test", "credentialMetadata", "statusReason", "allowedModels", "planType", "planLimit", "email", "routingCacheEvents", "sticky_reuse", "throughputBuckets"} {
 		if strings.Contains(publicBody, forbidden) {
 			t.Fatalf("public dashboard exposed %q", forbidden)
 		}
 	}
 	if !strings.Contains(publicBody, "pr***te@example.test") || !strings.Contains(publicBody, "Plus") || !strings.Contains(publicBody, `"statusTone":"low"`) || !strings.Contains(publicBody, `"statusLabel":"Limited"`) {
 		t.Fatalf("public dashboard omitted expected status data: %s", publicBody)
+	}
+	var publicPayload struct {
+		Dashboard struct {
+			Throughput map[string]any `json:"throughput"`
+		} `json:"dashboard"`
+	}
+	if err := json.Unmarshal(publicRecorder.Body.Bytes(), &publicPayload); err != nil {
+		t.Fatal(err)
+	}
+	windows, ok := publicPayload.Dashboard.Throughput["windows"].(map[string]any)
+	if !ok {
+		t.Fatalf("public dashboard omitted aggregate throughput: %#v", publicPayload.Dashboard.Throughput)
+	}
+	oneMinute, ok := windows["1m"].(map[string]any)
+	if !ok || oneMinute["requestCount"] != float64(1) {
+		t.Fatalf("public one-minute throughput = %#v", oneMinute)
+	}
+	if strings.Count(publicBody, `"throughput"`) != 1 {
+		t.Fatal("public dashboard must expose only pool-wide throughput, not per-account throughput")
 	}
 
 	managementRequest := httptest.NewRequest(http.MethodGet, "/admin/api/accounts", nil)

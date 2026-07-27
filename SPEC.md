@@ -1195,18 +1195,18 @@ this request-level event list because traffic timing, account selection, and
 failover correlation are management diagnostics. This bounded event list is
 operational correlation data, not a durable token ledger.
 
-Throughput observability is a separate management-only product contract. The
-provider must count one client request regardless of how many upstream accounts
-that request attempts during failover. It persists bounded 15-second aggregate
-buckets for at most 30 minutes and 10,000 account/model/agent-kind buckets; it
-must not persist prompts, response content, raw request/response/thread/route
+Throughput observability is a separate product contract. The provider must
+count one client request regardless of how many upstream accounts that request
+attempts during failover. It persists bounded 15-second aggregate buckets for
+at most 30 minutes and 10,000 account/model/agent-kind buckets; it must not
+persist prompts, response content, raw request/response/thread/route
 identifiers, API keys, or credential metadata in those buckets. Account disable
 or temporary pool removal may clear active routes but must not erase rolling
 throughput history. Account deletion or a verified upstream identity change
 must remove that account's attributed buckets.
 
-Authenticated management projections expose rolling 1, 5, and 15 minute
-windows with request/success/failure/cancellation counts, request rate,
+Pool-wide projections expose rolling 1, 5, and 15 minute windows with
+request/success/failure/cancellation counts, request rate,
 input/cached/output token rate, aggregate output-token throughput, latency,
 time-to-upstream-headers (TTFB), and streaming time-to-first-recognized-content
 (TTFT). Output token counts come from compatible upstream usage fields; output
@@ -1214,9 +1214,10 @@ tokens/second is calculated over the wall-clock window and is unavailable when
 no output usage was observed. TTFT is available only for recognized Responses
 or chat streaming delta content. Approximate p50/p95 values come from bounded
 fixed latency histograms rather than request logs. The active-request count is
-in-memory only. Per-account management rows use the 5-minute window. The
-unauthenticated public dashboard must not receive throughput buckets, traffic
-timing, active request counts, or per-account throughput.
+in-memory only. The unauthenticated public dashboard receives this pool-wide
+aggregate so routine traffic can be monitored without login. It must not receive
+raw throughput buckets, model/account attribution, or per-account throughput.
+Per-account management rows use the 5-minute window.
 
 Dashboard metric presentation is a product contract. The top cache window
 shows Pool-observed counters and actionable calculated read/request/cold rates
@@ -1757,13 +1758,14 @@ tokens. It may expose domain-separated identifier hashes in authenticated UI
 affordances, but never raw identifiers or account IDs. Public mode must neither
 render nor receive request-level routing/cache events.
 
-The management-only throughput panel must show 1, 5, and 15 minute cards with
-client requests/minute, rolling output tokens/second, input/cached/output tokens
-per minute, and approximate p50/p95 latency, TTFB, and streaming TTFT. It must
-also show the current in-memory active request count. Each account row shows its
-5-minute request rate, rolling output-token throughput, and p95 latency. Labels
-must make clear these are provider-calculated rates over upstream usage and
-provider timing, not raw upstream quota fields.
+The throughput panel must be visible in both public and management modes and
+show 1, 5, and 15 minute cards with client requests/minute, rolling output
+tokens/second, input/cached/output tokens per minute, and approximate p50/p95
+latency, TTFB, and streaming TTFT. It must also show the current in-memory
+active request count. Only authenticated account rows show their 5-minute
+request rate, rolling output-token throughput, and p95 latency. Labels must make
+clear these are provider-calculated rates over upstream usage and provider
+timing, not raw upstream quota fields.
 
 ### 16.3 Account actions
 
@@ -1973,10 +1975,11 @@ The implementation is acceptable when:
     finalization; sticky traffic receives a retryable 503, active device-auth is
     globally single-flight and recoverable after UI reload, and pool membership
     cannot change until verification completes.
-29. Management throughput counts client requests rather than upstream attempts,
-    persists only bounded aggregate buckets, keeps temporary pool removal from
-    erasing the rolling view, removes attribution on identity purge, and remains
-    absent from the public dashboard.
+29. Throughput counts client requests rather than upstream attempts, persists
+    only bounded aggregate buckets, keeps temporary pool removal from erasing
+    the rolling view, and removes attribution on identity purge. Public mode
+    receives only pool-wide rolling aggregates; per-account attribution and raw
+    buckets remain management-only.
 
 ---
 
