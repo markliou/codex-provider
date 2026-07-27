@@ -1385,6 +1385,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page omitted subagent cache metric %q", expected)
 		}
 	}
+	for _, expected := range []string{"throughput-panel", "throughput-active", "throughput-windows", "LIVE FLOW", "Throughput"} {
+		if !strings.Contains(recorder.Body.String(), expected) {
+			t.Fatalf("admin page omitted management throughput surface %q", expected)
+		}
+	}
 	for _, forbidden := range []string{`id="cache-window-read"`, `id="cache-window-write"`, "cache-window-write-rate", `id="cache-window-affinity"`, ">Cache write<", ">Parent affinity<", "metric-source-chip upstream", "metric-source-group upstream", "OPENAI"} {
 		if strings.Contains(recorder.Body.String(), forbidden) {
 			t.Fatalf("admin page still renders removed upstream cache summary %q", forbidden)
@@ -1432,6 +1437,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS omitted subagent cache metric %q", expected)
 		}
 	}
+	for _, expected := range []string{"renderThroughput", "accountThroughputMarkup", "requestsPerMinute", "outputTokensPerSecond", "p95LatencyMs", "Throughput (5m)"} {
+		if !strings.Contains(jsRecorder.Body.String(), expected) {
+			t.Fatalf("admin JS omitted throughput behavior %q", expected)
+		}
+	}
 	for _, forbidden := range []string{"Main cache (reqs)", "Subagent cache (reqs)", "<small>(${reqs})</small>", "cache-detail", "metric-origin-mini", "cache-derived-rate", "column-origin upstream", "column-origin calculated", ">OPENAI<", ">CALC<", `$("#cache-window-read")`, `$("#cache-window-write")`, `$("#cache-window-affinity")`, "cache-window-write-rate", "cacheWriteObservedRequestCount", "cacheWriteInputTokens", "cacheWriteRate", "cacheWindow.routingFailoverCount", `poolColumnHeader("Failovers")`, ">Write</span>", "Token usage: read", "write ratio"} {
 		if strings.Contains(jsRecorder.Body.String(), forbidden) {
 			t.Fatalf("admin JS still uses crowded cache-cell markup %q", forbidden)
@@ -1448,17 +1458,17 @@ func TestAdminDashboardAssets(t *testing.T) {
 	cssRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/app.css", nil)
 	cssRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(cssRecorder, cssRequest)
-	if !strings.Contains(cssRecorder.Body.String(), "::-webkit-progress-value") || !strings.Contains(cssRecorder.Body.String(), "background: #08131f") || !strings.Contains(cssRecorder.Body.String(), "border: 1px solid #34506c") {
+	if !strings.Contains(cssRecorder.Body.String(), "::-webkit-progress-value") || !strings.Contains(cssRecorder.Body.String(), "background: #140b32") || !strings.Contains(cssRecorder.Body.String(), "border: 1px solid #544482") {
 		t.Fatal("admin CSS does not provide a visible unfilled quota track")
 	}
-	for _, expected := range []string{".quota-track.watch", ".quota-track.low", ".quota-track.critical", ".quota-track.empty", "#f4c46d", "#ff8a6b", "#ff4f6d"} {
+	for _, expected := range []string{".quota-track.watch", ".quota-track.low", ".quota-track.critical", ".quota-track.empty", "#ffd166", "#ff9f43", "#ff4f6d"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS does not preserve the warm-to-red quota warning ramp %q", expected)
 		}
 	}
-	for _, expected := range []string{"#07111f", "#5dd6ff", "#ffb454"} {
+	for _, expected := range []string{"#120a2e", "#46e6ff", "#ff6f91", "#c095ff"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
-			t.Fatalf("admin CSS omitted refreshed navy/cyan/amber theme color %q", expected)
+			t.Fatalf("admin CSS omitted lively theme color %q", expected)
 		}
 	}
 	for _, forbidden := range []string{"#0f0b16", "#302440", "#1b1526"} {
@@ -1471,6 +1481,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin CSS omitted compact cache/routing layout %q", expected)
 		}
 	}
+	for _, expected := range []string{".throughput-panel", ".throughput-window-grid", ".throughput-card", ".throughput-primary", ".throughput-token-flow", ".throughput-latency", ".account-throughput", ".throughput-column"} {
+		if !strings.Contains(cssRecorder.Body.String(), expected) {
+			t.Fatalf("admin CSS omitted responsive throughput layout %q", expected)
+		}
+	}
 	for _, forbidden := range []string{".metric-source-chip.upstream", ".metric-source-group.upstream", ".column-origin.upstream", ".column-origin.calculated", ".cache-rate.good", ".cache-rate.fair", ".cache-rate.poor", ".cache-derived-rate"} {
 		if strings.Contains(cssRecorder.Body.String(), forbidden) {
 			t.Fatalf("admin CSS still exposes removed cache provenance/color treatment %q", forbidden)
@@ -1479,7 +1494,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 	logoRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/logo.svg", nil)
 	logoRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(logoRecorder, logoRequest)
-	if logoRecorder.Code != http.StatusOK || !strings.Contains(logoRecorder.Body.String(), "Balanced sticky routes") || !strings.Contains(logoRecorder.Body.String(), "#61ddcf") || !strings.Contains(logoRecorder.Body.String(), "#ffb454") {
+	if logoRecorder.Code != http.StatusOK || !strings.Contains(logoRecorder.Body.String(), "Balanced live routes") || !strings.Contains(logoRecorder.Body.String(), "#46f1c7") || !strings.Contains(logoRecorder.Body.String(), "#ff6f91") {
 		t.Fatal("admin logo does not communicate balanced account routing")
 	}
 }
@@ -1647,6 +1662,13 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 		RoutingOutcome: "sticky_reuse",
 		InputTokens:    2048,
 	}}
+	a.state.ThroughputBuckets = []throughputBucket{{
+		BucketAt:     time.Now().UTC().Truncate(throughputBucketInterval),
+		AccountID:    "private-account-id",
+		ModelID:      "gpt-test",
+		AgentKind:    "main",
+		RequestCount: 1,
+	}}
 
 	publicRequest := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard", nil)
 	publicRecorder := httptest.NewRecorder()
@@ -1655,7 +1677,7 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
 	}
 	publicBody := publicRecorder.Body.String()
-	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "Private private@example.test", "upstream.example.test", "upstream-secret-value", "gpt-test", "credentialMetadata", "statusReason", "allowedModels", "planType", "planLimit", "email", "routingCacheEvents", "sticky_reuse"} {
+	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "Private private@example.test", "upstream.example.test", "upstream-secret-value", "gpt-test", "credentialMetadata", "statusReason", "allowedModels", "planType", "planLimit", "email", "routingCacheEvents", "sticky_reuse", "throughput", "throughputBuckets"} {
 		if strings.Contains(publicBody, forbidden) {
 			t.Fatalf("public dashboard exposed %q", forbidden)
 		}
@@ -3101,13 +3123,14 @@ func TestCopyStreamingProxyResponseFlushesSSE(t *testing.T) {
 
 func TestPromptCacheUsageParsesReadWriteVariantsAndAbsence(t *testing.T) {
 	nested := promptCacheUsageFromPayload(map[string]any{"usage": map[string]any{
-		"input_tokens": 4096,
+		"input_tokens":  4096,
+		"output_tokens": 321,
 		"input_tokens_details": map[string]any{
 			"cached_tokens":      3072,
 			"cache_write_tokens": 512,
 		},
 	}})
-	if !nested.Present || nested.InputTokens != 4096 || nested.CachedTokens != 3072 || nested.CacheWriteTokens == nil || *nested.CacheWriteTokens != 512 {
+	if !nested.Present || nested.InputTokens != 4096 || nested.CachedTokens != 3072 || nested.CacheWriteTokens == nil || *nested.CacheWriteTokens != 512 || !nested.OutputPresent || nested.OutputTokens != 321 {
 		t.Fatalf("nested cache usage = %#v", nested)
 	}
 
@@ -3129,6 +3152,14 @@ func TestPromptCacheUsageParsesReadWriteVariantsAndAbsence(t *testing.T) {
 	if !absentWrite.Present || absentWrite.CacheWriteTokens != nil {
 		t.Fatalf("absent write tokens must remain unavailable: %#v", absentWrite)
 	}
+
+	chat := promptCacheUsageFromPayload(map[string]any{"usage": map[string]any{
+		"prompt_tokens":     512,
+		"completion_tokens": 77,
+	}})
+	if !chat.OutputPresent || chat.OutputTokens != 77 {
+		t.Fatalf("chat output usage = %#v", chat)
+	}
 }
 
 func TestStreamingUsageMergeRetainsObservedCacheWrite(t *testing.T) {
@@ -3138,6 +3169,8 @@ func TestStreamingUsageMergeRetainsObservedCacheWrite(t *testing.T) {
 		InputTokens:      4096,
 		CachedTokens:     0,
 		CacheWriteTokens: &writeTokens,
+		OutputTokens:     25,
+		OutputPresent:    true,
 		Present:          true,
 	}})
 	info.merge(proxyResponseInfo{Usage: promptCacheUsage{
@@ -3150,6 +3183,155 @@ func TestStreamingUsageMergeRetainsObservedCacheWrite(t *testing.T) {
 	}
 	if info.Usage.CachedTokens != 3072 {
 		t.Fatalf("final streaming usage did not retain latest read tokens: %#v", info.Usage)
+	}
+	if !info.Usage.OutputPresent || info.Usage.OutputTokens != 25 {
+		t.Fatalf("final streaming usage erased observed output tokens: %#v", info.Usage)
+	}
+}
+
+func TestSSELineHasGeneratedContent(t *testing.T) {
+	for _, line := range []string{
+		`data: {"type":"response.output_text.delta","delta":"hello"}`,
+		`data: {"type":"response.function_call_arguments.delta","delta":"{\"path\":"}`,
+		`data: {"choices":[{"delta":{"content":"hello"}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}`,
+	} {
+		if !sseLineHasGeneratedContent(line) {
+			t.Fatalf("generated SSE content was not detected: %s", line)
+		}
+	}
+	for _, line := range []string{
+		`event: response.completed`,
+		`data: [DONE]`,
+		`data: {"type":"response.created","response":{"id":"resp_1"}}`,
+		`data: {"type":"response.output_text.delta","delta":""}`,
+	} {
+		if sseLineHasGeneratedContent(line) {
+			t.Fatalf("non-content SSE line was treated as first token: %s", line)
+		}
+	}
+}
+
+func TestThroughputRollingWindowsAndAccountFiltering(t *testing.T) {
+	a := testApp(t, []account{{ID: "a"}, {ID: "b"}})
+	now := time.Now().UTC().Truncate(throughputBucketInterval).Add(10 * time.Second)
+	record := func(accountID string, completedOffset, duration time.Duration, success, cancelled, streaming bool, input, cached, output uint64, outputPresent bool) {
+		completedAt := now.Add(completedOffset)
+		measurement := throughputMeasurement{
+			StartedAt:   completedAt.Add(-duration),
+			CompletedAt: completedAt,
+			AccountID:   accountID,
+			ModelID:     "gpt-test",
+			AgentKind:   "main",
+			Streaming:   streaming,
+			Success:     success,
+			Cancelled:   cancelled,
+			Usage: promptCacheUsage{
+				InputTokens:   input,
+				CachedTokens:  cached,
+				OutputTokens:  output,
+				OutputPresent: outputPresent,
+				Present:       input > 0 || outputPresent,
+			},
+		}
+		if success {
+			measurement.HeadersAt = measurement.StartedAt.Add(500 * time.Millisecond)
+		}
+		if streaming {
+			measurement.FirstContentAt = measurement.StartedAt.Add(time.Second)
+		}
+		a.recordThroughputMeasurementLocked(measurement)
+	}
+	record("a", -10*time.Second, 2*time.Second, true, false, true, 1200, 600, 120, true)
+	record("a", -20*time.Second, 250*time.Millisecond, false, false, false, 0, 0, 0, false)
+	record("b", -30*time.Second, time.Second, false, true, false, 0, 0, 0, false)
+	record("a", -3*time.Minute, time.Second, true, false, false, 300, 0, 60, true)
+
+	window := a.throughputWindowLocked("a", now, time.Minute)
+	if window["requestCount"].(uint64) != 2 || window["successCount"].(uint64) != 1 || window["failureCount"].(uint64) != 1 || window["cancelledCount"].(uint64) != 0 {
+		t.Fatalf("account rolling request counts = %#v", window)
+	}
+	if got := window["requestsPerMinute"].(float64); got != 2 {
+		t.Fatalf("requests/min = %v, want 2", got)
+	}
+	if got := window["outputTokensPerSecond"].(float64); got != 2 {
+		t.Fatalf("rolling output tok/s = %v, want 2", got)
+	}
+	if window["p50LatencyMs"].(uint64) != 250 || window["p95LatencyMs"].(uint64) != 2000 {
+		t.Fatalf("latency percentiles = p50:%#v p95:%#v", window["p50LatencyMs"], window["p95LatencyMs"])
+	}
+	if window["p50TTFBMs"].(uint64) != 500 || window["p50TTFTMs"].(uint64) != 1000 {
+		t.Fatalf("first-byte/token percentiles = ttfb:%#v ttft:%#v", window["p50TTFBMs"], window["p50TTFTMs"])
+	}
+	all := a.throughputWindowLocked("", now, time.Minute)
+	if all["requestCount"].(uint64) != 3 || all["cancelledCount"].(uint64) != 1 {
+		t.Fatalf("pool rolling counts = %#v", all)
+	}
+	fiveMinutes := a.throughputWindowLocked("a", now, 5*time.Minute)
+	if fiveMinutes["requestCount"].(uint64) != 3 || fiveMinutes["outputTokens"].(uint64) != 180 {
+		t.Fatalf("five-minute account window = %#v", fiveMinutes)
+	}
+}
+
+func TestThroughputLifecyclePruningAndIdentityCleanup(t *testing.T) {
+	a := testApp(t, []account{{ID: "a"}})
+	now := time.Now().UTC()
+	measurement := a.beginThroughputMeasurement("gpt-test", requestIdentity{}, false)
+	if a.activeProxyRequests != 1 {
+		t.Fatalf("active requests = %d, want 1", a.activeProxyRequests)
+	}
+	measurement.AccountID = "a"
+	measurement.Success = true
+	measurement.CompletedAt = now
+	a.finishThroughputMeasurement(measurement)
+	if a.activeProxyRequests != 0 || len(a.state.ThroughputBuckets) != 1 {
+		t.Fatalf("finished throughput state = active:%d buckets:%d", a.activeProxyRequests, len(a.state.ThroughputBuckets))
+	}
+
+	a.state.ThroughputBuckets = append(a.state.ThroughputBuckets, throughputBucket{
+		BucketAt:     now.Add(-throughputBucketTTL - throughputBucketInterval),
+		AccountID:    "a",
+		RequestCount: 1,
+	})
+	if !a.pruneThroughputBucketsLocked(now) || len(a.state.ThroughputBuckets) != 1 {
+		t.Fatalf("throughput TTL prune left %#v", a.state.ThroughputBuckets)
+	}
+
+	a.clearStickyForAccountLocked("a")
+	if len(a.state.ThroughputBuckets) != 1 {
+		t.Fatal("pool route cleanup erased rolling throughput history")
+	}
+	a.clearAccountIdentityScopedStateLocked("a")
+	if len(a.state.ThroughputBuckets) != 0 {
+		t.Fatal("identity cleanup retained attributed throughput history")
+	}
+}
+
+func TestManagementThroughputProjection(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct", Enabled: true, InPool: true}})
+	now := time.Now().UTC()
+	a.state.ThroughputBuckets = []throughputBucket{{
+		BucketAt:                   now.Truncate(throughputBucketInterval),
+		AccountID:                  "acct",
+		ModelID:                    "gpt-test",
+		AgentKind:                  "main",
+		RequestCount:               2,
+		SuccessCount:               2,
+		OutputTokens:               120,
+		OutputObservedRequestCount: 2,
+	}}
+	adminState := a.adminStateLocked(now)
+	if adminState["throughput"] == nil {
+		t.Fatal("authenticated admin state omitted throughput")
+	}
+	health := a.accountHealthItemLocked(a.config.Accounts[0], now)
+	accountThroughput, ok := health["throughput"].(map[string]any)
+	if !ok {
+		t.Fatalf("management account health omitted throughput: %#v", health)
+	}
+	windows := accountThroughput["windows"].(map[string]any)
+	if windows["5m"].(map[string]any)["requestCount"].(uint64) != 2 {
+		t.Fatalf("management account throughput = %#v", accountThroughput)
 	}
 }
 
@@ -5305,6 +5487,10 @@ func TestFailoverTriesAllConfiguredAccounts(t *testing.T) {
 	}
 	if session := a.state.StickySessions["gpt-test:all-accounts"]; session.AccountID != "fourth" {
 		t.Fatalf("expected sticky failover to fourth, got %#v", session)
+	}
+	window := a.throughputWindowLocked("", time.Now().UTC(), time.Minute)
+	if window["requestCount"].(uint64) != 1 || window["successCount"].(uint64) != 1 || a.activeProxyRequests != 0 {
+		t.Fatalf("failover attempts were counted as client requests: %#v active=%d", window, a.activeProxyRequests)
 	}
 }
 

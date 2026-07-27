@@ -159,6 +159,19 @@ details. Runtime state retains at most 500 entries and drops entries older than
 identifiers are domain-separated hashes before persistence; authenticated
 browser responses omit local/upstream account IDs and use masked account labels.
 
+The management-only **Throughput** panel shows rolling 1, 5, and 15 minute
+client traffic. A failover request is counted once even if it tries several
+accounts. The panel calculates requests/minute and input/cached/output token
+rates from bounded provider aggregates; output tokens/second uses upstream
+output usage divided by the wall-clock window, so parallel sessions contribute
+to the same pool throughput. Latency and time-to-upstream-headers are measured
+by the provider. Streaming TTFT is shown only when a recognized Responses or
+chat delta first carries generated text or tool content. p50/p95 values are
+approximate fixed-histogram values, not retained request logs. Per-account rows
+show the 5-minute request rate, output throughput, and p95 latency. These traffic
+details remain behind management authentication and are never included in the
+public dashboard.
+
 ### Duplicate Upstream Accounts
 
 Pool treats the local slot ID as the management identity, but routing also tracks the upstream ChatGPT/Codex account identity reported by device auth. Multiple local slots that point at the same upstream account are not counted as multiple same-request failover targets. One local slot represents that upstream identity at a time; duplicate slots are skipped inside the failed request so one revoked token, team-workspace policy issue, or shared quota window is not amplified as if it were separate backup accounts. For later requests, a healthy duplicate credential copy can become the representative when the old representative is out of quota, cooling down, or has a persisted auth/quota metadata error.
@@ -213,7 +226,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - `POST /v1/chat/completions`, including translation to a Responses upstream.
 - Model aliases and `(thinking-tier)` suffix translation.
 - Thread-aware sticky balancing and failover with idle TTL, soft parent-account affinity, independent prompt-cache-key policy, per-model cooldowns, optional Pro-quota preservation, response-id continuation binding, and JSON persistence in `/data`. New sessions distribute across equal-priority healthy accounts; when an upstream account returns `429` or repeated server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
-- Main/subagent cache-read, cache-write, request-hit, cold-start, affinity, and failover observability, plus a bounded and redacted 24-hour request correlation panel.
+- Main/subagent cache-read, cache-write, request-hit, cold-start, affinity, and failover observability, a bounded and redacted 24-hour request correlation panel, and management-only rolling throughput/latency statistics.
 - Bundled, loopback-only CLIProxyAPI sidecar for Codex device-auth requests. Pool pins each request to the selected account through a sidecar model prefix, while the sidecar owns OAuth refreshes.
 - Public pool participation toggles on `/admin`, plus authenticated owner controls for add/remove account, same-slot device-auth repair jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Signing in`, `Duplicate`, `Disabled`, or `Standby`.
 - Codex quota refresh from `/backend-api/wham/usage`, including per-window percentages, reset times, plan-type updates, sanitized quota errors, and five-minute dashboard refresh.

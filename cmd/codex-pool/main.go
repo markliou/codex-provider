@@ -60,6 +60,15 @@ const (
 	routingCacheEventLimit     = 500
 	routingCacheEventViewLimit = 50
 	routingCacheEventTTL       = 24 * time.Hour
+	// Throughput buckets are operational aggregates, not a request log. Fifteen
+	// second buckets keep the 1/5/15 minute dashboard responsive without
+	// persisting prompts, response text, raw identifiers, or one row per request.
+	// Retain a short buffer beyond the largest visible window and keep a hard
+	// count bound so a large model/account matrix cannot grow runtime.json
+	// without limit.
+	throughputBucketInterval = 15 * time.Second
+	throughputBucketTTL      = 30 * time.Minute
+	throughputBucketLimit    = 10000
 	// promptCacheBucketsDefault spreads a coarse (project/user) prompt cache key
 	// across a few buckets so a hot scope stays under OpenAI's ~15 RPM per
 	// (prefix + prompt_cache_key) limit while still sharing the static prefix
@@ -79,6 +88,11 @@ const (
 	// silently remove the coding-agent instructions after a successful refresh.
 	codexModelBaseInstructions = "You are Codex, a coding agent running in a terminal-based coding assistant. Inspect the workspace before acting, follow repository instructions such as AGENTS.md, use the available tools to implement and verify changes, keep the user informed, and continue until the task is genuinely handled."
 )
+
+var throughputLatencyBoundsMillis = []uint64{
+	100, 250, 500, 1000, 2000, 5000, 10000, 30000,
+	60000, 120000, 300000, 600000, 900000,
+}
 
 var (
 	errAccountAuthFailed         = errors.New("account authentication failed")
@@ -272,6 +286,52 @@ type routingCacheEvent struct {
 	ColdCacheEligible     bool      `json:"coldCacheEligible"`
 }
 
+// throughputBucket stores only coarse timing/token aggregates. Account, model,
+// and agent kind are needed for operator-visible attribution, but raw request,
+// route, thread, prompt-cache, and response identifiers must never be added.
+type throughputBucket struct {
+	BucketAt                       time.Time `json:"bucketAt"`
+	AccountID                      string    `json:"accountId,omitempty"`
+	ModelID                        string    `json:"modelId,omitempty"`
+	AgentKind                      string    `json:"agentKind,omitempty"`
+	RequestCount                   uint64    `json:"requestCount"`
+	SuccessCount                   uint64    `json:"successCount"`
+	FailureCount                   uint64    `json:"failureCount"`
+	CancelledCount                 uint64    `json:"cancelledCount,omitempty"`
+	StreamingRequestCount          uint64    `json:"streamingRequestCount,omitempty"`
+	UsageObservedRequestCount      uint64    `json:"usageObservedRequestCount,omitempty"`
+	OutputObservedRequestCount     uint64    `json:"outputObservedRequestCount,omitempty"`
+	InputTokens                    uint64    `json:"inputTokens,omitempty"`
+	CachedTokens                   uint64    `json:"cachedTokens,omitempty"`
+	OutputTokens                   uint64    `json:"outputTokens,omitempty"`
+	TimedOutputTokens              uint64    `json:"timedOutputTokens,omitempty"`
+	TotalDurationMillis            uint64    `json:"totalDurationMillis,omitempty"`
+	TTFBMillis                     uint64    `json:"ttfbMillis,omitempty"`
+	TTFTMillis                     uint64    `json:"ttftMillis,omitempty"`
+	GenerationMillis               uint64    `json:"generationMillis,omitempty"`
+	TTFBObservedRequestCount       uint64    `json:"ttfbObservedRequestCount,omitempty"`
+	TTFTObservedRequestCount       uint64    `json:"ttftObservedRequestCount,omitempty"`
+	GenerationObservedRequestCount uint64    `json:"generationObservedRequestCount,omitempty"`
+	DurationHistogram              []uint64  `json:"durationHistogram,omitempty"`
+	TTFBHistogram                  []uint64  `json:"ttfbHistogram,omitempty"`
+	TTFTHistogram                  []uint64  `json:"ttftHistogram,omitempty"`
+}
+
+type throughputMeasurement struct {
+	StartedAt      time.Time
+	HeadersAt      time.Time
+	FirstContentAt time.Time
+	CompletedAt    time.Time
+	AccountID      string
+	ModelID        string
+	AgentKind      string
+	Streaming      bool
+	Success        bool
+	Cancelled      bool
+	Finished       bool
+	Usage          promptCacheUsage
+}
+
 type accountHealth struct {
 	LastSuccessAt      time.Time `json:"lastSuccessAt,omitempty"`
 	LastFailureAt      time.Time `json:"lastFailureAt,omitempty"`
@@ -320,6 +380,7 @@ type state struct {
 	// account's hit rate can be recalculated independently of the pool-wide reset.
 	PromptCacheResetAtByAccount map[string]time.Time `json:"promptCacheResetAtByAccount,omitempty"`
 	RoutingCacheEvents          []routingCacheEvent  `json:"routingCacheEvents,omitempty"`
+	ThroughputBuckets           []throughputBucket   `json:"throughputBuckets,omitempty"`
 	RequestCount                uint64               `json:"requestCount"`
 	SuccessCount                uint64               `json:"successCount"`
 	FailureCount                uint64               `json:"failureCount"`
@@ -357,6 +418,7 @@ type app struct {
 	loginCancels         map[string]context.CancelFunc
 	loginFailures        map[string]loginFailure
 	authLocks            map[string]*sync.Mutex
+	activeProxyRequests  uint64
 	client               *http.Client
 	streamClient         *http.Client
 	logger               *log.Logger
@@ -1033,6 +1095,9 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	dropHostedToolConflicts(payload)
 	route := a.routingDecision(r, payload, model, requestAPIKey(r))
 	a.applyPromptCacheControls(payload, route)
+	streaming, _ := payload["stream"].(bool)
+	throughput := a.beginThroughputMeasurement(model, route.Identity, streaming)
+	defer a.finishThroughputMeasurement(throughput)
 	updatedBody, err := json.Marshal(payload)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "unable to encode request")
@@ -1060,6 +1125,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			writeOpenAIError(w, http.StatusServiceUnavailable, "all_accounts_cooling_down", err.Error())
 			return
 		}
+		throughput.AccountID = candidate.ID
 		endpoint, outBody, convertResponse, err := a.prepareUpstreamRequest(candidate, updatedBody, chat)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", err.Error())
@@ -1071,6 +1137,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 				// The caller timed out or disconnected. Stop immediately and avoid
 				// marking the selected account unhealthy; no upstream failure was
 				// confirmed, and persisting one makes later unrelated requests slower.
+				throughput.Cancelled = true
 				return
 			}
 			excluded[candidate.ID] = true
@@ -1089,6 +1156,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			a.markFailure(candidate.ID, model, "upstream_transport_error", 30*time.Second)
 			continue
 		}
+		throughput.HeadersAt = time.Now().UTC()
 		if upstreamAuthFailureStatus(response.StatusCode) {
 			body, _ := io.ReadAll(io.LimitReader(response.Body, maxRequestBody))
 			_ = response.Body.Close()
@@ -1161,7 +1229,14 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		info.RequestID = requestID
 		info.FailoverFromAccountID = failoverFromAccountID
 		info.FailoverOutcome = failoverOutcome
-		a.markSuccess(route, model, candidate.ID, info)
+		throughput.FirstContentAt = info.FirstContentAt
+		throughput.CompletedAt = info.CompletedAt
+		throughput.Usage = info.Usage
+		// Account health treats a well-formed non-retryable upstream response as
+		// a healthy connection, but client throughput success is stricter: only
+		// a 2xx response belongs in the success numerator.
+		throughput.Success = response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+		a.markSuccessWithMeasurement(route, model, candidate.ID, info, throughput)
 		return
 	}
 	writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", "all eligible upstream accounts failed")
@@ -1340,12 +1415,16 @@ type promptCacheUsage struct {
 	InputTokens      uint64
 	CachedTokens     uint64
 	CacheWriteTokens *uint64
+	OutputTokens     uint64
+	OutputPresent    bool
 	Present          bool
 }
 
 type proxyResponseInfo struct {
 	ResponseID            string
 	Usage                 promptCacheUsage
+	FirstContentAt        time.Time
+	CompletedAt           time.Time
 	RequestID             string
 	FailoverFromAccountID string
 	FailoverOutcome       string
@@ -1366,7 +1445,9 @@ func (a *app) writeChatFromResponse(w http.ResponseWriter, response *http.Respon
 		"id": "chatcmpl_" + randomID(), "object": "chat.completion", "created": created, "model": model,
 		"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": text}, "finish_reason": "stop"}},
 	})
-	return responseInfoFromPayload(data), true
+	info := responseInfoFromPayload(data)
+	info.CompletedAt = time.Now().UTC()
+	return info, true
 }
 
 func outputText(data map[string]any) string {
@@ -1468,6 +1549,7 @@ func copyProxyResponse(w http.ResponseWriter, response *http.Response) (proxyRes
 	if err := json.Unmarshal(body, &payload); err == nil {
 		info = responseInfoFromPayload(payload)
 	}
+	info.CompletedAt = time.Now().UTC()
 	_, _ = w.Write(body)
 	return info, true
 }
@@ -1480,6 +1562,9 @@ func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResp
 		line, err := reader.ReadString('\n')
 		if line != "" {
 			_, _ = io.WriteString(w, line)
+			if info.FirstContentAt.IsZero() && sseLineHasGeneratedContent(line) {
+				info.FirstContentAt = time.Now().UTC()
+			}
 			info.merge(responseInfoFromSSELine(line))
 			if flusher != nil {
 				flusher.Flush()
@@ -1492,6 +1577,7 @@ func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResp
 			break
 		}
 	}
+	info.CompletedAt = time.Now().UTC()
 	return info
 }
 
@@ -1507,8 +1593,53 @@ func (info *proxyResponseInfo) merge(next proxyResponseInfo) {
 		if next.Usage.CacheWriteTokens == nil && info.Usage.CacheWriteTokens != nil {
 			next.Usage.CacheWriteTokens = info.Usage.CacheWriteTokens
 		}
+		if !next.Usage.OutputPresent && info.Usage.OutputPresent {
+			next.Usage.OutputTokens = info.Usage.OutputTokens
+			next.Usage.OutputPresent = true
+		}
 		info.Usage = next.Usage
 	}
+	if info.FirstContentAt.IsZero() && !next.FirstContentAt.IsZero() {
+		info.FirstContentAt = next.FirstContentAt
+	}
+	if !next.CompletedAt.IsZero() {
+		info.CompletedAt = next.CompletedAt
+	}
+}
+
+func sseLineHasGeneratedContent(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return false
+	}
+	data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if data == "" || data == "[DONE]" {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		return false
+	}
+	eventType, _ := payload["type"].(string)
+	if strings.HasSuffix(eventType, ".delta") {
+		for _, key := range []string{"delta", "text", "arguments"} {
+			if value, ok := payload[key].(string); ok && value != "" {
+				return true
+			}
+		}
+	}
+	choices, _ := payload["choices"].([]any)
+	for _, raw := range choices {
+		choice, _ := raw.(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		if content, ok := delta["content"].(string); ok && content != "" {
+			return true
+		}
+		if calls, ok := delta["tool_calls"].([]any); ok && len(calls) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func responseInfoFromSSELine(line string) proxyResponseInfo {
@@ -1547,6 +1678,7 @@ func promptCacheUsageFromPayload(payload map[string]any) promptCacheUsage {
 	if !inputOK {
 		inputTokens, inputOK = uint64Field(usage, "prompt_tokens")
 	}
+	outputTokens, outputOK := firstUint64Field(usage, "output_tokens", "completion_tokens")
 	var cachedTokens uint64
 	var cachedOK bool
 	var cacheWriteTokens uint64
@@ -1574,7 +1706,11 @@ func promptCacheUsageFromPayload(payload map[string]any) promptCacheUsage {
 		value := cacheWriteTokens
 		cacheWrite = &value
 	}
-	return promptCacheUsage{InputTokens: inputTokens, CachedTokens: cachedTokens, CacheWriteTokens: cacheWrite, Present: inputOK || cachedOK || cacheWriteOK}
+	return promptCacheUsage{
+		InputTokens: inputTokens, CachedTokens: cachedTokens, CacheWriteTokens: cacheWrite,
+		OutputTokens: outputTokens, OutputPresent: outputOK,
+		Present: inputOK || cachedOK || cacheWriteOK || outputOK,
+	}
 }
 
 func firstUint64Field(values map[string]any, names ...string) (uint64, bool) {
@@ -1702,7 +1838,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -2783,6 +2919,155 @@ func (a *app) proAccountLocked(item account) bool {
 	return normalizePlanType(plan) == "pro"
 }
 
+func (a *app) beginThroughputMeasurement(model string, identity requestIdentity, streaming bool) *throughputMeasurement {
+	agentKind := "main"
+	if identity.IsSubagent {
+		agentKind = "subagent"
+	}
+	measurement := &throughputMeasurement{
+		StartedAt: time.Now().UTC(),
+		ModelID:   model,
+		AgentKind: agentKind,
+		Streaming: streaming,
+	}
+	a.mu.Lock()
+	a.activeProxyRequests++
+	a.mu.Unlock()
+	return measurement
+}
+
+func (a *app) finishThroughputMeasurement(measurement *throughputMeasurement) {
+	if measurement == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if measurement.Finished {
+		return
+	}
+	a.finishThroughputMeasurementLocked(measurement, time.Now().UTC())
+	_ = a.saveRuntimeLocked()
+}
+
+func (a *app) finishThroughputMeasurementLocked(measurement *throughputMeasurement, now time.Time) {
+	if measurement == nil || measurement.Finished {
+		return
+	}
+	measurement.Finished = true
+	if measurement.CompletedAt.IsZero() {
+		measurement.CompletedAt = now
+	}
+	if a.activeProxyRequests > 0 {
+		a.activeProxyRequests--
+	}
+	a.recordThroughputMeasurementLocked(*measurement)
+}
+
+func (a *app) recordThroughputMeasurementLocked(measurement throughputMeasurement) {
+	completedAt := measurement.CompletedAt
+	if completedAt.IsZero() {
+		completedAt = time.Now().UTC()
+	}
+	if measurement.StartedAt.IsZero() || completedAt.Before(measurement.StartedAt) {
+		measurement.StartedAt = completedAt
+	}
+	a.pruneThroughputBucketsLocked(completedAt)
+	bucketAt := completedAt.Truncate(throughputBucketInterval)
+	index := -1
+	for i := len(a.state.ThroughputBuckets) - 1; i >= 0; i-- {
+		bucket := a.state.ThroughputBuckets[i]
+		if bucket.BucketAt.Equal(bucketAt) &&
+			bucket.AccountID == measurement.AccountID &&
+			bucket.ModelID == measurement.ModelID &&
+			bucket.AgentKind == measurement.AgentKind {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		a.state.ThroughputBuckets = append(a.state.ThroughputBuckets, throughputBucket{
+			BucketAt:  bucketAt,
+			AccountID: measurement.AccountID,
+			ModelID:   measurement.ModelID,
+			AgentKind: measurement.AgentKind,
+		})
+		index = len(a.state.ThroughputBuckets) - 1
+	}
+	bucket := &a.state.ThroughputBuckets[index]
+	bucket.RequestCount++
+	switch {
+	case measurement.Cancelled:
+		bucket.CancelledCount++
+	case measurement.Success:
+		bucket.SuccessCount++
+	default:
+		bucket.FailureCount++
+	}
+	if measurement.Streaming {
+		bucket.StreamingRequestCount++
+	}
+	if measurement.Usage.Present {
+		bucket.UsageObservedRequestCount++
+		bucket.InputTokens += measurement.Usage.InputTokens
+		bucket.CachedTokens += measurement.Usage.CachedTokens
+	}
+	if measurement.Usage.OutputPresent {
+		bucket.OutputObservedRequestCount++
+		bucket.OutputTokens += measurement.Usage.OutputTokens
+	}
+	durationMillis := elapsedMillis(measurement.StartedAt, completedAt)
+	bucket.TotalDurationMillis += durationMillis
+	bucket.DurationHistogram = addHistogramObservation(bucket.DurationHistogram, durationMillis)
+	if !measurement.HeadersAt.IsZero() && !measurement.HeadersAt.Before(measurement.StartedAt) {
+		ttfbMillis := elapsedMillis(measurement.StartedAt, measurement.HeadersAt)
+		bucket.TTFBMillis += ttfbMillis
+		bucket.TTFBObservedRequestCount++
+		bucket.TTFBHistogram = addHistogramObservation(bucket.TTFBHistogram, ttfbMillis)
+	}
+	if measurement.Streaming && !measurement.FirstContentAt.IsZero() && !measurement.FirstContentAt.Before(measurement.StartedAt) {
+		ttftMillis := elapsedMillis(measurement.StartedAt, measurement.FirstContentAt)
+		bucket.TTFTMillis += ttftMillis
+		bucket.TTFTObservedRequestCount++
+		bucket.TTFTHistogram = addHistogramObservation(bucket.TTFTHistogram, ttftMillis)
+		if measurement.Usage.OutputPresent && completedAt.After(measurement.FirstContentAt) {
+			bucket.GenerationMillis += elapsedMillis(measurement.FirstContentAt, completedAt)
+			bucket.TimedOutputTokens += measurement.Usage.OutputTokens
+			bucket.GenerationObservedRequestCount++
+		}
+	}
+	if extra := len(a.state.ThroughputBuckets) - throughputBucketLimit; extra > 0 {
+		sort.Slice(a.state.ThroughputBuckets, func(i, j int) bool {
+			return a.state.ThroughputBuckets[i].BucketAt.Before(a.state.ThroughputBuckets[j].BucketAt)
+		})
+		a.state.ThroughputBuckets = append([]throughputBucket(nil), a.state.ThroughputBuckets[extra:]...)
+	}
+}
+
+func elapsedMillis(start, end time.Time) uint64 {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return 0
+	}
+	return uint64(end.Sub(start) / time.Millisecond)
+}
+
+func addHistogramObservation(histogram []uint64, value uint64) []uint64 {
+	required := len(throughputLatencyBoundsMillis) + 1
+	if len(histogram) != required {
+		resized := make([]uint64, required)
+		copy(resized, histogram)
+		histogram = resized
+	}
+	index := len(throughputLatencyBoundsMillis)
+	for i, bound := range throughputLatencyBoundsMillis {
+		if value <= bound {
+			index = i
+			break
+		}
+	}
+	histogram[index]++
+	return histogram
+}
+
 func (a *app) markFailure(accountID, model, reason string, duration time.Duration) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -2847,9 +3132,14 @@ func (a *app) markAccountAuthFailure(accountID, model, reason string) {
 }
 
 func (a *app) markSuccess(route routingDecision, model, accountID string, info proxyResponseInfo) {
+	a.markSuccessWithMeasurement(route, model, accountID, info, nil)
+}
+
+func (a *app) markSuccessWithMeasurement(route routingDecision, model, accountID string, info proxyResponseInfo, measurement *throughputMeasurement) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
+	a.finishThroughputMeasurementLocked(measurement, now)
 	key := route.StickyKey
 	if a.state.Health == nil {
 		a.state.Health = map[string]accountHealth{}
@@ -3149,6 +3439,18 @@ func (a *app) clearAccountIdentityScopedStateLocked(accountID string) {
 	deletePromptCacheForAccount(a.state.PromptCacheBaseline, accountID)
 	delete(a.state.PromptCacheResetAtByAccount, accountID)
 	a.clearStickyForAccountLocked(accountID)
+	// Throughput is identity-scoped history. Pool removal/disable only clears
+	// routes and must not erase the operator's rolling traffic view, while
+	// account deletion or a verified identity change must remove attribution.
+	if len(a.state.ThroughputBuckets) > 0 {
+		filtered := a.state.ThroughputBuckets[:0]
+		for _, bucket := range a.state.ThroughputBuckets {
+			if bucket.AccountID != accountID {
+				filtered = append(filtered, bucket)
+			}
+		}
+		a.state.ThroughputBuckets = append([]throughputBucket(nil), filtered...)
+	}
 }
 
 func (a *app) clearAccountRuntimeStateLocked(accountID string) {
@@ -3225,6 +3527,9 @@ func (a *app) pruneExpiredRuntimeStateLocked(now time.Time) bool {
 	if a.pruneRoutingCacheEventsLocked(now) {
 		changed = true
 	}
+	if a.pruneThroughputBucketsLocked(now) {
+		changed = true
+	}
 	return changed
 }
 
@@ -3245,6 +3550,31 @@ func (a *app) pruneRoutingCacheEventsLocked(now time.Time) bool {
 	}
 	a.state.RoutingCacheEvents = append([]routingCacheEvent(nil), a.state.RoutingCacheEvents[first:]...)
 	return true
+}
+
+func (a *app) pruneThroughputBucketsLocked(now time.Time) bool {
+	if len(a.state.ThroughputBuckets) == 0 {
+		return false
+	}
+	cutoff := now.Add(-throughputBucketTTL)
+	filtered := a.state.ThroughputBuckets[:0]
+	for _, bucket := range a.state.ThroughputBuckets {
+		if bucket.BucketAt.Add(throughputBucketInterval).After(cutoff) {
+			filtered = append(filtered, bucket)
+		}
+	}
+	changed := len(filtered) != len(a.state.ThroughputBuckets)
+	if len(filtered) > throughputBucketLimit {
+		sort.Slice(filtered, func(i, j int) bool {
+			return filtered[i].BucketAt.Before(filtered[j].BucketAt)
+		})
+		filtered = filtered[len(filtered)-throughputBucketLimit:]
+		changed = true
+	}
+	if changed {
+		a.state.ThroughputBuckets = append([]throughputBucket(nil), filtered...)
+	}
+	return changed
 }
 
 func (a *app) latestStickySessionLocked(model string, now time.Time) (stickySession, bool) {
@@ -3327,6 +3657,11 @@ func (a *app) saveLocked() error {
 	if err := writeJSONAtomic(filepath.Join(a.dataDir, "config.json"), a.config); err != nil {
 		return err
 	}
+	return writeJSONAtomic(filepath.Join(a.dataDir, "state", "runtime.json"), a.state)
+}
+
+func (a *app) saveRuntimeLocked() error {
+	a.state.UpdatedAt = time.Now().UTC()
 	return writeJSONAtomic(filepath.Join(a.dataDir, "state", "runtime.json"), a.state)
 }
 
@@ -5464,6 +5799,11 @@ func (a *app) accountHasPriorIdentityLocked(item account) bool {
 			return true
 		}
 	}
+	for _, bucket := range a.state.ThroughputBuckets {
+		if bucket.AccountID == item.ID {
+			return true
+		}
+	}
 	return false
 }
 
@@ -5865,6 +6205,175 @@ func (a *app) promptCacheWindowForAccountLocked(accountID string) map[string]any
 	return a.promptCacheWindowFilteredLocked(accountID, resetAt)
 }
 
+type throughputAggregate struct {
+	requests            uint64
+	successes           uint64
+	failures            uint64
+	cancelled           uint64
+	streaming           uint64
+	usageObserved       uint64
+	outputObserved      uint64
+	inputTokens         uint64
+	cachedTokens        uint64
+	outputTokens        uint64
+	timedOutputTokens   uint64
+	totalDurationMillis uint64
+	ttfbMillis          uint64
+	ttftMillis          uint64
+	generationMillis    uint64
+	ttfbObserved        uint64
+	ttftObserved        uint64
+	generationObserved  uint64
+	durationHistogram   []uint64
+	ttfbHistogram       []uint64
+	ttftHistogram       []uint64
+}
+
+func (a *app) throughputSnapshotLocked(accountID string, now time.Time) map[string]any {
+	windows := map[string]any{
+		"1m":  a.throughputWindowLocked(accountID, now, time.Minute),
+		"5m":  a.throughputWindowLocked(accountID, now, 5*time.Minute),
+		"15m": a.throughputWindowLocked(accountID, now, 15*time.Minute),
+	}
+	result := map[string]any{
+		"windows":               windows,
+		"bucketIntervalSeconds": int(throughputBucketInterval / time.Second),
+	}
+	if accountID == "" {
+		result["activeRequests"] = a.activeProxyRequests
+	}
+	return result
+}
+
+func (a *app) throughputWindowLocked(accountID string, now time.Time, window time.Duration) map[string]any {
+	cutoff := now.Add(-window)
+	var aggregate throughputAggregate
+	for _, bucket := range a.state.ThroughputBuckets {
+		if accountID != "" && bucket.AccountID != accountID {
+			continue
+		}
+		if bucket.BucketAt.After(now) || !bucket.BucketAt.Add(throughputBucketInterval).After(cutoff) {
+			continue
+		}
+		aggregate.add(bucket)
+	}
+	minutes := window.Minutes()
+	result := map[string]any{
+		"windowSeconds":              int(window / time.Second),
+		"requestCount":               aggregate.requests,
+		"successCount":               aggregate.successes,
+		"failureCount":               aggregate.failures,
+		"cancelledCount":             aggregate.cancelled,
+		"streamingRequestCount":      aggregate.streaming,
+		"usageObservedRequestCount":  aggregate.usageObserved,
+		"outputObservedRequestCount": aggregate.outputObserved,
+		"inputTokens":                aggregate.inputTokens,
+		"cachedTokens":               aggregate.cachedTokens,
+		"outputTokens":               aggregate.outputTokens,
+		"requestsPerMinute":          float64(aggregate.requests) / minutes,
+		"inputTokensPerMinute":       float64(aggregate.inputTokens) / minutes,
+		"cachedTokensPerMinute":      float64(aggregate.cachedTokens) / minutes,
+		"outputTokensPerMinute":      float64(aggregate.outputTokens) / minutes,
+		"averageLatencyMs":           averageMillis(aggregate.totalDurationMillis, aggregate.requests),
+		"p50LatencyMs":               histogramPercentileMillis(aggregate.durationHistogram, 50),
+		"p95LatencyMs":               histogramPercentileMillis(aggregate.durationHistogram, 95),
+		"averageTTFBMs":              averageMillis(aggregate.ttfbMillis, aggregate.ttfbObserved),
+		"p50TTFBMs":                  histogramPercentileMillis(aggregate.ttfbHistogram, 50),
+		"p95TTFBMs":                  histogramPercentileMillis(aggregate.ttfbHistogram, 95),
+		"averageTTFTMs":              averageMillis(aggregate.ttftMillis, aggregate.ttftObserved),
+		"p50TTFTMs":                  histogramPercentileMillis(aggregate.ttftHistogram, 50),
+		"p95TTFTMs":                  histogramPercentileMillis(aggregate.ttftHistogram, 95),
+	}
+	if aggregate.outputObserved > 0 {
+		// This is actual rolling aggregate throughput: all observed output
+		// tokens divided by the wall-clock window. Do not replace it with summed
+		// per-request generation time, which under-reports parallel work.
+		result["outputTokensPerSecond"] = float64(aggregate.outputTokens) / window.Seconds()
+	} else {
+		result["outputTokensPerSecond"] = nil
+	}
+	if aggregate.generationMillis > 0 && aggregate.generationObserved > 0 {
+		result["generationTokensPerSecond"] = float64(aggregate.timedOutputTokens) / (float64(aggregate.generationMillis) / 1000)
+	} else {
+		result["generationTokensPerSecond"] = nil
+	}
+	if aggregate.requests > 0 {
+		result["successRate"] = float64(aggregate.successes) / float64(aggregate.requests)
+	} else {
+		result["successRate"] = nil
+	}
+	return result
+}
+
+func (aggregate *throughputAggregate) add(bucket throughputBucket) {
+	aggregate.requests += bucket.RequestCount
+	aggregate.successes += bucket.SuccessCount
+	aggregate.failures += bucket.FailureCount
+	aggregate.cancelled += bucket.CancelledCount
+	aggregate.streaming += bucket.StreamingRequestCount
+	aggregate.usageObserved += bucket.UsageObservedRequestCount
+	aggregate.outputObserved += bucket.OutputObservedRequestCount
+	aggregate.inputTokens += bucket.InputTokens
+	aggregate.cachedTokens += bucket.CachedTokens
+	aggregate.outputTokens += bucket.OutputTokens
+	aggregate.timedOutputTokens += bucket.TimedOutputTokens
+	aggregate.totalDurationMillis += bucket.TotalDurationMillis
+	aggregate.ttfbMillis += bucket.TTFBMillis
+	aggregate.ttftMillis += bucket.TTFTMillis
+	aggregate.generationMillis += bucket.GenerationMillis
+	aggregate.ttfbObserved += bucket.TTFBObservedRequestCount
+	aggregate.ttftObserved += bucket.TTFTObservedRequestCount
+	aggregate.generationObserved += bucket.GenerationObservedRequestCount
+	aggregate.durationHistogram = addHistograms(aggregate.durationHistogram, bucket.DurationHistogram)
+	aggregate.ttfbHistogram = addHistograms(aggregate.ttfbHistogram, bucket.TTFBHistogram)
+	aggregate.ttftHistogram = addHistograms(aggregate.ttftHistogram, bucket.TTFTHistogram)
+}
+
+func addHistograms(total, values []uint64) []uint64 {
+	if len(values) == 0 {
+		return total
+	}
+	if len(total) < len(values) {
+		resized := make([]uint64, len(values))
+		copy(resized, total)
+		total = resized
+	}
+	for index, value := range values {
+		total[index] += value
+	}
+	return total
+}
+
+func averageMillis(total, count uint64) any {
+	if count == 0 {
+		return nil
+	}
+	return float64(total) / float64(count)
+}
+
+func histogramPercentileMillis(histogram []uint64, percentile uint64) any {
+	var total uint64
+	for _, count := range histogram {
+		total += count
+	}
+	if total == 0 {
+		return nil
+	}
+	target := (total*percentile + 99) / 100
+	var seen uint64
+	for index, count := range histogram {
+		seen += count
+		if seen < target {
+			continue
+		}
+		if index < len(throughputLatencyBoundsMillis) {
+			return throughputLatencyBoundsMillis[index]
+		}
+		return throughputLatencyBoundsMillis[len(throughputLatencyBoundsMillis)-1]
+	}
+	return nil
+}
+
 // promptCacheWindowFilteredLocked computes the since-baseline deltas. An empty
 // accountID aggregates every account.
 func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Time) map[string]any {
@@ -5988,7 +6497,7 @@ func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]an
 	health := a.state.Health[item.ID]
 	quota := a.state.Quotas[item.ID]
 	cacheInput, cacheCached, cacheRequests := a.promptCacheStatsForAccountLocked(item.ID)
-	result := map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "activeRouteCount": a.activeRouteCountLocked(item.ID, now), "cacheInputTokens": cacheInput, "cacheCachedTokens": cacheCached, "cacheRequestCount": cacheRequests, "cacheWindow": a.promptCacheWindowForAccountLocked(item.ID), "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
+	result := map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "activeRouteCount": a.activeRouteCountLocked(item.ID, now), "cacheInputTokens": cacheInput, "cacheCachedTokens": cacheCached, "cacheRequestCount": cacheRequests, "cacheWindow": a.promptCacheWindowForAccountLocked(item.ID), "throughput": a.throughputSnapshotLocked(item.ID, now), "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
 	if job := a.activeLoginJobForAccountLocked(item.ID); job != nil {
 		// This endpoint is management-only. Returning the active job lets a page
 		// reload recover the device URL/code instead of orphaning a live login.

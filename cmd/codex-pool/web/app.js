@@ -49,6 +49,68 @@
     if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
     return String(n);
   };
+  const finiteMetric = (value) => {
+    if (value === null || value === undefined || value === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  };
+  const formatMetricRate = (value, suffix = "") => {
+    const number = finiteMetric(value);
+    if (number === null) return "—";
+    if (Math.abs(number) >= 1000) return `${formatTokens(number)}${suffix}`;
+    return `${number.toFixed(number >= 100 ? 0 : number >= 10 ? 1 : 2)}${suffix}`;
+  };
+  const formatDuration = (value) => {
+    const milliseconds = finiteMetric(value);
+    if (milliseconds === null) return "—";
+    if (milliseconds < 1000) return `${Math.round(milliseconds)}ms`;
+    if (milliseconds < 60000) return `${(milliseconds / 1000).toFixed(milliseconds < 10000 ? 1 : 0)}s`;
+    return `${(milliseconds / 60000).toFixed(1)}m`;
+  };
+
+  function renderThroughput(throughput) {
+    const windows = throughput?.windows || {};
+    const active = Number(throughput?.activeRequests) || 0;
+    $("#throughput-active").textContent = `${active} active`;
+    const definitions = [["1m", "Last minute"], ["5m", "Last 5 minutes"], ["15m", "Last 15 minutes"]];
+    $("#throughput-windows").innerHTML = definitions.map(([key, label]) => {
+      const win = windows[key] || {};
+      const requests = Number(win.requestCount) || 0;
+      const successes = Number(win.successCount) || 0;
+      const successRate = requests ? `${((successes / requests) * 100).toFixed(1)}% success` : "No completed requests";
+      const latency = `${formatDuration(win.p50LatencyMs)} / ${formatDuration(win.p95LatencyMs)}`;
+      const ttfb = `${formatDuration(win.p50TTFBMs)} / ${formatDuration(win.p95TTFBMs)}`;
+      const ttft = `${formatDuration(win.p50TTFTMs)} / ${formatDuration(win.p95TTFTMs)}`;
+      return `<article class="throughput-card">
+        <div class="throughput-card-head"><span>${escapeHTML(label)}</span><small>${escapeHTML(successRate)}</small></div>
+        <div class="throughput-primary">
+          <div><strong>${escapeHTML(formatMetricRate(win.requestsPerMinute))}</strong><span>req/min</span></div>
+          <div><strong>${escapeHTML(formatMetricRate(win.outputTokensPerSecond))}</strong><span>output tok/s</span></div>
+        </div>
+        <div class="throughput-token-flow">
+          <span><i class="flow-dot input"></i>${escapeHTML(formatMetricRate(win.inputTokensPerMinute))} input/min</span>
+          <span><i class="flow-dot cache"></i>${escapeHTML(formatMetricRate(win.cachedTokensPerMinute))} cached/min</span>
+          <span><i class="flow-dot output"></i>${escapeHTML(formatMetricRate(win.outputTokensPerMinute))} output/min</span>
+        </div>
+        <div class="throughput-latency" title="Approximate p50 / p95 from bounded latency histograms">
+          <span>Latency <b>${escapeHTML(latency)}</b></span>
+          <span>TTFB <b>${escapeHTML(ttfb)}</b></span>
+          <span>TTFT <b>${escapeHTML(ttft)}</b></span>
+        </div>
+      </article>`;
+    }).join("");
+  }
+
+  function accountThroughputMarkup(throughput) {
+    const win = throughput?.windows?.["5m"] || {};
+    const requests = Number(win.requestCount) || 0;
+    if (!requests) return '<span class="throughput-empty">No recent traffic</span>';
+    return `<div class="account-throughput" title="Rolling 5 minute client-request throughput">
+      <span><strong>${escapeHTML(formatMetricRate(win.requestsPerMinute))}</strong> req/min</span>
+      <span><strong>${escapeHTML(formatMetricRate(win.outputTokensPerSecond))}</strong> output tok/s</span>
+      <span><strong>${escapeHTML(formatDuration(win.p95LatencyMs))}</strong> p95 latency</span>
+    </div>`;
+  }
 
   function notify(message, error = false) {
     if (!error) return;
@@ -404,12 +466,12 @@
   }
 
   function renderAccounts(accounts, healthByID) {
-    $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity/Fallback")}</th><th>Last activity</th><th>Action</th></tr>`;
+    $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity/Fallback")}</th><th class="throughput-column">Throughput (5m)</th><th>Last activity</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} configured`;
     const body = $("#accounts-body");
     const activeLoginAccountId = accounts.find((account) => healthByID.get(account.id)?.loginJob)?.id || "";
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="9"><div class="empty-state">No accounts configured</div></td></tr>';
+      body.innerHTML = '<tr><td colspan="10"><div class="empty-state">No accounts configured</div></td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
@@ -442,6 +504,7 @@
         <td class="cache-column">${cacheHitMarkup(health, "main", account.id)}</td>
         <td class="cache-column">${cacheHitMarkup(health, "subagent")}</td>
         <td class="routing-count-column" title="${affinityHits} parent-affinity hits, ${affinityFallbacks} fallbacks">${affinityHits}/${affinityFallbacks}</td>
+        <td class="throughput-column">${accountThroughputMarkup(health.throughput)}</td>
         <td><div class="activity">${displayTime(activity)}${health.consecutiveFailure ? `<br>${health.consecutiveFailure} consecutive failure${health.consecutiveFailure === 1 ? "" : "s"}` : ""}</div></td>
         <td><div class="row-actions">${actions}</div></td>
       </tr>`;
@@ -565,6 +628,7 @@
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
       renderSettings(serviceState);
       renderSummary(serviceState.summary || {});
+      renderThroughput(serviceState.throughput);
       renderCacheWindow(serviceState.promptCacheWindow);
       renderAccounts(state.data.accounts, healthByID);
       renderRoutingCacheEvents(serviceState.routingCacheEvents);

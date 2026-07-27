@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#07111f">
+  <meta name="theme-color" content="#120a2e">
   <title>Codex Pool</title>
   <link rel="icon" href="/admin/assets/logo.svg" type="image/svg+xml">
   <link rel="manifest" href="/admin/manifest.webmanifest">
@@ -55,6 +55,21 @@
         </div>
 
         <section id="summary-grid" class="summary-grid" aria-label="Pool summary"></section>
+
+        <!-- Throughput reveals live traffic timing and volume, so it stays
+             management-only even though the public page may show aggregate
+             cache effectiveness. -->
+        <section id="throughput-panel" class="throughput-panel management-only" aria-labelledby="throughput-title">
+          <div class="throughput-heading">
+            <div>
+              <div class="eyebrow">LIVE FLOW</div>
+              <h2 id="throughput-title">Throughput</h2>
+              <p class="muted">Client requests and upstream token timing over rolling windows.</p>
+            </div>
+            <span id="throughput-active" class="live-chip">0 active</span>
+          </div>
+          <div id="throughput-windows" class="throughput-window-grid"></div>
+        </section>
 
         <section id="cache-window" class="cache-window" aria-label="Cache hit rate since reset" hidden>
           <!-- Keep the top window focused on operational counters and derived
