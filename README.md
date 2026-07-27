@@ -193,7 +193,7 @@ Do not forward the admin port directly from the Internet: the admin service does
 
 ### Public Status And Protected Management
 
-`GET /` on the admin port and `GET /admin` open the control page. Unauthenticated public pool status and join/leave controls are enabled by default; set `CODEX_POOL_PUBLIC_DASHBOARD=false` only when the public control page should be hidden. The public JSON uses an opaque per-process account reference for this toggle and returns only a partially masked email for account recognition. It never returns full email addresses, account IDs, upstream URLs, API keys, sticky sessions, traffic details, quota error codes, or upstream error bodies.
+`GET /` on the admin port and `GET /admin` open the control page. Unauthenticated public pool status and join/leave controls are enabled by default; set `CODEX_POOL_PUBLIC_DASHBOARD=false` only when the public control page should be hidden. The public JSON uses an opaque per-process account reference for this toggle, returns only a partially masked email for account recognition, and includes pool-wide rolling throughput. It never returns full email addresses, account IDs, upstream URLs, API keys, sticky sessions, per-account/request traffic details, quota error codes, or upstream error bodies.
 
 Authenticate with the admin password to add accounts, remove accounts, repair
 device auth in the same slot, and inspect or clear sticky sessions. Public and
