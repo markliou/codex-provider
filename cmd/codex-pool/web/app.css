@@ -108,6 +108,11 @@ input:focus, select:focus { border-color: var(--accent-hot); box-shadow: 0 0 0 3
 .chart-grid-line { stroke: rgba(112, 92, 168, .25); stroke-width: 1; vector-effect: non-scaling-stroke; }.chart-axis-label { fill: #8e83b5; font-size: 9px; font-variant-numeric: tabular-nums; }.chart-axis-label.left { text-anchor: end; }.chart-axis-label.right { text-anchor: start; }.chart-axis-label.time { text-anchor: middle; }
 .chart-series-line { fill: none; stroke: var(--series-color); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--series-color) 45%, transparent)); }
 .chart-series-point { fill: var(--series-color); stroke: #160c36; stroke-width: 1.2; vector-effect: non-scaling-stroke; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--series-color) 55%, transparent)); }
+/* Per-series colors are set here, not via inline style, because the admin CSP
+   (default-src 'self', no style-src 'unsafe-inline') strips inline style
+   attributes and would leave the line/marker unstyled (black, no stroke). */
+.chart-series-output { --series-color: #46e6ff; }
+.chart-series-kv { --series-color: #46f1c7; }
 .throughput-chart-empty { padding: 38px 16px; border: 1px dashed rgba(192, 149, 255, .28); border-radius: 13px; color: var(--muted); text-align: center; }
 .section-block { border-top: 1px solid var(--line-strong); padding-top: 16px; }
 .section-block.compact { min-width: 0; }

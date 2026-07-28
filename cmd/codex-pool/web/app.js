@@ -89,10 +89,24 @@
     { hours: 48, label: "48 hours", shortLabel: "48h" },
   ];
 
+  // Describe the actual observed span honestly instead of forcing it into the
+  // coarse 1h..48h buckets. A short post-restart history should read as
+  // "10m view", not be mislabeled "1h view" with the data crammed into a
+  // sliver of the plot.
+  const describeSpan = (spanMs) => {
+    const minutes = Math.max(1, Math.round(spanMs / 60000));
+    if (minutes < 90) return { hours: minutes / 60, label: `${minutes} min`, shortLabel: `${minutes}m` };
+    const hours = Math.round(minutes / 60);
+    return { hours, label: `${hours} hours`, shortLabel: `${hours}h` };
+  };
+
   // The backend deliberately returns the complete 48-hour retention grid,
-  // including leading empty buckets after a restart. Crop only the visual
-  // window around real observations; distributing sparse points evenly would
-  // falsify elapsed time and can mislead cache/throughput correlation analysis.
+  // including leading empty buckets after a restart. Anchor the left edge to
+  // the first real observation rather than a fixed now-minus-window cutoff:
+  // otherwise a short history is stranded in the far-right sliver of an
+  // otherwise empty plot and the line looks invisible. Every bucket inside the
+  // span (including interior null buckets) is kept, so true 10-minute spacing
+  // is preserved and sparse points are never redistributed evenly.
   const chartVisibleWindow = (points, series) => {
     const datedPoints = points.map((point) => ({
       point,
@@ -105,13 +119,15 @@
     if (!valuePoints.length) return { points: [], hasValues: false, ...throughputChartWindows[0] };
 
     const end = datedPoints[datedPoints.length - 1].timestamp;
-    const observedHours = Math.max(0, (end - valuePoints[0].timestamp) / (60 * 60 * 1000));
+    const firstValueTs = valuePoints[0].timestamp;
+    const observedHours = Math.max(0, (end - firstValueTs) / (60 * 60 * 1000));
     const range = throughputChartWindows.find(({ hours }) => observedHours <= hours) || throughputChartWindows[throughputChartWindows.length - 1];
-    const cutoff = end - range.hours * 60 * 60 * 1000;
+    const cutoff = Math.max(end - range.hours * 60 * 60 * 1000, firstValueTs);
+    const cropped = datedPoints.filter(({ timestamp }) => timestamp >= cutoff).map(({ point }) => point);
     return {
-      ...range,
+      ...describeSpan(end - firstValueTs),
       hasValues: true,
-      points: datedPoints.filter(({ timestamp }) => timestamp >= cutoff).map(({ point }) => point),
+      points: cropped,
     };
   };
 
@@ -129,6 +145,15 @@
     const plotWidth = plot.right - plot.left;
     const plotHeight = plot.bottom - plot.top;
     const axisMetrics = (axis) => config.series.filter((metric) => metric.axis === axis);
+    // Snap a dynamic axis maximum to a round step so that small fluctuations in
+    // the trailing in-progress bucket do not rescale the whole plot on every
+    // 30s refresh, which reads as the line jumping up and down.
+    const niceCeil = (value) => {
+      if (!(value > 0)) return 1;
+      const magnitude = Math.pow(10, Math.floor(Math.log10(value)));
+      const step = [1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10].find((candidate) => value <= candidate * magnitude);
+      return (step || 10) * magnitude;
+    };
     const axisMax = (axis) => {
       const fixed = axisMetrics(axis).map((metric) => metric.max).filter((value) => Number.isFinite(value));
       if (fixed.length) return Math.max(...fixed);
@@ -139,7 +164,7 @@
           if (value !== null) maximum = Math.max(maximum, value);
         });
       });
-      return maximum > 0 ? maximum * 1.08 : 1;
+      return maximum > 0 ? niceCeil(maximum * 1.08) : 1;
     };
     const leftMax = axisMax("left");
     const rightMax = axisMax("right");
@@ -172,7 +197,7 @@
       return samples.filter((sample, index) => index % stride === 0 || index === samples.length - 1).map(({ point, index, value }) => {
         const at = new Date(point?.at);
         const title = `${metric.label}: ${metric.format(value)}${Number.isNaN(at.getTime()) ? "" : ` at ${at.toLocaleString()}`}`;
-        return `<circle class="chart-series-point" cx="${xAt(index).toFixed(1)}" cy="${yAt(value, metric.axis).toFixed(1)}" r="2.6" style="--series-color:${metric.color}"><title>${escapeHTML(title)}</title></circle>`;
+        return `<circle class="chart-series-point ${metric.colorClass}" cx="${xAt(index).toFixed(1)}" cy="${yAt(value, metric.axis).toFixed(1)}" r="2.6"><title>${escapeHTML(title)}</title></circle>`;
       }).join("");
     };
     const grid = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
@@ -191,12 +216,12 @@
     const paths = config.series.map((metric) => {
       const path = pathFor(metric);
       if (!path) return "";
-      return `<path class="chart-series-line" d="${path}" style="--series-color:${metric.color}"></path>`;
+      return `<path class="chart-series-line ${metric.colorClass}" d="${path}"></path>`;
     }).join("");
     const markers = config.series.map(markersFor).join("");
     const legend = config.series.map((metric) => {
       const value = latestSeriesValue(points, metric.key);
-      return `<span class="chart-legend-item"><i style="--series-color:${metric.color}"></i><span>${escapeHTML(metric.label)}</span><strong>${escapeHTML(metric.format(value))}</strong></span>`;
+      return `<span class="chart-legend-item"><i class="${metric.colorClass}"></i><span>${escapeHTML(metric.label)}</span><strong>${escapeHTML(metric.format(value))}</strong></span>`;
     }).join("");
     return `<article class="throughput-chart-card">
       <div class="throughput-chart-heading"><div><div class="throughput-chart-title"><h3>${escapeHTML(config.title)}</h3><span class="chart-range-chip">${escapeHTML(visibleWindow.shortLabel)} view</span></div><p>${escapeHTML(config.description)}</p></div><div class="throughput-chart-legend">${legend}</div></div>
@@ -231,8 +256,12 @@
       leftFormat: (value) => formatMetricRate(value),
       rightFormat: chartPercent,
       series: [
-        { key: "outputTokensPerSecond", label: "Output tok/s", axis: "left", color: "#46e6ff", format: (value) => formatMetricRate(value) },
-        { key: "cacheHitRate", label: "KV hit rate", axis: "right", color: "#46f1c7", max: 1, format: chartPercent },
+        // Series colors live in app.css (.chart-series-output / .chart-series-kv)
+        // rather than inline styles: the admin CSP has no style-src
+        // 'unsafe-inline', so an inline style="--series-color:…" is dropped and
+        // the line/marker fall back to an unstyled black dot with no stroke.
+        { key: "outputTokensPerSecond", label: "Output tok/s", axis: "left", colorClass: "chart-series-output", format: (value) => formatMetricRate(value) },
+        { key: "cacheHitRate", label: "KV hit rate", axis: "right", colorClass: "chart-series-kv", max: 1, format: chartPercent },
       ],
     };
     const visibleWindow = chartVisibleWindow(points, chart.series);
