@@ -6228,11 +6228,21 @@ func (a *app) throughputSeriesLocked(accountID string, now time.Time) []map[stri
 		if stored := aggregates[at.Unix()]; stored != nil {
 			aggregate = *stored
 		}
-		point := throughputAggregateProjection(aggregate, window)
+		// The public history intentionally carries only the two metrics shown on
+		// the correlation chart. Keep request, token-flow, and latency aggregates
+		// available for the current/account summaries without shipping unused
+		// 48-hour series fields back to every browser refresh.
+		point := throughputSeriesPointProjection(aggregate, window)
 		point["at"] = at
 		points = append(points, point)
 	}
 	return points
+}
+
+func throughputSeriesPointProjection(aggregate throughputAggregate, window time.Duration) map[string]any {
+	result := map[string]any{"windowSeconds": int(window / time.Second)}
+	addThroughputOutputAndCacheProjection(result, aggregate, window)
+	return result
 }
 
 func throughputAggregateProjection(aggregate throughputAggregate, window time.Duration) map[string]any {
@@ -6260,6 +6270,16 @@ func throughputAggregateProjection(aggregate throughputAggregate, window time.Du
 		"p50LatencyMs":               histogramPercentileMillis(aggregate.durationHistogram, 50),
 		"p95LatencyMs":               histogramPercentileMillis(aggregate.durationHistogram, 95),
 	}
+	addThroughputOutputAndCacheProjection(result, aggregate, window)
+	if aggregate.requests > 0 {
+		result["successRate"] = float64(aggregate.successes) / float64(aggregate.requests)
+	} else {
+		result["successRate"] = nil
+	}
+	return result
+}
+
+func addThroughputOutputAndCacheProjection(result map[string]any, aggregate throughputAggregate, window time.Duration) {
 	if aggregate.outputObserved > 0 {
 		// This is actual rolling aggregate throughput: all observed output
 		// tokens divided by the wall-clock window. Do not replace it with summed
@@ -6277,12 +6297,6 @@ func throughputAggregateProjection(aggregate throughputAggregate, window time.Du
 	} else {
 		result["cacheHitRate"] = nil
 	}
-	if aggregate.requests > 0 {
-		result["successRate"] = float64(aggregate.successes) / float64(aggregate.requests)
-	} else {
-		result["successRate"] = nil
-	}
-	return result
 }
 
 func (aggregate *throughputAggregate) add(bucket throughputBucket) {

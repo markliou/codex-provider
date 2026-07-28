@@ -1485,14 +1485,14 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS omitted subagent cache metric %q", expected)
 		}
 	}
-	for _, expected := range []string{"renderThroughput", "throughputChartMarkup", "renderThroughput(body.dashboard.throughput)", "accountThroughputMarkup", "requestsPerMinute", "outputTokensPerSecond", "cacheHitRate", "p95LatencyMs", "Output vs KV cache", "Token flow", "Requests & latency", "Throughput (5m)"} {
+	for _, expected := range []string{"renderThroughput", "throughputChartMarkup", "renderThroughput(body.dashboard.throughput)", "accountThroughputMarkup", "requestsPerMinute", "outputTokensPerSecond", "cacheHitRate", "p95LatencyMs", "Output vs KV cache", "Throughput (5m)"} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS omitted throughput behavior %q", expected)
 		}
 	}
-	for _, forbidden := range []string{"p50TTFBMs", "p95TTFBMs", "p50TTFTMs", "p95TTFTMs", ">TTFB ", ">TTFT "} {
+	for _, forbidden := range []string{"p50TTFBMs", "p95TTFBMs", "p50TTFTMs", "p95TTFTMs", ">TTFB ", ">TTFT ", "Token flow", "Requests & latency", "inputTokensPerMinute", "cachedTokensPerMinute", "outputTokensPerMinute", "p50LatencyMs", "Requests/min"} {
 		if strings.Contains(jsRecorder.Body.String(), forbidden) {
-			t.Fatalf("admin JS still renders removed throughput timing %q", forbidden)
+			t.Fatalf("admin JS still renders removed throughput chart metric %q", forbidden)
 		}
 	}
 	for _, forbidden := range []string{"Main cache (reqs)", "Subagent cache (reqs)", "<small>(${reqs})</small>", "cache-detail", "metric-origin-mini", "cache-derived-rate", "column-origin upstream", "column-origin calculated", ">OPENAI<", ">CALC<", `$("#cache-window-read")`, `$("#cache-window-write")`, `$("#cache-window-affinity")`, "cache-window-write-rate", "cacheWriteObservedRequestCount", "cacheWriteInputTokens", "cacheWriteRate", "cacheWindow.routingFailoverCount", `poolColumnHeader("Failovers")`, ">Write</span>", "Token usage: read", "write ratio"} {
@@ -1754,6 +1754,15 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 	series, ok := publicPayload.Dashboard.Throughput["series"].([]any)
 	if !ok || len(series) != int(throughputBucketTTL/throughputSeriesInterval)+1 {
 		t.Fatalf("public 48-hour throughput series = %#v", publicPayload.Dashboard.Throughput["series"])
+	}
+	latest, ok := series[len(series)-1].(map[string]any)
+	if !ok {
+		t.Fatalf("public latest series point = %#v", series[len(series)-1])
+	}
+	for _, forbidden := range []string{"requestCount", "inputTokensPerMinute", "requestsPerMinute", "p95LatencyMs"} {
+		if _, present := latest[forbidden]; present {
+			t.Fatalf("public historical series retained removed metric %q: %#v", forbidden, latest)
+		}
 	}
 	if strings.Count(publicBody, `"throughput"`) != 1 {
 		t.Fatal("public dashboard must expose only pool-wide throughput, not per-account throughput")
@@ -3404,8 +3413,13 @@ func TestManagementThroughputProjection(t *testing.T) {
 		t.Fatalf("management pool series = %#v", poolThroughput["series"])
 	}
 	last := series[len(series)-1]
-	if last["requestCount"].(uint64) != 2 || last["cacheHitRate"].(float64) != 0.75 {
+	if last["cacheHitRate"].(float64) != 0.75 || last["outputTokensPerSecond"].(float64) <= 0 {
 		t.Fatalf("management latest series point = %#v", last)
+	}
+	for _, forbidden := range []string{"requestCount", "inputTokensPerMinute", "requestsPerMinute", "p95LatencyMs"} {
+		if _, present := last[forbidden]; present {
+			t.Fatalf("management historical series retained removed metric %q: %#v", forbidden, last)
+		}
 	}
 	health := a.accountHealthItemLocked(a.config.Accounts[0], now)
 	accountThroughput, ok := health["throughput"].(map[string]any)

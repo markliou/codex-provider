@@ -159,17 +159,17 @@ details. Runtime state retains at most 500 entries and drops entries older than
 identifiers are domain-separated hashes before persistence; authenticated
 browser responses omit local/upstream account IDs and use masked account labels.
 
-The default status page **Throughput** panel shows the previous 48 hours as
-three 10-minute-resolution line charts: output tokens/second versus KV cache hit
-rate, input/cached/output token flow per minute, and requests/minute versus
-provider-observed p50/p95 end-to-end latency. A failover request is counted once
-even if it tries several accounts. The provider builds the chart from bounded
-one-minute in-memory aggregates; the series resets when the provider restarts
-and is never written to `runtime.json`. Output tokens/second uses upstream
-output usage divided by wall-clock time, so parallel sessions contribute to the
-same pool throughput. KV cache hit rate uses cached input divided by input on
-the identical time buckets, making correlation visible without implying
-causation. Authenticated per-account rows retain a compact five-minute request
+The default status page **Throughput** panel shows the previous 48 hours as one
+10-minute-resolution correlation chart: output tokens/second versus KV cache
+hit rate. A failover request is counted once even if it tries several accounts.
+The provider builds the chart from bounded one-minute in-memory aggregates; the
+series resets when the provider restarts and is never written to `runtime.json`.
+Output tokens/second uses upstream output usage divided by wall-clock time, so
+parallel sessions contribute to the same pool throughput. KV cache hit rate
+uses cached input divided by input on the identical time buckets, making
+correlation visible without implying causation. Historical token-flow,
+request-rate, and latency series are intentionally omitted to keep this view
+focused. Authenticated per-account rows retain a compact five-minute request
 rate, output throughput, and p95 latency; account attribution and request-level
 traffic details remain behind management authentication.
 

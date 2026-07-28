@@ -1208,20 +1208,25 @@ clear active routes but must not erase the in-process rolling view. Account
 deletion or a verified upstream identity change must remove that account's
 attributed buckets.
 
-Pool-wide projections expose 48 hours of request/success/failure/cancellation
+The pool-wide current projection exposes request/success/failure/cancellation
 counts, request rate, input/cached/output token rate, aggregate output-token
-throughput, KV cache hit rate, and end-to-end latency. Output token counts come
-from compatible upstream usage fields; output tokens/second is calculated over
-the chart bucket's wall-clock duration and is unavailable when no output usage
-was observed. KV cache hit rate is cached input divided by input on the same
-bucket, clamped to 0–100%; it supports correlation analysis but does not claim
-that cache reuse causes a throughput change. Approximate p50/p95 latency values
-come from bounded fixed histograms rather than request logs. TTFB and TTFT are
-not collected or projected by throughput telemetry. The active-request count is
-in-memory only. The unauthenticated public dashboard receives this pool-wide
-aggregate so routine traffic can be monitored without login. It must not receive
-raw throughput buckets or per-account throughput. Per-account management rows
-use a compact five-minute window.
+throughput, KV cache hit rate, and end-to-end latency. The 48-hour series is
+deliberately narrower: each point exposes only its timestamp/window duration,
+output tokens/second, and KV cache hit rate. Historical token-flow, request-rate,
+and latency fields must not be shipped to the browser because the correlation
+chart is intentionally limited to output throughput versus cache reuse. Output
+token counts come from compatible upstream usage fields; output tokens/second
+is calculated over the chart bucket's wall-clock duration and is unavailable
+when no output usage was observed. KV cache hit rate is cached input divided by
+input on the same bucket, clamped to 0–100%; it supports correlation analysis
+but does not claim that cache reuse causes a throughput change. Approximate
+p50/p95 current and per-account latency values come from bounded fixed
+histograms rather than request logs. TTFB and TTFT are not collected or
+projected by throughput telemetry. The active-request count is in-memory only.
+The unauthenticated public dashboard receives this pool-wide aggregate so
+routine traffic can be monitored without login. It must not receive raw
+throughput buckets or per-account throughput. Per-account management rows use a
+compact five-minute window.
 
 Dashboard metric presentation is a product contract. The top cache window
 shows Pool-observed counters and actionable calculated read/request/cold rates
@@ -1763,15 +1768,14 @@ affordances, but never raw identifiers or account IDs. Public mode must neither
 render nor receive request-level routing/cache events.
 
 The throughput panel must be visible in both public and management modes. It
-shows a current 10-minute summary and three 48-hour line charts: output
-tokens/second against KV cache hit rate, input/cached/output tokens per minute,
-and client requests/minute against approximate p50/p95 end-to-end latency. The
-panel also shows the current in-memory active request count and clearly states
-that history resets when the provider restarts. It must not show TTFB or TTFT.
-Only authenticated account rows show their five-minute request rate, rolling
-output-token throughput, and p95 latency. Labels must make clear these are
-provider-calculated rates over upstream usage and provider timing, not raw
-upstream quota fields.
+shows a current 10-minute summary and one 48-hour line chart comparing output
+tokens/second against KV cache hit rate. It must not add separate historical
+token-flow, request-rate, or latency charts. The panel also shows the current
+in-memory active request count and clearly states that history resets when the
+provider restarts. It must not show TTFB or TTFT. Only authenticated account
+rows show their five-minute request rate, rolling output-token throughput, and
+p95 latency. Labels must make clear these are provider-calculated rates over
+upstream usage and provider timing, not raw upstream quota fields.
 
 ### 16.3 Account actions
 

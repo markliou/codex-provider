@@ -165,42 +165,22 @@
       ["p95 latency", formatDuration(current.p95LatencyMs), "provider"],
     ];
     $("#throughput-current").innerHTML = currentItems.map(([label, value, suffix]) => `<div class="throughput-current-stat"><span>${escapeHTML(label)}</span><strong>${escapeHTML(value)}</strong><small>${escapeHTML(suffix)}</small></div>`).join("");
-    const charts = [
-      {
-        title: "Output vs KV cache",
-        description: "Compare delivered output throughput with cache reuse on the same 10-minute timeline.",
-        leftFormat: (value) => formatMetricRate(value),
-        rightFormat: chartPercent,
-        series: [
-          { key: "outputTokensPerSecond", label: "Output tok/s", axis: "left", color: "#46e6ff", format: (value) => formatMetricRate(value) },
-          { key: "cacheHitRate", label: "KV hit rate", axis: "right", color: "#46f1c7", max: 1, format: chartPercent },
-        ],
-      },
-      {
-        title: "Token flow",
-        description: "Input, cached input, and generated output tokens per minute.",
-        leftFormat: (value) => formatMetricRate(value),
-        rightFormat: (value) => formatMetricRate(value),
-        series: [
-          { key: "inputTokensPerMinute", label: "Input/min", axis: "left", color: "#c095ff", format: (value) => formatMetricRate(value) },
-          { key: "cachedTokensPerMinute", label: "Cached/min", axis: "left", color: "#46f1c7", format: (value) => formatMetricRate(value) },
-          { key: "outputTokensPerMinute", label: "Output/min", axis: "left", color: "#46e6ff", format: (value) => formatMetricRate(value) },
-        ],
-      },
-      {
-        title: "Requests & latency",
-        description: "Client request rate against provider-observed end-to-end response latency.",
-        leftFormat: (value) => formatMetricRate(value),
-        rightFormat: formatDuration,
-        series: [
-          { key: "requestsPerMinute", label: "Requests/min", axis: "left", color: "#ff6f91", format: (value) => formatMetricRate(value) },
-          { key: "p50LatencyMs", label: "p50 latency", axis: "right", color: "#ffd166", format: formatDuration },
-          { key: "p95LatencyMs", label: "p95 latency", axis: "right", color: "#ff9f43", format: formatDuration },
-        ],
-      },
-    ];
+    // This history is intentionally one focused correlation view. The current
+    // strip and per-account rows retain operational rates, but adding separate
+    // token-flow or latency charts here would recreate the dashboard clutter
+    // that the operator explicitly removed.
+    const chart = {
+      title: "Output vs KV cache",
+      description: "Compare delivered output throughput with cache reuse on the same 10-minute timeline.",
+      leftFormat: (value) => formatMetricRate(value),
+      rightFormat: chartPercent,
+      series: [
+        { key: "outputTokensPerSecond", label: "Output tok/s", axis: "left", color: "#46e6ff", format: (value) => formatMetricRate(value) },
+        { key: "cacheHitRate", label: "KV hit rate", axis: "right", color: "#46f1c7", max: 1, format: chartPercent },
+      ],
+    };
     $("#throughput-charts").innerHTML = points.length
-      ? charts.map((config) => throughputChartMarkup(points, config)).join("")
+      ? throughputChartMarkup(points, chart)
       : '<div class="throughput-chart-empty">No in-memory traffic history yet</div>';
   }
 
