@@ -60,15 +60,15 @@ const (
 	routingCacheEventLimit     = 500
 	routingCacheEventViewLimit = 50
 	routingCacheEventTTL       = 24 * time.Hour
-	// Throughput buckets are operational aggregates, not a request log. Fifteen
-	// second buckets keep the 1/5/15 minute dashboard responsive without
-	// persisting prompts, response text, raw identifiers, or one row per request.
-	// Retain a short buffer beyond the largest visible window and keep a hard
-	// count bound so a large model/account matrix cannot grow runtime.json
-	// without limit.
-	throughputBucketInterval = 15 * time.Second
-	throughputBucketTTL      = 30 * time.Minute
-	throughputBucketLimit    = 10000
+	// Throughput buckets are in-memory operational aggregates, not a request log.
+	// One-minute account buckets preserve enough resolution for five-minute
+	// management rows while the public chart combines them into 10-minute points.
+	// Retain 48 hours and enforce a hard cap so telemetry cannot consume memory
+	// without limit; these buckets must never be written to runtime.json.
+	throughputBucketInterval = time.Minute
+	throughputSeriesInterval = 10 * time.Minute
+	throughputBucketTTL      = 48 * time.Hour
+	throughputBucketLimit    = 100000
 	// promptCacheBucketsDefault spreads a coarse (project/user) prompt cache key
 	// across a few buckets so a hot scope stays under OpenAI's ~15 RPM per
 	// (prefix + prompt_cache_key) limit while still sharing the static prefix
@@ -286,50 +286,37 @@ type routingCacheEvent struct {
 	ColdCacheEligible     bool      `json:"coldCacheEligible"`
 }
 
-// throughputBucket stores only coarse timing/token aggregates. Account, model,
-// and agent kind are needed for operator-visible attribution, but raw request,
-// route, thread, prompt-cache, and response identifiers must never be added.
+// throughputBucket is an in-memory aggregate used for the 48-hour chart and
+// per-account rolling rows. Account is retained only for management filtering
+// and identity cleanup; model, agent, request, route, thread, prompt-cache, and
+// response identifiers must never be added. Keeping these buckets out of
+// runtime.json avoids turning exploratory telemetry into durable traffic logs.
 type throughputBucket struct {
-	BucketAt                       time.Time `json:"bucketAt"`
-	AccountID                      string    `json:"accountId,omitempty"`
-	ModelID                        string    `json:"modelId,omitempty"`
-	AgentKind                      string    `json:"agentKind,omitempty"`
-	RequestCount                   uint64    `json:"requestCount"`
-	SuccessCount                   uint64    `json:"successCount"`
-	FailureCount                   uint64    `json:"failureCount"`
-	CancelledCount                 uint64    `json:"cancelledCount,omitempty"`
-	StreamingRequestCount          uint64    `json:"streamingRequestCount,omitempty"`
-	UsageObservedRequestCount      uint64    `json:"usageObservedRequestCount,omitempty"`
-	OutputObservedRequestCount     uint64    `json:"outputObservedRequestCount,omitempty"`
-	InputTokens                    uint64    `json:"inputTokens,omitempty"`
-	CachedTokens                   uint64    `json:"cachedTokens,omitempty"`
-	OutputTokens                   uint64    `json:"outputTokens,omitempty"`
-	TimedOutputTokens              uint64    `json:"timedOutputTokens,omitempty"`
-	TotalDurationMillis            uint64    `json:"totalDurationMillis,omitempty"`
-	TTFBMillis                     uint64    `json:"ttfbMillis,omitempty"`
-	TTFTMillis                     uint64    `json:"ttftMillis,omitempty"`
-	GenerationMillis               uint64    `json:"generationMillis,omitempty"`
-	TTFBObservedRequestCount       uint64    `json:"ttfbObservedRequestCount,omitempty"`
-	TTFTObservedRequestCount       uint64    `json:"ttftObservedRequestCount,omitempty"`
-	GenerationObservedRequestCount uint64    `json:"generationObservedRequestCount,omitempty"`
-	DurationHistogram              []uint64  `json:"durationHistogram,omitempty"`
-	TTFBHistogram                  []uint64  `json:"ttfbHistogram,omitempty"`
-	TTFTHistogram                  []uint64  `json:"ttftHistogram,omitempty"`
+	BucketAt                   time.Time `json:"bucketAt"`
+	AccountID                  string    `json:"accountId,omitempty"`
+	RequestCount               uint64    `json:"requestCount"`
+	SuccessCount               uint64    `json:"successCount"`
+	FailureCount               uint64    `json:"failureCount"`
+	CancelledCount             uint64    `json:"cancelledCount,omitempty"`
+	StreamingRequestCount      uint64    `json:"streamingRequestCount,omitempty"`
+	UsageObservedRequestCount  uint64    `json:"usageObservedRequestCount,omitempty"`
+	OutputObservedRequestCount uint64    `json:"outputObservedRequestCount,omitempty"`
+	InputTokens                uint64    `json:"inputTokens,omitempty"`
+	CachedTokens               uint64    `json:"cachedTokens,omitempty"`
+	OutputTokens               uint64    `json:"outputTokens,omitempty"`
+	TotalDurationMillis        uint64    `json:"totalDurationMillis,omitempty"`
+	DurationHistogram          []uint64  `json:"durationHistogram,omitempty"`
 }
 
 type throughputMeasurement struct {
-	StartedAt      time.Time
-	HeadersAt      time.Time
-	FirstContentAt time.Time
-	CompletedAt    time.Time
-	AccountID      string
-	ModelID        string
-	AgentKind      string
-	Streaming      bool
-	Success        bool
-	Cancelled      bool
-	Finished       bool
-	Usage          promptCacheUsage
+	StartedAt   time.Time
+	CompletedAt time.Time
+	AccountID   string
+	Streaming   bool
+	Success     bool
+	Cancelled   bool
+	Finished    bool
+	Usage       promptCacheUsage
 }
 
 type accountHealth struct {
@@ -380,11 +367,14 @@ type state struct {
 	// account's hit rate can be recalculated independently of the pool-wide reset.
 	PromptCacheResetAtByAccount map[string]time.Time `json:"promptCacheResetAtByAccount,omitempty"`
 	RoutingCacheEvents          []routingCacheEvent  `json:"routingCacheEvents,omitempty"`
-	ThroughputBuckets           []throughputBucket   `json:"throughputBuckets,omitempty"`
-	RequestCount                uint64               `json:"requestCount"`
-	SuccessCount                uint64               `json:"successCount"`
-	FailureCount                uint64               `json:"failureCount"`
-	UpdatedAt                   time.Time            `json:"updatedAt"`
+	// LegacyThroughputBuckets is read once when upgrading from the persisted
+	// 30-minute implementation, then migrated into app memory and cleared before
+	// the next runtime save. New throughput history must never be written here.
+	LegacyThroughputBuckets []throughputBucket `json:"throughputBuckets,omitempty"`
+	RequestCount            uint64             `json:"requestCount"`
+	SuccessCount            uint64             `json:"successCount"`
+	FailureCount            uint64             `json:"failureCount"`
+	UpdatedAt               time.Time          `json:"updatedAt"`
 }
 
 type app struct {
@@ -419,6 +409,7 @@ type app struct {
 	loginFailures        map[string]loginFailure
 	authLocks            map[string]*sync.Mutex
 	activeProxyRequests  uint64
+	throughputBuckets    []throughputBucket
 	client               *http.Client
 	streamClient         *http.Client
 	logger               *log.Logger
@@ -627,7 +618,16 @@ func (a *app) load() error {
 	if a.state.PromptCache == nil {
 		a.state.PromptCache = map[string]promptCacheStat{}
 	}
-	if a.pruneExpiredRuntimeStateLocked(time.Now().UTC()) {
+	// Upgrade compatibility: import the old persisted 30-minute buckets once,
+	// then clear the JSON field. From this point onward the 48-hour series is
+	// intentionally process-memory telemetry and starts fresh after a restart.
+	migratedThroughput := len(a.state.LegacyThroughputBuckets) > 0
+	if migratedThroughput {
+		a.throughputBuckets = append(a.throughputBuckets, a.state.LegacyThroughputBuckets...)
+		a.state.LegacyThroughputBuckets = nil
+		a.pruneThroughputBucketsLocked(time.Now().UTC())
+	}
+	if a.pruneExpiredRuntimeStateLocked(time.Now().UTC()) || migratedThroughput {
 		_ = a.saveLocked()
 	}
 	for i := range a.config.Accounts {
@@ -1096,7 +1096,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	route := a.routingDecision(r, payload, model, requestAPIKey(r))
 	a.applyPromptCacheControls(payload, route)
 	streaming, _ := payload["stream"].(bool)
-	throughput := a.beginThroughputMeasurement(model, route.Identity, streaming)
+	throughput := a.beginThroughputMeasurement(streaming)
 	defer a.finishThroughputMeasurement(throughput)
 	updatedBody, err := json.Marshal(payload)
 	if err != nil {
@@ -1156,7 +1156,6 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			a.markFailure(candidate.ID, model, "upstream_transport_error", 30*time.Second)
 			continue
 		}
-		throughput.HeadersAt = time.Now().UTC()
 		if upstreamAuthFailureStatus(response.StatusCode) {
 			body, _ := io.ReadAll(io.LimitReader(response.Body, maxRequestBody))
 			_ = response.Body.Close()
@@ -1229,7 +1228,6 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		info.RequestID = requestID
 		info.FailoverFromAccountID = failoverFromAccountID
 		info.FailoverOutcome = failoverOutcome
-		throughput.FirstContentAt = info.FirstContentAt
 		throughput.CompletedAt = info.CompletedAt
 		throughput.Usage = info.Usage
 		// Account health treats a well-formed non-retryable upstream response as
@@ -1423,7 +1421,6 @@ type promptCacheUsage struct {
 type proxyResponseInfo struct {
 	ResponseID            string
 	Usage                 promptCacheUsage
-	FirstContentAt        time.Time
 	CompletedAt           time.Time
 	RequestID             string
 	FailoverFromAccountID string
@@ -1562,9 +1559,6 @@ func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResp
 		line, err := reader.ReadString('\n')
 		if line != "" {
 			_, _ = io.WriteString(w, line)
-			if info.FirstContentAt.IsZero() && sseLineHasGeneratedContent(line) {
-				info.FirstContentAt = time.Now().UTC()
-			}
 			info.merge(responseInfoFromSSELine(line))
 			if flusher != nil {
 				flusher.Flush()
@@ -1599,47 +1593,9 @@ func (info *proxyResponseInfo) merge(next proxyResponseInfo) {
 		}
 		info.Usage = next.Usage
 	}
-	if info.FirstContentAt.IsZero() && !next.FirstContentAt.IsZero() {
-		info.FirstContentAt = next.FirstContentAt
-	}
 	if !next.CompletedAt.IsZero() {
 		info.CompletedAt = next.CompletedAt
 	}
-}
-
-func sseLineHasGeneratedContent(line string) bool {
-	line = strings.TrimSpace(line)
-	if !strings.HasPrefix(line, "data:") {
-		return false
-	}
-	data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-	if data == "" || data == "[DONE]" {
-		return false
-	}
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(data), &payload); err != nil {
-		return false
-	}
-	eventType, _ := payload["type"].(string)
-	if strings.HasSuffix(eventType, ".delta") {
-		for _, key := range []string{"delta", "text", "arguments"} {
-			if value, ok := payload[key].(string); ok && value != "" {
-				return true
-			}
-		}
-	}
-	choices, _ := payload["choices"].([]any)
-	for _, raw := range choices {
-		choice, _ := raw.(map[string]any)
-		delta, _ := choice["delta"].(map[string]any)
-		if content, ok := delta["content"].(string); ok && content != "" {
-			return true
-		}
-		if calls, ok := delta["tool_calls"].([]any); ok && len(calls) > 0 {
-			return true
-		}
-	}
-	return false
 }
 
 func responseInfoFromSSELine(line string) proxyResponseInfo {
@@ -2920,15 +2876,9 @@ func (a *app) proAccountLocked(item account) bool {
 	return normalizePlanType(plan) == "pro"
 }
 
-func (a *app) beginThroughputMeasurement(model string, identity requestIdentity, streaming bool) *throughputMeasurement {
-	agentKind := "main"
-	if identity.IsSubagent {
-		agentKind = "subagent"
-	}
+func (a *app) beginThroughputMeasurement(streaming bool) *throughputMeasurement {
 	measurement := &throughputMeasurement{
 		StartedAt: time.Now().UTC(),
-		ModelID:   model,
-		AgentKind: agentKind,
 		Streaming: streaming,
 	}
 	a.mu.Lock()
@@ -2947,7 +2897,6 @@ func (a *app) finishThroughputMeasurement(measurement *throughputMeasurement) {
 		return
 	}
 	a.finishThroughputMeasurementLocked(measurement, time.Now().UTC())
-	_ = a.saveRuntimeLocked()
 }
 
 func (a *app) finishThroughputMeasurementLocked(measurement *throughputMeasurement, now time.Time) {
@@ -2975,26 +2924,21 @@ func (a *app) recordThroughputMeasurementLocked(measurement throughputMeasuremen
 	a.pruneThroughputBucketsLocked(completedAt)
 	bucketAt := completedAt.Truncate(throughputBucketInterval)
 	index := -1
-	for i := len(a.state.ThroughputBuckets) - 1; i >= 0; i-- {
-		bucket := a.state.ThroughputBuckets[i]
-		if bucket.BucketAt.Equal(bucketAt) &&
-			bucket.AccountID == measurement.AccountID &&
-			bucket.ModelID == measurement.ModelID &&
-			bucket.AgentKind == measurement.AgentKind {
+	for i := len(a.throughputBuckets) - 1; i >= 0; i-- {
+		bucket := a.throughputBuckets[i]
+		if bucket.BucketAt.Equal(bucketAt) && bucket.AccountID == measurement.AccountID {
 			index = i
 			break
 		}
 	}
 	if index < 0 {
-		a.state.ThroughputBuckets = append(a.state.ThroughputBuckets, throughputBucket{
+		a.throughputBuckets = append(a.throughputBuckets, throughputBucket{
 			BucketAt:  bucketAt,
 			AccountID: measurement.AccountID,
-			ModelID:   measurement.ModelID,
-			AgentKind: measurement.AgentKind,
 		})
-		index = len(a.state.ThroughputBuckets) - 1
+		index = len(a.throughputBuckets) - 1
 	}
-	bucket := &a.state.ThroughputBuckets[index]
+	bucket := &a.throughputBuckets[index]
 	bucket.RequestCount++
 	switch {
 	case measurement.Cancelled:
@@ -3019,28 +2963,11 @@ func (a *app) recordThroughputMeasurementLocked(measurement throughputMeasuremen
 	durationMillis := elapsedMillis(measurement.StartedAt, completedAt)
 	bucket.TotalDurationMillis += durationMillis
 	bucket.DurationHistogram = addHistogramObservation(bucket.DurationHistogram, durationMillis)
-	if !measurement.HeadersAt.IsZero() && !measurement.HeadersAt.Before(measurement.StartedAt) {
-		ttfbMillis := elapsedMillis(measurement.StartedAt, measurement.HeadersAt)
-		bucket.TTFBMillis += ttfbMillis
-		bucket.TTFBObservedRequestCount++
-		bucket.TTFBHistogram = addHistogramObservation(bucket.TTFBHistogram, ttfbMillis)
-	}
-	if measurement.Streaming && !measurement.FirstContentAt.IsZero() && !measurement.FirstContentAt.Before(measurement.StartedAt) {
-		ttftMillis := elapsedMillis(measurement.StartedAt, measurement.FirstContentAt)
-		bucket.TTFTMillis += ttftMillis
-		bucket.TTFTObservedRequestCount++
-		bucket.TTFTHistogram = addHistogramObservation(bucket.TTFTHistogram, ttftMillis)
-		if measurement.Usage.OutputPresent && completedAt.After(measurement.FirstContentAt) {
-			bucket.GenerationMillis += elapsedMillis(measurement.FirstContentAt, completedAt)
-			bucket.TimedOutputTokens += measurement.Usage.OutputTokens
-			bucket.GenerationObservedRequestCount++
-		}
-	}
-	if extra := len(a.state.ThroughputBuckets) - throughputBucketLimit; extra > 0 {
-		sort.Slice(a.state.ThroughputBuckets, func(i, j int) bool {
-			return a.state.ThroughputBuckets[i].BucketAt.Before(a.state.ThroughputBuckets[j].BucketAt)
+	if extra := len(a.throughputBuckets) - throughputBucketLimit; extra > 0 {
+		sort.Slice(a.throughputBuckets, func(i, j int) bool {
+			return a.throughputBuckets[i].BucketAt.Before(a.throughputBuckets[j].BucketAt)
 		})
-		a.state.ThroughputBuckets = append([]throughputBucket(nil), a.state.ThroughputBuckets[extra:]...)
+		a.throughputBuckets = append([]throughputBucket(nil), a.throughputBuckets[extra:]...)
 	}
 }
 
@@ -3443,14 +3370,14 @@ func (a *app) clearAccountIdentityScopedStateLocked(accountID string) {
 	// Throughput is identity-scoped history. Pool removal/disable only clears
 	// routes and must not erase the operator's rolling traffic view, while
 	// account deletion or a verified identity change must remove attribution.
-	if len(a.state.ThroughputBuckets) > 0 {
-		filtered := a.state.ThroughputBuckets[:0]
-		for _, bucket := range a.state.ThroughputBuckets {
+	if len(a.throughputBuckets) > 0 {
+		filtered := a.throughputBuckets[:0]
+		for _, bucket := range a.throughputBuckets {
 			if bucket.AccountID != accountID {
 				filtered = append(filtered, bucket)
 			}
 		}
-		a.state.ThroughputBuckets = append([]throughputBucket(nil), filtered...)
+		a.throughputBuckets = append([]throughputBucket(nil), filtered...)
 	}
 }
 
@@ -3528,9 +3455,6 @@ func (a *app) pruneExpiredRuntimeStateLocked(now time.Time) bool {
 	if a.pruneRoutingCacheEventsLocked(now) {
 		changed = true
 	}
-	if a.pruneThroughputBucketsLocked(now) {
-		changed = true
-	}
 	return changed
 }
 
@@ -3554,17 +3478,17 @@ func (a *app) pruneRoutingCacheEventsLocked(now time.Time) bool {
 }
 
 func (a *app) pruneThroughputBucketsLocked(now time.Time) bool {
-	if len(a.state.ThroughputBuckets) == 0 {
+	if len(a.throughputBuckets) == 0 {
 		return false
 	}
 	cutoff := now.Add(-throughputBucketTTL)
-	filtered := a.state.ThroughputBuckets[:0]
-	for _, bucket := range a.state.ThroughputBuckets {
+	filtered := a.throughputBuckets[:0]
+	for _, bucket := range a.throughputBuckets {
 		if bucket.BucketAt.Add(throughputBucketInterval).After(cutoff) {
 			filtered = append(filtered, bucket)
 		}
 	}
-	changed := len(filtered) != len(a.state.ThroughputBuckets)
+	changed := len(filtered) != len(a.throughputBuckets)
 	if len(filtered) > throughputBucketLimit {
 		sort.Slice(filtered, func(i, j int) bool {
 			return filtered[i].BucketAt.Before(filtered[j].BucketAt)
@@ -3573,7 +3497,7 @@ func (a *app) pruneThroughputBucketsLocked(now time.Time) bool {
 		changed = true
 	}
 	if changed {
-		a.state.ThroughputBuckets = append([]throughputBucket(nil), filtered...)
+		a.throughputBuckets = append([]throughputBucket(nil), filtered...)
 	}
 	return changed
 }
@@ -3658,11 +3582,6 @@ func (a *app) saveLocked() error {
 	if err := writeJSONAtomic(filepath.Join(a.dataDir, "config.json"), a.config); err != nil {
 		return err
 	}
-	return writeJSONAtomic(filepath.Join(a.dataDir, "state", "runtime.json"), a.state)
-}
-
-func (a *app) saveRuntimeLocked() error {
-	a.state.UpdatedAt = time.Now().UTC()
 	return writeJSONAtomic(filepath.Join(a.dataDir, "state", "runtime.json"), a.state)
 }
 
@@ -5800,7 +5719,7 @@ func (a *app) accountHasPriorIdentityLocked(item account) bool {
 			return true
 		}
 	}
-	for _, bucket := range a.state.ThroughputBuckets {
+	for _, bucket := range a.throughputBuckets {
 		if bucket.AccountID == item.ID {
 			return true
 		}
@@ -6217,39 +6136,33 @@ type throughputAggregate struct {
 	inputTokens         uint64
 	cachedTokens        uint64
 	outputTokens        uint64
-	timedOutputTokens   uint64
 	totalDurationMillis uint64
-	ttfbMillis          uint64
-	ttftMillis          uint64
-	generationMillis    uint64
-	ttfbObserved        uint64
-	ttftObserved        uint64
-	generationObserved  uint64
 	durationHistogram   []uint64
-	ttfbHistogram       []uint64
-	ttftHistogram       []uint64
 }
 
 func (a *app) throughputSnapshotLocked(accountID string, now time.Time) map[string]any {
-	windows := map[string]any{
-		"1m":  a.throughputWindowLocked(accountID, now, time.Minute),
-		"5m":  a.throughputWindowLocked(accountID, now, 5*time.Minute),
-		"15m": a.throughputWindowLocked(accountID, now, 15*time.Minute),
-	}
 	result := map[string]any{
-		"windows":               windows,
 		"bucketIntervalSeconds": int(throughputBucketInterval / time.Second),
+		"retentionHours":        int(throughputBucketTTL / time.Hour),
 	}
-	if accountID == "" {
-		result["activeRequests"] = a.activeProxyRequests
+	if accountID != "" {
+		// Account rows remain a compact recent operational view; the large
+		// 48-hour series is pool-wide so the public payload cannot reveal traffic
+		// attribution for an individual credential.
+		result["windows"] = map[string]any{"5m": a.throughputWindowLocked(accountID, now, 5*time.Minute)}
+		return result
 	}
+	result["activeRequests"] = a.activeProxyRequests
+	result["seriesIntervalSeconds"] = int(throughputSeriesInterval / time.Second)
+	result["current"] = a.throughputWindowLocked("", now, throughputSeriesInterval)
+	result["series"] = a.throughputSeriesLocked("", now)
 	return result
 }
 
 func (a *app) throughputWindowLocked(accountID string, now time.Time, window time.Duration) map[string]any {
 	cutoff := now.Add(-window)
 	var aggregate throughputAggregate
-	for _, bucket := range a.state.ThroughputBuckets {
+	for _, bucket := range a.throughputBuckets {
 		if accountID != "" && bucket.AccountID != accountID {
 			continue
 		}
@@ -6258,7 +6171,75 @@ func (a *app) throughputWindowLocked(accountID string, now time.Time, window tim
 		}
 		aggregate.add(bucket)
 	}
+	return throughputAggregateProjection(aggregate, window)
+}
+
+func (a *app) throughputSeriesLocked(accountID string, now time.Time) []map[string]any {
+	end := now.Truncate(throughputSeriesInterval)
+	start := end.Add(-throughputBucketTTL)
+	cutoff := now.Add(-throughputBucketTTL)
+	aggregates := map[int64]*throughputAggregate{}
+	for _, bucket := range a.throughputBuckets {
+		if accountID != "" && bucket.AccountID != accountID {
+			continue
+		}
+		if bucket.BucketAt.After(now) || !bucket.BucketAt.Add(throughputBucketInterval).After(cutoff) {
+			continue
+		}
+		at := bucket.BucketAt.Truncate(throughputSeriesInterval)
+		if at.Before(start) || at.After(end) {
+			continue
+		}
+		key := at.Unix()
+		aggregate := aggregates[key]
+		if aggregate == nil {
+			aggregate = &throughputAggregate{}
+			aggregates[key] = aggregate
+		}
+		aggregate.add(bucket)
+	}
+	if len(aggregates) == 0 {
+		// An empty slice lets the UI distinguish "no process-memory history yet"
+		// from a real 48-hour interval in which the provider was running but idle.
+		// Do not manufacture a full chart of zeroes before the first observation.
+		return []map[string]any{}
+	}
+	points := make([]map[string]any, 0, int(throughputBucketTTL/throughputSeriesInterval)+1)
+	for at := start; !at.After(end); at = at.Add(throughputSeriesInterval) {
+		windowStart := at
+		windowEnd := at.Add(throughputSeriesInterval)
+		if cutoff.After(windowStart) {
+			windowStart = cutoff
+		}
+		if now.Before(windowEnd) {
+			windowEnd = now
+		}
+		// The first and newest points can be partial fixed buckets. Use their
+		// actual visible wall time, with a one-minute floor, so boundary rates
+		// are neither diluted by a full ten minutes nor amplified by seconds.
+		window := windowEnd.Sub(windowStart)
+		if window < throughputBucketInterval {
+			window = throughputBucketInterval
+		}
+		if window > throughputSeriesInterval {
+			window = throughputSeriesInterval
+		}
+		aggregate := throughputAggregate{}
+		if stored := aggregates[at.Unix()]; stored != nil {
+			aggregate = *stored
+		}
+		point := throughputAggregateProjection(aggregate, window)
+		point["at"] = at
+		points = append(points, point)
+	}
+	return points
+}
+
+func throughputAggregateProjection(aggregate throughputAggregate, window time.Duration) map[string]any {
 	minutes := window.Minutes()
+	if minutes <= 0 {
+		minutes = throughputBucketInterval.Minutes()
+	}
 	result := map[string]any{
 		"windowSeconds":              int(window / time.Second),
 		"requestCount":               aggregate.requests,
@@ -6278,12 +6259,6 @@ func (a *app) throughputWindowLocked(accountID string, now time.Time, window tim
 		"averageLatencyMs":           averageMillis(aggregate.totalDurationMillis, aggregate.requests),
 		"p50LatencyMs":               histogramPercentileMillis(aggregate.durationHistogram, 50),
 		"p95LatencyMs":               histogramPercentileMillis(aggregate.durationHistogram, 95),
-		"averageTTFBMs":              averageMillis(aggregate.ttfbMillis, aggregate.ttfbObserved),
-		"p50TTFBMs":                  histogramPercentileMillis(aggregate.ttfbHistogram, 50),
-		"p95TTFBMs":                  histogramPercentileMillis(aggregate.ttfbHistogram, 95),
-		"averageTTFTMs":              averageMillis(aggregate.ttftMillis, aggregate.ttftObserved),
-		"p50TTFTMs":                  histogramPercentileMillis(aggregate.ttftHistogram, 50),
-		"p95TTFTMs":                  histogramPercentileMillis(aggregate.ttftHistogram, 95),
 	}
 	if aggregate.outputObserved > 0 {
 		// This is actual rolling aggregate throughput: all observed output
@@ -6293,10 +6268,14 @@ func (a *app) throughputWindowLocked(accountID string, now time.Time, window tim
 	} else {
 		result["outputTokensPerSecond"] = nil
 	}
-	if aggregate.generationMillis > 0 && aggregate.generationObserved > 0 {
-		result["generationTokensPerSecond"] = float64(aggregate.timedOutputTokens) / (float64(aggregate.generationMillis) / 1000)
+	if aggregate.inputTokens > 0 {
+		cached := aggregate.cachedTokens
+		if cached > aggregate.inputTokens {
+			cached = aggregate.inputTokens
+		}
+		result["cacheHitRate"] = float64(cached) / float64(aggregate.inputTokens)
 	} else {
-		result["generationTokensPerSecond"] = nil
+		result["cacheHitRate"] = nil
 	}
 	if aggregate.requests > 0 {
 		result["successRate"] = float64(aggregate.successes) / float64(aggregate.requests)
@@ -6317,17 +6296,8 @@ func (aggregate *throughputAggregate) add(bucket throughputBucket) {
 	aggregate.inputTokens += bucket.InputTokens
 	aggregate.cachedTokens += bucket.CachedTokens
 	aggregate.outputTokens += bucket.OutputTokens
-	aggregate.timedOutputTokens += bucket.TimedOutputTokens
 	aggregate.totalDurationMillis += bucket.TotalDurationMillis
-	aggregate.ttfbMillis += bucket.TTFBMillis
-	aggregate.ttftMillis += bucket.TTFTMillis
-	aggregate.generationMillis += bucket.GenerationMillis
-	aggregate.ttfbObserved += bucket.TTFBObservedRequestCount
-	aggregate.ttftObserved += bucket.TTFTObservedRequestCount
-	aggregate.generationObserved += bucket.GenerationObservedRequestCount
 	aggregate.durationHistogram = addHistograms(aggregate.durationHistogram, bucket.DurationHistogram)
-	aggregate.ttfbHistogram = addHistograms(aggregate.ttfbHistogram, bucket.TTFBHistogram)
-	aggregate.ttftHistogram = addHistograms(aggregate.ttftHistogram, bucket.TTFTHistogram)
 }
 
 func addHistograms(total, values []uint64) []uint64 {

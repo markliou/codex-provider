@@ -255,6 +255,51 @@ func TestDefaultModelEnvOverridesPersistedConfig(t *testing.T) {
 	}
 }
 
+func TestLoadMigratesLegacyThroughputBucketsIntoMemoryOnly(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(throughputBucketInterval)
+	legacy := state{
+		StickySessions:   map[string]stickySession{},
+		ResponseBindings: map[string]responseBinding{},
+		ThreadBindings:   map[string]threadBinding{},
+		Cooldowns:        map[string][]cooldown{},
+		Health:           map[string]accountHealth{},
+		Quotas:           map[string]quotaSnapshot{},
+		PromptCache:      map[string]promptCacheStat{},
+		LegacyThroughputBuckets: []throughputBucket{{
+			BucketAt:     now.Add(-5 * time.Minute),
+			AccountID:    "legacy-slot",
+			RequestCount: 3,
+			InputTokens:  900,
+			CachedTokens: 600,
+		}},
+	}
+	if err := writeJSONAtomic(filepath.Join(dir, "state", "runtime.json"), legacy); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &app{dataDir: dir}
+	if err := a.load(); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.throughputBuckets) != 1 || a.throughputBuckets[0].AccountID != "legacy-slot" {
+		t.Fatalf("legacy throughput was not imported into memory: %#v", a.throughputBuckets)
+	}
+	if len(a.state.LegacyThroughputBuckets) != 0 {
+		t.Fatalf("legacy persisted throughput field was retained: %#v", a.state.LegacyThroughputBuckets)
+	}
+	persisted, err := os.ReadFile(filepath.Join(dir, "state", "runtime.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(persisted), "throughputBuckets") {
+		t.Fatalf("migrated throughput was written back to runtime.json: %s", persisted)
+	}
+}
+
 func TestIsLoopbackAddress(t *testing.T) {
 	for address, expected := range map[string]bool{
 		"127.0.0.1:8318": true,
@@ -1385,7 +1430,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page omitted subagent cache metric %q", expected)
 		}
 	}
-	for _, expected := range []string{"throughput-panel", "throughput-active", "throughput-windows", "LIVE FLOW", "Throughput"} {
+	for _, expected := range []string{"throughput-panel", "throughput-active", "throughput-current", "throughput-charts", "48-hour in-memory history", "LIVE FLOW", "Throughput"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page omitted shared throughput surface %q", expected)
 		}
@@ -1440,9 +1485,14 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS omitted subagent cache metric %q", expected)
 		}
 	}
-	for _, expected := range []string{"renderThroughput", "renderThroughput(body.dashboard.throughput)", "accountThroughputMarkup", "requestsPerMinute", "outputTokensPerSecond", "p95LatencyMs", "Throughput (5m)"} {
+	for _, expected := range []string{"renderThroughput", "throughputChartMarkup", "renderThroughput(body.dashboard.throughput)", "accountThroughputMarkup", "requestsPerMinute", "outputTokensPerSecond", "cacheHitRate", "p95LatencyMs", "Output vs KV cache", "Token flow", "Requests & latency", "Throughput (5m)"} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS omitted throughput behavior %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"p50TTFBMs", "p95TTFBMs", "p50TTFTMs", "p95TTFTMs", ">TTFB ", ">TTFT "} {
+		if strings.Contains(jsRecorder.Body.String(), forbidden) {
+			t.Fatalf("admin JS still renders removed throughput timing %q", forbidden)
 		}
 	}
 	for _, forbidden := range []string{"Main cache (reqs)", "Subagent cache (reqs)", "<small>(${reqs})</small>", "cache-detail", "metric-origin-mini", "cache-derived-rate", "column-origin upstream", "column-origin calculated", ">OPENAI<", ">CALC<", `$("#cache-window-read")`, `$("#cache-window-write")`, `$("#cache-window-affinity")`, "cache-window-write-rate", "cacheWriteObservedRequestCount", "cacheWriteInputTokens", "cacheWriteRate", "cacheWindow.routingFailoverCount", `poolColumnHeader("Failovers")`, ">Write</span>", "Token usage: read", "write ratio"} {
@@ -1484,7 +1534,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin CSS omitted compact cache/routing layout %q", expected)
 		}
 	}
-	for _, expected := range []string{".throughput-panel", ".throughput-window-grid", ".throughput-card", ".throughput-primary", ".throughput-token-flow", ".throughput-latency", ".account-throughput", ".throughput-column"} {
+	for _, expected := range []string{".throughput-panel", ".throughput-current-grid", ".throughput-current-stat", ".throughput-chart-grid", ".throughput-chart-card", ".throughput-chart-plot", ".chart-series-line", ".account-throughput", ".throughput-column"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS omitted responsive throughput layout %q", expected)
 		}
@@ -1665,11 +1715,9 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 		RoutingOutcome: "sticky_reuse",
 		InputTokens:    2048,
 	}}
-	a.state.ThroughputBuckets = []throughputBucket{{
+	a.throughputBuckets = []throughputBucket{{
 		BucketAt:     time.Now().UTC().Truncate(throughputBucketInterval),
 		AccountID:    "private-account-id",
-		ModelID:      "gpt-test",
-		AgentKind:    "main",
 		RequestCount: 1,
 	}}
 
@@ -1696,13 +1744,16 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 	if err := json.Unmarshal(publicRecorder.Body.Bytes(), &publicPayload); err != nil {
 		t.Fatal(err)
 	}
-	windows, ok := publicPayload.Dashboard.Throughput["windows"].(map[string]any)
+	current, ok := publicPayload.Dashboard.Throughput["current"].(map[string]any)
 	if !ok {
 		t.Fatalf("public dashboard omitted aggregate throughput: %#v", publicPayload.Dashboard.Throughput)
 	}
-	oneMinute, ok := windows["1m"].(map[string]any)
-	if !ok || oneMinute["requestCount"] != float64(1) {
-		t.Fatalf("public one-minute throughput = %#v", oneMinute)
+	if current["requestCount"] != float64(1) {
+		t.Fatalf("public current throughput = %#v", current)
+	}
+	series, ok := publicPayload.Dashboard.Throughput["series"].([]any)
+	if !ok || len(series) != int(throughputBucketTTL/throughputSeriesInterval)+1 {
+		t.Fatalf("public 48-hour throughput series = %#v", publicPayload.Dashboard.Throughput["series"])
 	}
 	if strings.Count(publicBody, `"throughput"`) != 1 {
 		t.Fatal("public dashboard must expose only pool-wide throughput, not per-account throughput")
@@ -3211,29 +3262,6 @@ func TestStreamingUsageMergeRetainsObservedCacheWrite(t *testing.T) {
 	}
 }
 
-func TestSSELineHasGeneratedContent(t *testing.T) {
-	for _, line := range []string{
-		`data: {"type":"response.output_text.delta","delta":"hello"}`,
-		`data: {"type":"response.function_call_arguments.delta","delta":"{\"path\":"}`,
-		`data: {"choices":[{"delta":{"content":"hello"}}]}`,
-		`data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}`,
-	} {
-		if !sseLineHasGeneratedContent(line) {
-			t.Fatalf("generated SSE content was not detected: %s", line)
-		}
-	}
-	for _, line := range []string{
-		`event: response.completed`,
-		`data: [DONE]`,
-		`data: {"type":"response.created","response":{"id":"resp_1"}}`,
-		`data: {"type":"response.output_text.delta","delta":""}`,
-	} {
-		if sseLineHasGeneratedContent(line) {
-			t.Fatalf("non-content SSE line was treated as first token: %s", line)
-		}
-	}
-}
-
 func TestThroughputRollingWindowsAndAccountFiltering(t *testing.T) {
 	a := testApp(t, []account{{ID: "a"}, {ID: "b"}})
 	now := time.Now().UTC().Truncate(throughputBucketInterval).Add(10 * time.Second)
@@ -3243,8 +3271,6 @@ func TestThroughputRollingWindowsAndAccountFiltering(t *testing.T) {
 			StartedAt:   completedAt.Add(-duration),
 			CompletedAt: completedAt,
 			AccountID:   accountID,
-			ModelID:     "gpt-test",
-			AgentKind:   "main",
 			Streaming:   streaming,
 			Success:     success,
 			Cancelled:   cancelled,
@@ -3255,12 +3281,6 @@ func TestThroughputRollingWindowsAndAccountFiltering(t *testing.T) {
 				OutputPresent: outputPresent,
 				Present:       input > 0 || outputPresent,
 			},
-		}
-		if success {
-			measurement.HeadersAt = measurement.StartedAt.Add(500 * time.Millisecond)
-		}
-		if streaming {
-			measurement.FirstContentAt = measurement.StartedAt.Add(time.Second)
 		}
 		a.recordThroughputMeasurementLocked(measurement)
 	}
@@ -3282,8 +3302,8 @@ func TestThroughputRollingWindowsAndAccountFiltering(t *testing.T) {
 	if window["p50LatencyMs"].(uint64) != 250 || window["p95LatencyMs"].(uint64) != 2000 {
 		t.Fatalf("latency percentiles = p50:%#v p95:%#v", window["p50LatencyMs"], window["p95LatencyMs"])
 	}
-	if window["p50TTFBMs"].(uint64) != 500 || window["p50TTFTMs"].(uint64) != 1000 {
-		t.Fatalf("first-byte/token percentiles = ttfb:%#v ttft:%#v", window["p50TTFBMs"], window["p50TTFTMs"])
+	if got := window["cacheHitRate"].(float64); got != 0.5 {
+		t.Fatalf("cache hit rate = %v, want 0.5", got)
 	}
 	all := a.throughputWindowLocked("", now, time.Minute)
 	if all["requestCount"].(uint64) != 3 || all["cancelledCount"].(uint64) != 1 {
@@ -3298,7 +3318,7 @@ func TestThroughputRollingWindowsAndAccountFiltering(t *testing.T) {
 func TestThroughputLifecyclePruningAndIdentityCleanup(t *testing.T) {
 	a := testApp(t, []account{{ID: "a"}})
 	now := time.Now().UTC()
-	measurement := a.beginThroughputMeasurement("gpt-test", requestIdentity{}, false)
+	measurement := a.beginThroughputMeasurement(false)
 	if a.activeProxyRequests != 1 {
 		t.Fatalf("active requests = %d, want 1", a.activeProxyRequests)
 	}
@@ -3306,45 +3326,86 @@ func TestThroughputLifecyclePruningAndIdentityCleanup(t *testing.T) {
 	measurement.Success = true
 	measurement.CompletedAt = now
 	a.finishThroughputMeasurement(measurement)
-	if a.activeProxyRequests != 0 || len(a.state.ThroughputBuckets) != 1 {
-		t.Fatalf("finished throughput state = active:%d buckets:%d", a.activeProxyRequests, len(a.state.ThroughputBuckets))
+	if a.activeProxyRequests != 0 || len(a.throughputBuckets) != 1 {
+		t.Fatalf("finished throughput state = active:%d buckets:%d", a.activeProxyRequests, len(a.throughputBuckets))
 	}
 
-	a.state.ThroughputBuckets = append(a.state.ThroughputBuckets, throughputBucket{
+	a.throughputBuckets = append(a.throughputBuckets, throughputBucket{
 		BucketAt:     now.Add(-throughputBucketTTL - throughputBucketInterval),
 		AccountID:    "a",
 		RequestCount: 1,
 	})
-	if !a.pruneThroughputBucketsLocked(now) || len(a.state.ThroughputBuckets) != 1 {
-		t.Fatalf("throughput TTL prune left %#v", a.state.ThroughputBuckets)
+	if !a.pruneThroughputBucketsLocked(now) || len(a.throughputBuckets) != 1 {
+		t.Fatalf("throughput TTL prune left %#v", a.throughputBuckets)
 	}
 
 	a.clearStickyForAccountLocked("a")
-	if len(a.state.ThroughputBuckets) != 1 {
+	if len(a.throughputBuckets) != 1 {
 		t.Fatal("pool route cleanup erased rolling throughput history")
 	}
 	a.clearAccountIdentityScopedStateLocked("a")
-	if len(a.state.ThroughputBuckets) != 0 {
+	if len(a.throughputBuckets) != 0 {
 		t.Fatal("identity cleanup retained attributed throughput history")
+	}
+	if series := a.throughputSeriesLocked("", now); len(series) != 0 {
+		t.Fatalf("empty in-memory history produced chart points: %#v", series)
+	}
+	encoded, err := json.Marshal(a.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "throughputBuckets") {
+		t.Fatal("new throughput history was persisted instead of remaining in memory")
+	}
+}
+
+func TestThroughputSeriesUsesPartialBoundaryDurations(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct"}})
+	now := time.Date(2026, time.July, 28, 10, 5, 30, 0, time.UTC)
+	cutoff := now.Add(-throughputBucketTTL)
+	a.throughputBuckets = []throughputBucket{
+		{BucketAt: cutoff.Truncate(throughputBucketInterval), AccountID: "acct", RequestCount: 1},
+		{BucketAt: now.Truncate(throughputBucketInterval), AccountID: "acct", RequestCount: 1},
+	}
+
+	series := a.throughputSeriesLocked("", now)
+	if len(series) != int(throughputBucketTTL/throughputSeriesInterval)+1 {
+		t.Fatalf("series point count = %d", len(series))
+	}
+	if got := series[0]["windowSeconds"]; got != 270 {
+		t.Fatalf("oldest partial window = %#v seconds, want 270", got)
+	}
+	if got := series[len(series)-1]["windowSeconds"]; got != 330 {
+		t.Fatalf("newest partial window = %#v seconds, want 330", got)
 	}
 }
 
 func TestManagementThroughputProjection(t *testing.T) {
 	a := testApp(t, []account{{ID: "acct", Enabled: true, InPool: true}})
 	now := time.Now().UTC()
-	a.state.ThroughputBuckets = []throughputBucket{{
+	a.throughputBuckets = []throughputBucket{{
 		BucketAt:                   now.Truncate(throughputBucketInterval),
 		AccountID:                  "acct",
-		ModelID:                    "gpt-test",
-		AgentKind:                  "main",
 		RequestCount:               2,
 		SuccessCount:               2,
+		InputTokens:                200,
+		CachedTokens:               150,
 		OutputTokens:               120,
+		UsageObservedRequestCount:  2,
 		OutputObservedRequestCount: 2,
 	}}
 	adminState := a.adminStateLocked(now)
-	if adminState["throughput"] == nil {
+	poolThroughput, ok := adminState["throughput"].(map[string]any)
+	if !ok {
 		t.Fatal("authenticated admin state omitted throughput")
+	}
+	series, ok := poolThroughput["series"].([]map[string]any)
+	if !ok || len(series) != int(throughputBucketTTL/throughputSeriesInterval)+1 {
+		t.Fatalf("management pool series = %#v", poolThroughput["series"])
+	}
+	last := series[len(series)-1]
+	if last["requestCount"].(uint64) != 2 || last["cacheHitRate"].(float64) != 0.75 {
+		t.Fatalf("management latest series point = %#v", last)
 	}
 	health := a.accountHealthItemLocked(a.config.Accounts[0], now)
 	accountThroughput, ok := health["throughput"].(map[string]any)

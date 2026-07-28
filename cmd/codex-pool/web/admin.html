@@ -64,11 +64,12 @@
             <div>
               <div class="eyebrow">LIVE FLOW</div>
               <h2 id="throughput-title">Throughput</h2>
-              <p class="muted">Client requests and upstream token timing over rolling windows.</p>
+              <p class="muted">48-hour in-memory history at 10-minute resolution; resets when the provider restarts.</p>
             </div>
             <span id="throughput-active" class="live-chip">0 active</span>
           </div>
-          <div id="throughput-windows" class="throughput-window-grid"></div>
+          <div id="throughput-current" class="throughput-current-grid" aria-label="Current throughput"></div>
+          <div id="throughput-charts" class="throughput-chart-grid"></div>
         </section>
 
         <section id="cache-window" class="cache-window" aria-label="Cache hit rate since reset" hidden>

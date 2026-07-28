@@ -68,37 +68,140 @@
     return `${(milliseconds / 60000).toFixed(1)}m`;
   };
 
+  const chartPercent = (value) => {
+    const number = finiteMetric(value);
+    return number === null ? "—" : `${(Math.max(0, Math.min(1, number)) * 100).toFixed(1)}%`;
+  };
+
+  const latestSeriesValue = (points, key) => {
+    for (let index = points.length - 1; index >= 0; index--) {
+      const value = finiteMetric(points[index]?.[key]);
+      if (value !== null) return value;
+    }
+    return null;
+  };
+
+  function throughputChartMarkup(points, config) {
+    const width = 820;
+    const height = 248;
+    const plot = { left: 63, right: 757, top: 22, bottom: 204 };
+    const plotWidth = plot.right - plot.left;
+    const plotHeight = plot.bottom - plot.top;
+    const axisMetrics = (axis) => config.series.filter((metric) => metric.axis === axis);
+    const axisMax = (axis) => {
+      const fixed = axisMetrics(axis).map((metric) => metric.max).filter((value) => Number.isFinite(value));
+      if (fixed.length) return Math.max(...fixed);
+      let maximum = 0;
+      axisMetrics(axis).forEach((metric) => {
+        points.forEach((point) => {
+          const value = finiteMetric(point?.[metric.key]);
+          if (value !== null) maximum = Math.max(maximum, value);
+        });
+      });
+      return maximum > 0 ? maximum * 1.08 : 1;
+    };
+    const leftMax = axisMax("left");
+    const rightMax = axisMax("right");
+    const xAt = (index) => plot.left + (points.length <= 1 ? 0 : (index / (points.length - 1)) * plotWidth);
+    const yAt = (value, axis) => plot.bottom - (Math.max(0, value) / (axis === "right" ? rightMax : leftMax)) * plotHeight;
+    const pathFor = (metric) => {
+      let drawing = false;
+      let path = "";
+      points.forEach((point, index) => {
+        const value = finiteMetric(point?.[metric.key]);
+        if (value === null) {
+          drawing = false;
+          return;
+        }
+        const command = drawing ? "L" : "M";
+        path += `${command}${xAt(index).toFixed(1)} ${yAt(value, metric.axis).toFixed(1)} `;
+        drawing = true;
+      });
+      return path.trim();
+    };
+    const grid = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+      const y = plot.top + ratio * plotHeight;
+      const leftValue = leftMax * (1 - ratio);
+      const rightValue = rightMax * (1 - ratio);
+      return `<line class="chart-grid-line" x1="${plot.left}" y1="${y}" x2="${plot.right}" y2="${y}"></line>
+        <text class="chart-axis-label left" x="${plot.left - 9}" y="${y + 4}">${escapeHTML(config.leftFormat(leftValue))}</text>
+        ${axisMetrics("right").length ? `<text class="chart-axis-label right" x="${plot.right + 9}" y="${y + 4}">${escapeHTML(config.rightFormat(rightValue))}</text>` : ""}`;
+    }).join("");
+    const labelIndexes = points.length ? [...new Set([0, Math.floor((points.length - 1) / 4), Math.floor((points.length - 1) / 2), Math.floor(((points.length - 1) * 3) / 4), points.length - 1])] : [];
+    const xLabels = labelIndexes.map((index) => {
+      const at = new Date(points[index]?.at);
+      const label = index === points.length - 1 ? "Now" : Number.isNaN(at.getTime()) ? "" : at.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" });
+      return `<text class="chart-axis-label time" x="${xAt(index)}" y="${plot.bottom + 28}">${escapeHTML(label)}</text>`;
+    }).join("");
+    const paths = config.series.map((metric) => {
+      const path = pathFor(metric);
+      if (!path) return "";
+      return `<path class="chart-series-line" d="${path}" style="--series-color:${metric.color}"></path>`;
+    }).join("");
+    const legend = config.series.map((metric) => {
+      const value = latestSeriesValue(points, metric.key);
+      return `<span class="chart-legend-item"><i style="--series-color:${metric.color}"></i><span>${escapeHTML(metric.label)}</span><strong>${escapeHTML(metric.format(value))}</strong></span>`;
+    }).join("");
+    return `<article class="throughput-chart-card">
+      <div class="throughput-chart-heading"><div><h3>${escapeHTML(config.title)}</h3><p>${escapeHTML(config.description)}</p></div><div class="throughput-chart-legend">${legend}</div></div>
+      <div class="throughput-chart-plot">
+        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHTML(config.title)} over the past 48 hours" preserveAspectRatio="none">
+          ${grid}${xLabels}${paths}
+        </svg>
+      </div>
+    </article>`;
+  }
+
   function renderThroughput(throughput) {
-    const windows = throughput?.windows || {};
+    const points = Array.isArray(throughput?.series) ? throughput.series : [];
+    const current = throughput?.current || {};
     const active = Number(throughput?.activeRequests) || 0;
     $("#throughput-active").textContent = `${active} active`;
-    const definitions = [["1m", "Last minute"], ["5m", "Last 5 minutes"], ["15m", "Last 15 minutes"]];
-    $("#throughput-windows").innerHTML = definitions.map(([key, label]) => {
-      const win = windows[key] || {};
-      const requests = Number(win.requestCount) || 0;
-      const successes = Number(win.successCount) || 0;
-      const successRate = requests ? `${((successes / requests) * 100).toFixed(1)}% success` : "No completed requests";
-      const latency = `${formatDuration(win.p50LatencyMs)} / ${formatDuration(win.p95LatencyMs)}`;
-      const ttfb = `${formatDuration(win.p50TTFBMs)} / ${formatDuration(win.p95TTFBMs)}`;
-      const ttft = `${formatDuration(win.p50TTFTMs)} / ${formatDuration(win.p95TTFTMs)}`;
-      return `<article class="throughput-card">
-        <div class="throughput-card-head"><span>${escapeHTML(label)}</span><small>${escapeHTML(successRate)}</small></div>
-        <div class="throughput-primary">
-          <div><strong>${escapeHTML(formatMetricRate(win.requestsPerMinute))}</strong><span>req/min</span></div>
-          <div><strong>${escapeHTML(formatMetricRate(win.outputTokensPerSecond))}</strong><span>output tok/s</span></div>
-        </div>
-        <div class="throughput-token-flow">
-          <span><i class="flow-dot input"></i>${escapeHTML(formatMetricRate(win.inputTokensPerMinute))} input/min</span>
-          <span><i class="flow-dot cache"></i>${escapeHTML(formatMetricRate(win.cachedTokensPerMinute))} cached/min</span>
-          <span><i class="flow-dot output"></i>${escapeHTML(formatMetricRate(win.outputTokensPerMinute))} output/min</span>
-        </div>
-        <div class="throughput-latency" title="Approximate p50 / p95 from bounded latency histograms">
-          <span>Latency <b>${escapeHTML(latency)}</b></span>
-          <span>TTFB <b>${escapeHTML(ttfb)}</b></span>
-          <span>TTFT <b>${escapeHTML(ttft)}</b></span>
-        </div>
-      </article>`;
-    }).join("");
+    const currentItems = [
+      ["Requests", formatMetricRate(current.requestsPerMinute), "req/min"],
+      ["Output", formatMetricRate(current.outputTokensPerSecond), "tok/s"],
+      ["KV cache", chartPercent(current.cacheHitRate), "hit rate"],
+      ["Success", chartPercent(current.successRate), "completed"],
+      ["p95 latency", formatDuration(current.p95LatencyMs), "provider"],
+    ];
+    $("#throughput-current").innerHTML = currentItems.map(([label, value, suffix]) => `<div class="throughput-current-stat"><span>${escapeHTML(label)}</span><strong>${escapeHTML(value)}</strong><small>${escapeHTML(suffix)}</small></div>`).join("");
+    const charts = [
+      {
+        title: "Output vs KV cache",
+        description: "Compare delivered output throughput with cache reuse on the same 10-minute timeline.",
+        leftFormat: (value) => formatMetricRate(value),
+        rightFormat: chartPercent,
+        series: [
+          { key: "outputTokensPerSecond", label: "Output tok/s", axis: "left", color: "#46e6ff", format: (value) => formatMetricRate(value) },
+          { key: "cacheHitRate", label: "KV hit rate", axis: "right", color: "#46f1c7", max: 1, format: chartPercent },
+        ],
+      },
+      {
+        title: "Token flow",
+        description: "Input, cached input, and generated output tokens per minute.",
+        leftFormat: (value) => formatMetricRate(value),
+        rightFormat: (value) => formatMetricRate(value),
+        series: [
+          { key: "inputTokensPerMinute", label: "Input/min", axis: "left", color: "#c095ff", format: (value) => formatMetricRate(value) },
+          { key: "cachedTokensPerMinute", label: "Cached/min", axis: "left", color: "#46f1c7", format: (value) => formatMetricRate(value) },
+          { key: "outputTokensPerMinute", label: "Output/min", axis: "left", color: "#46e6ff", format: (value) => formatMetricRate(value) },
+        ],
+      },
+      {
+        title: "Requests & latency",
+        description: "Client request rate against provider-observed end-to-end response latency.",
+        leftFormat: (value) => formatMetricRate(value),
+        rightFormat: formatDuration,
+        series: [
+          { key: "requestsPerMinute", label: "Requests/min", axis: "left", color: "#ff6f91", format: (value) => formatMetricRate(value) },
+          { key: "p50LatencyMs", label: "p50 latency", axis: "right", color: "#ffd166", format: formatDuration },
+          { key: "p95LatencyMs", label: "p95 latency", axis: "right", color: "#ff9f43", format: formatDuration },
+        ],
+      },
+    ];
+    $("#throughput-charts").innerHTML = points.length
+      ? charts.map((config) => throughputChartMarkup(points, config)).join("")
+      : '<div class="throughput-chart-empty">No in-memory traffic history yet</div>';
   }
 
   function accountThroughputMarkup(throughput) {
