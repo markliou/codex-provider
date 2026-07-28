@@ -1430,7 +1430,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page omitted subagent cache metric %q", expected)
 		}
 	}
-	for _, expected := range []string{"throughput-panel", "throughput-active", "throughput-current", "throughput-charts", "48-hour in-memory history", "LIVE FLOW", "Throughput"} {
+	for _, expected := range []string{"throughput-panel", "throughput-active", "throughput-current", "throughput-charts", "Up to 48 hours in memory", "chart zooms to available history", "LIVE FLOW", "Throughput"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page omitted shared throughput surface %q", expected)
 		}
@@ -1485,12 +1485,12 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS omitted subagent cache metric %q", expected)
 		}
 	}
-	for _, expected := range []string{"renderThroughput", "throughputChartMarkup", "renderThroughput(body.dashboard.throughput)", "accountThroughputMarkup", "requestsPerMinute", "outputTokensPerSecond", "cacheHitRate", "p95LatencyMs", "Output vs KV cache", "Throughput (5m)"} {
+	for _, expected := range []string{"renderThroughput", "throughputChartMarkup", "chartVisibleWindow", "throughputChartWindows", "chart-series-point", "chart-range-chip", "renderThroughput(body.dashboard.throughput)", "accountThroughputMarkup", "requestsPerMinute", "outputTokensPerSecond", "cacheHitRate", "p95LatencyMs", "Output vs KV cache", "Throughput (5m)"} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS omitted throughput behavior %q", expected)
 		}
 	}
-	for _, forbidden := range []string{"p50TTFBMs", "p95TTFBMs", "p50TTFTMs", "p95TTFTMs", ">TTFB ", ">TTFT ", "Token flow", "Requests & latency", "inputTokensPerMinute", "cachedTokensPerMinute", "outputTokensPerMinute", "p50LatencyMs", "Requests/min"} {
+	for _, forbidden := range []string{"p50TTFBMs", "p95TTFBMs", "p50TTFTMs", "p95TTFTMs", ">TTFB ", ">TTFT ", "Token flow", "Requests & latency", "inputTokensPerMinute", "cachedTokensPerMinute", "outputTokensPerMinute", "p50LatencyMs", "Requests/min", "over the past 48 hours"} {
 		if strings.Contains(jsRecorder.Body.String(), forbidden) {
 			t.Fatalf("admin JS still renders removed throughput chart metric %q", forbidden)
 		}
@@ -1534,7 +1534,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin CSS omitted compact cache/routing layout %q", expected)
 		}
 	}
-	for _, expected := range []string{".throughput-panel", ".throughput-current-grid", ".throughput-current-stat", ".throughput-chart-grid", ".throughput-chart-card", ".throughput-chart-plot", ".chart-series-line", ".account-throughput", ".throughput-column"} {
+	for _, expected := range []string{".throughput-panel", ".throughput-current-grid", ".throughput-current-stat", ".throughput-chart-grid", ".throughput-chart-card", ".throughput-chart-plot", ".throughput-chart-title", ".chart-range-chip", ".chart-series-line", ".chart-series-point", ".account-throughput", ".throughput-column"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS omitted responsive throughput layout %q", expected)
 		}

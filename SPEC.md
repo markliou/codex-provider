@@ -1772,9 +1772,14 @@ shows a current 10-minute summary and one 48-hour line chart comparing output
 tokens/second against KV cache hit rate. It must not add separate historical
 token-flow, request-rate, or latency charts. The panel also shows the current
 in-memory active request count and clearly states that history resets when the
-provider restarts. It must not show TTFB or TTFT. Only authenticated account
-rows show their five-minute request rate, rolling output-token throughput, and
-p95 latency. Labels must make clear these are provider-calculated rates over
+provider restarts. Until enough observations exist to fill 48 hours, the chart
+must use the smallest 1-, 6-, 12-, 24-, or 48-hour window containing all
+observed history. This is a visual crop of the real 10-minute time grid, not
+even redistribution of sparse points. A single observation must remain visible
+through a point marker, while mature histories may reduce marker density to
+avoid overlap. It must not show TTFB or TTFT. Only authenticated account rows
+show their five-minute request rate, rolling output-token throughput, and p95
+latency. Labels must make clear these are provider-calculated rates over
 upstream usage and provider timing, not raw upstream quota fields.
 
 ### 16.3 Account actions

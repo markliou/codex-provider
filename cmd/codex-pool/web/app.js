@@ -81,7 +81,48 @@
     return null;
   };
 
-  function throughputChartMarkup(points, config) {
+  const throughputChartWindows = [
+    { hours: 1, label: "1 hour", shortLabel: "1h" },
+    { hours: 6, label: "6 hours", shortLabel: "6h" },
+    { hours: 12, label: "12 hours", shortLabel: "12h" },
+    { hours: 24, label: "24 hours", shortLabel: "24h" },
+    { hours: 48, label: "48 hours", shortLabel: "48h" },
+  ];
+
+  // The backend deliberately returns the complete 48-hour retention grid,
+  // including leading empty buckets after a restart. Crop only the visual
+  // window around real observations; distributing sparse points evenly would
+  // falsify elapsed time and can mislead cache/throughput correlation analysis.
+  const chartVisibleWindow = (points, series) => {
+    const datedPoints = points.map((point) => ({
+      point,
+      timestamp: new Date(point?.at).getTime(),
+    })).filter(({ timestamp }) => Number.isFinite(timestamp));
+    if (!datedPoints.length) return { points: [], hasValues: false, ...throughputChartWindows[0] };
+
+    const valuePoints = datedPoints.filter(({ point }) =>
+      series.some((metric) => finiteMetric(point?.[metric.key]) !== null));
+    if (!valuePoints.length) return { points: [], hasValues: false, ...throughputChartWindows[0] };
+
+    const end = datedPoints[datedPoints.length - 1].timestamp;
+    const observedHours = Math.max(0, (end - valuePoints[0].timestamp) / (60 * 60 * 1000));
+    const range = throughputChartWindows.find(({ hours }) => observedHours <= hours) || throughputChartWindows[throughputChartWindows.length - 1];
+    const cutoff = end - range.hours * 60 * 60 * 1000;
+    return {
+      ...range,
+      hasValues: true,
+      points: datedPoints.filter(({ timestamp }) => timestamp >= cutoff).map(({ point }) => point),
+    };
+  };
+
+  const chartTimeLabel = (value, windowHours) => {
+    const at = new Date(value);
+    if (Number.isNaN(at.getTime())) return "";
+    if (windowHours <= 12) return at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return at.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" });
+  };
+
+  function throughputChartMarkup(points, config, visibleWindow) {
     const width = 820;
     const height = 248;
     const plot = { left: 63, right: 757, top: 22, bottom: 204 };
@@ -119,6 +160,21 @@
       });
       return path.trim();
     };
+    const markersFor = (metric) => {
+      const samples = [];
+      points.forEach((point, index) => {
+        const value = finiteMetric(point?.[metric.key]);
+        if (value !== null) samples.push({ point, index, value });
+      });
+      // Preserve visible evidence for single/few-point histories without
+      // turning a mature 48-hour series into hundreds of overlapping circles.
+      const stride = Math.max(1, Math.ceil(samples.length / 72));
+      return samples.filter((sample, index) => index % stride === 0 || index === samples.length - 1).map(({ point, index, value }) => {
+        const at = new Date(point?.at);
+        const title = `${metric.label}: ${metric.format(value)}${Number.isNaN(at.getTime()) ? "" : ` at ${at.toLocaleString()}`}`;
+        return `<circle class="chart-series-point" cx="${xAt(index).toFixed(1)}" cy="${yAt(value, metric.axis).toFixed(1)}" r="2.6" style="--series-color:${metric.color}"><title>${escapeHTML(title)}</title></circle>`;
+      }).join("");
+    };
     const grid = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
       const y = plot.top + ratio * plotHeight;
       const leftValue = leftMax * (1 - ratio);
@@ -129,8 +185,7 @@
     }).join("");
     const labelIndexes = points.length ? [...new Set([0, Math.floor((points.length - 1) / 4), Math.floor((points.length - 1) / 2), Math.floor(((points.length - 1) * 3) / 4), points.length - 1])] : [];
     const xLabels = labelIndexes.map((index) => {
-      const at = new Date(points[index]?.at);
-      const label = index === points.length - 1 ? "Now" : Number.isNaN(at.getTime()) ? "" : at.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" });
+      const label = index === points.length - 1 ? "Now" : chartTimeLabel(points[index]?.at, visibleWindow.hours);
       return `<text class="chart-axis-label time" x="${xAt(index)}" y="${plot.bottom + 28}">${escapeHTML(label)}</text>`;
     }).join("");
     const paths = config.series.map((metric) => {
@@ -138,15 +193,16 @@
       if (!path) return "";
       return `<path class="chart-series-line" d="${path}" style="--series-color:${metric.color}"></path>`;
     }).join("");
+    const markers = config.series.map(markersFor).join("");
     const legend = config.series.map((metric) => {
       const value = latestSeriesValue(points, metric.key);
       return `<span class="chart-legend-item"><i style="--series-color:${metric.color}"></i><span>${escapeHTML(metric.label)}</span><strong>${escapeHTML(metric.format(value))}</strong></span>`;
     }).join("");
     return `<article class="throughput-chart-card">
-      <div class="throughput-chart-heading"><div><h3>${escapeHTML(config.title)}</h3><p>${escapeHTML(config.description)}</p></div><div class="throughput-chart-legend">${legend}</div></div>
+      <div class="throughput-chart-heading"><div><div class="throughput-chart-title"><h3>${escapeHTML(config.title)}</h3><span class="chart-range-chip">${escapeHTML(visibleWindow.shortLabel)} view</span></div><p>${escapeHTML(config.description)}</p></div><div class="throughput-chart-legend">${legend}</div></div>
       <div class="throughput-chart-plot">
-        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHTML(config.title)} over the past 48 hours" preserveAspectRatio="none">
-          ${grid}${xLabels}${paths}
+        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHTML(config.title)} over the past ${escapeHTML(visibleWindow.label)}" preserveAspectRatio="none">
+          ${grid}${xLabels}${paths}${markers}
         </svg>
       </div>
     </article>`;
@@ -179,8 +235,9 @@
         { key: "cacheHitRate", label: "KV hit rate", axis: "right", color: "#46f1c7", max: 1, format: chartPercent },
       ],
     };
-    $("#throughput-charts").innerHTML = points.length
-      ? throughputChartMarkup(points, chart)
+    const visibleWindow = chartVisibleWindow(points, chart.series);
+    $("#throughput-charts").innerHTML = visibleWindow.hasValues
+      ? throughputChartMarkup(visibleWindow.points, chart, visibleWindow)
       : '<div class="throughput-chart-empty">No in-memory traffic history yet</div>';
   }
 

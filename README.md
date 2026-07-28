@@ -159,9 +159,12 @@ details. Runtime state retains at most 500 entries and drops entries older than
 identifiers are domain-separated hashes before persistence; authenticated
 browser responses omit local/upstream account IDs and use masked account labels.
 
-The default status page **Throughput** panel shows the previous 48 hours as one
+The default status page **Throughput** panel retains up to 48 hours as one
 10-minute-resolution correlation chart: output tokens/second versus KV cache
-hit rate. A failover request is counted once even if it tries several accounts.
+hit rate. After a restart or with limited history, the display automatically
+uses a 1-, 6-, 12-, 24-, or 48-hour window so real observations remain visible
+without changing their time spacing; point markers keep a single observation
+visible. A failover request is counted once even if it tries several accounts.
 The provider builds the chart from bounded one-minute in-memory aggregates; the
 series resets when the provider restarts and is never written to `runtime.json`.
 Output tokens/second uses upstream output usage divided by wall-clock time, so
