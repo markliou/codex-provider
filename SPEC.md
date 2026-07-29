@@ -111,7 +111,12 @@ Admin API prefix:
 /admin/api/*
 ```
 
-Public mode is visible without admin login and may show pool status plus join/leave controls. Management APIs under `/admin/api/*`, except login and public-dashboard endpoints, require strong password authentication. If remote admin is enabled, require explicit opt-in with `CODEX_POOL_ALLOW_REMOTE_ADMIN=true`.
+Public mode is visible without admin login and may show pool status, join/leave
+controls, editable public owner notes, and strict same-identity repair for an
+invalid in-pool Codex credential. Management APIs under `/admin/api/*`, except
+login and public-dashboard endpoints, require strong password authentication.
+If remote admin is enabled, require explicit opt-in with
+`CODEX_POOL_ALLOW_REMOTE_ADMIN=true`.
 
 Unauthenticated and login chrome must use deliberately neutral copy, such as `Service`, `Access`, and `Continue`, instead of obvious Codex, pool, provider, or admin labels. This is passive exposure reduction for casual browsing and keyword probes, not a security boundary; management APIs remain protected server-side.
 
@@ -801,6 +806,16 @@ Behavior:
 8. Device-auth execution is process-wide single-flight. The management health
    response exposes the active job so an admin-page reload can recover its
    verification URL/code instead of orphaning a live login.
+9. The unauthenticated repair endpoint may start or resume only a job marked as
+   public repair for that same opaque account reference. It must reject
+   admin-originated login jobs, accounts outside the pool, provider API-key
+   accounts, healthy credentials, and slots without a previously verified
+   upstream account ID.
+10. Public repair requires an exact upstream account-ID match both immediately
+    after Codex writes `auth.json` and after quota/subscription metadata
+    enrichment. A mismatch fails closed with the durable routing gate still set
+    and must not replace the slot, purge its history, or expose internal job
+    output.
 
 This preserves Pool's local cache/affinity observations and route continuity;
 it does not copy or directly write upstream KV cache contents. Continued
@@ -839,6 +854,20 @@ Waiting for user:
   "message": "Open the verification URL and enter the code."
 }
 ```
+
+Unauthenticated same-identity repair uses the opaque `poolRef` returned by the
+public dashboard:
+
+```http
+POST /admin/api/public-dashboard/accounts/{poolRef}/repair
+GET  /admin/api/public-dashboard/accounts/{poolRef}/repair
+```
+
+The public response contains only `status`, `reauthentication`,
+`historyReset`, the verification URL/code and expiry, and optional timestamps.
+It must not contain the local account ID, upstream account ID, raw job ID,
+internal error text, CLI output, or messages. Closing the browser dialog stops
+only local polling; selecting **Repair** again resumes the same public job.
 
 Completed:
 
@@ -883,15 +912,22 @@ Public trusted-user endpoints:
 ```http
 POST /admin/api/public-dashboard/accounts/{poolRef}/pool-add
 POST /admin/api/public-dashboard/accounts/{poolRef}/pool-remove
+POST /admin/api/public-dashboard/accounts/{poolRef}/note
 ```
 
 `poolRef` is an opaque per-process account reference returned by the public dashboard. The public dashboard may return a partially masked email for account recognition, but must not expose full email addresses, account IDs, upstream URLs, API keys, sticky session keys, traffic details, quota error codes, or upstream error bodies.
+
+`note` accepts `{"ownerNote":"..."}`. The value is public plain text, collapses
+whitespace, rejects non-whitespace control characters, is limited to 80 Unicode
+characters, and persists with the local slot. It is intentionally editable
+without admin authentication; users must not store secrets in it.
 
 Legacy authenticated owner endpoints:
 
 ```http
 POST /admin/api/accounts/{accountId}/pool-add
 POST /admin/api/accounts/{accountId}/pool-remove
+POST /admin/api/accounts/{accountId}/note
 ```
 
 `pool-remove` keeps credentials but prevents scheduler selection. It should also clear sticky sessions bound to the account.
@@ -1712,7 +1748,14 @@ Build a minimal web UI on the single admin port.
 
 ### 16.1 Pages
 
-Single-page dashboard is enough. `/` on the admin port and `/admin` serve the same page. Public mode is visible without admin login and may show pool status plus join/leave pool controls. Management mode is unlocked with the admin password and is reserved for account creation, deletion, device-auth repair, and sticky-session inspection.
+Single-page dashboard is enough. `/` on the admin port and `/admin` serve the
+same page. Public mode is visible without admin login and may show pool status,
+join/leave pool controls, owner notes, and strict repair for invalid in-pool
+credentials. While such a credential needs repair, **Repair** (or
+**Continue repair** for an active public job) replaces **Leave pool**.
+Management mode is unlocked with the admin password and is reserved for
+account creation, deletion, unrestricted owner-started device-auth repair, and
+sticky-session inspection.
 
 The footer version must be injected from git-derived build metadata. Keep the HTML source as a placeholder and build local images through `scripts/build-local-image.sh` or an equivalent command that passes `CODEX_POOL_VERSION` and `CODEX_POOL_COMMIT`. Do not manually edit the footer string for releases; that has already caused deployed fixes to be indistinguishable from stale builds.
 
@@ -1990,7 +2033,14 @@ The implementation is acceptable when:
     finalization; sticky traffic receives a retryable 503, active device-auth is
     globally single-flight and recoverable after UI reload, and pool membership
     cannot change until verification completes.
-29. Throughput counts client requests rather than upstream attempts, keeps
+29. Unauthenticated repair uses only an opaque account reference and a redacted
+    job projection, cannot expose or resume an owner-started job, and cannot
+    replace the slot: the final upstream account ID must exactly match the
+    durable pre-repair identity.
+30. Account owner notes are public, editable without login, normalized as plain
+    text, limited to 80 Unicode characters, persisted with the local slot, and
+    never used as credential, routing, or identity keys.
+31. Throughput counts client requests rather than upstream attempts, keeps
     bounded one-minute buckets in memory for 48 hours, emits 10-minute chart
     points, never persists new history, keeps temporary pool removal from
     erasing the in-process view, and removes attribution on identity purge.

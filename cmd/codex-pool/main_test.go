@@ -1307,8 +1307,12 @@ func TestPersistedAuthVerificationGateSurvivesRestart(t *testing.T) {
 	if status, reason := a.accountStatusLocked(a.config.Accounts[0], now); status != "missing_auth" || !strings.Contains(reason, "completed") {
 		t.Fatalf("persisted repair status = %q/%q", status, reason)
 	}
-	if action := publicPoolAction(a.config.Accounts[0]); action != "" {
-		t.Fatalf("public dashboard exposed pool action %q during persisted repair", action)
+	publicItem := a.publicDashboardAccountLocked(a.config.Accounts[0], 0, now)
+	if action := publicItem["poolAction"]; action != "repair" {
+		t.Fatalf("public dashboard action during persisted repair = %#v, want repair", action)
+	}
+	if label := publicItem["poolActionLabel"]; label != "Repair" {
+		t.Fatalf("public dashboard repair label = %#v, want Repair", label)
 	}
 	if label := publicPoolLabel(a.config.Accounts[0]); label != "Verification pending" {
 		t.Fatalf("public pool label = %q, want verification pending", label)
@@ -1466,6 +1470,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 	for _, expected := range []string{"loginJob", "activeLoginJob", "state.currentLoginJobId = activeLoginJob.jobId"} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS cannot recover an active login after reload: missing %q", expected)
+		}
+	}
+	for _, expected := range []string{"currentPublicRepairRef", "startPublicDeviceAuth", "watchPublicLoginJob", `poolAction === "repair"`, "account-owner-note", "Who owns this account?", "data-owner-note-ref", "data-owner-note-account-id"} {
+		if !strings.Contains(jsRecorder.Body.String(), expected) {
+			t.Fatalf("admin JS omitted public repair/account note behavior %q", expected)
 		}
 	}
 	if !strings.Contains(jsRecorder.Body.String(), "codeExpiresAt") {
@@ -1993,6 +2002,225 @@ func TestPublicPoolToggleDoesNotExposeAccountID(t *testing.T) {
 	}
 	if !a.config.Accounts[0].Enabled || !a.config.Accounts[0].InPool {
 		t.Fatalf("public pool-add did not enable pool participation: %#v", a.config.Accounts[0])
+	}
+}
+
+func TestPublicRepairActionReplacesLeavePoolOnlyForInvalidCredential(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{
+		{ID: "slot-codex", AccountID: "upstream-one", AuthType: "codex_device_auth", Enabled: true, InPool: true, LastLoginAt: now.Add(-time.Hour)},
+		{ID: "slot-provider", AccountID: "provider-one", AuthType: "provider_api_key", UpstreamBaseURL: "https://provider.example.test/v1", Enabled: true, InPool: true},
+	})
+	writeCodexDeviceAuth(t, a, "slot-codex", "upstream-one", "same@example.test")
+
+	healthy := a.publicDashboardAccountLocked(a.config.Accounts[0], 0, now)
+	if healthy["poolAction"] != "pool-remove" || healthy["poolActionLabel"] != "Leave pool" {
+		t.Fatalf("healthy public action = %#v/%#v", healthy["poolAction"], healthy["poolActionLabel"])
+	}
+
+	a.state.Quotas["slot-codex"] = quotaSnapshot{AccountID: "slot-codex", QuotaError: &quotaErrorInfo{Code: "token_invalidated", Message: "redacted", Timestamp: now}}
+	invalid := a.publicDashboardAccountLocked(a.config.Accounts[0], 0, now)
+	if invalid["poolAction"] != "repair" || invalid["poolActionLabel"] != "Repair" {
+		t.Fatalf("invalid credential action = %#v/%#v", invalid["poolAction"], invalid["poolActionLabel"])
+	}
+
+	provider := a.publicDashboardAccountLocked(a.config.Accounts[1], 1, now)
+	if provider["poolAction"] != "pool-remove" {
+		t.Fatalf("provider API-key account exposed repair: %#v", provider)
+	}
+
+	ref := a.publicAccountRefLocked("slot-provider")
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/"+ref+"/repair", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("provider public repair returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPublicRepairJobUsesOpaqueRefAndRedactedPolling(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{{
+		ID:                           "slot-public-repair",
+		AccountID:                    "upstream-one",
+		AuthType:                     "codex_device_auth",
+		Enabled:                      true,
+		InPool:                       true,
+		PendingAuthVerification:      true,
+		PendingAuthExpectedAccountID: "upstream-one",
+		LastLoginAt:                  now.Add(-time.Hour),
+	}})
+	bin := t.TempDir()
+	script := `#!/bin/sh
+set -eu
+mkdir -p "$CODEX_HOME"
+printf '%s\n' 'Open https://auth.openai.com/activate' 'ABCD-EFGH'
+while true; do sleep 1; done
+`
+	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ref := a.publicAccountRefLocked("slot-public-repair")
+	startRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/"+ref+"/repair", nil)
+	startRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(startRecorder, startRequest)
+	if startRecorder.Code != http.StatusAccepted {
+		t.Fatalf("public repair start returned %d: %s", startRecorder.Code, startRecorder.Body.String())
+	}
+	for _, forbidden := range []string{"slot-public-repair", "upstream-one", "job-login-", `"jobId"`, `"accountId"`, `"message"`, `"error"`} {
+		if strings.Contains(startRecorder.Body.String(), forbidden) {
+			t.Fatalf("public repair start exposed %q: %s", forbidden, startRecorder.Body.String())
+		}
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var pollBody string
+	for time.Now().Before(deadline) {
+		pollRequest := httptest.NewRequest(http.MethodGet, "/admin/api/public-dashboard/accounts/"+ref+"/repair", nil)
+		pollRecorder := httptest.NewRecorder()
+		a.adminMux().ServeHTTP(pollRecorder, pollRequest)
+		if pollRecorder.Code != http.StatusOK {
+			t.Fatalf("public repair poll returned %d: %s", pollRecorder.Code, pollRecorder.Body.String())
+		}
+		pollBody = pollRecorder.Body.String()
+		if strings.Contains(pollBody, "ABCD-EFGH") {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !strings.Contains(pollBody, "ABCD-EFGH") || !strings.Contains(pollBody, "https://auth.openai.com/activate") {
+		t.Fatalf("public repair poll did not expose device prompt: %s", pollBody)
+	}
+	for _, forbidden := range []string{"slot-public-repair", "upstream-one", "job-login-", `"jobId"`, `"accountId"`, `"message"`, `"error"`} {
+		if strings.Contains(pollBody, forbidden) {
+			t.Fatalf("public repair poll exposed %q: %s", forbidden, pollBody)
+		}
+	}
+
+	a.mu.RLock()
+	job := a.latestPublicRepairJobForAccountLocked("slot-public-repair")
+	if job == nil || !job.PublicRepair {
+		a.mu.RUnlock()
+		t.Fatalf("public repair job policy missing: %#v", job)
+	}
+	jobID := job.ID
+	a.mu.RUnlock()
+	cancel, _, err := a.cancelLoginJob(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func TestPublicRepairCannotAdoptOwnerLoginOrReplaceIdentity(t *testing.T) {
+	now := time.Now().UTC()
+	a := testApp(t, []account{{
+		ID:                           "slot-public-repair",
+		AccountID:                    "upstream-one",
+		Email:                        "old@example.test",
+		AuthType:                     "codex_device_auth",
+		Enabled:                      true,
+		InPool:                       true,
+		PendingAuthVerification:      true,
+		PendingAuthExpectedAccountID: "upstream-one",
+		LastLoginAt:                  now.Add(-time.Hour),
+	}})
+	seedDeviceAuthIdentityHistory(a, "slot-public-repair", now)
+	a.jobs["job-owner"] = &loginJob{ID: "job-owner", AccountID: "slot-public-repair", Status: "waiting_for_user"}
+	if _, err := a.startPublicRepairJobLocked(a.config.Accounts[0]); !errors.Is(err, errAnotherLoginJobInProgress) {
+		t.Fatalf("public repair adopted owner job: %v", err)
+	}
+	delete(a.jobs, "job-owner")
+
+	bin := t.TempDir()
+	script := `#!/bin/sh
+set -eu
+mkdir -p "$CODEX_HOME"
+printf '%s\n' 'Open https://auth.openai.com/activate' 'ABCD-EFGH'
+cat > "$CODEX_HOME/auth.json" <<EOF
+{"auth_mode":"chatgpt","tokens":{"id_token":"` + fakeJWTClaims(map[string]any{"email": "visitor@example.test", "https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "upstream-visitor"}}) + `","access_token":"<access-token>","refresh_token":"<refresh-token>"}}
+EOF
+`
+	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	a.mu.Lock()
+	job, err := a.startPublicRepairJobLocked(a.config.Accounts[0])
+	a.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.RLock()
+		current := *a.jobs[job.ID]
+		a.mu.RUnlock()
+		if current.Status == "failed" {
+			if !current.PublicRepair || current.HistoryReset {
+				t.Fatalf("public mismatch job = %#v", current)
+			}
+			item := a.config.Accounts[0]
+			if item.AccountID != "upstream-one" || item.Email != "old@example.test" || !item.PendingAuthVerification || item.PendingAuthExpectedAccountID != "upstream-one" {
+				t.Fatalf("public mismatch replaced account metadata or released gate: %#v", item)
+			}
+			if len(a.state.PromptCache) != 1 || len(a.state.StickySessions) != 1 || len(a.state.ResponseBindings) != 1 || len(a.state.ThreadBindings) != 1 || len(a.state.RoutingCacheEvents) != 1 {
+				t.Fatalf("public mismatch discarded identity history: cache=%#v sticky=%#v responses=%#v threads=%#v events=%#v", a.state.PromptCache, a.state.StickySessions, a.state.ResponseBindings, a.state.ThreadBindings, a.state.RoutingCacheEvents)
+			}
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("public identity mismatch did not fail: %#v", a.jobs[job.ID])
+}
+
+func TestPublicAndManagementAccountOwnerNotePersists(t *testing.T) {
+	a := testApp(t, []account{{ID: "slot-note", AccountID: "upstream-one", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
+	ref := a.publicAccountRefLocked("slot-note")
+
+	publicRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/"+ref+"/note", strings.NewReader(`{"ownerNote":"  Alice   workstation  "}`))
+	publicRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(publicRecorder, publicRequest)
+	if publicRecorder.Code != http.StatusOK {
+		t.Fatalf("public note returned %d: %s", publicRecorder.Code, publicRecorder.Body.String())
+	}
+	if a.config.Accounts[0].OwnerNote != "Alice workstation" || !strings.Contains(publicRecorder.Body.String(), `"ownerNote":"Alice workstation"`) {
+		t.Fatalf("public note was not normalized: %#v / %s", a.config.Accounts[0], publicRecorder.Body.String())
+	}
+	var persisted config
+	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.Accounts) != 1 || persisted.Accounts[0].OwnerNote != "Alice workstation" {
+		t.Fatalf("public note was not persisted: %#v", persisted.Accounts)
+	}
+
+	tooLong := strings.Repeat("界", maxOwnerNoteRunes+1)
+	invalidRequest := httptest.NewRequest(http.MethodPost, "/admin/api/public-dashboard/accounts/"+ref+"/note", strings.NewReader(`{"ownerNote":"`+tooLong+`"}`))
+	invalidRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(invalidRecorder, invalidRequest)
+	if invalidRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("overlong public note returned %d: %s", invalidRecorder.Code, invalidRecorder.Body.String())
+	}
+
+	cookies, csrf := adminSession(t, a)
+	managementRequest := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/slot-note/note", strings.NewReader(`{"ownerNote":"Bob"}`))
+	for _, cookie := range cookies {
+		managementRequest.AddCookie(cookie)
+	}
+	managementRequest.Header.Set("X-CSRF-Token", csrf)
+	managementRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(managementRecorder, managementRequest)
+	if managementRecorder.Code != http.StatusOK {
+		t.Fatalf("management note returned %d: %s", managementRecorder.Code, managementRecorder.Body.String())
+	}
+	if a.config.Accounts[0].OwnerNote != "Bob" || !strings.Contains(managementRecorder.Body.String(), `"ownerNote":"Bob"`) {
+		t.Fatalf("management note was not saved: %#v / %s", a.config.Accounts[0], managementRecorder.Body.String())
 	}
 }
 

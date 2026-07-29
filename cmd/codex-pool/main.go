@@ -43,6 +43,7 @@ const (
 	adminLoginMaxFailures     = 5
 	adminLoginLockout         = 15 * time.Minute
 	maxRequestBody            = 16 << 20
+	maxOwnerNoteRunes         = 80
 	sessionLifetime           = 12 * time.Hour
 	sessionAffinityTTLDefault = 24 * time.Hour
 	accountActiveWindow       = 60 * time.Second
@@ -95,10 +96,11 @@ var throughputLatencyBoundsMillis = []uint64{
 }
 
 var (
-	errAccountAuthFailed         = errors.New("account authentication failed")
-	errCodexAuthMissing          = errors.New("codex auth missing")
-	errAccountAuthRepairPending  = errors.New("sticky account sign-in repair is in progress")
-	errAnotherLoginJobInProgress = errors.New("another device-auth login is already in progress")
+	errAccountAuthFailed            = errors.New("account authentication failed")
+	errCodexAuthMissing             = errors.New("codex auth missing")
+	errAccountAuthRepairPending     = errors.New("sticky account sign-in repair is in progress")
+	errAnotherLoginJobInProgress    = errors.New("another device-auth login is already in progress")
+	errPublicRepairIdentityMismatch = errors.New("public sign-in repair identity did not match the existing account")
 )
 
 type config struct {
@@ -111,8 +113,12 @@ type config struct {
 }
 
 type account struct {
-	ID               string `json:"id"`
-	Label            string `json:"label"`
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	// OwnerNote is deliberately user-supplied public display text. It helps
+	// shared users identify who owns a credential without exposing the local or
+	// upstream account IDs that the unauthenticated dashboard must keep hidden.
+	OwnerNote        string `json:"ownerNote,omitempty"`
 	Email            string `json:"email,omitempty"`
 	AccountID        string `json:"accountId,omitempty"`
 	OrganizationName string `json:"organizationName,omitempty"`
@@ -327,10 +333,14 @@ type accountHealth struct {
 }
 
 type loginJob struct {
-	ID               string    `json:"jobId"`
-	Type             string    `json:"type"`
-	Status           string    `json:"status"`
-	AccountID        string    `json:"accountId"`
+	ID        string `json:"jobId"`
+	Type      string `json:"type"`
+	Status    string `json:"status"`
+	AccountID string `json:"accountId"`
+	// PublicRepair is process-local policy, never API output. Public repair jobs
+	// may expose only a redacted projection and must not accept a different
+	// upstream identity, unlike the authenticated owner's replacement flow.
+	PublicRepair     bool      `json:"-"`
 	Reauthentication bool      `json:"reauthentication,omitempty"`
 	HistoryReset     bool      `json:"historyReset,omitempty"`
 	VerificationURL  string    `json:"verificationUrl,omitempty"`
@@ -631,6 +641,7 @@ func (a *app) load() error {
 		_ = a.saveLocked()
 	}
 	for i := range a.config.Accounts {
+		a.config.Accounts[i].OwnerNote = cleanOwnerNote(a.config.Accounts[i].OwnerNote)
 		a.config.Accounts[i].Email = normalizeEmail(a.config.Accounts[i].Email)
 		a.config.Accounts[i].OrganizationName = cleanOrganizationName(a.config.Accounts[i].OrganizationName)
 		if a.config.Accounts[i].OrganizationName == "" {
@@ -768,6 +779,7 @@ func (a *app) adminMux() http.Handler {
 	mux.HandleFunc("GET /admin/assets/logo.svg", handleAdminLogo)
 	mux.HandleFunc("GET /admin/manifest.webmanifest", handleAdminManifest)
 	mux.HandleFunc("GET /admin/api/public-dashboard", a.handlePublicDashboard)
+	mux.HandleFunc("GET /admin/api/public-dashboard/accounts/", a.handlePublicAccountAction)
 	mux.HandleFunc("POST /admin/api/public-dashboard/accounts/", a.handlePublicAccountAction)
 	mux.HandleFunc("POST /admin/api/login", a.handleAdminLogin)
 	mux.HandleFunc("POST /admin/api/logout", a.requireAdmin(a.handleAdminLogout))
@@ -1824,16 +1836,26 @@ func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) 
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "not found")
 		return
 	}
-	// Public users may only join/leave the pool through an opaque per-process
-	// reference. Do not add account IDs, delete/login actions, or unmasked
-	// metadata to this surface; those belong to authenticated management APIs.
+	// Public users act only through an opaque per-process reference. Repair is a
+	// deliberately narrow exception to owner-only login: it is offered only for
+	// an invalid in-pool credential, exposes a redacted job, and requires the
+	// exact previously verified upstream identity. Never return local account or
+	// raw job IDs from this surface.
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/admin/api/public-dashboard/accounts/"), "/")
 	if len(parts) != 2 || parts[0] == "" {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "public account action not found")
 		return
 	}
 	ref, action := parts[0], parts[1]
-	if action != "pool-add" && action != "pool-remove" {
+	if action != "pool-add" && action != "pool-remove" && action != "repair" && action != "note" {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "public account action not found")
+		return
+	}
+	if r.Method == http.MethodGet && action != "repair" {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "public account action not found")
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "public account action not found")
 		return
 	}
@@ -1845,15 +1867,80 @@ func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) 
 		if !a.publicAccountRefMatchesLocked(item.ID, ref) {
 			continue
 		}
-		if item.PendingAuthVerification || a.accountLoginInProgressLocked(item.ID) {
-			writeOpenAIError(w, http.StatusConflict, "account_authenticating", "complete sign-in repair before changing pool participation")
-			return
-		}
 		switch action {
+		case "repair":
+			if r.Method == http.MethodGet {
+				job := a.latestPublicRepairJobForAccountLocked(item.ID)
+				if job == nil {
+					writeOpenAIError(w, http.StatusNotFound, "not_found", "repair job not found")
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"ok": true, "job": publicRepairJob(*job)})
+				return
+			}
+			if !a.publicRepairAvailableLocked(*item) {
+				writeOpenAIError(w, http.StatusConflict, "repair_unavailable", "this credential does not currently require public repair")
+				return
+			}
+			job, err := a.startPublicRepairJobLocked(*item)
+			if err != nil {
+				if errors.Is(err, errAnotherLoginJobInProgress) {
+					writeOpenAIError(w, http.StatusConflict, "login_in_progress", "another sign-in is already in progress")
+					return
+				}
+				if errors.Is(err, errPublicRepairIdentityMismatch) {
+					writeOpenAIError(w, http.StatusConflict, "repair_unavailable", "this credential cannot be repaired from the public page")
+					return
+				}
+				writeOpenAIError(w, http.StatusInternalServerError, "storage_error", "unable to start sign-in repair")
+				return
+			}
+			writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "job": publicRepairJob(job)})
+			return
+		case "note":
+			if r.Method != http.MethodPost {
+				writeOpenAIError(w, http.StatusNotFound, "not_found", "public account action not found")
+				return
+			}
+			var request struct {
+				OwnerNote string `json:"ownerNote"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, maxRequestBody)).Decode(&request); err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid account note JSON")
+				return
+			}
+			note, err := validateOwnerNote(request.OwnerNote)
+			if err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+				return
+			}
+			item.OwnerNote = note
+			item.UpdatedAt = now
+			if err := a.saveLocked(); err != nil {
+				writeOpenAIError(w, http.StatusInternalServerError, "storage_error", "unable to persist account note")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": a.publicDashboardAccountLocked(*item, index, now)})
+			return
 		case "pool-add":
+			if item.PendingAuthVerification || a.accountLoginInProgressLocked(item.ID) {
+				writeOpenAIError(w, http.StatusConflict, "account_authenticating", "complete sign-in repair before changing pool participation")
+				return
+			}
 			item.Enabled = true
 			item.InPool = true
 		case "pool-remove":
+			if item.PendingAuthVerification || a.accountLoginInProgressLocked(item.ID) {
+				writeOpenAIError(w, http.StatusConflict, "account_authenticating", "complete sign-in repair before changing pool participation")
+				return
+			}
+			if a.publicRepairAvailableLocked(*item) {
+				// The public contract replaces Leave pool with Repair while the
+				// credential is invalid. Enforce that server-side too so a stale
+				// page cannot silently discard affinity instead of repairing it.
+				writeOpenAIError(w, http.StatusConflict, "account_authenticating", "complete sign-in repair before changing pool participation")
+				return
+			}
 			item.InPool = false
 			a.clearStickyForAccountLocked(item.ID)
 		}
@@ -1881,6 +1968,12 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	input.ID = strings.TrimSpace(input.ID)
+	ownerNote, err := validateOwnerNote(input.OwnerNote)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	input.OwnerNote = ownerNote
 	input.Email = normalizeEmail(input.Email)
 	input.OrganizationName = cleanOrganizationName(input.OrganizationName)
 	input.Label = strings.TrimSpace(input.Label)
@@ -2118,6 +2211,27 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "job": job})
+		return
+	case "note":
+		var request struct {
+			OwnerNote string `json:"ownerNote"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, maxRequestBody)).Decode(&request); err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid account note JSON")
+			return
+		}
+		note, err := validateOwnerNote(request.OwnerNote)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		item.OwnerNote = note
+		item.UpdatedAt = time.Now().UTC()
+		if err := a.saveLocked(); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "storage_error", "unable to persist account note")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": publicAccount(*item, index)})
 		return
 	case "enable":
 		item.Enabled = true
@@ -5057,6 +5171,14 @@ func firstMetadataString(values map[string]any, keys ...string) string {
 }
 
 func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaSnapshot, error) {
+	return a.refreshAccountQuotaWithExpectedIdentity(ctx, accountID, "")
+}
+
+func (a *app) refreshAccountQuotaForRepair(ctx context.Context, accountID, expectedUpstreamAccountID string) (quotaSnapshot, error) {
+	return a.refreshAccountQuotaWithExpectedIdentity(ctx, accountID, strings.TrimSpace(expectedUpstreamAccountID))
+}
+
+func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accountID, expectedUpstreamAccountID string) (quotaSnapshot, error) {
 	ctx, cancel := context.WithTimeout(ctx, quotaRefreshTimeout)
 	defer cancel()
 
@@ -5084,6 +5206,7 @@ func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaS
 		a.saveQuotaError(accountID, code, "refresh codex token failed")
 		return quotaSnapshot{}, errors.New("refresh codex token failed")
 	}
+	verifiedUpstreamAccountID := strings.TrimSpace(auth.AccountID)
 	if auth.AccountID == "" {
 		auth.AccountID = accountCopy.AccountID
 	}
@@ -5158,6 +5281,7 @@ func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaS
 		if metadata, err := a.fetchCodexSubscriptionMetadata(ctx, auth); err == nil {
 			if metadata.AccountID != "" {
 				auth.AccountID = metadata.AccountID
+				verifiedUpstreamAccountID = strings.TrimSpace(metadata.AccountID)
 			}
 			if metadata.PlanType != "" && metadata.PlanType != "unknown" {
 				plan = metadata.PlanType
@@ -5177,6 +5301,12 @@ func (a *app) refreshAccountQuota(ctx context.Context, accountID string) (quotaS
 	}
 	if !organizationScopedPlan(plan) {
 		organizationName = ""
+	}
+	if expectedUpstreamAccountID != "" && verifiedUpstreamAccountID != expectedUpstreamAccountID {
+		// Public repair is not an account-replacement API. Perform this check
+		// after subscription/workspace enrichment but before any config/runtime
+		// mutation so a visitor cannot transfer a slot or its history.
+		return quotaSnapshot{}, errPublicRepairIdentityMismatch
 	}
 	snapshot := quotaSnapshot{AccountID: accountID, OrganizationName: organizationName, PlanType: plan, PlanLimit: planLimit, Quota: &quota, UsageUpdatedAt: now}
 
@@ -5421,6 +5551,24 @@ func claimString(claims map[string]any, name string) string {
 }
 
 func (a *app) startLoginJobLocked(item account) (loginJob, error) {
+	return a.startLoginJobWithPolicyLocked(item, false)
+}
+
+func (a *app) startPublicRepairJobLocked(item account) (loginJob, error) {
+	expectedAccountID := strings.TrimSpace(item.AccountID)
+	if item.PendingAuthVerification {
+		expectedAccountID = strings.TrimSpace(item.PendingAuthExpectedAccountID)
+	}
+	// Public repair cannot safely initialize or replace a slot. Without a
+	// previously verified upstream account ID, any visitor could bind their own
+	// account to the credential directory, so require the owner-only flow.
+	if expectedAccountID == "" {
+		return loginJob{}, errPublicRepairIdentityMismatch
+	}
+	return a.startLoginJobWithPolicyLocked(item, true)
+}
+
+func (a *app) startLoginJobWithPolicyLocked(item account, publicRepair bool) (loginJob, error) {
 	if a.jobs == nil {
 		a.jobs = map[string]*loginJob{}
 	}
@@ -5432,6 +5580,12 @@ func (a *app) startLoginJobLocked(item account) (loginJob, error) {
 			continue
 		}
 		if job.AccountID == item.ID {
+			if publicRepair && !job.PublicRepair {
+				// Never expose or adopt an owner-originated login job on the
+				// unauthenticated page; it may have been started to replace the
+				// slot and its device code belongs to the authenticated session.
+				return loginJob{}, errAnotherLoginJobInProgress
+			}
 			slot := a.accountLocked(item.ID)
 			if slot != nil && !slot.PendingAuthVerification {
 				slot.PendingAuthVerification = true
@@ -5479,6 +5633,7 @@ func (a *app) startLoginJobLocked(item account) (loginJob, error) {
 		Type:             "account_login",
 		Status:           "running",
 		AccountID:        item.ID,
+		PublicRepair:     publicRepair,
 		Reauthentication: reauthentication,
 		Message:          "Starting Codex device auth login",
 		StartedAt:        now,
@@ -5490,11 +5645,11 @@ func (a *app) startLoginJobLocked(item account) (loginJob, error) {
 	// login. Carry it across the asynchronous job so completion can distinguish
 	// same-account credential repair from replacing the slot with another
 	// upstream identity.
-	go a.runLoginJob(ctx, jobID, item.ID, home, expectedUpstreamAccountID, reauthentication)
+	go a.runLoginJob(ctx, jobID, item.ID, home, expectedUpstreamAccountID, reauthentication, publicRepair)
 	return *job, nil
 }
 
-func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome, expectedUpstreamAccountID string, reauthentication bool) {
+func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome, expectedUpstreamAccountID string, reauthentication, publicRepair bool) {
 	if err := os.MkdirAll(codexHome, 0o700); err != nil {
 		a.finishLoginJob(jobID, "failed", "", "", fmt.Sprintf("create CODEX_HOME: %v", err))
 		return
@@ -5589,15 +5744,22 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome, expe
 		if item := a.accountLocked(accountID); item != nil {
 			if auth, err := a.codexAuth(*item); err == nil {
 				activateAfterFinalize = item.PendingPoolActivation
-				historyReset = a.applyCompletedDeviceAuthLocked(item, auth, expectedUpstreamAccountID, reauthentication, now)
-				job.HistoryReset = historyReset
-				if err := a.saveLocked(); err != nil {
-					finalizeError = "Unable to persist authenticated account state"
+				if publicRepair && reauthenticationChangedUpstreamIdentity(auth, expectedUpstreamAccountID, reauthentication) {
+					// Public callers may repair only the same upstream identity.
+					// Fail before mutating metadata, history, or the sidecar; the
+					// durable gate remains set so the legitimate user can retry.
+					finalizeError = "Authenticated account did not match this credential"
 				} else {
-					refreshQuotaAccountID = accountID
-					if a.usesCliproxySidecar(*item) {
-						sidecarAccount = *item
-						syncSidecar = true
+					historyReset = a.applyCompletedDeviceAuthLocked(item, auth, expectedUpstreamAccountID, reauthentication, now)
+					job.HistoryReset = historyReset
+					if err := a.saveLocked(); err != nil {
+						finalizeError = "Unable to persist authenticated account state"
+					} else {
+						refreshQuotaAccountID = accountID
+						if a.usesCliproxySidecar(*item) {
+							sidecarAccount = *item
+							syncSidecar = true
+						}
 					}
 				}
 			} else {
@@ -5627,7 +5789,17 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome, expe
 		}
 	}
 	if refreshQuotaAccountID != "" {
-		if _, err := a.refreshAccountQuota(ctx, refreshQuotaAccountID); err != nil && ctx.Err() == nil {
+		var err error
+		if publicRepair {
+			_, err = a.refreshAccountQuotaForRepair(ctx, refreshQuotaAccountID, expectedUpstreamAccountID)
+		} else {
+			_, err = a.refreshAccountQuota(ctx, refreshQuotaAccountID)
+		}
+		if errors.Is(err, errPublicRepairIdentityMismatch) {
+			a.finishLoginJob(jobID, "failed", verificationURL, userCode, "Authenticated account did not match this credential")
+			return
+		}
+		if err != nil && ctx.Err() == nil {
 			a.logger.Printf("quota refresh after login skipped for %s: %s", refreshQuotaAccountID, err)
 		}
 	}
@@ -5645,28 +5817,35 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome, expe
 		// the routing gate so that later metadata enrichment cannot smuggle old
 		// affinity/history across an account boundary.
 		finalIdentityReset := reauthenticationChangedUpstreamIdentity(codexAuthInfo{AccountID: item.AccountID}, expectedUpstreamAccountID, reauthentication)
-		if finalIdentityReset && !historyReset {
+		if publicRepair && finalIdentityReset {
+			// A metadata refresh may resolve a more specific workspace ID than
+			// auth.json. Public repair still requires an exact final identity;
+			// never release the routing gate or convert this slot for a visitor.
+			finalizeError = "Authenticated account did not match this credential"
+		} else if finalIdentityReset && !historyReset {
 			a.clearAccountIdentityScopedStateLocked(accountID)
 			historyReset = true
 			if job := a.jobs[jobID]; job != nil {
 				job.HistoryReset = true
 			}
 		}
-		item.PendingAuthVerification = false
-		item.PendingAuthExpectedAccountID = ""
-		if activateAfterFinalize {
-			item.Enabled = true
-			item.InPool = true
-			item.PendingPoolActivation = false
-		}
-		item.UpdatedAt = time.Now().UTC()
-		if err := a.saveCompletedAuthVerificationLocked(); err != nil {
-			// Keep the in-memory routing gate aligned with the durable pending
-			// marker written at job start. A storage failure must not release a
-			// credential whose identity transition was not persisted.
-			item.PendingAuthVerification = true
-			item.PendingAuthExpectedAccountID = expectedUpstreamAccountID
-			finalizeError = "Unable to persist completed sign-in repair"
+		if finalizeError == "" {
+			item.PendingAuthVerification = false
+			item.PendingAuthExpectedAccountID = ""
+			if activateAfterFinalize {
+				item.Enabled = true
+				item.InPool = true
+				item.PendingPoolActivation = false
+			}
+			item.UpdatedAt = time.Now().UTC()
+			if err := a.saveCompletedAuthVerificationLocked(); err != nil {
+				// Keep the in-memory routing gate aligned with the durable pending
+				// marker written at job start. A storage failure must not release a
+				// credential whose identity transition was not persisted.
+				item.PendingAuthVerification = true
+				item.PendingAuthExpectedAccountID = expectedUpstreamAccountID
+				finalizeError = "Unable to persist completed sign-in repair"
+			}
 		}
 	}
 	a.mu.Unlock()
@@ -5805,6 +5984,78 @@ func (a *app) activeLoginJobForAccountLocked(accountID string) *loginJob {
 		}
 	}
 	return nil
+}
+
+func (a *app) latestPublicRepairJobForAccountLocked(accountID string) *loginJob {
+	var latest *loginJob
+	for _, job := range a.jobs {
+		if job.AccountID != accountID || !job.PublicRepair {
+			continue
+		}
+		if latest == nil || job.StartedAt.After(latest.StartedAt) {
+			latest = job
+		}
+	}
+	return latest
+}
+
+func (a *app) publicRepairJobActiveLocked(accountID string) bool {
+	job := a.activeLoginJobForAccountLocked(accountID)
+	return job != nil && job.PublicRepair
+}
+
+func (a *app) publicRepairAvailableLocked(item account) bool {
+	if !isCodexDeviceAuth(item) || !item.Enabled || !item.InPool {
+		return false
+	}
+	expectedAccountID := strings.TrimSpace(item.AccountID)
+	if item.PendingAuthVerification {
+		expectedAccountID = strings.TrimSpace(item.PendingAuthExpectedAccountID)
+	}
+	// Public repair must prove continuity with a prior verified identity. Empty
+	// or legacy identity metadata requires authenticated owner intervention.
+	if expectedAccountID == "" {
+		return false
+	}
+	if job := a.activeLoginJobForAccountLocked(item.ID); job != nil {
+		return job.PublicRepair
+	}
+	if item.PendingAuthVerification {
+		return true
+	}
+	if _, err := a.codexAuth(item); err != nil {
+		return true
+	}
+	return quotaErrorBlocksRouting(a.state.Quotas[item.ID].QuotaError)
+}
+
+func publicRepairJob(job loginJob) map[string]any {
+	// This is the complete unauthenticated job projection. Keep raw job/account
+	// IDs, CLI output, internal errors, and owner-originated login jobs private.
+	result := map[string]any{
+		"status":           job.Status,
+		"reauthentication": job.Reauthentication,
+		"historyReset":     job.HistoryReset,
+	}
+	if job.VerificationURL != "" {
+		result["verificationUrl"] = job.VerificationURL
+	}
+	if job.UserCode != "" {
+		result["userCode"] = job.UserCode
+	}
+	if !job.CodeExpiresAt.IsZero() {
+		result["codeExpiresAt"] = job.CodeExpiresAt
+	}
+	if !job.StartedAt.IsZero() {
+		result["startedAt"] = job.StartedAt
+	}
+	if !job.UpdatedAt.IsZero() {
+		result["updatedAt"] = job.UpdatedAt
+	}
+	if !job.CompletedAt.IsZero() {
+		result["completedAt"] = job.CompletedAt
+	}
+	return result
 }
 
 func (a *app) accountAuthVerificationPendingLocked(item account) bool {
@@ -6606,7 +6857,7 @@ func publicAccounts(values []account) []map[string]any {
 func publicAccount(item account, index int) map[string]any {
 	displayName := managementCredentialDisplayName(item)
 	metadata := credentialMetadata(item)
-	return map[string]any{"id": item.ID, "label": displayName, "displayName": displayName, "credentialMetadata": metadata, "email": metadata["email"], "organizationName": metadata["organizationName"], "planType": metadata["planType"], "planLimit": metadata["planLimit"], "planDisplayName": metadata["planDisplayName"], "planRank": metadata["planRank"], "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
+	return map[string]any{"id": item.ID, "label": displayName, "displayName": displayName, "ownerNote": item.OwnerNote, "credentialMetadata": metadata, "email": metadata["email"], "organizationName": metadata["organizationName"], "planType": metadata["planType"], "planLimit": metadata["planLimit"], "planDisplayName": metadata["planDisplayName"], "planRank": metadata["planRank"], "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
 }
 
 func (a *app) publicDashboardAccountLocked(item account, index int, now time.Time) map[string]any {
@@ -6630,15 +6881,17 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 		remainingQuota = &remaining
 	}
 	cacheInput, cacheCached, cacheRequests := a.promptCacheStatsForAccountLocked(item.ID)
+	repairAvailable := a.publicRepairAvailableLocked(item)
 	return map[string]any{
 		"displayName":       publicDashboardAccountLabel(displayItem, index),
 		"detail":            publicDashboardAccountDetail(displayItem),
+		"ownerNote":         item.OwnerNote,
 		"statusTone":        statusTone,
 		"statusLabel":       statusLabel,
 		"poolLabel":         publicPoolLabel(item),
 		"poolRef":           a.publicAccountRefLocked(item.ID),
-		"poolAction":        publicPoolAction(item),
-		"poolActionLabel":   publicPoolActionLabel(item),
+		"poolAction":        publicPoolAction(item, repairAvailable),
+		"poolActionLabel":   publicPoolActionLabel(item, repairAvailable, a.publicRepairJobActiveLocked(item.ID)),
 		"remainingQuota":    remainingQuota,
 		"quota":             quota.Quota,
 		"quotaUnavailable":  quota.QuotaError != nil,
@@ -6689,7 +6942,10 @@ func publicPoolLabel(item account) string {
 	return "In pool"
 }
 
-func publicPoolAction(item account) string {
+func publicPoolAction(item account, repairAvailable bool) string {
+	if repairAvailable {
+		return "repair"
+	}
 	if item.PendingAuthVerification {
 		return ""
 	}
@@ -6699,7 +6955,13 @@ func publicPoolAction(item account) string {
 	return "pool-add"
 }
 
-func publicPoolActionLabel(item account) string {
+func publicPoolActionLabel(item account, repairAvailable, repairActive bool) string {
+	if repairAvailable {
+		if repairActive {
+			return "Continue repair"
+		}
+		return "Repair"
+	}
 	if item.PendingAuthVerification {
 		return ""
 	}
@@ -6734,6 +6996,42 @@ func publicOrganizationName(value string) string {
 		return ""
 	}
 	return emailInDisplayPattern.ReplaceAllStringFunc(value, maskedPublicEmail)
+}
+
+func normalizedOwnerNote(value string) string {
+	// Notes are rendered on an unauthenticated page. Collapse whitespace and
+	// remove control characters at the storage boundary so every UI/API caller
+	// receives the same compact plain-text value.
+	var safe strings.Builder
+	for _, r := range value {
+		if unicode.IsControl(r) && !unicode.IsSpace(r) {
+			continue
+		}
+		safe.WriteRune(r)
+	}
+	return strings.Join(strings.Fields(safe.String()), " ")
+}
+
+func cleanOwnerNote(value string) string {
+	value = normalizedOwnerNote(value)
+	runes := []rune(value)
+	if len(runes) > maxOwnerNoteRunes {
+		value = string(runes[:maxOwnerNoteRunes])
+	}
+	return value
+}
+
+func validateOwnerNote(value string) (string, error) {
+	for _, r := range value {
+		if unicode.IsControl(r) && !unicode.IsSpace(r) {
+			return "", errors.New("account note must contain plain text only")
+		}
+	}
+	value = normalizedOwnerNote(value)
+	if len([]rune(value)) > maxOwnerNoteRunes {
+		return "", fmt.Errorf("account note must be %d characters or fewer", maxOwnerNoteRunes)
+	}
+	return value, nil
 }
 
 func effectiveOrganizationName(item account) string {

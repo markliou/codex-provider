@@ -1,5 +1,5 @@
 (() => {
-  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", mode: "public" };
+  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public" };
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => document.querySelectorAll(selector);
   const loginView = $("#login-view");
@@ -404,8 +404,12 @@
     state.deviceAuthPollTimer = null;
     const jobId = state.currentLoginJobId;
     state.currentLoginJobId = "";
+    state.currentPublicRepairRef = "";
     if (dialog.open) dialog.close();
-    if (cancelJob && jobId) cancelDeviceAuthJob(jobId);
+    // Closing a public repair dialog only stops local polling. Public users do
+    // not receive a cancellation endpoint; reopening Repair resumes the same
+    // redacted job without exposing its internal ID.
+    if (cancelJob && jobId && state.mode === "management") cancelDeviceAuthJob(jobId);
   }
 
   async function api(path, options = {}) {
@@ -421,6 +425,7 @@
 
   async function publicApi(path, options = {}) {
     const headers = new Headers(options.headers || {});
+    if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     const response = await fetch(`/admin/api/public-dashboard${path}`, { credentials: "same-origin", ...options, headers });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
@@ -634,6 +639,13 @@
     return parts.join(" · ");
   }
 
+  function ownerNoteInput(account, publicMode = false) {
+    const ref = publicMode ? account.poolRef : account.id;
+    if (!ref) return "";
+    const attribute = publicMode ? "data-owner-note-ref" : "data-owner-note-account-id";
+    return `<input class="account-owner-note" type="text" value="${escapeHTML(account.ownerNote || "")}" placeholder="Who owns this account?" maxlength="80" aria-label="Account owner note" ${attribute}="${escapeHTML(ref)}">`;
+  }
+
   function renderAccounts(accounts, healthByID) {
     $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity/Fallback")}</th><th class="throughput-column">Throughput (5m)</th><th>Last activity</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} configured`;
@@ -666,7 +678,7 @@
       const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
       return `<tr data-account-row="${escapeHTML(account.id)}">
-        <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
+        <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${ownerNoteInput(account)}</div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt)}</td>
         <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)} · ${escapeHTML(routeCount)}</div></td>
@@ -695,13 +707,13 @@
       const label = account.statusLabel || statusLabel(account.status);
       const quota = account.quotaUnavailable ? '<span class="quota-unknown">Quota unavailable</span>' : quotaMarkup(account.remainingQuota, account.quota, null, null);
       const action = account.poolRef && account.poolAction
-        ? `<button class="button ${account.poolAction === "pool-remove" ? "warn" : "secondary"}" type="button" data-public-pool-action="${escapeHTML(account.poolAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${escapeHTML(account.poolActionLabel || "Update")}</button>`
+        ? `<button class="button ${account.poolAction === "repair" ? "primary" : account.poolAction === "pool-remove" ? "warn" : "secondary"}" type="button" data-public-pool-action="${escapeHTML(account.poolAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${escapeHTML(account.poolActionLabel || "Update")}</button>`
         : "";
       const cacheWindow = account.cacheWindow || {};
       const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
       return `<tr>
-      <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}</div></td>
+      <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${ownerNoteInput(account, true)}</div></td>
       <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span>${activeBadge(account.active)}</div></td>
       <td>${quota}</td>
       <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong></div></td>
@@ -864,6 +876,18 @@
   async function handlePublicPoolAction(button) {
     const action = button.dataset.publicPoolAction;
     const ref = button.dataset.poolRef;
+    if (action === "repair") {
+      if (!window.confirm("Repair this sign-in? Continue with the same upstream account so its cache and affinity history can be preserved.")) return;
+      button.disabled = true;
+      try {
+        await startPublicDeviceAuth(ref);
+        await refreshPublic(true);
+      } catch (error) {
+        button.disabled = false;
+        notify(error.message, true);
+      }
+      return;
+    }
     button.disabled = true;
     try {
       await publicApi(`/accounts/${encodeURIComponent(ref)}/${action}`, { method: "POST" });
@@ -878,6 +902,15 @@
     const response = await api(`/accounts/${encodeURIComponent(accountId)}/login`, { method: "POST" });
     state.currentLoginJobId = response.job.jobId;
     watchLoginJob(response.job.jobId);
+  }
+
+  async function startPublicDeviceAuth(ref) {
+    const response = await publicApi(`/accounts/${encodeURIComponent(ref)}/repair`, { method: "POST" });
+    state.currentPublicRepairRef = ref;
+    if (response.job.status === "waiting_for_user" && (response.job.verificationUrl || response.job.userCode)) {
+      showDeviceAuth(response.job);
+    }
+    watchPublicLoginJob(ref);
   }
 
   async function createAccountAndStartLogin() {
@@ -949,6 +982,58 @@
     tick();
   }
 
+  async function watchPublicLoginJob(ref) {
+    let attempts = 0;
+    const tick = async () => {
+      if (state.currentPublicRepairRef !== ref) return;
+      attempts += 1;
+      try {
+        const response = await publicApi(`/accounts/${encodeURIComponent(ref)}/repair`);
+        const job = response.job;
+        if (state.currentPublicRepairRef !== ref) return;
+        if (job.status === "waiting_for_user" && (job.verificationUrl || job.userCode)) {
+          showDeviceAuth(job);
+        }
+        if (job.status === "completed") {
+          closeDeviceAuth(false);
+          await refreshPublic(true);
+          notify("Sign-in repaired");
+          return;
+        }
+        if (job.status === "failed" || job.status === "cancelled") {
+          closeDeviceAuth(false);
+          await refreshPublic(true);
+          if (job.status === "failed") notify("Sign-in repair failed; verify that you used the same account", true);
+          return;
+        }
+        if (attempts < 180) state.deviceAuthPollTimer = window.setTimeout(tick, 5000);
+      } catch (error) {
+        notify(error.message, true);
+      }
+    };
+    tick();
+  }
+
+  async function updateOwnerNote(input) {
+    const ownerNote = input.value;
+    const publicRef = input.dataset.ownerNoteRef;
+    const accountId = input.dataset.ownerNoteAccountId;
+    input.disabled = true;
+    try {
+      if (publicRef) {
+        await publicApi(`/accounts/${encodeURIComponent(publicRef)}/note`, { method: "POST", body: JSON.stringify({ ownerNote }) });
+        await refreshPublic(true);
+      } else if (accountId) {
+        await api(`/accounts/${encodeURIComponent(accountId)}/note`, { method: "POST", body: JSON.stringify({ ownerNote }) });
+        await refresh(true);
+      }
+      notify("Account note saved");
+    } catch (error) {
+      input.disabled = false;
+      notify(error.message, true);
+    }
+  }
+
   $("#login-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -994,6 +1079,10 @@
     }
     const button = event.target.closest("[data-account-action]");
     if (button) handleAccountAction(button);
+  });
+  $("#accounts-body").addEventListener("change", (event) => {
+    const input = event.target.closest("[data-owner-note-ref], [data-owner-note-account-id]");
+    if (input) updateOwnerNote(input);
   });
   $("#sticky-list").addEventListener("click", async (event) => { const button = event.target.closest("[data-sticky-key]"); if (!button) return; try { await api(`/sticky-sessions/${encodeURIComponent(button.dataset.stickyKey)}`, { method: "DELETE" }); notify("Route cleared"); refresh(true); } catch (error) { notify(error.message, true); } });
 
