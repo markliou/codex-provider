@@ -112,7 +112,7 @@ input:focus, select:focus { border-color: var(--accent-hot); box-shadow: 0 0 0 3
    (default-src 'self', no style-src 'unsafe-inline') strips inline style
    attributes and would leave the line/marker unstyled (black, no stroke). */
 .chart-series-output { --series-color: #46e6ff; }
-.chart-series-kv { --series-color: #46f1c7; }
+.chart-series-prompt { --series-color: #46f1c7; }
 .throughput-chart-empty { padding: 38px 16px; border: 1px dashed rgba(192, 149, 255, .28); border-radius: 13px; color: var(--muted); text-align: center; }
 .section-block { border-top: 1px solid var(--line-strong); padding-top: 16px; }
 .section-block.compact { min-width: 0; }

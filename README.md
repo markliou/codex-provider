@@ -168,15 +168,15 @@ identifiers are domain-separated hashes before persistence; authenticated
 browser responses omit local/upstream account IDs and use masked account labels.
 
 The default status page **Throughput** panel retains up to 48 hours as one
-10-minute-resolution correlation chart: output tokens/second versus KV cache
-hit rate. After a restart or with limited history, the display automatically
+10-minute-resolution correlation chart: output tokens/second versus prompt
+cache hit rate. After a restart or with limited history, the display automatically
 uses a 1-, 6-, 12-, 24-, or 48-hour window so real observations remain visible
 without changing their time spacing; point markers keep a single observation
 visible. A failover request is counted once even if it tries several accounts.
 The provider builds the chart from bounded one-minute in-memory aggregates; the
 series resets when the provider restarts and is never written to `runtime.json`.
 Output tokens/second uses upstream output usage divided by wall-clock time, so
-parallel sessions contribute to the same pool throughput. KV cache hit rate
+parallel sessions contribute to the same pool throughput. Prompt cache hit rate
 uses cached input divided by input on the identical time buckets, making
 correlation visible without implying causation. Historical token-flow,
 request-rate, and latency series are intentionally omitted to keep this view
@@ -243,7 +243,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - `POST /v1/chat/completions`, including translation to a Responses upstream.
 - Model aliases and `(thinking-tier)` suffix translation.
 - Thread-aware sticky balancing and failover with idle TTL, soft parent-account affinity, independent prompt-cache-key policy, per-model cooldowns, optional Pro-quota preservation, response-id continuation binding, and JSON persistence in `/data`. New sessions distribute across equal-priority healthy accounts; when an upstream account returns `429` or repeated server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
-- Main/subagent cache-read, cache-write, request-hit, cold-start, affinity, and failover observability, a bounded and redacted 24-hour request correlation panel, a public 48-hour in-memory throughput/KV-hit time series, and management-only per-account throughput.
+- Main/subagent cache-read, cache-write, request-hit, cold-start, affinity, and failover observability, a bounded and redacted 24-hour request correlation panel, a public 48-hour in-memory throughput/prompt-cache-hit time series, and management-only per-account throughput.
 - Bundled, loopback-only CLIProxyAPI sidecar for Codex device-auth requests. Pool pins each request to the selected account through a sidecar model prefix, while the sidecar owns OAuth refreshes.
 - Public pool participation toggles, strict same-identity repair for invalid in-pool credentials, and editable owner notes on `/admin`, plus authenticated owner controls for add/remove account, broader same-slot device-auth repair jobs, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Cooldown`, `Error`, `Login needed`, `Signing in`, `Duplicate`, `Disabled`, or `Standby`.
 - Codex quota refresh from `/backend-api/wham/usage`, including per-window percentages, reset times, plan-type updates, sanitized quota errors, and five-minute dashboard refresh.

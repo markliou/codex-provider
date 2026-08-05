@@ -241,7 +241,7 @@
     const currentItems = [
       ["Requests", formatMetricRate(current.requestsPerMinute), "req/min"],
       ["Output", formatMetricRate(current.outputTokensPerSecond), "tok/s"],
-      ["KV cache", chartPercent(current.cacheHitRate), "hit rate"],
+      ["Prompt cache", chartPercent(current.cacheHitRate), "hit rate"],
       ["Success", chartPercent(current.successRate), "completed"],
       ["p95 latency", formatDuration(current.p95LatencyMs), "provider"],
     ];
@@ -251,17 +251,17 @@
     // token-flow or latency charts here would recreate the dashboard clutter
     // that the operator explicitly removed.
     const chart = {
-      title: "Output vs KV cache",
+      title: "Output vs prompt cache",
       description: "Compare delivered output throughput with cache reuse on the same 10-minute timeline.",
       leftFormat: (value) => formatMetricRate(value),
       rightFormat: chartPercent,
       series: [
-        // Series colors live in app.css (.chart-series-output / .chart-series-kv)
+        // Series colors live in app.css (.chart-series-output / .chart-series-prompt)
         // rather than inline styles: the admin CSP has no style-src
         // 'unsafe-inline', so an inline style="--series-color:…" is dropped and
         // the line/marker fall back to an unstyled black dot with no stroke.
         { key: "outputTokensPerSecond", label: "Output tok/s", axis: "left", colorClass: "chart-series-output", format: (value) => formatMetricRate(value) },
-        { key: "cacheHitRate", label: "KV hit rate", axis: "right", colorClass: "chart-series-kv", max: 1, format: chartPercent },
+        { key: "cacheHitRate", label: "Prompt cache hit", axis: "right", colorClass: "chart-series-prompt", max: 1, format: chartPercent },
       ],
     };
     const visibleWindow = chartVisibleWindow(points, chart.series);
