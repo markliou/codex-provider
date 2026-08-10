@@ -37,5 +37,5 @@ COPY cliproxy-supervisor.sh /usr/local/bin/cliproxy-supervisor.sh
 RUN ln -sf ../lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex && \
     chmod 0755 /usr/local/bin/codex-pool /usr/local/bin/cliproxy-sidecar /usr/local/bin/docker-entrypoint.sh /usr/local/bin/cliproxy-supervisor.sh
 VOLUME ["/data"]
-EXPOSE 8317 8318
+EXPOSE 8317
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

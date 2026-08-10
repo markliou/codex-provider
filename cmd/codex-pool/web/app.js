@@ -251,7 +251,7 @@
     // token-flow or latency charts here would recreate the dashboard clutter
     // that the operator explicitly removed.
     const chart = {
-      title: "Output vs prompt cache",
+      title: "Output vs KV cache",
       description: "Compare delivered output throughput with cache reuse on the same 10-minute timeline.",
       leftFormat: (value) => formatMetricRate(value),
       rightFormat: chartPercent,

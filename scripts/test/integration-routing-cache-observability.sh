@@ -47,7 +47,7 @@ docker run -d --name "$POOL" --network "$NETWORK" --network-alias codex-pool -v 
   -e CODEX_POOL_ADMIN_PASSWORD_HASH="$ADMIN_HASH" \
   -e CODEX_POOL_DEFAULT_MODEL=gpt-test \
   -e CODEX_POOL_ROUTING_STRATEGY=sticky_failover \
-  -e CODEX_POOL_ADMIN_ADDR=0.0.0.0:8318 \
+  -e CODEX_POOL_ADDR=0.0.0.0:8317 \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
   "$POOL_IMAGE" >/dev/null
 
@@ -75,11 +75,11 @@ for (let index = 0; index < 3; index += 1) {
   if (!response.ok) throw new Error(`proxy request ${index} returned ${response.status}: ${await response.text()}`);
 }
 
-const publicDashboard = await (await fetch("http://codex-pool:8318/admin/api/public-dashboard")).json();
+const publicDashboard = await (await fetch("http://codex-pool:8317/admin/api/public-dashboard")).json();
 if (Object.prototype.hasOwnProperty.call(publicDashboard.dashboard || {}, "routingCacheEvents")) {
   throw new Error("public dashboard exposed request-level routing events");
 }
-const loginResponse = await fetch("http://codex-pool:8318/admin/api/login", {
+const loginResponse = await fetch("http://codex-pool:8317/admin/api/login", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ password: "'"$ADMIN_PASSWORD"'" }),
@@ -87,7 +87,7 @@ const loginResponse = await fetch("http://codex-pool:8318/admin/api/login", {
 if (!loginResponse.ok) throw new Error(`admin login returned ${loginResponse.status}: ${await loginResponse.text()}`);
 const cookie = String(loginResponse.headers.get("set-cookie") || "").split(";")[0];
 if (!cookie) throw new Error("admin login omitted session cookie");
-const stateResponse = await fetch("http://codex-pool:8318/admin/api/state", { headers: { Cookie: cookie } });
+const stateResponse = await fetch("http://codex-pool:8317/admin/api/state", { headers: { Cookie: cookie } });
 if (!stateResponse.ok) throw new Error(`admin state returned ${stateResponse.status}: ${await stateResponse.text()}`);
 const dashboard = (await stateResponse.json()).state || {};
 const events = dashboard.routingCacheEvents || [];

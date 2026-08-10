@@ -4,8 +4,8 @@
   "start_url": "/admin",
   "scope": "/admin",
   "display": "standalone",
-  "background_color": "#120a2e",
-  "theme_color": "#120a2e",
+  "background_color": "#f2eee3",
+  "theme_color": "#143740",
   "icons": [
     {
       "src": "/admin/assets/logo.svg",

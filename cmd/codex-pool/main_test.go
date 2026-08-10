@@ -42,6 +42,18 @@ func testApp(t *testing.T, accounts []account) *app {
 	}
 }
 
+// Historical tests name the two former network surfaces separately. Both
+// helpers must exercise the unified production mux now so route/auth coverage
+// cannot accidentally pass against a split configuration that is no longer
+// served.
+func (a *app) publicMux() http.Handler {
+	return a.mux()
+}
+
+func (a *app) adminMux() http.Handler {
+	return a.mux()
+}
+
 func TestParseModel(t *testing.T) {
 	cases := []struct{ input, model, tier string }{
 		{"gpt-5.4(high)", "gpt-5.4", "high"},
@@ -302,14 +314,55 @@ func TestLoadMigratesLegacyThroughputBucketsIntoMemoryOnly(t *testing.T) {
 
 func TestIsLoopbackAddress(t *testing.T) {
 	for address, expected := range map[string]bool{
-		"127.0.0.1:8318": true,
-		"localhost:8318": true,
-		"0.0.0.0:8318":   false,
-		":8318":          false,
+		"127.0.0.1:8317": true,
+		"localhost:8317": true,
+		"0.0.0.0:8317":   false,
+		":8317":          false,
 	} {
 		if actual := isLoopbackAddress(address); actual != expected {
 			t.Fatalf("isLoopbackAddress(%q) = %v, want %v", address, actual, expected)
 		}
+	}
+}
+
+func TestCombinedListenAddressPrefersCanonicalEnvAndSupportsLegacyAlias(t *testing.T) {
+	t.Setenv("CODEX_POOL_ADDR", "127.0.0.1:9000")
+	t.Setenv("CODEX_POOL_PUBLIC_ADDR", "127.0.0.1:9001")
+	if actual := combinedListenAddressFromEnv(); actual != "127.0.0.1:9000" {
+		t.Fatalf("combined address = %q, want canonical address", actual)
+	}
+
+	t.Setenv("CODEX_POOL_ADDR", "")
+	if actual := combinedListenAddressFromEnv(); actual != "127.0.0.1:9001" {
+		t.Fatalf("combined legacy address = %q, want public-address alias", actual)
+	}
+}
+
+func TestCombinedListenerRequiresRemoteAdminOptIn(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := newPasswordHash("admin-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_POOL_DATA_DIR", dir)
+	t.Setenv("CODEX_POOL_API_KEY", "client-key")
+	t.Setenv("CODEX_POOL_ADMIN_PASSWORD_HASH", hash)
+	t.Setenv("CODEX_POOL_ADDR", "0.0.0.0:8317")
+	t.Setenv("CODEX_POOL_ALLOW_REMOTE_ADMIN", "false")
+	if _, err := newAppFromEnv(); err == nil || !strings.Contains(err.Error(), "combined HTTP address must be loopback") {
+		t.Fatalf("non-loopback combined listener was not rejected: %v", err)
+	}
+
+	t.Setenv("CODEX_POOL_ALLOW_REMOTE_ADMIN", "true")
+	a, err := newAppFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.listenAddress != "0.0.0.0:8317" {
+		t.Fatalf("combined listener = %q", a.listenAddress)
 	}
 }
 
@@ -1390,9 +1443,10 @@ func TestAdminDashboardAssets(t *testing.T) {
 
 	a := testApp(t, nil)
 	checks := map[string]string{
-		"/admin":                "Pool status",
-		"/admin/assets/app.css": ".badge.error",
-		"/admin/assets/app.js":  "Low quota",
+		"/admin":                      "Pool status",
+		"/admin/assets/app.css":       ".badge.error",
+		"/admin/assets/app.js":        "Low quota",
+		"/admin/manifest.webmanifest": `"background_color": "#f2eee3"`,
 	}
 	for path, expected := range checks {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -1413,6 +1467,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), adminVersionPlaceholder) || !strings.Contains(recorder.Body.String(), "vtest+abcdef12") {
 		t.Fatal("admin page did not inject build metadata version")
+	}
+	for _, expected := range []string{`<meta name="color-scheme" content="light">`, `<meta name="theme-color" content="#143740">`} {
+		if !strings.Contains(recorder.Body.String(), expected) {
+			t.Fatalf("admin page omitted light theme metadata %q", expected)
+		}
 	}
 	for _, forbidden := range []string{"Admin sign in", "Username", "Account ID", "Label", "Models", "Subscription tier", "Email hint", "Quota hint", "account-form", "toast"} {
 		if strings.Contains(recorder.Body.String(), forbidden) {
@@ -1520,22 +1579,22 @@ func TestAdminDashboardAssets(t *testing.T) {
 	cssRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/app.css", nil)
 	cssRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(cssRecorder, cssRequest)
-	if !strings.Contains(cssRecorder.Body.String(), "::-webkit-progress-value") || !strings.Contains(cssRecorder.Body.String(), "background: #140b32") || !strings.Contains(cssRecorder.Body.String(), "border: 1px solid #544482") {
+	if !strings.Contains(cssRecorder.Body.String(), "::-webkit-progress-value") || !strings.Contains(cssRecorder.Body.String(), "background: #e1e6dc") || !strings.Contains(cssRecorder.Body.String(), "border: 1px solid #a8b9b0") {
 		t.Fatal("admin CSS does not provide a visible unfilled quota track")
 	}
-	for _, expected := range []string{".quota-track.watch", ".quota-track.low", ".quota-track.critical", ".quota-track.empty", "#ffd166", "#ff9f43", "#ff4f6d"} {
+	for _, expected := range []string{".quota-track.watch", ".quota-track.low", ".quota-track.critical", ".quota-track.empty", "#f2c14e", "#f08a3e", "#df314d"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS does not preserve the warm-to-red quota warning ramp %q", expected)
 		}
 	}
-	for _, expected := range []string{"#120a2e", "#46e6ff", "#ff6f91", "#c095ff"} {
+	for _, expected := range []string{"#f2eee3", "#176b87", "#d95136", "#0d8f78", "#f2c14e"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
-			t.Fatalf("admin CSS omitted lively theme color %q", expected)
+			t.Fatalf("admin CSS omitted warm coastal theme color %q", expected)
 		}
 	}
-	for _, forbidden := range []string{"#0f0b16", "#302440", "#1b1526"} {
+	for _, forbidden := range []string{"#120a2e", "#46e6ff", "#ff6f91", "#c095ff", "#0f0b16", "#302440", "#1b1526"} {
 		if strings.Contains(cssRecorder.Body.String(), forbidden) {
-			t.Fatalf("admin CSS retained legacy purple theme color %q", forbidden)
+			t.Fatalf("admin CSS retained legacy dark/neon theme color %q", forbidden)
 		}
 	}
 	for _, expected := range []string{".cache-column", ".routing-count-column", ".cache-window-groups", ".metric-source-chip.observed", ".metric-source-chip.calculated", ".cache-token-row", ".cache-rate { color: var(--green)", ".cache-token-value { color: var(--green)", ".routing-cache-table", ".event-cache.hit", ".event-cache.cold"} {
@@ -1556,55 +1615,47 @@ func TestAdminDashboardAssets(t *testing.T) {
 	logoRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/logo.svg", nil)
 	logoRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(logoRecorder, logoRequest)
-	if logoRecorder.Code != http.StatusOK || !strings.Contains(logoRecorder.Body.String(), "Balanced live routes") || !strings.Contains(logoRecorder.Body.String(), "#46f1c7") || !strings.Contains(logoRecorder.Body.String(), "#ff6f91") {
+	if logoRecorder.Code != http.StatusOK || !strings.Contains(logoRecorder.Body.String(), "Balanced live routes") || !strings.Contains(logoRecorder.Body.String(), "#49b6a4") || !strings.Contains(logoRecorder.Body.String(), "#f06449") || !strings.Contains(logoRecorder.Body.String(), "#f2c14e") {
 		t.Fatal("admin logo does not communicate balanced account routing")
 	}
 }
 
-func TestRootEndpointsAreHelpful(t *testing.T) {
+func TestUnifiedRootAndProtectedProviderEndpoints(t *testing.T) {
 	a := testApp(t, nil)
 
-	publicRequest := httptest.NewRequest(http.MethodGet, "/", nil)
-	publicRecorder := httptest.NewRecorder()
-	a.publicMux().ServeHTTP(publicRecorder, publicRequest)
-	if publicRecorder.Code != http.StatusNotFound {
-		t.Fatalf("public root without key returned %d", publicRecorder.Code)
+	rootRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	rootRecorder := httptest.NewRecorder()
+	a.mux().ServeHTTP(rootRecorder, rootRequest)
+	if rootRecorder.Code != http.StatusOK {
+		t.Fatalf("combined root returned %d", rootRecorder.Code)
 	}
-
-	publicRequest = httptest.NewRequest(http.MethodGet, "/", nil)
-	publicRequest.Header.Set("Authorization", "Bearer client-key")
-	publicRecorder = httptest.NewRecorder()
-	a.publicMux().ServeHTTP(publicRecorder, publicRequest)
-	if publicRecorder.Code != http.StatusNotFound {
-		t.Fatalf("public root with key returned %d", publicRecorder.Code)
-	}
-	if body := publicRecorder.Body.String(); strings.Contains(body, "codex-pool") || strings.Contains(body, "admin") || strings.Contains(body, "/v1") {
-		t.Fatalf("public root exposed service details: %s", body)
+	if body := rootRecorder.Body.String(); !strings.Contains(body, `id="dashboard-view"`) || !strings.Contains(body, `id="login-view"`) {
+		t.Fatalf("combined root did not serve dashboard shell: %s", body)
 	}
 
 	healthRequest := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	healthRecorder := httptest.NewRecorder()
-	a.publicMux().ServeHTTP(healthRecorder, healthRequest)
+	a.mux().ServeHTTP(healthRecorder, healthRequest)
 	if healthRecorder.Code != http.StatusUnauthorized {
-		t.Fatalf("public health without key returned %d", healthRecorder.Code)
+		t.Fatalf("combined health without key returned %d", healthRecorder.Code)
 	}
 
 	healthRequest = httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	healthRequest.Header.Set("Authorization", "Bearer client-key")
 	healthRecorder = httptest.NewRecorder()
-	a.publicMux().ServeHTTP(healthRecorder, healthRequest)
+	a.mux().ServeHTTP(healthRecorder, healthRequest)
 	if healthRecorder.Code != http.StatusOK {
-		t.Fatalf("public health with key returned %d", healthRecorder.Code)
+		t.Fatalf("combined health with key returned %d", healthRecorder.Code)
 	}
 
-	adminRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	adminRequest := httptest.NewRequest(http.MethodGet, "/admin", nil)
 	adminRecorder := httptest.NewRecorder()
-	a.adminMux().ServeHTTP(adminRecorder, adminRequest)
+	a.mux().ServeHTTP(adminRecorder, adminRequest)
 	if adminRecorder.Code != http.StatusOK {
-		t.Fatalf("admin root returned %d", adminRecorder.Code)
+		t.Fatalf("combined admin page returned %d", adminRecorder.Code)
 	}
 	if body := adminRecorder.Body.String(); !strings.Contains(body, `id="dashboard-view"`) || !strings.Contains(body, `id="login-view"`) {
-		t.Fatalf("admin root did not serve dashboard shell: %s", body)
+		t.Fatalf("combined admin page did not serve dashboard shell: %s", body)
 	}
 }
 
@@ -1615,6 +1666,7 @@ func TestPublicDashboardEnabledByDefaultFromEnv(t *testing.T) {
 	}
 	t.Setenv("CODEX_POOL_DATA_DIR", dir)
 	t.Setenv("CODEX_POOL_API_KEY", "client-key")
+	t.Setenv("CODEX_POOL_ADDR", "127.0.0.1:8317")
 	hash, err := newPasswordHash("admin-password")
 	if err != nil {
 		t.Fatal(err)
@@ -1642,6 +1694,7 @@ func TestPublicDashboardCanBeDisabledFromEnv(t *testing.T) {
 	}
 	t.Setenv("CODEX_POOL_DATA_DIR", dir)
 	t.Setenv("CODEX_POOL_API_KEY", "client-key")
+	t.Setenv("CODEX_POOL_ADDR", "127.0.0.1:8317")
 	t.Setenv("CODEX_POOL_PUBLIC_DASHBOARD", "false")
 	hash, err := newPasswordHash("admin-password")
 	if err != nil {

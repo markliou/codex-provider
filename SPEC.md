@@ -46,15 +46,16 @@ These comments are part of the product contract. They must explain purpose and r
 
 ---
 
-## 1. Public vs Admin Surface
+## 1. Unified HTTP Surface
 
-The service has two logical surfaces.
+The service has two logical surfaces on one HTTP listener. Network reachability
+is shared; authentication remains route-specific.
 
 ### 1.1 Public API surface
 
 This is used by Codex CLI, IDEs, scripts, or OpenAI-compatible clients.
 
-Default bind:
+Combined default bind:
 
 ```text
 0.0.0.0:8317
@@ -92,12 +93,6 @@ POST /v1/chat/completions
 
 This serves a public control page for account owners and a password-protected management mode for the owner.
 
-Default bind:
-
-```text
-127.0.0.1:8318
-```
-
 UI paths:
 
 ```text
@@ -115,8 +110,10 @@ Public mode is visible without admin login and may show pool status, join/leave
 controls, editable public owner notes, and strict same-identity repair for an
 invalid in-pool Codex credential. Management APIs under `/admin/api/*`, except
 login and public-dashboard endpoints, require strong password authentication.
-If remote admin is enabled, require explicit opt-in with
-`CODEX_POOL_ALLOW_REMOTE_ADMIN=true`.
+Because this surface shares the provider listener, a non-loopback bind exposes
+both `/v1` and `/admin`. Require explicit opt-in with
+`CODEX_POOL_ALLOW_REMOTE_ADMIN=true`; merging the ports must not weaken the
+route-level API-key, session, and CSRF boundaries.
 
 Unauthenticated and login chrome must use deliberately neutral copy, such as `Service`, `Access`, and `Continue`, instead of obvious Codex, pool, provider, or admin labels. This is passive exposure reduction for casual browsing and keyword probes, not a security boundary; management APIs remain protected server-side.
 
@@ -133,13 +130,11 @@ docker run -d \
   --name codex-pool \
   --restart unless-stopped \
   -p 8317:8317 \
-  -p 127.0.0.1:8318:8318 \
   -v /srv/codex-pool/data:/data \
   -e CODEX_POOL_API_KEY="cpk_replace_with_long_random_key" \
   -e CODEX_POOL_ADMIN_PASSWORD_HASH='pbkdf2_hash_from_hash-password' \
   -e CODEX_POOL_DATA_DIR="/data" \
-  -e CODEX_POOL_PUBLIC_ADDR="0.0.0.0:8317" \
-  -e CODEX_POOL_ADMIN_ADDR="0.0.0.0:8318" \
+  -e CODEX_POOL_ADDR="0.0.0.0:8317" \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
   registry.gitlab.com/YOUR_NAMESPACE/codex-pool:latest
 ```
@@ -154,9 +149,9 @@ docker run -d \
 | `CODEX_POOL_ADMIN_USERNAME` | no | `admin` | Internal admin session subject and legacy login API username. The UI uses password-only login. |
 | `CODEX_POOL_ADMIN_PASSWORD_HASH` | yes | none | PBKDF2-HMAC-SHA256 hash emitted by the container's `hash-password` command. Do not require plaintext password. |
 | `CODEX_POOL_DATA_DIR` | no | `/data` | Persistent runtime data root. |
-| `CODEX_POOL_PUBLIC_ADDR` | no | `0.0.0.0:8317` | Public API bind address. |
-| `CODEX_POOL_ADMIN_ADDR` | no | `127.0.0.1:8318` | Admin UI/API bind address. |
-| `CODEX_POOL_ALLOW_REMOTE_ADMIN` | no | `false` | Required if admin address is non-loopback. |
+| `CODEX_POOL_ADDR` | no | `0.0.0.0:8317` | Combined provider API and control/admin UI bind address. |
+| `CODEX_POOL_PUBLIC_ADDR` | no | none | Compatibility alias for the former provider bind; used only when `CODEX_POOL_ADDR` is unset. |
+| `CODEX_POOL_ALLOW_REMOTE_ADMIN` | no | `false` | Required if the combined address is non-loopback, acknowledging that `/admin` is reachable wherever `/v1` is reachable. |
 | `CODEX_POOL_PUBLIC_DASHBOARD` | no | `true` | Enable unauthenticated public pool status and join/leave controls on the control page. Set to `false` to hide the public mode. |
 | `CODEX_POOL_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error`. |
 | `CODEX_POOL_REDACT_LOGS` | no | `true` | Redact tokens, auth headers, API keys, refresh tokens. |
@@ -182,7 +177,7 @@ The service must refuse to start when:
 2. Admin password hash is missing.
 3. Public API key equals a known example value.
 4. Admin password hash equals a known example value.
-5. Admin binds to `0.0.0.0` or another non-loopback address while `CODEX_POOL_ALLOW_REMOTE_ADMIN` is not `true`.
+5. The combined listener binds to `0.0.0.0` or another non-loopback address while `CODEX_POOL_ALLOW_REMOTE_ADMIN` is not `true`.
 
 ### 2.3 Bundled Codex sidecar
 
@@ -733,6 +728,10 @@ Notes:
 - Actual consumed tokens are tracked in usage stats.
 - Absolute remaining Codex token quota may not be available from upstream. Display both quota-window percentages and token usage counters.
 - Quota progress colors are an operational warning scale: healthy capacity uses the cool Jade/Wasabi range, then becomes amber, Persimmon, and finally red as remaining capacity approaches zero. Do not use one neutral color for all values or make a near-zero bar appear healthy.
+- The dashboard theme uses a warm off-white canvas with deep coastal ink,
+  blue-green operational accents, and coral/mango highlights. Keep surfaces
+  light and readable while preserving labels, shapes, and text so status is
+  never communicated by color alone.
 - Admin API account responses must not expose full email addresses, upstream account IDs, upstream URLs, API keys, `codexHome`, or auth file paths. A device-auth credential slot is the primary local identity. Email, plan, upstream account ID, and organization values are descriptive credential metadata; browser-facing account labels may use masked email for recognition, but routing, storage, and management actions must use the local credential slot ID.
 
 ### 7.2 Add account
@@ -1744,11 +1743,11 @@ Internally support a Cockpit-like manifest shape for config export/import.
 
 ## 16. Dashboard And Admin UI Requirements
 
-Build a minimal web UI on the single admin port.
+Build a minimal web UI on the unified provider/control port.
 
 ### 16.1 Pages
 
-Single-page dashboard is enough. `/` on the admin port and `/admin` serve the
+Single-page dashboard is enough. `/` and `/admin` on the unified port serve the
 same page. Public mode is visible without admin login and may show pool status,
 join/leave pool controls, owner notes, and strict repair for invalid in-pool
 credentials. While such a credential needs repair, **Repair** (or

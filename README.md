@@ -26,33 +26,36 @@ Copy the emitted `pbkdf2-sha256:...` value into `CODEX_POOL_ADMIN_PASSWORD_HASH`
 docker run -d \
   --name codex-pool \
   --restart unless-stopped \
-  -p <host-api-bind>:8317 \
-  -p <host-admin-bind>:8318 \
+  -p <host-bind>:8317 \
   -v codex-pool-data:/data \
   -e CODEX_POOL_API_KEY='replace-with-a-long-random-client-key' \
   -e CODEX_POOL_ADMIN_PASSWORD_HASH='pbkdf2-sha256:...' \
   -e CODEX_POOL_DEFAULT_MODEL='gpt-5.5(xhigh)' \
   -e CODEX_POOL_ROUTING_STRATEGY='sticky_balanced' \
   -e CODEX_POOL_SESSION_AFFINITY_TTL_MS=86400000 \
-  -e CODEX_POOL_ADMIN_ADDR='0.0.0.0:8318' \
+  -e CODEX_POOL_ADDR='0.0.0.0:8317' \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
   codex-pool:local
 ```
 
-`CODEX_POOL_ALLOW_REMOTE_ADMIN=true` is required because Docker port forwarding reaches the container over its network interface. The published admin port remains loopback-only on the host through `-p 127.0.0.1:8318:8318`; do not publish that port to a public interface without TLS and additional access controls.
+One HTTP listener serves both the provider and control surfaces. `CODEX_POOL_ALLOW_REMOTE_ADMIN=true` is required because a non-loopback bind makes `/admin` reachable everywhere `/v1` is reachable. Publish this HTTP service only on a trusted network; API keys, the admin password, and admin session cookies are not encrypted in transit.
+
+When upgrading from a split-port release, remove the `8318` port publication and
+`CODEX_POOL_ADMIN_ADDR`. Keep the client base URL on port `8317`; the control
+page has moved to that same port.
 
 All persistent configuration, sticky sessions, cooldowns, and account data are stored in the `codex-pool-data` Docker volume at `/data`.
 
 Open these paths after startup:
 
 ```text
-Public API: http://<api-host>:<api-port>/v1
-Control UI: http://<admin-host>:<admin-port>/
-Admin UI:   http://<admin-host>:<admin-port>/admin
-Health:     http://<api-host>:<api-port>/healthz
+Public API: http://<host>:<port>/v1
+Control UI: http://<host>:<port>/
+Admin UI:   http://<host>:<port>/admin
+Health:     http://<host>:<port>/healthz
 ```
 
-The admin-port root and `/admin` serve the same control page. Public mode is visible without a password; selecting `Access` unlocks management mode after password authentication. Public API root intentionally returns `404` so the API port does not advertise service details in a browser. Public API endpoints under `/v1` and `/healthz` require the configured API key.
+The root and `/admin` serve the same control page on the unified port. Public mode is visible without a password; selecting `Access` unlocks management mode after password authentication. Provider endpoints under `/v1` and `/healthz` continue to require the configured API key.
 
 ### Add Codex Accounts
 
@@ -192,20 +195,20 @@ Pool treats the local slot ID as the management identity, but routing also track
 
 Use the `Use Pro last` switch in the admin Console to defer Pro accounts until no eligible non-Pro account is available. When this mode is enabled, a session that temporarily moved to Pro because other accounts were cooling down moves back to a non-Pro account once one becomes eligible again. Duplicate slots for the same upstream identity are still not immediate retry capacity, but the representative for that identity is chosen from healthy local credential copies with usable quota before Pro is selected. The switch is stored in `/data/config.json`; `CODEX_POOL_PRESERVE_PRO_QUOTA=true` only sets the initial default before the Console setting is saved.
 
-### Remote Admin
+### Unified HTTP Exposure
 
-Keep the admin port on loopback unless it is behind a private network or a reverse proxy with TLS and access controls. For remote administration, keep these two environment variables in the container configuration and publish the admin port only through your protected network path:
+The provider API and control UI deliberately share one listener. For Docker or another non-loopback deployment, acknowledge that shared exposure with:
 
 ```bash
--e CODEX_POOL_ADMIN_ADDR='0.0.0.0:8318' \
+-e CODEX_POOL_ADDR='0.0.0.0:8317' \
 -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true
 ```
 
-Do not forward the admin port directly from the Internet: the admin service does not terminate TLS itself. Use a reverse proxy with a valid TLS certificate, preserve the original `Host` header, and restrict the proxy to `/admin` and `/admin/api/` if the public API is served separately.
+There is no separate admin port to firewall. Anyone who can reach `/v1` can also reach the public control page and the admin login route, although owner-only APIs still require the signed admin session and CSRF token. Because the service does not terminate TLS, do not expose this HTTP listener to the Internet, public Wi-Fi, or another untrusted network.
 
 ### Public Status And Protected Management
 
-`GET /` on the admin port and `GET /admin` open the control page. Unauthenticated public pool status and join/leave controls are enabled by default; set `CODEX_POOL_PUBLIC_DASHBOARD=false` only when the public control page should be hidden. The public JSON uses an opaque per-process account reference for this toggle, returns only a partially masked email for account recognition, and includes pool-wide rolling throughput. It never returns full email addresses, account IDs, upstream URLs, API keys, sticky sessions, per-account/request traffic details, quota error codes, or upstream error bodies.
+`GET /` and `GET /admin` on the unified port open the control page. Unauthenticated public pool status and join/leave controls are enabled by default; set `CODEX_POOL_PUBLIC_DASHBOARD=false` only when the public control page should be hidden. The public JSON uses an opaque per-process account reference for this toggle, returns only a partially masked email for account recognition, and includes pool-wide rolling throughput. It never returns full email addresses, account IDs, upstream URLs, API keys, sticky sessions, per-account/request traffic details, quota error codes, or upstream error bodies.
 
 Each account row also has an optional 80-character owner note. The note is
 plain text, persisted with the local slot, and intentionally visible/editable
@@ -213,10 +216,9 @@ on the unauthenticated page so shared users can label whose credential it is;
 do not put secrets in this field.
 
 Authenticate with the admin password to add accounts, remove accounts, repair
-device auth in the same slot, and inspect or clear sticky sessions. Public and
-management modes use the same admin port `8318`; no additional port is
-required. The dashboard auto-refreshes every five minutes; use `Refresh` for
-an immediate status read.
+device auth in the same slot, and inspect or clear sticky sessions. Provider,
+public control, and management routes all use the same port. The dashboard
+auto-refreshes every five minutes; use `Refresh` for an immediate status read.
 
 ## Codex CLI
 

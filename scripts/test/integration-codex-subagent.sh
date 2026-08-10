@@ -49,7 +49,7 @@ docker run -d \
   -e CODEX_POOL_DEFAULT_MODEL=gpt-test \
   -e CODEX_POOL_MAX_RETRY_ACCOUNTS=2 \
   -e CODEX_POOL_PROMPT_CACHE_KEY_POLICY=preserve \
-  -e CODEX_POOL_ADMIN_ADDR=0.0.0.0:8318 \
+  -e CODEX_POOL_ADDR=0.0.0.0:8317 \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
   codex-pool:local >/dev/null
 

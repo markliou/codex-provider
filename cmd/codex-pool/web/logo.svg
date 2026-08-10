@@ -1,45 +1,45 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Balanced live routes">
   <defs>
     <linearGradient id="bg" x1="58" y1="48" x2="454" y2="464" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#3a2275"/>
-      <stop offset=".52" stop-color="#21134d"/>
-      <stop offset="1" stop-color="#120a2e"/>
+      <stop offset="0" stop-color="#205f6c"/>
+      <stop offset=".52" stop-color="#143740"/>
+      <stop offset="1" stop-color="#0b2630"/>
     </linearGradient>
     <linearGradient id="trunk" x1="104" y1="256" x2="267" y2="256" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#46e6ff"/>
-      <stop offset="1" stop-color="#fff8ff"/>
+      <stop stop-color="#49b6a4"/>
+      <stop offset="1" stop-color="#fffaf0"/>
     </linearGradient>
     <linearGradient id="upper" x1="250" y1="250" x2="410" y2="134" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#fff8ff"/>
-      <stop offset="1" stop-color="#46f1c7"/>
+      <stop stop-color="#fffaf0"/>
+      <stop offset="1" stop-color="#82b84d"/>
     </linearGradient>
     <linearGradient id="middle" x1="250" y1="256" x2="410" y2="256" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#fff8ff"/>
-      <stop offset="1" stop-color="#c095ff"/>
+      <stop stop-color="#fffaf0"/>
+      <stop offset="1" stop-color="#6f70d2"/>
     </linearGradient>
     <linearGradient id="lower" x1="250" y1="262" x2="410" y2="378" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#fff8ff"/>
-      <stop offset="1" stop-color="#ff6f91"/>
+      <stop stop-color="#fffaf0"/>
+      <stop offset="1" stop-color="#f06449"/>
     </linearGradient>
     <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
-      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#08021c" flood-opacity=".58"/>
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#061d24" flood-opacity=".5"/>
     </filter>
   </defs>
 
   <rect width="512" height="512" rx="112" fill="url(#bg)"/>
-  <circle cx="108" cy="256" r="42" fill="#160c37" stroke="#46e6ff" stroke-width="18" filter="url(#glow)"/>
+  <circle cx="108" cy="256" r="42" fill="#102f38" stroke="#49b6a4" stroke-width="18" filter="url(#glow)"/>
   <path d="M150 256H226" fill="none" stroke="url(#trunk)" stroke-width="30" stroke-linecap="round"/>
 
   <!-- The central ring is the sticky route anchor: one session enters once,
        then remains attached to one healthy account branch. -->
-  <circle cx="256" cy="256" r="45" fill="#160c37" stroke="#fff8ff" stroke-width="20" filter="url(#glow)"/>
-  <circle cx="256" cy="256" r="13" fill="#b8f56d"/>
+  <circle cx="256" cy="256" r="45" fill="#102f38" stroke="#fffaf0" stroke-width="20" filter="url(#glow)"/>
+  <circle cx="256" cy="256" r="13" fill="#f2c14e"/>
 
   <path d="M294 236C326 218 338 157 378 143" fill="none" stroke="url(#upper)" stroke-width="28" stroke-linecap="round"/>
   <path d="M301 256H378" fill="none" stroke="url(#middle)" stroke-width="28" stroke-linecap="round"/>
   <path d="M294 276C326 294 338 355 378 369" fill="none" stroke="url(#lower)" stroke-width="28" stroke-linecap="round"/>
 
-  <circle cx="404" cy="132" r="34" fill="#160c37" stroke="#46f1c7" stroke-width="17"/>
-  <circle cx="404" cy="256" r="34" fill="#160c37" stroke="#c095ff" stroke-width="17"/>
-  <circle cx="404" cy="380" r="34" fill="#160c37" stroke="#ff6f91" stroke-width="17"/>
+  <circle cx="404" cy="132" r="34" fill="#102f38" stroke="#82b84d" stroke-width="17"/>
+  <circle cx="404" cy="256" r="34" fill="#102f38" stroke="#6f70d2" stroke-width="17"/>
+  <circle cx="404" cy="380" r="34" fill="#102f38" stroke="#f06449" stroke-width="17"/>
 </svg>

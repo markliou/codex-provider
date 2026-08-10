@@ -34,7 +34,7 @@ docker run -d \
   -e CODEX_POOL_DEFAULT_MODEL="gpt-test" \
   -e CODEX_POOL_UPSTREAM_BASE_URL="http://codex-mock:4010/v1" \
   -e CODEX_POOL_UPSTREAM_API_KEY="$UPSTREAM_KEY" \
-  -e CODEX_POOL_ADMIN_ADDR="0.0.0.0:8318" \
+  -e CODEX_POOL_ADDR="0.0.0.0:8317" \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
   codex-pool:local >/dev/null
 
@@ -48,21 +48,27 @@ for (let i = 0; i < 60; i += 1) {
   await wait(500);
 }
 const fail = (message) => { throw new Error(message); };
-const apiRootNoKey = await fetch("http://codex-pool:8317/");
-if (apiRootNoKey.status !== 404) fail(`public API root without key status ${apiRootNoKey.status}`);
-const apiRoot = await fetch("http://codex-pool:8317/", { headers: { Authorization: "Bearer '"$CLIENT_KEY"'" } });
-if (apiRoot.status !== 404) fail(`public API root with key status ${apiRoot.status}`);
+const controlRoot = await fetch("http://codex-pool:8317/");
+if (controlRoot.status !== 200) fail(`combined control root status ${controlRoot.status}`);
+const controlRootBody = await controlRoot.text();
+if (!controlRootBody.includes(`id="dashboard-view"`) || !controlRootBody.includes(`id="login-view"`)) fail("combined control root did not serve dashboard shell");
 const healthNoKey = await fetch("http://codex-pool:8317/healthz");
 if (healthNoKey.status !== 401) fail(`public health without key status ${healthNoKey.status}`);
 const health = await fetch("http://codex-pool:8317/healthz", { headers: { Authorization: "Bearer '"$CLIENT_KEY"'" } });
 if (health.status !== 200) fail(`public health with key status ${health.status}`);
-const adminRoot = await fetch("http://codex-pool:8318/", { redirect: "manual" });
+try {
+  await fetch("http://codex-pool:8318/admin", { signal: AbortSignal.timeout(1000) });
+  fail("legacy admin port 8318 is still reachable");
+} catch (error) {
+  if (error.message === "legacy admin port 8318 is still reachable") throw error;
+}
+const adminRoot = await fetch("http://codex-pool:8317/admin", { redirect: "manual" });
 if (adminRoot.status !== 200) fail(`admin root status ${adminRoot.status}`);
 const adminRootBody = await adminRoot.text();
 if (!adminRootBody.includes(`id="dashboard-view"`) || !adminRootBody.includes(`id="login-view"`)) fail("admin root did not serve dashboard shell");
-const publicResp = await fetch("http://codex-pool:8318/admin/api/public-dashboard");
+const publicResp = await fetch("http://codex-pool:8317/admin/api/public-dashboard");
 if (publicResp.status !== 200) fail(`public dashboard status ${publicResp.status}`);
-const unauth = await fetch("http://codex-pool:8318/admin/api/accounts");
+const unauth = await fetch("http://codex-pool:8317/admin/api/accounts");
 if (unauth.status !== 401) fail(`management API without auth status ${unauth.status}`);
 const modelsNoKey = await fetch("http://codex-pool:8317/v1/models");
 if (modelsNoKey.status !== 401) fail(`models without key status ${modelsNoKey.status}`);

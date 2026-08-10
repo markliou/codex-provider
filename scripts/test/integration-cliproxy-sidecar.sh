@@ -36,7 +36,7 @@ docker run -d --name "$POOL" --network "$NETWORK" --network-alias codex-pool -v 
   -e CODEX_POOL_API_KEY="$CLIENT_KEY" \
   -e CODEX_POOL_ADMIN_PASSWORD_HASH="$ADMIN_HASH" \
   -e CODEX_POOL_DEFAULT_MODEL=gpt-test \
-  -e CODEX_POOL_ADMIN_ADDR=0.0.0.0:8318 \
+  -e CODEX_POOL_ADDR=0.0.0.0:8317 \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
   codex-pool:local >/dev/null
 
