@@ -6241,31 +6241,50 @@ func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 	return result
 }
 func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
-	summary := map[string]int{"total": len(a.config.Accounts), "ready": 0, "low": 0, "cooldown": 0, "error": 0, "missing_auth": 0, "authenticating": 0, "duplicate": 0}
+	// These raw status counts plus the unavailable roll-up are the source of
+	// truth for the cards above the account table. Keep standby and duplicate
+	// separate: both can be unroutable, but only standby is actually out of the
+	// pool. The visible mutually-exclusive cards must always reconcile to total.
+	summary := map[string]int{
+		"total":          len(a.config.Accounts),
+		"ready":          0,
+		"low":            0,
+		"cooldown":       0,
+		"standby":        0,
+		"duplicate":      0,
+		"error":          0,
+		"missing_auth":   0,
+		"authenticating": 0,
+		"disabled":       0,
+		"unavailable":    0,
+	}
 	for _, item := range a.config.Accounts {
 		status, _ := a.accountStatusLocked(item, now)
 		if _, ok := summary[status]; ok {
 			summary[status]++
+		} else {
+			summary["unavailable"]++
+			continue
+		}
+		switch status {
+		case "error", "missing_auth", "authenticating", "disabled":
+			summary["unavailable"]++
 		}
 	}
 	return summary
 }
 func (a *app) publicDashboardSummaryLocked(now time.Time) map[string]int {
-	summary := map[string]int{"total": len(a.config.Accounts), "ready": 0, "low": 0, "cooldown": 0, "standby": 0, "unavailable": 0}
-	for _, item := range a.config.Accounts {
-		status, _ := a.accountStatusLocked(item, now)
-		switch status {
-		case "ready":
-			summary["ready"]++
-		case "low":
-			summary["low"]++
-		case "cooldown":
-			summary["cooldown"]++
-		case "standby", "duplicate":
-			summary["standby"]++
-		default:
-			summary["unavailable"]++
-		}
+	detailed := a.dashboardSummaryLocked(now)
+	// Public mode exposes only operational buckets, not the auth-specific raw
+	// breakdown. These six buckets are mutually exclusive and add up to total.
+	summary := map[string]int{
+		"total":       detailed["total"],
+		"ready":       detailed["ready"],
+		"low":         detailed["low"],
+		"cooldown":    detailed["cooldown"],
+		"standby":     detailed["standby"],
+		"duplicate":   detailed["duplicate"],
+		"unavailable": detailed["unavailable"],
 	}
 	return summary
 }
@@ -6795,9 +6814,27 @@ func (a *app) accountStatusLocked(item account, now time.Time) (string, string) 
 			return "missing_auth", "Device auth login is required"
 		}
 	}
+	quotaSnapshot := a.state.Quotas[item.ID]
+	// A proven credential failure is more direct and actionable than duplicate
+	// identity. Keep it ahead of duplicate classification so an in-pool slot that
+	// needs Repair is counted as Unavailable rather than falsely inflating the
+	// Out-of-pool/Duplicate cards. Healthy sibling copies still show Duplicate.
+	//
+	// Transient quota polling failures remain diagnostic history rather than
+	// availability gates; quotaErrorBlocksRouting only accepts errors that prove
+	// the credential itself cannot route requests.
+	if quotaErrorBlocksRouting(quotaSnapshot.QuotaError) {
+		reason := "Quota refresh failed"
+		if quotaSnapshot.QuotaError.Code != "" {
+			reason += ": " + quotaSnapshot.QuotaError.Code
+		}
+		return "error", reason
+	}
 	// Check duplicate identity before cooldown/quota so the operator sees the
 	// structural reason this slot is not routable. The primary slot owns the
 	// upstream identity; runtime cooldown and quota are evaluated on that slot.
+	// Credential failures are intentionally handled above because Repair is more
+	// urgent than the otherwise healthy duplicate relationship.
 	if primaryID := a.duplicateUpstreamAccountPrimaryLocked(item, now); primaryID != "" {
 		return "duplicate", "Duplicate upstream account; routing uses " + primaryID
 	}
@@ -6809,14 +6846,6 @@ func (a *app) accountStatusLocked(item account, now time.Time) (string, string) 
 	// auth, exhausted quota, and explicit credential errors; otherwise a usage API
 	// outage can hide a healthy Pro fallback and create a false 503 exactly when a
 	// non-Pro account runs out.
-	quotaSnapshot := a.state.Quotas[item.ID]
-	if quotaErrorBlocksRouting(quotaSnapshot.QuotaError) {
-		reason := "Quota refresh failed"
-		if quotaSnapshot.QuotaError.Code != "" {
-			reason += ": " + quotaSnapshot.QuotaError.Code
-		}
-		return "error", reason
-	}
 	if quotaSnapshot.Quota != nil {
 		remaining := remainingQuotaHint(*quotaSnapshot.Quota)
 		if remaining <= 20 {

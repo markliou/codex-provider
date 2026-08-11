@@ -402,6 +402,68 @@ func TestDashboardStatusSeparatesQuotaAndErrors(t *testing.T) {
 	}
 }
 
+func TestDashboardSummariesPartitionVisibleAccountStates(t *testing.T) {
+	lowQuota := 20
+	now := time.Now().UTC()
+	a := testApp(t, []account{
+		{ID: "ready", AuthType: "provider_api_key", Enabled: true, InPool: true, UpstreamBaseURL: "https://ready.example.test/v1"},
+		{ID: "low", AuthType: "provider_api_key", Enabled: true, InPool: true, UpstreamBaseURL: "https://low.example.test/v1", RemainingQuota: &lowQuota},
+		{ID: "cooldown", AuthType: "provider_api_key", Enabled: true, InPool: true, UpstreamBaseURL: "https://cooldown.example.test/v1"},
+		{ID: "standby", AuthType: "provider_api_key", Enabled: true, InPool: false, UpstreamBaseURL: "https://standby.example.test/v1"},
+		{ID: "disabled", AuthType: "provider_api_key", Enabled: false, InPool: true, UpstreamBaseURL: "https://disabled.example.test/v1"},
+		{ID: "missing", AuthType: "codex_device_auth", Enabled: true, InPool: true},
+		{ID: "primary", AccountID: "shared-upstream", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
+		{ID: "healthy-duplicate", AccountID: "shared-upstream", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 90},
+		{ID: "invalid-duplicate", AccountID: "shared-upstream", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 80},
+	})
+	for _, id := range []string{"primary", "healthy-duplicate", "invalid-duplicate"} {
+		writeCodexDeviceAuth(t, a, id, "shared-upstream", id+"@example.test")
+	}
+	a.state.Cooldowns["cooldown"] = []cooldown{{ModelID: "gpt-test", NextRetryAt: now.Add(time.Minute), Reason: "rate_limited"}}
+	a.state.Quotas["invalid-duplicate"] = quotaSnapshot{
+		AccountID:  "invalid-duplicate",
+		QuotaError: &quotaErrorInfo{Code: "token_invalidated", Message: "credential unavailable", Timestamp: now},
+	}
+
+	if status, _ := a.accountStatusLocked(a.config.Accounts[7], now); status != "duplicate" {
+		t.Fatalf("healthy duplicate status = %q, want duplicate", status)
+	}
+	if status, _ := a.accountStatusLocked(a.config.Accounts[8], now); status != "error" {
+		t.Fatalf("invalid duplicate status = %q, want credential error to take precedence", status)
+	}
+
+	detailed := a.dashboardSummaryLocked(now)
+	expectedDetailed := map[string]int{
+		"total": 9, "ready": 2, "low": 1, "cooldown": 1, "standby": 1,
+		"duplicate": 1, "error": 1, "missing_auth": 1, "disabled": 1,
+		"authenticating": 0, "unavailable": 3,
+	}
+	for key, expected := range expectedDetailed {
+		if detailed[key] != expected {
+			t.Fatalf("management summary[%q] = %d, want %d: %#v", key, detailed[key], expected, detailed)
+		}
+	}
+
+	public := a.publicDashboardSummaryLocked(now)
+	expectedPublic := map[string]int{
+		"total": 9, "ready": 2, "low": 1, "cooldown": 1,
+		"standby": 1, "duplicate": 1, "unavailable": 3,
+	}
+	for key, expected := range expectedPublic {
+		if public[key] != expected {
+			t.Fatalf("public summary[%q] = %d, want %d: %#v", key, public[key], expected, public)
+		}
+	}
+	if classified := public["ready"] + public["low"] + public["cooldown"] + public["standby"] + public["duplicate"] + public["unavailable"]; classified != public["total"] {
+		t.Fatalf("public summary categories total %d, want %d: %#v", classified, public["total"], public)
+	}
+	for _, privateKey := range []string{"error", "missing_auth", "authenticating", "disabled"} {
+		if _, present := public[privateKey]; present {
+			t.Fatalf("public summary exposed auth-specific bucket %q: %#v", privateKey, public)
+		}
+	}
+}
+
 func TestMissingCodexAuthClassifiesWithoutRetry(t *testing.T) {
 	a := testApp(t, []account{{ID: "missing-fast", AuthType: "codex_device_auth", Enabled: true, InPool: true}})
 	start := time.Now()
@@ -1558,6 +1620,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS omitted throughput behavior %q", expected)
 		}
 	}
+	for _, expected := range []string{`["Cooling down", summary.cooldown`, `["Out of pool", summary.standby`, `["Duplicate", summary.duplicate`, `["Unavailable", summary.unavailable`} {
+		if !strings.Contains(jsRecorder.Body.String(), expected) {
+			t.Fatalf("admin JS omitted reconciled summary card %q", expected)
+		}
+	}
 	for _, forbidden := range []string{"p50TTFBMs", "p95TTFBMs", "p50TTFTMs", "p95TTFTMs", ">TTFB ", ">TTFT ", "Token flow", "Requests & latency", "inputTokensPerMinute", "cachedTokensPerMinute", "outputTokensPerMinute", "p50LatencyMs", "Requests/min", "over the past 48 hours"} {
 		if strings.Contains(jsRecorder.Body.String(), forbidden) {
 			t.Fatalf("admin JS still renders removed throughput chart metric %q", forbidden)
@@ -1591,6 +1658,9 @@ func TestAdminDashboardAssets(t *testing.T) {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS omitted warm coastal theme color %q", expected)
 		}
+	}
+	if !strings.Contains(cssRecorder.Body.String(), "grid-template-columns: repeat(7") {
+		t.Fatal("admin CSS does not reserve one summary card for each mutually-exclusive account state")
 	}
 	for _, forbidden := range []string{"#120a2e", "#46e6ff", "#ff6f91", "#c095ff", "#0f0b16", "#302440", "#1b1526"} {
 		if strings.Contains(cssRecorder.Body.String(), forbidden) {

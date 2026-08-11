@@ -475,20 +475,18 @@
   }
 
   // Pool status cards. The aggregate cache hit rate lives in its own
-  // #cache-window row, so it is intentionally not duplicated here.
+  // #cache-window row, so it is intentionally not duplicated here. Every
+  // account belongs to exactly one non-total card; do not merge Duplicate into
+  // Out of pool, because duplicate credential copies may still be in the pool.
   function renderSummary(summary, publicMode = false) {
-    const items = publicMode ? [
+    const items = [
       ["Total accounts", summary.total || 0, ""],
       ["Ready", summary.ready || 0, ""],
-      ["Limited", summary.low || 0, "low"],
+      [publicMode ? "Limited" : "Low quota", summary.low || 0, "low"],
+      ["Cooling down", summary.cooldown || 0, "cooldown"],
       ["Out of pool", summary.standby || 0, "missing_auth"],
+      ["Duplicate", summary.duplicate || 0, "missing_auth"],
       ["Unavailable", summary.unavailable || 0, "error"],
-    ] : [
-      ["Total accounts", summary.total || 0, ""],
-      ["Ready", summary.ready || 0, ""],
-      ["Low quota", summary.low || 0, "low"],
-      ["Errors", summary.error || 0, "error"],
-      ["Needs attention", (summary.missing_auth || 0) + (summary.authenticating || 0), "missing_auth"],
     ];
     $("#summary-grid").innerHTML = items.map(([label, value, tone]) => `<div class="summary-item ${tone}"><div class="eyebrow">${label}</div><span class="summary-value">${value}</span></div>`).join("");
   }

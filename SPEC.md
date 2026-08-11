@@ -732,6 +732,12 @@ Notes:
   blue-green operational accents, and coral/mango highlights. Keep surfaces
   light and readable while preserving labels, shapes, and text so status is
   never communicated by color alone.
+- The account summary cards must partition every configured slot into exactly
+  one of Ready, Low/Limited, Cooling down, Out of pool, Duplicate, or
+  Unavailable, so those cards always add up to Total accounts. Duplicate means
+  an otherwise healthy in-pool copy of an upstream identity and must never be
+  counted as Out of pool. A proven credential failure requiring repair takes
+  precedence over Duplicate and is counted as Unavailable.
 - Admin API account responses must not expose full email addresses, upstream account IDs, upstream URLs, API keys, `codexHome`, or auth file paths. A device-auth credential slot is the primary local identity. Email, plan, upstream account ID, and organization values are descriptive credential metadata; browser-facing account labels may use masked email for recognition, but routing, storage, and management actions must use the local credential slot ID.
 
 ### 7.2 Add account
