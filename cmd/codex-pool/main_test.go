@@ -1540,7 +1540,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page still includes %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"ACCESS", "Continue", "Password", "Add account", "Use Pro last", "Balanced sticky", "routing-strategy-pill", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown", "Copy verification link", "Copy verification code"} {
+	for _, expected := range []string{"ACCESS", "Continue", "Password", "Add account", "Use Pro last", "Balanced sticky", "routing-strategy-pill", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown", "Copy verification link", "Copy verification code", `data-theme="coastal"`, `id="theme-select"`, "Choose dashboard theme", ">Coastal<", ">Forest<", ">Indigo<", ">Ember<", ">Slate<"} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page does not include low-key label %q", expected)
 		}
@@ -1607,6 +1607,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if !strings.Contains(jsRecorder.Body.String(), "preserveProQuota") {
 		t.Fatal("admin JS does not render the Pro quota preservation switch")
 	}
+	for _, expected := range []string{"codexPoolAdminTheme", "themeMetaColors", "themeNames.has", "document.documentElement.dataset.theme", `window.localStorage.getItem(themeStorageKey)`, `window.localStorage.setItem(themeStorageKey, theme)`, `$("#theme-select").addEventListener("change"`} {
+		if !strings.Contains(jsRecorder.Body.String(), expected) {
+			t.Fatalf("admin JS omitted browser-local theme behavior %q", expected)
+		}
+	}
 	if !strings.Contains(jsRecorder.Body.String(), "sticky_balanced") || !strings.Contains(jsRecorder.Body.String(), "activeRouteCount") {
 		t.Fatal("admin JS does not expose balanced routing state and per-account active routes")
 	}
@@ -1657,6 +1662,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 	for _, expected := range []string{"#f2eee3", "#176b87", "#d95136", "#0d8f78", "#f2c14e"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS omitted warm coastal theme color %q", expected)
+		}
+	}
+	for _, expected := range []string{`:root[data-theme="forest"]`, `:root[data-theme="indigo"]`, `:root[data-theme="ember"]`, `:root[data-theme="slate"]`, ".theme-picker", "--body-background", "--topbar-bg", "--summary-featured-bg", "--throughput-bg", "--table-head-bg"} {
+		if !strings.Contains(cssRecorder.Body.String(), expected) {
+			t.Fatalf("admin CSS omitted selectable pool theme behavior %q", expected)
 		}
 	}
 	if !strings.Contains(cssRecorder.Body.String(), "grid-template-columns: repeat(7") {

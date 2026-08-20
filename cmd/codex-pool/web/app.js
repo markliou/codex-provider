@@ -1,10 +1,48 @@
 (() => {
+  const themeStorageKey = "codexPoolAdminTheme";
+  const themeMetaColors = Object.freeze({
+    coastal: "#143740",
+    forest: "#19483b",
+    indigo: "#2e356f",
+    ember: "#5a2d28",
+    slate: "#263548",
+  });
+  const themeNames = new Set(Object.keys(themeMetaColors));
   const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public" };
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => document.querySelectorAll(selector);
   const loginView = $("#login-view");
   const dashboardView = $("#dashboard-view");
   const refreshIntervalMs = 30 * 1000;
+
+  // Theme is intentionally browser-local presentation state. It helps an
+  // operator tell pool tabs apart without changing routing, authentication,
+  // account state, or any server-side pool configuration. Invalid or
+  // unavailable storage must fall back silently so the dashboard still loads.
+  const applyTheme = (requestedTheme, persist = false) => {
+    const theme = themeNames.has(requestedTheme) ? requestedTheme : "coastal";
+    document.documentElement.dataset.theme = theme;
+    const select = $("#theme-select");
+    if (select) select.value = theme;
+    const themeMeta = document.querySelector('meta[name="theme-color"]');
+    if (themeMeta) themeMeta.content = themeMetaColors[theme];
+    if (persist) {
+      try {
+        window.localStorage.setItem(themeStorageKey, theme);
+      } catch (_) {}
+    }
+    return theme;
+  };
+
+  const initializeTheme = () => {
+    let storedTheme = "";
+    try {
+      storedTheme = window.localStorage.getItem(themeStorageKey) || "";
+    } catch (_) {}
+    applyTheme(storedTheme);
+  };
+
+  initializeTheme();
 
   const escapeHTML = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
   const displayTime = (value) => {
@@ -1047,6 +1085,7 @@
   });
 
   $("#refresh-button").addEventListener("click", () => refresh());
+  $("#theme-select").addEventListener("change", (event) => applyTheme(event.currentTarget.value, true));
   $("#cache-window-reset").addEventListener("click", async () => {
     try { await api("/cache/reset", { method: "POST" }); notify("Cache window reset"); refresh(true); }
     catch (error) { notify(error.message, true); }

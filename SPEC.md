@@ -728,10 +728,13 @@ Notes:
 - Actual consumed tokens are tracked in usage stats.
 - Absolute remaining Codex token quota may not be available from upstream. Display both quota-window percentages and token usage counters.
 - Quota progress colors are an operational warning scale: healthy capacity uses the cool Jade/Wasabi range, then becomes amber, Persimmon, and finally red as remaining capacity approaches zero. Do not use one neutral color for all values or make a near-zero bar appear healthy.
-- The dashboard theme uses a warm off-white canvas with deep coastal ink,
-  blue-green operational accents, and coral/mango highlights. Keep surfaces
-  light and readable while preserving labels, shapes, and text so status is
-  never communicated by color alone.
+- The dashboard offers five light, readable themes: Coastal (the default warm
+  off-white canvas), Forest, Indigo, Ember, and Slate. Management mode exposes
+  the selector, and the selected theme is browser-local presentation state
+  persisted in `localStorage`; it must not change routing, authentication,
+  account state, or server-side pool configuration. Preserve labels, shapes,
+  text, and the semantic warning palette so status is never communicated by
+  color alone.
 - The account summary cards must partition every configured slot into exactly
   one of Ready, Low/Limited, Cooling down, Out of pool, Duplicate, or
   Unavailable, so those cards always add up to Total accounts. Duplicate means
