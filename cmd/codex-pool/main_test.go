@@ -5460,6 +5460,84 @@ func TestSubscriptionMetadataFromAccountCheckUsesExplicitWorkspaceName(t *testin
 	}
 }
 
+// A login that owns both a personal Pro subscription and a Team workspace gets
+// every workspace back from accounts/check. Selecting an unrelated record used
+// to label the Team slot "Pro 20x" and drop its organization, so an unresolved
+// preferred workspace must report no metadata instead of guessing.
+func TestSubscriptionMetadataRejectsUnmatchedWorkspace(t *testing.T) {
+	payload := map[string]any{
+		"accounts": map[string]any{
+			"acct-team": map[string]any{
+				"account":     map[string]any{"account_id": "acct-team", "name": "markliou", "structure": "workspace", "plan_type": "team"},
+				"entitlement": map[string]any{"subscription_plan": "chatgptteamplan"},
+			},
+			"acct-pro": map[string]any{
+				"account":     map[string]any{"account_id": "acct-pro", "plan_type": "pro"},
+				"entitlement": map[string]any{"subscription_plan": "chatgptpro"},
+			},
+		},
+		"account_ordering": []any{"acct-pro", "acct-team"},
+	}
+
+	if metadata, ok := subscriptionMetadataFromValue(payload, "acct-missing"); ok {
+		t.Fatalf("unmatched workspace reported foreign metadata: %#v", metadata)
+	}
+
+	// Repeated because the records come from a randomized Go map iteration: an
+	// arbitrary-record fallback would only fail intermittently.
+	for i := 0; i < 64; i++ {
+		if metadata, ok := subscriptionMetadataFromValue(payload, ""); ok {
+			t.Fatalf("ambiguous multi-workspace login reported metadata: %#v", metadata)
+		}
+	}
+
+	metadata, ok := subscriptionMetadataFromValue(payload, "acct-team")
+	if !ok {
+		t.Fatal("preferred team workspace was not resolved")
+	}
+	if metadata.AccountID != "acct-team" || metadata.PlanType != "team" || metadata.OrganizationName != "markliou" {
+		t.Fatalf("preferred team workspace resolved incorrectly: %#v", metadata)
+	}
+
+	// An unmatched preference against a sole accessible workspace still resolves:
+	// the login can no longer act as the previous workspace, which the caller
+	// reports as an upstream identity change instead of a plan relabel.
+	metadata, ok = subscriptionMetadataFromValue(map[string]any{
+		"accounts": map[string]any{
+			"acct-moved": map[string]any{
+				"account":     map[string]any{"account_id": "acct-moved", "workspace_name": "Different Workspace", "plan_type": "team"},
+				"entitlement": map[string]any{"subscription_plan": "chatgptteamplan"},
+			},
+		},
+		"account_ordering": []any{"acct-moved"},
+	}, "acct-team")
+	if !ok {
+		t.Fatal("sole remaining workspace was not resolved for a moved credential")
+	}
+	if metadata.AccountID != "acct-moved" || metadata.PlanType != "team" {
+		t.Fatalf("sole remaining workspace resolved incorrectly: %#v", metadata)
+	}
+}
+
+// A single-workspace login has no ambiguity, so an unbound credential must still
+// learn its plan and workspace identity from accounts/check.
+func TestSubscriptionMetadataResolvesSoleWorkspaceWithoutPreference(t *testing.T) {
+	metadata, ok := subscriptionMetadataFromValue(map[string]any{
+		"accounts": map[string]any{
+			"acct-team": map[string]any{
+				"account":     map[string]any{"account_id": "acct-team", "name": "markliou", "structure": "workspace", "plan_type": "team"},
+				"entitlement": map[string]any{"subscription_plan": "chatgptteamplan"},
+			},
+		},
+	}, "")
+	if !ok {
+		t.Fatal("sole workspace was not resolved")
+	}
+	if metadata.AccountID != "acct-team" || metadata.PlanType != "team" || metadata.OrganizationName != "markliou" {
+		t.Fatalf("sole workspace resolved incorrectly: %#v", metadata)
+	}
+}
+
 func TestCodexQuotaErrorDoesNotPersistUpstreamBody(t *testing.T) {
 	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

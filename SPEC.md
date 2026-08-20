@@ -1057,6 +1057,25 @@ Accept: application/json
 ChatGPT-Account-Id: <account-id-if-known>
 ```
 
+Plan tier, plan limit, and organization name may be enriched from
+`/backend-api/accounts/check/v4-2023-04-27`, which returns every workspace the
+login may act as. One login can hold both a personal subscription and one or
+more Team/Business workspaces, so a record may only be applied to a credential
+slot when it is positively identified:
+
+- a record matching the slot's known upstream account ID is used;
+- otherwise, a response describing exactly one accessible workspace is used,
+  including when it differs from the slot's previous ID, which the device-auth
+  identity check treats as an upstream identity change (section 7);
+- otherwise the lookup reports nothing and the workspace-scoped
+  `/backend-api/subscriptions?account_id=<id>` response is used instead.
+
+An arbitrary or default-ordered record must never be selected. Labeling a Team
+slot with the login's personal `Pro` entitlement is a visible defect, and the
+selected record's account ID is persisted as the slot's upstream identity, which
+routing uses for the duplicate-identity guard (section 9.1 Duplicate upstream
+identity guard).
+
 ### 9.2 Upstream usage response shape
 
 Expected upstream fields:

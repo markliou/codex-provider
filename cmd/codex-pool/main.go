@@ -4991,42 +4991,50 @@ func subscriptionMetadataFromValue(value any, preferredAccountID string) (codexS
 		return subscriptionMetadataFromMap(values), true
 	}
 	preferredAccountID = strings.TrimSpace(preferredAccountID)
-	selected := records[0]
+	// accounts/check lists every workspace the login may act as, and the records
+	// are collected from a Go map whose iteration order is randomized. Picking an
+	// arbitrary record labels this credential with a foreign workspace's
+	// entitlement: a login that holds both a personal Pro subscription and a Team
+	// workspace would show its Team slot as "Pro 20x", lose the organization
+	// suffix, and then persist the foreign account ID as the slot's upstream
+	// identity, which routing uses for duplicate detection.
 	if preferredAccountID != "" {
-		for _, record := range records {
-			metadata := subscriptionMetadataFromRecord(record.node)
-			if metadata.AccountID == preferredAccountID || strings.TrimSpace(record.key) == preferredAccountID {
-				selected = record
-				break
-			}
-		}
-	} else if orderingKey := firstAccountOrderingKey(value); orderingKey != "" {
-		for _, record := range records {
-			metadata := subscriptionMetadataFromRecord(record.node)
-			if metadata.AccountID == orderingKey || strings.TrimSpace(record.key) == orderingKey {
-				selected = record
-				break
-			}
+		if record, ok := subscriptionAccountRecordByID(records, preferredAccountID); ok {
+			return subscriptionMetadataFromSelectedRecord(record), true
 		}
 	}
-	metadata := subscriptionMetadataFromRecord(selected.node)
-	if metadata.AccountID == "" {
-		metadata.AccountID = strings.TrimSpace(selected.key)
+	// A sole accessible workspace stays unambiguous even when it is not the one
+	// the credential last reported: the login can no longer act as the previous
+	// workspace, and the caller deliberately treats that as an upstream identity
+	// change that resets cache and sticky history. Several workspaces with no
+	// match carry no evidence tying any of them to this credential, so report
+	// nothing and let the caller fall back to the workspace-scoped
+	// /subscriptions lookup instead of guessing. account_ordering only names the
+	// login default, which is not necessarily the workspace this slot acts as.
+	if len(records) != 1 {
+		return codexSubscriptionMetadata{}, false
 	}
-	return metadata, true
+	return subscriptionMetadataFromSelectedRecord(records[0]), true
 }
 
-func firstAccountOrderingKey(value any) string {
-	values, _ := value.(map[string]any)
-	if values == nil {
-		return ""
+func subscriptionAccountRecordByID(records []subscriptionAccountRecord, accountID string) (subscriptionAccountRecord, bool) {
+	for _, record := range records {
+		if strings.TrimSpace(record.key) == accountID {
+			return record, true
+		}
+		if subscriptionMetadataFromRecord(record.node).AccountID == accountID {
+			return record, true
+		}
 	}
-	ordering, _ := values["account_ordering"].([]any)
-	if len(ordering) == 0 {
-		return ""
+	return subscriptionAccountRecord{}, false
+}
+
+func subscriptionMetadataFromSelectedRecord(record subscriptionAccountRecord) codexSubscriptionMetadata {
+	metadata := subscriptionMetadataFromRecord(record.node)
+	if metadata.AccountID == "" {
+		metadata.AccountID = strings.TrimSpace(record.key)
 	}
-	first, _ := ordering[0].(string)
-	return strings.TrimSpace(first)
+	return metadata
 }
 
 func collectSubscriptionAccountRecords(value any) []subscriptionAccountRecord {
