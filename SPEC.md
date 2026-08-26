@@ -658,6 +658,19 @@ On upstream quota exhaustion or rate limiting (`429`), mark the account/model in
 
 Quota polling is advisory and must not become an inference availability gate for transient usage-endpoint failures. A quota refresh timeout, transport error, decode error, or upstream `5xx` may be retained for diagnostics, but it must not make an otherwise authenticated account ineligible. Only an explicit credential failure such as `401`, `403`, `invalid_token`, or a failed OAuth refresh that is classified as an auth failure may block routing. This distinction is required so exhaustion of a non-Pro account can still fail over to a healthy Pro account instead of returning a false initial `503`.
 
+Per-slot quota protection is a separate opt-in exception based on positive quota
+evidence, not on polling availability. It is disabled by default and is
+supported only for Codex device-auth slots. Select an explicitly reported
+300-minute base window first, otherwise an explicitly reported 10,080-minute
+base window; no other duration or additional/model-specific limit is a
+proactive reserve signal. `remaining <= threshold` blocks selection. A
+confirmed violation may remain blocked until an above-threshold refresh or its
+observed reset time, but after reset expiry it fails open. Missing, stale,
+timeout, transport, decode, and upstream `5xx` telemetry never create a new
+block and do not weaken the advisory-polling contract above. The guarantee is
+the latest stored snapshot at selection time, not an in-flight quota
+reservation.
+
 If at least one upstream account has already been selected and then failed in a request, exhausting the remaining failover candidates is an upstream failure (`502 bad_gateway`), not initial pool exhaustion (`503 no eligible account`). Initial `503 no eligible account` is reserved for the strict case where no account can be selected before any upstream attempt.
 
 A transient upstream `5xx` without `Retry-After` must preserve sticky account locality for KV cache hit rate. Do not cool down or fail over the selected account on the first isolated `5xx`; return `502` for that request and let the next request retry the same sticky account. Only recent repeated `5xx` failures may cool down that account and move the sticky route to another upstream identity.
@@ -728,10 +741,13 @@ Notes:
 - Actual consumed tokens are tracked in usage stats.
 - Absolute remaining Codex token quota may not be available from upstream. Display both quota-window percentages and token usage counters.
 - Quota progress colors are an operational warning scale: healthy capacity uses the cool Jade/Wasabi range, then becomes amber, Persimmon, and finally red as remaining capacity approaches zero. Do not use one neutral color for all values or make a near-zero bar appear healthy.
-- The dashboard theme uses a warm off-white canvas with deep coastal ink,
-  blue-green operational accents, and coral/mango highlights. Keep surfaces
-  light and readable while preserving labels, shapes, and text so status is
-  never communicated by color alone.
+- The dashboard offers five light, readable themes: Coastal (the default warm
+  off-white canvas), Forest, Indigo, Ember, and Slate. Management mode exposes
+  the selector, and the selected theme is browser-local presentation state
+  persisted in `localStorage`; it must not change routing, authentication,
+  account state, or server-side pool configuration. Preserve labels, shapes,
+  text, and the semantic warning palette so status is never communicated by
+  color alone.
 - The account summary cards must partition every configured slot into exactly
   one of Ready, Low/Limited, Cooling down, Out of pool, Duplicate, or
   Unavailable, so those cards always add up to Total accounts. Duplicate means
@@ -1057,7 +1073,7 @@ Accept: application/json
 ChatGPT-Account-Id: <account-id-if-known>
 ```
 
-Plan tier, plan limit, and organization name may be enriched from
+Plan and organization metadata may be enriched from
 `/backend-api/accounts/check/v4-2023-04-27`, which returns every workspace the
 login may act as. One login can hold both a personal subscription and one or
 more Team/Business workspaces, so a record may only be applied to a credential
@@ -1076,6 +1092,25 @@ selected record's account ID is persisted as the slot's upstream identity, which
 routing uses for the duplicate-identity guard (section 9.1 Duplicate upstream
 identity guard).
 
+Account metadata keeps these concepts separate:
+
+- `rawPlanType`: sanitized upstream wire value;
+- `planFamily`: explicit normalized display family;
+- `seatType`: authoritative Business `standard`/`premium`, if supported;
+- `seatTypeRaw`: sanitized unknown authoritative seat value, display-only;
+- `planLimit`: exact reported `5x`, `10x`, or `20x` multiplier only;
+- `quotaPolicy`: explicit policy such as `no_five_hour_cap`.
+
+For the pinned Codex client, raw `team` and
+`self_serve_business_usage_based` map to the Business family, while raw
+`business` and `enterprise_cbp_usage_based` map to Enterprise. These mappings
+do not prove a Business seat. The pinned `AccountsCheckResponse` has no
+Standard/Premium field, so this release does not enable a seat mapping:
+Business rows show `Seat type: Not reported`. Workspace name, default account,
+record order, plan name, and absence of Premium metadata are never seat
+evidence. Generic Pro does not imply `20x`, and plan text containing a supported
+substring is not multiplier evidence.
+
 ### 9.2 Upstream usage response shape
 
 Expected upstream fields:
@@ -1083,6 +1118,24 @@ Expected upstream fields:
 ```json
 {
   "plan_type": "plus",
+  "credits": {
+    "has_credits": true,
+    "unlimited": false,
+    "balance": "12.50"
+  },
+  "spend_control": {
+    "reached": false,
+    "individual_limit": {
+      "limit": "25000",
+      "used": "8000",
+      "remaining": "17000",
+      "remaining_percent": 68,
+      "reset_at": 1782016800
+    }
+  },
+  "rate_limit_reached_type": {
+    "type": "workspace_member_credits_depleted"
+  },
   "rate_limit": {
     "allowed": true,
     "limit_reached": false,
@@ -1099,12 +1152,17 @@ Expected upstream fields:
       "reset_at": 1782016800
     }
   },
-  "code_review_rate_limit": {
-    "allowed": true,
-    "limit_reached": false,
-    "primary_window": null,
-    "secondary_window": null
-  }
+  "additional_rate_limits": [{
+    "limit_name": "Code review",
+    "metered_feature": "code_review",
+    "rate_limit": {
+      "allowed": true,
+      "limit_reached": false,
+      "primary_window": null,
+      "secondary_window": null
+    }
+  }],
+  "rate_limit_reset_credits": {"available_count": 2}
 }
 ```
 
@@ -1118,13 +1176,59 @@ reset time = reset_at if present, otherwise now + reset_after_seconds
 window minutes = ceil(limit_window_seconds / 60)
 ```
 
+A window has percentage evidence only when `used_percent` is an explicit JSON
+number. Missing, null, or invalid values remain `Not reported`; explicitly
+numeric values are clamped to 0–100 before computing remaining percentage.
+Primary and secondary are positional identities, not semantic duration names.
+The visible label comes from actual duration: 300 minutes is `5h`, 10,080
+minutes is `Week`, and all other durations use a truthful generic label.
+
+`limit_reached`, `allowed=false`, reached type, and reached spend control are
+separate exhaustion state. They must never fabricate a zero-percent 5h window.
+Credits-scoped `unlimited=true` means only flexible credits are unlimited; it
+does not mean unlimited runtime rate, model access, spend, or policy.
+
 Response object:
 
 ```json
 {
   "accountId": "acct-org-a",
+  "rawPlanType": "plus",
+  "planFamily": "plus",
   "planType": "plus",
   "quota": {
+    "limitId": "codex",
+    "primary": {
+      "role": "primary",
+      "label": "5h",
+      "usedPercent": 20,
+      "remainingPercent": 80,
+      "resetAt": 1781934000,
+      "windowMinutes": 300,
+      "observed": true,
+      "present": true
+    },
+    "secondary": {
+      "role": "secondary",
+      "label": "Week",
+      "usedPercent": 50,
+      "remainingPercent": 50,
+      "resetAt": 1782016800,
+      "windowMinutes": 10080,
+      "observed": true,
+      "present": true
+    },
+    "windows": [],
+    "credits": {
+      "hasCredits": true,
+      "unlimited": false,
+      "balance": "12.50"
+    },
+    "individualLimit": {},
+    "additionalLimits": [],
+    "resetCredits": {"availableCount": 2},
+    "exhausted": false,
+    "provenance": "chatgpt_wham_usage",
     "hourly": {
       "percentage": 80,
       "resetAt": 1781934000,
@@ -1138,10 +1242,25 @@ Response object:
       "present": true
     }
   },
+  "lastSuccessfulRefreshAt": "2026-06-21T12:30:00Z",
+  "freshness": "fresh",
+  "provenance": "chatgpt_wham_usage",
   "usageUpdatedAt": "2026-06-21T12:30:00Z",
   "quotaError": null
 }
 ```
+
+`hourly` and `weekly` are compatibility aliases only. They are populated from
+actual 300-minute and 10,080-minute base windows; new code and the UI consume
+`primary`/`secondary` or `windows`. One window must never borrow another
+window's percentage or reset.
+
+Successful sparse updates retain previously verified credits, individual
+spend-control, reset-credit, additional-limit, and plan metadata when the
+corresponding optional field is omitted/null. The server derives freshness with
+a deterministic 10-minute interval: `fresh`, `stale`, `not_reported`, or
+`refresh_unavailable`. Freshness is presentation evidence and is not itself a
+routing gate.
 
 ### 9.4 Refresh one account quota
 
@@ -1204,6 +1323,28 @@ Response:
 ```
 
 Quota refresh must not block normal `/v1` request handling. Run refresh jobs in background with bounded concurrency. The service refreshes Codex quotas once after a successful device-auth login, once during startup, and then every five minutes. `remainingQuota` is a routing hint derived from the lowest present quota window.
+
+API-key provider accounts are `api_metered`; they do not receive ChatGPT
+subscription windows, Business seat semantics, or per-slot ChatGPT quota
+protection. Runtime HTTP `429`/`Retry-After` behavior remains authoritative.
+
+### 9.6 Per-slot quota protection
+
+`quotaProtectionEnabled` defaults to false.
+`quotaProtectionThreshold` is an integer 0–100. The authenticated management
+action is:
+
+```http
+POST /admin/api/accounts/{accountId}/quota-protection/set
+Content-Type: application/json
+
+{"enabled": true, "threshold": 20}
+```
+
+The policy belongs to the local credential slot. Duplicate slots can have
+different settings but still share upstream capacity and remain subject to the
+same-request duplicate suppression rule. Blocking does not delete existing
+sticky bindings; the next request reselects normally.
 
 ### 9.1 Duplicate upstream identity guard
 
@@ -1547,6 +1688,17 @@ For streaming responses:
 
 - Preserve `text/event-stream` semantics.
 - Flush chunks immediately.
+- Parse complete SSE event blocks and retain terminal
+  `response.completed`, `response.failed`, and `response.incomplete` state.
+- HTTP `200` plus `response.failed`/`response.incomplete` is a failed client
+  request. Preserve reported usage, but do not record success, clear consecutive
+  failures, refresh sticky/thread affinity, or create a response binding.
+- Capacity/retryable terminal failures may set cooldown; authentication
+  failures may quarantine the credential. Context length, invalid prompt, and
+  policy failures do not penalize account health. Unknown codes remain a
+  sanitized generic failure instead of being guessed as quota/auth.
+- Once any SSE bytes are committed downstream, never retry another account or
+  splice a second response stream.
 - Detect stream idle timeout.
 - On stream error, emit SSE `error` event where possible.
 - Track incomplete streams separately.
@@ -1817,6 +1969,18 @@ tooltip rather than the visible cell. Affinity/Fallback is the compact
 Pool-observed `hit/fallback` count. Per-account routing-failover totals remain
 available in backend state but must not appear as a separate account-table
 column.
+
+The quota cell must keep every upstream-reported quota window visible as its
+own labeled progress bar. Distinct subscription, Pro/Spark, and additional
+limit windows must not be merged, hidden, or treated as duplicate renderings.
+Supporting text belongs below the bars in compact labeled facts: reset
+countdowns pair a `Reset` label with the remaining time. The primary view must
+use flat, aligned rows rather than a nested card for every fact; credits, spend
+control, reset credits, telemetry freshness, and protection controls are
+secondary context and stay behind a compact disclosure control by default.
+Blocked or unavailable states remain visible without opening the disclosure.
+Exact reset and refresh timestamps may remain in tooltips so the table stays
+scannable without discarding diagnostic detail.
 
 The pool-wide cache window must show the total request count since reset and
 must group and visibly label Pool-observed counters separately from calculated

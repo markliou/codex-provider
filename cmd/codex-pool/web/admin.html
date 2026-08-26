@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="coastal">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -16,6 +16,16 @@
       <!-- Keep pre-unlock chrome generic; detailed labels belong behind the unlocked mode or specific dialogs. -->
       <div class="brand"><img class="brand-mark" src="/admin/assets/logo.svg" alt="" aria-hidden="true"><span>Codex Pool</span></div>
       <div class="topbar-actions management-only">
+        <label class="theme-picker" for="theme-select">
+          <span>Theme</span>
+          <select id="theme-select" aria-label="Choose dashboard theme">
+            <option value="coastal">Coastal</option>
+            <option value="forest">Forest</option>
+            <option value="indigo">Indigo</option>
+            <option value="ember">Ember</option>
+            <option value="slate">Slate</option>
+          </select>
+        </label>
         <span id="service-status" class="service-status">Checking service</span>
         <button id="refresh-button" class="button secondary" type="button">Refresh</button>
         <button id="logout-button" class="button quiet" type="button">Sign out</button>

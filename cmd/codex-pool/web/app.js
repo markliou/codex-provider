@@ -1,4 +1,13 @@
 (() => {
+  const themeStorageKey = "codexPoolAdminTheme";
+  const themeMetaColors = Object.freeze({
+    coastal: "#143740",
+    forest: "#19483b",
+    indigo: "#2e356f",
+    ember: "#5a2d28",
+    slate: "#263548",
+  });
+  const themeNames = new Set(Object.keys(themeMetaColors));
   const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public" };
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => document.querySelectorAll(selector);
@@ -6,13 +15,42 @@
   const dashboardView = $("#dashboard-view");
   const refreshIntervalMs = 30 * 1000;
 
+  // Theme is intentionally browser-local presentation state. It helps an
+  // operator tell pool tabs apart without changing routing, authentication,
+  // account state, or any server-side pool configuration. Invalid or
+  // unavailable storage must fall back silently so the dashboard still loads.
+  const applyTheme = (requestedTheme, persist = false) => {
+    const theme = themeNames.has(requestedTheme) ? requestedTheme : "coastal";
+    document.documentElement.dataset.theme = theme;
+    const select = $("#theme-select");
+    if (select) select.value = theme;
+    const themeMeta = document.querySelector('meta[name="theme-color"]');
+    if (themeMeta) themeMeta.content = themeMetaColors[theme];
+    if (persist) {
+      try {
+        window.localStorage.setItem(themeStorageKey, theme);
+      } catch (_) {}
+    }
+    return theme;
+  };
+
+  const initializeTheme = () => {
+    let storedTheme = "";
+    try {
+      storedTheme = window.localStorage.getItem(themeStorageKey) || "";
+    } catch (_) {}
+    applyTheme(storedTheme);
+  };
+
+  initializeTheme();
+
   const escapeHTML = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
   const displayTime = (value) => {
     if (!value || value === "0001-01-01T00:00:00Z") return "No activity";
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? "No activity" : date.toLocaleString();
   };
-  const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Out of pool", duplicate: "Duplicate", missing_auth: "Login needed", authenticating: "Signing in" }[status] || "Unknown");
+  const statusLabel = (status) => ({ ready: "Ready", low: "Low quota", protected: "Protected", exhausted: "Exhausted", cooldown: "Cooldown", error: "Error", disabled: "Disabled", standby: "Out of pool", duplicate: "Duplicate", missing_auth: "Login needed", authenticating: "Signing in" }[status] || "Unknown");
   const activeBadge = (active) => active ? '<span class="badge active">Active</span>' : "";
   const cacheHitRate = (input, cached) => {
     const total = Number(input) || 0;
@@ -584,26 +622,90 @@
   }
 
   function quotaWindowMarkup(label, window) {
-    if (!window || !window.present) return "";
-    const value = quotaPercent(window.percentage);
+    if (!window || (!window.observed && !window.present)) return "";
+    const durationLabel = window.label || label || "Window";
+    if (!window.present) {
+      return `<div class="quota-window quota-window-unreported"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>Not reported</strong></div></div>`;
+    }
+    const rawValue = window.remainingPercent ?? window.percentage;
+    const value = finiteMetric(rawValue);
     const reset = displayUnixTime(window.resetAt);
     const countdown = displayResetCountdown(window.resetAt);
-    return `<div class="quota-window"><div class="quota-line"><span>${label} quota</span><strong>${value}% left</strong></div>${quotaTrackMarkup(value, label)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}">Resets in ${escapeHTML(countdown || "soon")}</div>` : ""}</div>`;
+    if (value === null) {
+      return `<div class="quota-window quota-window-unreported"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>Not reported</strong></div>${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
+    }
+    return `<div class="quota-window"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>${quotaPercent(value)}% left</strong></div>${quotaTrackMarkup(value, durationLabel)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
   }
 
-  function quotaMarkup(value, quota, quotaError, usageUpdatedAt) {
+  function quotaFreshnessMarkup(freshness, updatedAt) {
+    const labels = {
+      fresh: "Fresh",
+      stale: "Stale",
+      not_reported: "Not reported",
+      refresh_unavailable: "Refresh unavailable",
+    };
+    const label = labels[freshness] || "Not reported";
+    const updated = updatedAt && updatedAt !== "0001-01-01T00:00:00Z" ? displayTime(updatedAt) : "";
+    const title = updated ? `Last successful refresh ${updated}` : "No successful quota refresh recorded";
+    return `<div class="quota-fact quota-fact-telemetry" title="${escapeHTML(title)}"><span class="quota-fact-label">Telemetry:</span><strong class="quota-fact-value">${escapeHTML(label)}</strong>${updated ? `<span class="quota-fact-note">${escapeHTML(updated)}</span>` : ""}</div>`;
+  }
+
+  function quotaDetailsMarkup(content) {
+    if (!content) return "";
+    // Progressive disclosure is intentional here: the progress bars are the
+    // operator's first-glance signal, while credits and telemetry are useful
+    // diagnostic context. Keep every quota window open in the primary view,
+    // but do not make secondary facts compete with those bars.
+    return `<details class="quota-details"><summary>More details</summary><div class="quota-facts">${content}</div></details>`;
+  }
+  function quotaCreditsMarkup(credits) {
+    if (!credits) return '<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">Not reported</strong></div>';
+    if (credits.unlimited) return '<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">Unlimited</strong><span class="quota-fact-note">separate credits</span></div>';
+    if (!credits.hasCredits) return '<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">None reported</strong></div>';
+    return `<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">${escapeHTML(credits.balance || "Available")}</strong></div>`;
+  }
+
+  function spendControlMarkup(limit) {
+    if (!limit) return '<div class="quota-fact"><span class="quota-fact-label">Spend control:</span><strong class="quota-fact-value">Not reported</strong></div>';
+    const amount = limit.limit ? `${limit.used || "0"} / ${limit.limit}` : "Reported";
+    const remaining = limit.remainingPercent !== null && limit.remainingPercent !== undefined ? ` · ${quotaPercent(limit.remainingPercent)}% left` : "";
+    return `<div class="quota-fact"><span class="quota-fact-label">Spend control:</span><strong class="quota-fact-value">${escapeHTML(limit.reached ? "Reached" : amount)}</strong>${remaining ? `<span class="quota-fact-note">${escapeHTML(remaining.slice(3))}</span>` : ""}</div>`;
+  }
+
+  function additionalLimitsMarkup(limits) {
+    if (!Array.isArray(limits) || !limits.length) return "";
+    const entries = limits.map((limit) => {
+      const windows = Array.isArray(limit.windows) ? limit.windows : [limit.primary, limit.secondary].filter(Boolean);
+      const detail = windows.map((window) => quotaWindowMarkup(limit.limitName || limit.limitId || "Additional", window)).join("");
+      const name = limit.limitName || limit.limitId || "Reported limit";
+      const reached = limit.exhausted ? '<span class="quota-additional-status">Reached</span>' : "";
+      return `<div class="quota-additional-limit"><div class="quota-additional-heading"><strong>${escapeHTML(name)}</strong>${reached}</div><div class="quota-windows">${detail || '<div class="quota-detail">Window: Not reported</div>'}</div></div>`;
+    }).join("");
+    return `<div class="quota-additional-group"><div class="quota-section-label">Additional limits</div>${entries}</div>`;
+  }
+  function quotaMarkup(value, quota, quotaError, usageUpdatedAt, freshness, lastSuccessfulRefreshAt, metering) {
     const refreshError = quotaError ? `<span class="quota-error" title="${escapeHTML(quotaError.message)}">Quota update unavailable</span>` : "";
+    if (metering === "api_metered" && !quota) {
+      return '<div class="quota quota-detailed"><span class="quota-unknown">API-metered · ChatGPT quota not applicable</span></div>';
+    }
     if (quota) {
-      // The 5h row normally shows the real 5h window. Only when the weekly
-      // budget is fully exhausted is the account unusable no matter how full
-      // the 5h window looks, so force the 5h row to 0% with the weekly reset.
-      let hourly = quota.hourly;
-      if (hourly && hourly.present && quota.weekly && quota.weekly.present && quotaPercent(quota.weekly.percentage) <= 0) {
-        hourly = { ...hourly, percentage: 0, resetAt: quota.weekly.resetAt };
-      }
-      const windows = [quotaWindowMarkup("5h", hourly), quotaWindowMarkup("Week", quota.weekly)].filter(Boolean).join("");
-      const updated = usageUpdatedAt && usageUpdatedAt !== "0001-01-01T00:00:00Z" ? `<div class="quota-updated">Updated ${escapeHTML(displayTime(usageUpdatedAt))}</div>` : "";
-      return `<div class="quota quota-detailed">${windows || '<span class="quota-unknown">Quota unavailable</span>'}${updated}${refreshError}</div>`;
+      // Consume duration-bearing windows. Never overwrite one window with
+      // another window's percentage/reset merely because the other is empty.
+      const sourceWindows = Array.isArray(quota.windows) && quota.windows.length
+        ? quota.windows
+        : [quota.primary, quota.secondary].filter((window) => window && (window.observed || window.present));
+      const windows = sourceWindows.map((window) => quotaWindowMarkup(window.label, window)).filter(Boolean).join("");
+      const blocked = quota.exhausted ? `<div class="quota-blocked">Blocked: ${escapeHTML(quota.exhaustionReason || "quota exhausted")}</div>` : "";
+      const reached = quota.rateLimitReachedType ? `<div class="quota-fact quota-fact-warning"><span class="quota-fact-label">Reached type:</span><strong class="quota-fact-value">${escapeHTML(quota.rateLimitReachedType.replaceAll("_", " "))}</strong></div>` : "";
+      const resetCredits = quota.resetCredits?.availableCount !== null && quota.resetCredits?.availableCount !== undefined
+        ? `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(quota.resetCredits.availableCount))}</strong></div>`
+        : "";
+      // Keep every reported quota window visible: Pro/Spark and other windows
+      // are distinct upstream limits, not duplicate renderings. Only the
+      // supporting text is grouped so operators can scan bars first, then read
+      // reset/credit/telemetry facts without losing any quota semantics.
+      const details = quotaDetailsMarkup(`${reached}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
+      return `<div class="quota quota-detailed">${windows ? `<div class="quota-windows">${windows}</div>` : '<div class="quota-detail">Quota windows: Not reported</div>'}${blocked}${additionalLimitsMarkup(quota.additionalLimits)}${details}${refreshError}</div>`;
     }
     if (quotaError) return refreshError;
     if (value === null || value === undefined) return '<span class="quota-unknown">Not reported</span>';
@@ -637,6 +739,50 @@
     return parts.join(" · ");
   }
 
+  function accountEntitlementMarkup(account) {
+    const metadata = account.credentialMetadata || account;
+    const family = metadata.planFamily || metadata.planType;
+    const rawPlan = metadata.rawPlanType;
+    const lines = [];
+    if (family === "business") {
+      const seat = metadata.seatType;
+      if (seat === "standard" || seat === "premium") {
+        lines.push(`Business ${seat === "premium" ? "Premium" : "Standard"}`);
+        lines.push(`Seat type: ${seat === "premium" ? "Premium" : "Standard"}`);
+      } else {
+        lines.push("Seat type: Not reported");
+      }
+      lines.push(`Usage: ${metadata.planLimit ? `${metadata.planLimit} vs Standard` : "Not reported"}`);
+      const noFiveHourCap = Array.isArray(metadata.quotaPolicy) && metadata.quotaPolicy.includes("no_five_hour_cap");
+      lines.push(`5-hour policy: ${noFiveHourCap ? "No 5h limit" : "Not reported"}`);
+    }
+    if (rawPlan && rawPlan !== family) lines.push(`Raw plan: ${rawPlan}`);
+    return lines.length ? `<span class="account-entitlement">${lines.map((line) => escapeHTML(line)).join("<br>")}</span>` : "";
+  }
+
+  function quotaProtectionMarkup(account, health) {
+    const protection = health.quotaProtection;
+    if (!protection?.supported) {
+      return `<div class="quota-protection quota-protection-unavailable" title="Not available for API-key account"><span>Protection</span><strong>Unavailable</strong></div>`;
+    }
+    const protectionMessage = protection.message || (protection.blocked ? "Protected: threshold reached" : protection.enabled ? "Protection active" : "Protection disabled");
+    const window = protection.effectiveWindow;
+    const windowDetail = window?.present
+      ? ` · ${window.label || "Window"} ${quotaPercent(window.remainingPercent ?? window.percentage)}% left`
+      : "";
+    const state = protection.blocked ? "Blocked" : protection.enabled ? "On" : "Off";
+    return `<details class="quota-protection"><summary><span>Protection</span><strong>${escapeHTML(state)}</strong></summary>
+      <div class="quota-protection-body">
+        <div class="quota-detail"><strong>${escapeHTML(protectionMessage)}</strong>${escapeHTML(windowDetail)}</div>
+        <div class="quota-protection-controls">
+          <label><input type="checkbox" data-quota-protection-enabled="${escapeHTML(account.id)}"${protection.enabled ? " checked" : ""}> Protect quota</label>
+          <label>Threshold <input class="quota-threshold-input" type="number" min="0" max="100" step="1" value="${quotaPercent(protection.threshold)}" data-quota-protection-threshold="${escapeHTML(account.id)}">%</label>
+          <button class="button quiet" type="button" data-quota-protection-save="${escapeHTML(account.id)}">Save</button>
+        </div>
+        <div class="quota-detail">Duplicate slots share upstream capacity; this threshold applies only to this local slot.</div>
+      </div>
+    </details>`;
+  }
   function ownerNoteInput(account, publicMode = false) {
     const ref = publicMode ? account.poolRef : account.id;
     if (!ref) return "";
@@ -676,9 +822,9 @@
       const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
       return `<tr data-account-row="${escapeHTML(account.id)}">
-        <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${ownerNoteInput(account)}</div></td>
+        <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${accountEntitlementMarkup(account)}${ownerNoteInput(account)}</div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
-        <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt)}</td>
+        <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt, health.quotaFreshness, health.lastSuccessfulRefreshAt, health.quotaMetering)}${quotaProtectionMarkup(account, health)}</td>
         <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)} · ${escapeHTML(routeCount)}</div></td>
         <td class="cache-column">${cacheHitMarkup(health, "main", account.id)}</td>
         <td class="cache-column">${cacheHitMarkup(health, "subagent")}</td>
@@ -703,7 +849,7 @@
       const metadata = account.detail || "";
       const tone = account.statusTone || account.status || "standby";
       const label = account.statusLabel || statusLabel(account.status);
-      const quota = account.quotaUnavailable ? '<span class="quota-unknown">Quota unavailable</span>' : quotaMarkup(account.remainingQuota, account.quota, null, null);
+      const quota = account.quotaUnavailable ? '<span class="quota-unknown">Quota unavailable</span>' : quotaMarkup(account.remainingQuota, account.quota, null, null, account.quotaFreshness, account.lastSuccessfulRefreshAt, account.quotaMetering);
       const action = account.poolRef && account.poolAction
         ? `<button class="button ${account.poolAction === "repair" ? "primary" : account.poolAction === "pool-remove" ? "warn" : "secondary"}" type="button" data-public-pool-action="${escapeHTML(account.poolAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${escapeHTML(account.poolActionLabel || "Update")}</button>`
         : "";
@@ -733,6 +879,7 @@
     auth_failover: "Auth failover",
     transport_failover: "Transport failover",
     repeated_5xx_failover: "Repeated 5xx failover",
+    upstream_response_failed: "Upstream response failed",
   }[value] || "Routing result");
 
   function renderRoutingCacheEvents(events) {
@@ -754,11 +901,14 @@
         event.promptCacheKeyHash ? `cache ${event.promptCacheKeyHash}` : "",
       ].filter(Boolean).join(" · ");
       const cacheTone = event.cacheHit ? "hit" : event.coldCacheEligible ? "cold" : "";
+      const terminal = event.terminalEvent
+        ? `<span class="event-secondary">${escapeHTML(`${event.terminalEvent}${event.terminalFailureClass ? ` · ${event.terminalFailureClass}` : ""}${event.terminalErrorCode ? ` · ${event.terminalErrorCode}` : ""}`)}</span>`
+        : "";
       return `<tr title="${escapeHTML(identifiers)}">
         <td>${escapeHTML(new Date(event.timestamp).toLocaleTimeString())}</td>
         <td><span class="agent-kind ${escapeHTML(event.agentKind)}">${escapeHTML(event.agentKind || "main")}</span></td>
         <td>${escapeHTML(event.accountLabel || "Credential")}</td>
-        <td><span class="routing-outcome">${escapeHTML(routingOutcomeLabel(event.routingOutcome))}</span>${failover}<span class="event-secondary">${escapeHTML(event.routingSource || "fallback")}</span></td>
+        <td><span class="routing-outcome">${escapeHTML(routingOutcomeLabel(event.routingOutcome))}</span>${failover}<span class="event-secondary">${escapeHTML(event.routingSource || "fallback")}</span>${terminal}</td>
         <td class="event-cache ${cacheTone}">${escapeHTML(read)}</td>
         <td>${event.usageObserved ? escapeHTML(formatTokens(event.inputTokens)) : "—"}</td>
       </tr>`;
@@ -869,6 +1019,26 @@
       notify("Account updated");
       refresh(true);
     } catch (error) { notify(error.message, true); }
+  }
+
+  async function updateQuotaProtection(accountId) {
+    const enabledInput = document.querySelector(`[data-quota-protection-enabled="${CSS.escape(accountId)}"]`);
+    const thresholdInput = document.querySelector(`[data-quota-protection-threshold="${CSS.escape(accountId)}"]`);
+    const threshold = Number(thresholdInput?.value);
+    if (!Number.isInteger(threshold) || threshold < 0 || threshold > 100) {
+      notify("Quota protection threshold must be an integer from 0 to 100", true);
+      return;
+    }
+    try {
+      await api(`/accounts/${encodeURIComponent(accountId)}/quota-protection/set`, {
+        method: "POST",
+        body: JSON.stringify({ enabled: Boolean(enabledInput?.checked), threshold }),
+      });
+      notify("Quota protection updated");
+      refresh(true);
+    } catch (error) {
+      notify(error.message, true);
+    }
   }
 
   async function handlePublicPoolAction(button) {
@@ -1047,6 +1217,7 @@
   });
 
   $("#refresh-button").addEventListener("click", () => refresh());
+  $("#theme-select").addEventListener("change", (event) => applyTheme(event.currentTarget.value, true));
   $("#cache-window-reset").addEventListener("click", async () => {
     try { await api("/cache/reset", { method: "POST" }); notify("Cache window reset"); refresh(true); }
     catch (error) { notify(error.message, true); }
@@ -1073,6 +1244,11 @@
         try { await api(`/accounts/${encodeURIComponent(id)}/cache/reset`, { method: "POST" }); notify("Account cache window reset"); refresh(true); }
         catch (error) { notify(error.message, true); }
       })();
+      return;
+    }
+    const protectionButton = event.target.closest("[data-quota-protection-save]");
+    if (protectionButton) {
+      updateQuotaProtection(protectionButton.dataset.quotaProtectionSave);
       return;
     }
     const button = event.target.closest("[data-account-action]");
