@@ -77,12 +77,16 @@ const (
 	promptCacheBucketsDefault = 4
 	quotaRefreshInterval      = 5 * time.Minute
 	quotaRefreshTimeout       = 30 * time.Second
-	codexAuthReadAttempts     = 20
-	codexAuthReadRetryDelay   = 50 * time.Millisecond
-	upstreamFirstByteTimeout  = 45 * time.Second
-	upstream5xxCooldown       = 10 * time.Second
-	upstream5xxFailoverAfter  = 3
-	upstream5xxFailureWindow  = 2 * time.Minute
+	// Quota telemetry is refreshed every five minutes. Give one missed poll a
+	// grace interval for display, but do not use freshness itself as a routing
+	// gate: SPEC section 6.4 deliberately keeps telemetry failures fail-open.
+	quotaTelemetryFreshness  = 10 * time.Minute
+	codexAuthReadAttempts    = 20
+	codexAuthReadRetryDelay  = 50 * time.Millisecond
+	upstreamFirstByteTimeout = 45 * time.Second
+	upstream5xxCooldown      = 10 * time.Second
+	upstream5xxFailoverAfter = 3
+	upstream5xxFailureWindow = 2 * time.Minute
 	// Codex treats remote model metadata as authoritative for ChatGPT-backed
 	// providers. This fallback must remain non-empty or a schema-only fix would
 	// silently remove the coding-agent instructions after a successful refresh.
@@ -122,16 +126,31 @@ type account struct {
 	AccountID        string `json:"accountId,omitempty"`
 	OrganizationName string `json:"organizationName,omitempty"`
 	// Deprecated: migrated into OrganizationName at load time. Not exposed in admin APIs.
-	OrganizationNameOverride string   `json:"organizationNameOverride,omitempty"`
-	PlanType                 string   `json:"planType,omitempty"`
-	PlanLimit                string   `json:"planLimit,omitempty"`
-	PlanRank                 int      `json:"planRank,omitempty"`
-	AuthType                 string   `json:"authType"`
-	CodexHome                string   `json:"codexHome,omitempty"`
-	Enabled                  bool     `json:"enabled"`
-	InPool                   bool     `json:"inPool"`
-	Priority                 int      `json:"priority"`
-	RemainingQuota           *int     `json:"remainingQuota,omitempty"`
+	OrganizationNameOverride string `json:"organizationNameOverride,omitempty"`
+	PlanType                 string `json:"planType,omitempty"`
+	PlanLimit                string `json:"planLimit,omitempty"`
+	PlanRank                 int    `json:"planRank,omitempty"`
+	// RawPlanType preserves the sanitized upstream wire value. PlanFamily is the
+	// explicit display/ranking family; neither field is evidence of a Business
+	// Standard/Premium seat. SeatType must stay empty until a supported endpoint
+	// and exact field path are proven with a sanitized real fixture.
+	RawPlanType string `json:"rawPlanType,omitempty"`
+	PlanFamily  string `json:"planFamily,omitempty"`
+	SeatType    string `json:"seatType,omitempty"`
+	// SeatTypeRaw is display-only forward compatibility for an authoritative but
+	// not-yet-recognized seat value. It must never grant models or capacity.
+	SeatTypeRaw    string   `json:"seatTypeRaw,omitempty"`
+	QuotaPolicy    []string `json:"quotaPolicy,omitempty"`
+	AuthType       string   `json:"authType"`
+	CodexHome      string   `json:"codexHome,omitempty"`
+	Enabled        bool     `json:"enabled"`
+	InPool         bool     `json:"inPool"`
+	Priority       int      `json:"priority"`
+	RemainingQuota *int     `json:"remainingQuota,omitempty"`
+	// Quota protection is local-slot policy, not upstream-account capacity.
+	// Missing fields load as disabled so upgrades preserve fail-open routing.
+	QuotaProtectionEnabled   bool     `json:"quotaProtectionEnabled,omitempty"`
+	QuotaProtectionThreshold int      `json:"quotaProtectionThreshold,omitempty"`
 	AllowedModels            []string `json:"allowedModels,omitempty"`
 	ExcludedModels           []string `json:"excludedModels,omitempty"`
 	UpstreamBaseURL          string   `json:"upstreamBaseUrl,omitempty"`
@@ -164,13 +183,70 @@ type cooldown struct {
 }
 
 type quotaWindow struct {
-	Percentage    int    `json:"percentage"`
-	ResetAt       *int64 `json:"resetAt,omitempty"`
-	WindowMinutes *int64 `json:"windowMinutes,omitempty"`
-	Present       bool   `json:"present"`
+	Role             string   `json:"role,omitempty"`
+	Label            string   `json:"label,omitempty"`
+	Percentage       int      `json:"percentage"`
+	UsedPercent      *float64 `json:"usedPercent,omitempty"`
+	RemainingPercent *float64 `json:"remainingPercent,omitempty"`
+	ResetAt          *int64   `json:"resetAt,omitempty"`
+	WindowMinutes    *int64   `json:"windowMinutes,omitempty"`
+	// Observed means the upstream returned a window object. Present is stricter:
+	// it is true only when used_percent was an explicit valid number.
+	Observed bool `json:"observed,omitempty"`
+	Present  bool `json:"present"`
+}
+
+type quotaCredits struct {
+	HasCredits bool    `json:"hasCredits"`
+	Unlimited  bool    `json:"unlimited"`
+	Balance    *string `json:"balance,omitempty"`
+}
+
+type quotaSpendControl struct {
+	Reached          bool   `json:"reached"`
+	Source           string `json:"source,omitempty"`
+	Limit            string `json:"limit,omitempty"`
+	Used             string `json:"used,omitempty"`
+	Remaining        string `json:"remaining,omitempty"`
+	RemainingPercent *int   `json:"remainingPercent,omitempty"`
+	ResetAt          *int64 `json:"resetAt,omitempty"`
+}
+
+type quotaLimit struct {
+	LimitID          string        `json:"limitId,omitempty"`
+	LimitName        string        `json:"limitName,omitempty"`
+	Primary          quotaWindow   `json:"primary"`
+	Secondary        quotaWindow   `json:"secondary"`
+	Windows          []quotaWindow `json:"windows,omitempty"`
+	Allowed          *bool         `json:"allowed,omitempty"`
+	LimitReached     *bool         `json:"limitReached,omitempty"`
+	Exhausted        bool          `json:"exhausted"`
+	ExhaustionReason string        `json:"exhaustionReason,omitempty"`
+}
+
+type quotaResetCredits struct {
+	AvailableCount *int64 `json:"availableCount,omitempty"`
 }
 
 type accountQuota struct {
+	LimitID              string             `json:"limitId,omitempty"`
+	LimitName            string             `json:"limitName,omitempty"`
+	Primary              quotaWindow        `json:"primary"`
+	Secondary            quotaWindow        `json:"secondary"`
+	Windows              []quotaWindow      `json:"windows,omitempty"`
+	Credits              *quotaCredits      `json:"credits,omitempty"`
+	IndividualLimit      *quotaSpendControl `json:"individualLimit,omitempty"`
+	Allowed              *bool              `json:"allowed,omitempty"`
+	LimitReached         *bool              `json:"limitReached,omitempty"`
+	RateLimitReachedType string             `json:"rateLimitReachedType,omitempty"`
+	AdditionalLimits     []quotaLimit       `json:"additionalLimits,omitempty"`
+	ResetCredits         *quotaResetCredits `json:"resetCredits,omitempty"`
+	Exhausted            bool               `json:"exhausted"`
+	ExhaustionReason     string             `json:"exhaustionReason,omitempty"`
+	Provenance           string             `json:"provenance,omitempty"`
+	ObservedAt           time.Time          `json:"observedAt,omitempty"`
+	// Hourly/Weekly are compatibility aliases only. They are populated by actual
+	// 300-minute and 10,080-minute durations and must not drive new UI semantics.
 	Hourly quotaWindow `json:"hourly"`
 	Weekly quotaWindow `json:"weekly"`
 }
@@ -182,13 +258,22 @@ type quotaErrorInfo struct {
 }
 
 type quotaSnapshot struct {
-	AccountID        string          `json:"accountId"`
-	OrganizationName string          `json:"organizationName,omitempty"`
-	PlanType         string          `json:"planType,omitempty"`
-	PlanLimit        string          `json:"planLimit,omitempty"`
-	Quota            *accountQuota   `json:"quota,omitempty"`
-	UsageUpdatedAt   time.Time       `json:"usageUpdatedAt,omitempty"`
-	QuotaError       *quotaErrorInfo `json:"quotaError,omitempty"`
+	AccountID               string          `json:"accountId"`
+	OrganizationName        string          `json:"organizationName,omitempty"`
+	RawPlanType             string          `json:"rawPlanType,omitempty"`
+	PlanFamily              string          `json:"planFamily,omitempty"`
+	PlanType                string          `json:"planType,omitempty"`
+	PlanLimit               string          `json:"planLimit,omitempty"`
+	SeatType                string          `json:"seatType,omitempty"`
+	SeatTypeRaw             string          `json:"seatTypeRaw,omitempty"`
+	QuotaPolicy             []string        `json:"quotaPolicy,omitempty"`
+	Quota                   *accountQuota   `json:"quota,omitempty"`
+	ObservedAt              time.Time       `json:"observedAt,omitempty"`
+	LastSuccessfulRefreshAt time.Time       `json:"lastSuccessfulRefreshAt,omitempty"`
+	UsageUpdatedAt          time.Time       `json:"usageUpdatedAt,omitempty"`
+	Freshness               string          `json:"freshness,omitempty"`
+	Provenance              string          `json:"provenance,omitempty"`
+	QuotaError              *quotaErrorInfo `json:"quotaError,omitempty"`
 }
 
 type stickySession struct {
@@ -277,6 +362,9 @@ type routingCacheEvent struct {
 	PromptCacheKeyHash    string    `json:"promptCacheKeyHash,omitempty"`
 	RoutingOutcome        string    `json:"routingOutcome"`
 	RoutingSource         string    `json:"routingSource"`
+	TerminalEvent         string    `json:"terminalEvent,omitempty"`
+	TerminalFailureClass  string    `json:"terminalFailureClass,omitempty"`
+	TerminalErrorCode     string    `json:"terminalErrorCode,omitempty"`
 	ParentAffinity        string    `json:"parentAffinity"`
 	FailoverFromAccountID string    `json:"failoverFromAccountId,omitempty"`
 	UsageObserved         bool      `json:"usageObserved"`
@@ -379,11 +467,13 @@ type state struct {
 	// LegacyThroughputBuckets is read once when upgrading from the persisted
 	// 30-minute implementation, then migrated into app memory and cleared before
 	// the next runtime save. New throughput history must never be written here.
-	LegacyThroughputBuckets []throughputBucket `json:"throughputBuckets,omitempty"`
-	RequestCount            uint64             `json:"requestCount"`
-	SuccessCount            uint64             `json:"successCount"`
-	FailureCount            uint64             `json:"failureCount"`
-	UpdatedAt               time.Time          `json:"updatedAt"`
+	LegacyThroughputBuckets     []throughputBucket `json:"throughputBuckets,omitempty"`
+	RequestCount                uint64             `json:"requestCount"`
+	SuccessCount                uint64             `json:"successCount"`
+	FailureCount                uint64             `json:"failureCount"`
+	UpstreamResponseFailedCount uint64             `json:"upstreamResponseFailedCount,omitempty"`
+	StreamIncompleteCount       uint64             `json:"streamIncompleteCount,omitempty"`
+	UpdatedAt                   time.Time          `json:"updatedAt"`
 }
 
 type app struct {
@@ -646,9 +736,15 @@ func (a *app) load() error {
 			a.config.Accounts[i].OrganizationName = cleanOrganizationName(a.config.Accounts[i].OrganizationNameOverride)
 		}
 		a.config.Accounts[i].OrganizationNameOverride = ""
-		a.config.Accounts[i].PlanType = normalizePlanType(a.config.Accounts[i].PlanType)
+		normalizeAccountPlanMetadata(&a.config.Accounts[i])
 		a.config.Accounts[i].PlanLimit = cleanPlanLimit(a.config.Accounts[i].PlanLimit)
-		a.config.Accounts[i].PlanRank = planRank(a.config.Accounts[i].PlanType)
+		a.config.Accounts[i].PlanRank = planRank(effectivePlanFamily(a.config.Accounts[i]))
+		if a.config.Accounts[i].QuotaProtectionThreshold < 0 || a.config.Accounts[i].QuotaProtectionThreshold > 100 {
+			// Invalid persisted policy must fail open rather than unexpectedly
+			// removing a credential from routing after an upgrade.
+			a.config.Accounts[i].QuotaProtectionEnabled = false
+			a.config.Accounts[i].QuotaProtectionThreshold = 0
+		}
 		if strings.TrimSpace(a.config.Accounts[i].Label) == "" {
 			a.config.Accounts[i].Label = accountDisplayName(a.config.Accounts[i])
 		}
@@ -656,6 +752,11 @@ func (a *app) load() error {
 			a.config.Accounts[i].CodexHome = a.accountCodexHome(a.config.Accounts[i].ID)
 			a.config.Accounts[i].UpstreamBaseURL = ""
 			a.config.Accounts[i].UpstreamAPIKey = ""
+		} else {
+			// API-key providers are API-metered and do not have ChatGPT
+			// subscription windows in this implementation.
+			a.config.Accounts[i].QuotaProtectionEnabled = false
+			a.config.Accounts[i].QuotaProtectionThreshold = 0
 		}
 	}
 	if a.codexGatewayMode != "direct" {
@@ -1223,6 +1324,14 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		info.FailoverOutcome = failoverOutcome
 		throughput.CompletedAt = info.CompletedAt
 		throughput.Usage = info.Usage
+		if info.TerminalEvent == "response.failed" || info.TerminalEvent == "response.incomplete" {
+			// Bytes have already been forwarded. Never retry another account here:
+			// splicing a second stream could duplicate work and corrupt the SSE
+			// sequence. Record the terminal failure without refreshing affinity.
+			throughput.Success = false
+			a.markTerminalResponseFailureWithMeasurement(route, model, candidate.ID, info, throughput)
+			return
+		}
 		// Account health treats a well-formed non-retryable upstream response as
 		// a healthy connection, but client throughput success is stricter: only
 		// a 2xx response belongs in the success numerator.
@@ -1415,6 +1524,9 @@ type proxyResponseInfo struct {
 	ResponseID            string
 	Usage                 promptCacheUsage
 	CompletedAt           time.Time
+	TerminalEvent         string
+	TerminalFailureClass  string
+	TerminalErrorCode     string
 	RequestID             string
 	FailoverFromAccountID string
 	FailoverOutcome       string
@@ -1548,19 +1660,32 @@ func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResp
 	var info proxyResponseInfo
 	reader := bufio.NewReader(body)
 	flusher, _ := w.(http.Flusher)
+	var eventBlock strings.Builder
+	mergeBlock := func() {
+		if eventBlock.Len() == 0 {
+			return
+		}
+		info.merge(responseInfoFromSSEBlock(eventBlock.String()))
+		eventBlock.Reset()
+	}
 	for {
 		line, err := reader.ReadString('\n')
 		if line != "" {
 			_, _ = io.WriteString(w, line)
-			info.merge(responseInfoFromSSELine(line))
+			eventBlock.WriteString(line)
+			if strings.TrimRight(line, "\r\n") == "" {
+				mergeBlock()
+			}
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
 		if errors.Is(err, io.EOF) {
+			mergeBlock()
 			break
 		}
 		if err != nil {
+			mergeBlock()
 			break
 		}
 	}
@@ -1589,25 +1714,91 @@ func (info *proxyResponseInfo) merge(next proxyResponseInfo) {
 	if !next.CompletedAt.IsZero() {
 		info.CompletedAt = next.CompletedAt
 	}
+	if next.TerminalEvent != "" {
+		info.TerminalEvent = next.TerminalEvent
+		info.TerminalFailureClass = next.TerminalFailureClass
+		info.TerminalErrorCode = next.TerminalErrorCode
+	}
 }
 
 func responseInfoFromSSELine(line string) proxyResponseInfo {
-	line = strings.TrimSpace(line)
-	if !strings.HasPrefix(line, "data:") {
-		return proxyResponseInfo{}
+	return responseInfoFromSSEBlock(line)
+}
+
+func responseInfoFromSSEBlock(block string) proxyResponseInfo {
+	var eventType string
+	dataLines := make([]string, 0, 1)
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		switch {
+		case strings.HasPrefix(line, "event:"):
+			eventType = cleanMetadataToken(strings.TrimSpace(strings.TrimPrefix(line, "event:")))
+		case strings.HasPrefix(line, "data:"):
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
 	}
-	data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	data := strings.Join(dataLines, "\n")
 	if data == "" || data == "[DONE]" {
+		if isTerminalResponseEvent(eventType) && eventType != "response.completed" {
+			return proxyResponseInfo{TerminalEvent: eventType, TerminalFailureClass: terminalFailureClass(eventType, "")}
+		}
 		return proxyResponseInfo{}
 	}
 	var payload map[string]any
 	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		if isTerminalResponseEvent(eventType) && eventType != "response.completed" {
+			return proxyResponseInfo{TerminalEvent: eventType, TerminalFailureClass: terminalFailureClass(eventType, "")}
+		}
 		return proxyResponseInfo{}
 	}
-	if response, ok := payload["response"].(map[string]any); ok {
-		return responseInfoFromPayload(response)
+	if payloadType, _ := payload["type"].(string); isTerminalResponseEvent(cleanMetadataToken(payloadType)) {
+		eventType = cleanMetadataToken(payloadType)
 	}
-	return responseInfoFromPayload(payload)
+	var info proxyResponseInfo
+	if response, ok := payload["response"].(map[string]any); ok {
+		info = responseInfoFromPayload(response)
+		if errorPayload, _ := response["error"].(map[string]any); errorPayload != nil {
+			info.TerminalErrorCode = sanitizedErrorCode(claimString(errorPayload, "code"))
+		}
+	} else {
+		info = responseInfoFromPayload(payload)
+		if errorPayload, _ := payload["error"].(map[string]any); errorPayload != nil {
+			info.TerminalErrorCode = sanitizedErrorCode(claimString(errorPayload, "code"))
+		}
+	}
+	if isTerminalResponseEvent(eventType) {
+		info.TerminalEvent = eventType
+		info.TerminalFailureClass = terminalFailureClass(eventType, info.TerminalErrorCode)
+	}
+	return info
+}
+
+func isTerminalResponseEvent(value string) bool {
+	switch value {
+	case "response.completed", "response.failed", "response.incomplete":
+		return true
+	default:
+		return false
+	}
+}
+
+func terminalFailureClass(eventType, code string) string {
+	if eventType == "response.incomplete" {
+		return "incomplete"
+	}
+	if eventType != "response.failed" {
+		return ""
+	}
+	switch sanitizedErrorCode(code) {
+	case "rate_limit_exceeded", "insufficient_quota", "usage_not_included", "server_is_overloaded", "slow_down":
+		return "capacity"
+	case "account_auth_failed", "authentication_error", "invalid_api_key", "invalid_token", "token_invalidated", "token_revoked", "unauthorized", "forbidden":
+		return "authentication"
+	case "context_length_exceeded", "invalid_prompt", "cyber_policy", "content_policy_violation", "policy_violation":
+		return "request"
+	default:
+		return "unknown"
+	}
 }
 
 func responseInfoFromPayload(payload map[string]any) proxyResponseInfo {
@@ -1787,7 +1978,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "summary": a.dashboardSummaryLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -1972,17 +2163,31 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		input.AccountID = ""
 		input.OrganizationName = ""
 		input.PlanType = ""
+		input.RawPlanType = ""
+		input.PlanFamily = ""
 		input.PlanLimit = ""
+		input.SeatType = ""
+		input.SeatTypeRaw = ""
+		input.QuotaPolicy = nil
 		input.PlanRank = 0
+		if input.QuotaProtectionThreshold < 0 || input.QuotaProtectionThreshold > 100 {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "quotaProtectionThreshold must be an integer from 0 to 100")
+			return
+		}
 		// Verification markers are internal lifecycle state, never client input.
 		// Accepting them here could create a permanently blocked slot or inject an
 		// identity comparison baseline that never came from a verified login.
 		input.PendingAuthVerification = false
 		input.PendingAuthExpectedAccountID = ""
 	} else {
-		input.PlanType = normalizePlanType(input.PlanType)
+		normalizeAccountPlanMetadata(&input)
 		input.PlanLimit = cleanPlanLimit(input.PlanLimit)
-		input.PlanRank = planRank(input.PlanType)
+		input.PlanRank = planRank(effectivePlanFamily(input))
+		input.SeatType = ""
+		input.SeatTypeRaw = ""
+		input.QuotaPolicy = nil
+		input.QuotaProtectionEnabled = false
+		input.QuotaProtectionThreshold = 0
 	}
 	generateID := input.ID == ""
 	if !generateID && !validAccountID(input.ID) {
@@ -2058,7 +2263,8 @@ func (a *app) handleRefreshAllQuota(w http.ResponseWriter, r *http.Request) {
 			results = append(results, map[string]any{"accountId": accountID, "ok": false, "error": map[string]any{"code": "quota_refresh_failed", "message": err.Error()}})
 			continue
 		}
-		results = append(results, map[string]any{"accountId": accountID, "ok": true, "quota": snapshot.Quota, "organizationName": publicOrganizationName(snapshot.OrganizationName), "planType": snapshot.PlanType, "planLimit": snapshot.PlanLimit, "usageUpdatedAt": snapshot.UsageUpdatedAt})
+		snapshot = quotaSnapshotForDisplay(snapshot, time.Now().UTC())
+		results = append(results, map[string]any{"accountId": accountID, "ok": true, "quota": snapshot.Quota, "organizationName": publicOrganizationName(snapshot.OrganizationName), "rawPlanType": snapshot.RawPlanType, "planFamily": snapshot.PlanFamily, "planType": snapshot.PlanType, "planLimit": snapshot.PlanLimit, "seatType": snapshot.SeatType, "seatTypeRaw": snapshot.SeatTypeRaw, "quotaPolicy": snapshot.QuotaPolicy, "usageUpdatedAt": snapshot.UsageUpdatedAt, "lastSuccessfulRefreshAt": snapshot.LastSuccessfulRefreshAt, "freshness": snapshot.Freshness, "provenance": snapshot.Provenance})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
 }
@@ -2165,7 +2371,8 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusBadGateway, "quota_refresh_failed", err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "quota": snapshot.Quota, "organizationName": publicOrganizationName(snapshot.OrganizationName), "planType": snapshot.PlanType, "planLimit": snapshot.PlanLimit, "usageUpdatedAt": snapshot.UsageUpdatedAt})
+		snapshot = quotaSnapshotForDisplay(snapshot, time.Now().UTC())
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "quota": snapshot.Quota, "organizationName": publicOrganizationName(snapshot.OrganizationName), "rawPlanType": snapshot.RawPlanType, "planFamily": snapshot.PlanFamily, "planType": snapshot.PlanType, "planLimit": snapshot.PlanLimit, "seatType": snapshot.SeatType, "seatTypeRaw": snapshot.SeatTypeRaw, "quotaPolicy": snapshot.QuotaPolicy, "usageUpdatedAt": snapshot.UsageUpdatedAt, "lastSuccessfulRefreshAt": snapshot.LastSuccessfulRefreshAt, "freshness": snapshot.Freshness, "provenance": snapshot.Provenance})
 		return
 	}
 	defer a.mu.Unlock()
@@ -2244,6 +2451,24 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		item.RemainingQuota = request.RemainingQuota
+	case "quota-protection/set":
+		if !isCodexDeviceAuth(*item) {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "quota protection is only available for Codex device-auth accounts")
+			return
+		}
+		var request struct {
+			Enabled   bool `json:"enabled"`
+			Threshold *int `json:"threshold"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&request); err != nil || request.Threshold == nil || *request.Threshold < 0 || *request.Threshold > 100 {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "threshold must be an integer from 0 to 100")
+			return
+		}
+		// This is deliberately per local slot. Duplicate slots may share upstream
+		// capacity, but changing one slot must not silently mutate another slot's
+		// protection policy or its sticky history.
+		item.QuotaProtectionEnabled = request.Enabled
+		item.QuotaProtectionThreshold = *request.Threshold
 	default:
 		writeOpenAIError(w, 404, "not_found", "account action not found")
 		return
@@ -2719,8 +2944,8 @@ func (a *app) identityRepresentativeBeforeLocked(left, right account, model stri
 	if leftCooldown != rightCooldown {
 		return !leftCooldown
 	}
-	leftQuotaClass, leftRemaining := a.identityRepresentativeQuotaClassLocked(left)
-	rightQuotaClass, rightRemaining := a.identityRepresentativeQuotaClassLocked(right)
+	leftQuotaClass, leftRemaining := a.identityRepresentativeQuotaClassLocked(left, model, now)
+	rightQuotaClass, rightRemaining := a.identityRepresentativeQuotaClassLocked(right, model, now)
 	if leftQuotaClass != rightQuotaClass {
 		return leftQuotaClass > rightQuotaClass
 	}
@@ -2730,17 +2955,17 @@ func (a *app) identityRepresentativeBeforeLocked(left, right account, model stri
 	return a.preferredBeforeLocked(left, right)
 }
 
-func (a *app) identityRepresentativeQuotaClassLocked(item account) (int, int) {
+func (a *app) identityRepresentativeQuotaClassLocked(item account, model string, now time.Time) (int, int) {
 	snapshot := a.state.Quotas[item.ID]
-	if snapshot.QuotaError != nil {
+	if quotaErrorBlocksRouting(snapshot.QuotaError) {
 		return 0, 0
 	}
 	if snapshot.Quota != nil {
-		remaining := remainingQuotaHint(*snapshot.Quota)
-		if remaining > 0 {
-			return 2, remaining
+		if quotaExplicitlyBlocksRouting(*snapshot.Quota, model, now) || a.quotaProtectionStatusLocked(item, snapshot, now).Blocked {
+			return 0, 0
 		}
-		return 0, 0
+		remaining := remainingQuotaHint(*snapshot.Quota)
+		return 2, remaining
 	}
 	if available, decided := manualQuotaAvailable(item); decided {
 		if available {
@@ -2892,10 +3117,13 @@ func (a *app) quotaAvailableLocked(item account, model string, now time.Time) bo
 		return false
 	}
 	if snapshot.Quota != nil {
-		if remainingQuotaHint(*snapshot.Quota) > 0 {
-			return true
+		if quotaExplicitlyBlocksRouting(*snapshot.Quota, model, now) {
+			return a.sameIdentityQuotaHintAvailableLocked(item, model, now)
 		}
-		return a.sameIdentityQuotaHintAvailableLocked(item, model, now)
+		if a.quotaProtectionStatusLocked(item, snapshot, now).Blocked {
+			return false
+		}
+		return true
 	}
 	if available, decided := manualQuotaAvailable(item); decided {
 		if available {
@@ -2906,13 +3134,17 @@ func (a *app) quotaAvailableLocked(item account, model string, now time.Time) bo
 	return true
 }
 
-func (a *app) quotaSnapshotAvailableLocked(accountID string) (bool, bool) {
+func (a *app) quotaSnapshotAvailableLocked(item account, model string, now time.Time) (bool, bool) {
+	accountID := item.ID
 	snapshot := a.state.Quotas[accountID]
 	if quotaErrorBlocksRouting(snapshot.QuotaError) {
 		return false, true
 	}
 	if snapshot.Quota != nil {
-		return remainingQuotaHint(*snapshot.Quota) > 0, true
+		if quotaExplicitlyBlocksRouting(*snapshot.Quota, model, now) || a.quotaProtectionStatusLocked(item, snapshot, now).Blocked {
+			return false, true
+		}
+		return true, true
 	}
 	return false, false
 }
@@ -2922,6 +3154,92 @@ func manualQuotaAvailable(item account) (bool, bool) {
 		return *item.RemainingQuota > 0, true
 	}
 	return false, false
+}
+
+type quotaProtectionStatus struct {
+	Supported            bool         `json:"supported"`
+	Enabled              bool         `json:"enabled"`
+	Threshold            int          `json:"threshold"`
+	State                string       `json:"state"`
+	Message              string       `json:"message"`
+	Blocked              bool         `json:"blocked"`
+	EffectiveWindow      *quotaWindow `json:"effectiveWindow,omitempty"`
+	Freshness            string       `json:"freshness"`
+	LastSuccessfulUpdate time.Time    `json:"lastSuccessfulUpdate,omitempty"`
+}
+
+func (a *app) quotaProtectionStatusLocked(item account, snapshot quotaSnapshot, now time.Time) quotaProtectionStatus {
+	status := quotaProtectionStatus{
+		Supported:            isCodexDeviceAuth(item),
+		Enabled:              item.QuotaProtectionEnabled,
+		Threshold:            clampInt(item.QuotaProtectionThreshold, 0, 100),
+		State:                "disabled",
+		Message:              "Protection disabled",
+		Freshness:            quotaTelemetryState(snapshot, now),
+		LastSuccessfulUpdate: snapshot.LastSuccessfulRefreshAt,
+	}
+	if status.LastSuccessfulUpdate.IsZero() {
+		status.LastSuccessfulUpdate = snapshot.UsageUpdatedAt
+	}
+	if !status.Supported {
+		status.Message = "Protection unavailable: API-key accounts do not use ChatGPT quota windows"
+		return status
+	}
+	if !status.Enabled {
+		return status
+	}
+	if snapshot.Quota == nil {
+		status.State = "unavailable"
+		status.Message = "Protection unavailable: quota not reported; routing remains fail-open"
+		return status
+	}
+	var effective *quotaWindow
+	for _, duration := range []int64{300, 10080} {
+		for _, window := range quotaReportedWindows(*snapshot.Quota) {
+			if window.Present && window.WindowMinutes != nil && *window.WindowMinutes == duration {
+				copy := window
+				effective = &copy
+				break
+			}
+		}
+		if effective != nil {
+			break
+		}
+	}
+	if effective == nil {
+		status.State = "unavailable"
+		status.Message = "Protection unavailable: 5h/week quota not reported; routing remains fail-open"
+		return status
+	}
+	status.EffectiveWindow = effective
+	remaining := quotaWindowRemaining(*effective)
+	if remaining <= float64(status.Threshold) {
+		if effective.ResetAt != nil && now.Unix() >= *effective.ResetAt {
+			status.State = "unavailable"
+			status.Message = "Protection unavailable: observed threshold window reset expired; routing remains fail-open"
+			return status
+		}
+		if effective.ResetAt == nil && status.Freshness != "fresh" {
+			status.State = "unavailable"
+			status.Message = "Protection unavailable: quota telemetry is stale; routing remains fail-open"
+			return status
+		}
+		// A positively observed violation remains evidence until the same window
+		// resets, even if a later advisory refresh fails. This is narrower than
+		// fail-closed polling: missing/failed telemetry never creates a new block.
+		status.State = "blocked"
+		status.Message = "Protected: threshold reached"
+		status.Blocked = true
+		return status
+	}
+	if status.Freshness != "fresh" {
+		status.State = "unavailable"
+		status.Message = "Protection unavailable: quota not reported/stale; routing remains fail-open"
+		return status
+	}
+	status.State = "available"
+	status.Message = "Protection active: quota is above threshold"
+	return status
 }
 
 func (a *app) sameIdentityQuotaHintAvailableLocked(item account, model string, now time.Time) bool {
@@ -2953,7 +3271,7 @@ func (a *app) sameIdentityQuotaHintAvailableLocked(item account, model string, n
 		if a.accountMetadataErrorLocked(candidate.ID) {
 			continue
 		}
-		if available, decided := a.quotaSnapshotAvailableLocked(candidate.ID); decided && available {
+		if available, decided := a.quotaSnapshotAvailableLocked(candidate, model, now); decided && available {
 			return true
 		}
 		if available, decided := manualQuotaAvailable(candidate); decided && available {
@@ -3158,6 +3476,61 @@ func (a *app) markSuccess(route routingDecision, model, accountID string, info p
 	a.markSuccessWithMeasurement(route, model, accountID, info, nil)
 }
 
+func (a *app) markTerminalResponseFailureWithMeasurement(route routingDecision, model, accountID string, info proxyResponseInfo, measurement *throughputMeasurement) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now().UTC()
+	a.finishThroughputMeasurementLocked(measurement, now)
+	class := info.TerminalFailureClass
+	if class == "" {
+		class = "unknown"
+	}
+	reason := codeOr(sanitizedErrorCode(info.TerminalErrorCode), "upstream_response_failed")
+	if info.TerminalEvent == "response.incomplete" {
+		reason = "stream_incomplete"
+	}
+	switch class {
+	case "capacity":
+		health := a.state.Health[accountID]
+		health.LastFailureAt = now
+		health.LastFailureReason = reason
+		health.ConsecutiveFailure++
+		a.state.Health[accountID] = health
+		duration := 30 * time.Second
+		if reason == "server_is_overloaded" || reason == "slow_down" {
+			duration = upstream5xxCooldown
+		}
+		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
+	case "authentication":
+		health := a.state.Health[accountID]
+		health.LastFailureAt = now
+		health.LastFailureReason = reason
+		health.ConsecutiveFailure++
+		a.state.Health[accountID] = health
+		if item := a.accountLocked(accountID); item != nil && isCodexDeviceAuth(*item) {
+			prior := a.state.Quotas[accountID]
+			prior.AccountID = accountID
+			prior.QuotaError = &quotaErrorInfo{Code: reason, Message: "account credential is unavailable; sign in again", Timestamp: now}
+			a.state.Quotas[accountID] = prior
+		} else {
+			a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(15 * time.Minute), Reason: reason})
+		}
+	}
+	// Request-specific and unknown terminal failures intentionally do not touch
+	// account health. Context length, invalid prompt, policy rejection, or a new
+	// unknown code does not prove another credential could serve the request.
+	a.recordPromptCacheResultWithRoutingLocked(accountID, model, route.Identity, info.Usage, false, false, false, "upstream_response_failed", now)
+	a.appendRoutingCacheEventLocked(route, model, accountID, info.FailoverFromAccountID, "upstream_response_failed", info, now)
+	a.state.RequestCount++
+	a.state.FailureCount++
+	if info.TerminalEvent == "response.failed" {
+		a.state.UpstreamResponseFailedCount++
+	} else if info.TerminalEvent == "response.incomplete" {
+		a.state.StreamIncompleteCount++
+	}
+	_ = a.saveLocked()
+}
+
 func (a *app) markSuccessWithMeasurement(route routingDecision, model, accountID string, info proxyResponseInfo, measurement *throughputMeasurement) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -3321,8 +3694,10 @@ func (a *app) persistedFailoverOutcomeLocked(accountID, model string, now time.T
 	if quotaErrorBlocksRouting(snapshot.QuotaError) {
 		return "auth_failover"
 	}
-	if snapshot.Quota != nil && remainingQuotaHint(*snapshot.Quota) <= 0 {
-		return "quota_failover"
+	if snapshot.Quota != nil {
+		if quotaExplicitlyBlocksRouting(*snapshot.Quota, model, now) || a.quotaProtectionStatusLocked(*item, snapshot, now).Blocked {
+			return "quota_failover"
+		}
 	}
 	if available, decided := manualQuotaAvailable(*item); decided && !available {
 		return "quota_failover"
@@ -3386,6 +3761,9 @@ func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accoun
 		PromptCacheKeyHash:    operationalIdentifierHash("prompt-cache", route.UpstreamPromptCacheKey),
 		RoutingOutcome:        routingOutcome,
 		RoutingSource:         routingEventSource(route.Source),
+		TerminalEvent:         info.TerminalEvent,
+		TerminalFailureClass:  info.TerminalFailureClass,
+		TerminalErrorCode:     sanitizedErrorCode(info.TerminalErrorCode),
 		ParentAffinity:        parentAffinity,
 		FailoverFromAccountID: failoverFromAccountID,
 		UsageObserved:         usage.Present,
@@ -4308,6 +4686,13 @@ func isCodexDeviceAuth(item account) bool {
 	return item.AuthType == "codex_device_auth"
 }
 
+func quotaMeteringKind(item account) string {
+	if isCodexDeviceAuth(item) {
+		return "chatgpt_subscription"
+	}
+	return "api_metered"
+}
+
 type codexAuthInfo struct {
 	AccessToken      string
 	AccountID        string
@@ -4353,16 +4738,22 @@ type codexRefreshResponse struct {
 }
 
 type codexUsageResponse struct {
-	PlanType            string                `json:"plan_type"`
-	SubscriptionPlan    string                `json:"subscription_plan"`
-	RateLimit           *codexRateLimitInfo   `json:"rate_limit"`
-	CodeReviewRateLimit *codexRateLimitInfo   `json:"code_review_rate_limit"`
-	ResetCredits        *codexResetCreditInfo `json:"rate_limit_reset_credits"`
+	PlanType             string                      `json:"plan_type"`
+	SubscriptionPlan     string                      `json:"subscription_plan"`
+	RateLimit            *codexRateLimitInfo         `json:"rate_limit"`
+	CodeReviewRateLimit  *codexRateLimitInfo         `json:"code_review_rate_limit"`
+	Credits              *codexCreditInfo            `json:"credits"`
+	SpendControl         *codexSpendControlInfo      `json:"spend_control"`
+	AdditionalRateLimits *[]codexAdditionalRateLimit `json:"additional_rate_limits"`
+	RateLimitReachedType codexReachedType            `json:"rate_limit_reached_type"`
+	ResetCredits         *codexResetCreditInfo       `json:"rate_limit_reset_credits"`
 }
 
 type codexSubscriptionMetadata struct {
 	AccountID        string
 	OrganizationName string
+	RawPlanType      string
+	PlanFamily       string
 	PlanType         string
 	PlanLimit        string
 }
@@ -4375,10 +4766,82 @@ type codexRateLimitInfo struct {
 }
 
 type codexWindowInfo struct {
-	UsedPercent        *int   `json:"used_percent"`
-	LimitWindowSeconds *int64 `json:"limit_window_seconds"`
-	ResetAfterSeconds  *int64 `json:"reset_after_seconds"`
-	ResetAt            *int64 `json:"reset_at"`
+	UsedPercent        optionalNumber `json:"used_percent"`
+	LimitWindowSeconds *int64         `json:"limit_window_seconds"`
+	ResetAfterSeconds  *int64         `json:"reset_after_seconds"`
+	ResetAt            *int64         `json:"reset_at"`
+}
+
+// optionalNumber deliberately accepts malformed future wire values without
+// failing the whole quota refresh. Only an explicitly reported JSON number is
+// percentage evidence; null, missing, strings, and objects stay Not reported.
+type optionalNumber struct {
+	Value    float64
+	Reported bool
+	Valid    bool
+}
+
+func (number *optionalNumber) UnmarshalJSON(data []byte) error {
+	number.Reported = true
+	if strings.TrimSpace(string(data)) == "null" {
+		return nil
+	}
+	var value float64
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil
+	}
+	number.Value = value
+	number.Valid = true
+	return nil
+}
+
+type codexCreditInfo struct {
+	HasCredits *bool   `json:"has_credits"`
+	Unlimited  *bool   `json:"unlimited"`
+	Balance    *string `json:"balance"`
+}
+
+type codexSpendControlInfo struct {
+	Reached         *bool                `json:"reached"`
+	IndividualLimit *codexSpendLimitInfo `json:"individual_limit"`
+}
+
+type codexSpendLimitInfo struct {
+	Source            string `json:"source"`
+	Limit             string `json:"limit"`
+	Used              string `json:"used"`
+	Remaining         string `json:"remaining"`
+	RemainingPercent  *int   `json:"remaining_percent"`
+	ResetAfterSeconds *int64 `json:"reset_after_seconds"`
+	ResetAt           *int64 `json:"reset_at"`
+}
+
+type codexAdditionalRateLimit struct {
+	LimitName      string              `json:"limit_name"`
+	MeteredFeature string              `json:"metered_feature"`
+	RateLimit      *codexRateLimitInfo `json:"rate_limit"`
+}
+
+type codexReachedType struct {
+	Type string
+}
+
+func (reached *codexReachedType) UnmarshalJSON(data []byte) error {
+	if strings.TrimSpace(string(data)) == "null" {
+		return nil
+	}
+	var object struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &object); err == nil && object.Type != "" {
+		reached.Type = cleanMetadataToken(object.Type)
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err == nil {
+		reached.Type = cleanMetadataToken(value)
+	}
+	return nil
 }
 
 type codexResetCreditInfo struct {
@@ -4514,7 +4977,7 @@ func (a *app) syncCliproxyAuthLocked(item account, force bool) error {
 		AccountID:        accountID,
 		OrganizationName: cleanOrganizationName(chooseString(info.OrganizationName, item.OrganizationName)),
 		Prefix:           cliproxyAccountPrefix(item.ID),
-		PlanType:         normalizePlanType(chooseString(info.PlanType, item.PlanType)),
+		PlanType:         cleanRawPlanType(chooseString(info.PlanType, chooseString(item.RawPlanType, item.PlanType))),
 		PlanLimit:        cleanPlanLimit(chooseString(info.PlanLimit, item.PlanLimit)),
 	}
 	if source.LastRefresh != nil {
@@ -4564,9 +5027,9 @@ func (a *app) updateCliproxyAuthMetadata(item account) error {
 		record.OrganizationName = cleanOrganizationName(item.OrganizationName)
 	}
 	if item.PlanType != "" {
-		record.PlanType = normalizePlanType(item.PlanType)
+		record.PlanType = cleanRawPlanType(chooseString(item.RawPlanType, item.PlanType))
 	}
-	if item.PlanLimit != "" || normalizePlanType(item.PlanType) == "pro" {
+	if item.PlanLimit != "" || effectivePlanFamily(item) == "pro" {
 		record.PlanLimit = cleanPlanLimit(item.PlanLimit)
 	}
 	record.Prefix = cliproxyAccountPrefix(item.ID)
@@ -4598,7 +5061,7 @@ func (a *app) cliproxyCodexAuth(item account) (codexAuthInfo, error) {
 	if err != nil || strings.TrimSpace(record.AccessToken) == "" {
 		return codexAuthInfo{}, fmt.Errorf("cliproxy auth is unavailable for account %s", item.ID)
 	}
-	info := codexAuthInfo{AccessToken: strings.TrimSpace(record.AccessToken), AccountID: strings.TrimSpace(record.AccountID), Email: normalizeEmail(record.Email), PlanType: normalizePlanType(record.PlanType), PlanLimit: cleanPlanLimit(record.PlanLimit)}
+	info := codexAuthInfo{AccessToken: strings.TrimSpace(record.AccessToken), AccountID: strings.TrimSpace(record.AccountID), Email: normalizeEmail(record.Email), PlanType: cleanRawPlanType(record.PlanType), PlanLimit: cleanPlanLimit(record.PlanLimit)}
 	if claims := jwtPayload(record.IDToken); claims != nil {
 		if info.Email == "" {
 			info.Email = normalizeEmail(claimString(claims, "email"))
@@ -4617,7 +5080,7 @@ func (a *app) cliproxyCodexAuth(item account) (codexAuthInfo, error) {
 				info.OrganizationName = organizationName
 			}
 			if info.PlanType == "" || info.PlanType == "unknown" {
-				info.PlanType = normalizePlanType(claimString(authClaims, "chatgpt_plan_type"))
+				info.PlanType = cleanRawPlanType(claimString(authClaims, "chatgpt_plan_type"))
 			}
 			if info.PlanLimit == "" {
 				info.PlanLimit = cleanPlanLimit(claimString(authClaims, "chatgpt_plan_type"))
@@ -4782,12 +5245,14 @@ func (a *app) fetchCodexSubscriptionMetadata(ctx context.Context, auth codexAuth
 	if accountID == "" {
 		return metadata, nil
 	}
-	if metadata.PlanType == "" || metadata.PlanLimit == "" {
+	if metadata.RawPlanType == "" || metadata.PlanLimit == "" {
 		if subscriptions, err := a.fetchCodexSubscriptionsMetadata(ctx, auth, accountID); err == nil {
 			metadata.AccountID = chooseString(metadata.AccountID, subscriptions.AccountID)
 			metadata.OrganizationName = cleanOrganizationName(chooseString(metadata.OrganizationName, subscriptions.OrganizationName))
-			if subscriptions.PlanType != "" {
-				metadata.PlanType = subscriptions.PlanType
+			if subscriptions.RawPlanType != "" {
+				metadata.RawPlanType = subscriptions.RawPlanType
+				metadata.PlanFamily = subscriptions.PlanFamily
+				metadata.PlanType = subscriptions.PlanFamily
 			}
 			if subscriptions.PlanLimit != "" {
 				metadata.PlanLimit = subscriptions.PlanLimit
@@ -4958,20 +5423,19 @@ func chatGPTTimezoneOffsetMinutes() int {
 
 func subscriptionMetadataFromMap(values map[string]any) codexSubscriptionMetadata {
 	rawPlan := firstMetadataString(values, "plan_type", "planType", "subscription_plan", "subscriptionPlan", "plan_name", "planName", "sku", "sku_name", "product", "product_name")
+	rawPlan = cleanRawPlanType(rawPlan)
+	planFamily := planFamilyFromRaw(rawPlan)
 	metadata := codexSubscriptionMetadata{
 		AccountID:        firstMetadataString(values, "account_id", "accountId", "id", "chatgpt_account_id", "workspace_id", "workspaceId"),
 		OrganizationName: cleanOrganizationName(organizationNameFromMap(values)),
-		PlanType:         normalizePlanType(rawPlan),
-		PlanLimit:        cleanPlanLimit(rawPlan),
-	}
-	if metadata.PlanLimit == "" {
-		metadata.PlanLimit = planLimitFromMap(values)
-	}
-	if metadata.PlanLimit == "" {
-		metadata.PlanLimit = planLimitFromSubscriptionPlan(rawPlan)
+		RawPlanType:      rawPlan,
+		PlanFamily:       planFamily,
+		PlanType:         planFamily,
+		PlanLimit:        planLimitFromMap(values),
 	}
 	if metadata.PlanType == "unknown" {
 		metadata.PlanType = ""
+		metadata.PlanFamily = ""
 	}
 	return metadata
 }
@@ -5099,6 +5563,8 @@ func subscriptionMetadataFromRecord(record map[string]any) codexSubscriptionMeta
 	if rawPlan == "" {
 		rawPlan = firstMetadataString(accountRecord, "plan_type", "planType", "subscription_plan", "subscriptionPlan", "plan_name", "planName", "sku", "sku_name", "product", "product_name")
 	}
+	rawPlan = cleanRawPlanType(rawPlan)
+	planFamily := planFamilyFromRaw(rawPlan)
 	organizationName := cleanOrganizationName(organizationNameFromMap(accountRecord))
 	if organizationName == "" {
 		organizationName = cleanOrganizationName(organizationNameFromMap(record))
@@ -5106,32 +5572,28 @@ func subscriptionMetadataFromRecord(record map[string]any) codexSubscriptionMeta
 	metadata := codexSubscriptionMetadata{
 		AccountID:        firstMetadataString(accountRecord, "account_id", "accountId", "id", "chatgpt_account_id", "workspace_id", "workspaceId"),
 		OrganizationName: organizationName,
-		PlanType:         normalizePlanType(rawPlan),
-		PlanLimit:        cleanPlanLimit(rawPlan),
+		RawPlanType:      rawPlan,
+		PlanFamily:       planFamily,
 	}
-	if metadata.PlanLimit == "" && entitlement != nil {
+	metadata.PlanType = metadata.PlanFamily
+	if entitlement != nil {
 		metadata.PlanLimit = planLimitFromMap(entitlement)
 	}
 	if metadata.PlanLimit == "" {
 		metadata.PlanLimit = planLimitFromMap(accountRecord)
 	}
-	if metadata.PlanLimit == "" {
-		metadata.PlanLimit = planLimitFromSubscriptionPlan(rawPlan)
-	}
 	if metadata.PlanType == "unknown" {
 		metadata.PlanType = ""
+		metadata.PlanFamily = ""
 	}
 	return metadata
 }
 
 func planLimitFromSubscriptionPlan(value string) string {
-	compact := compactPlanLimitText(value)
-	switch compact {
-	case "chatgptpro", "chatgptproplan", "proplan":
-		return "20x"
-	default:
-		return ""
-	}
+	// Plan names are descriptive metadata, not multiplier evidence. Generic Pro
+	// (including legacy chatgptproplan) must remain Not reported unless an exact
+	// supported numeric multiplier is present in its own upstream field.
+	return ""
 }
 
 func firstMetadataString(values map[string]any, keys ...string) string {
@@ -5249,31 +5711,31 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 	}
 	var usageFields map[string]any
 	_ = json.Unmarshal(body, &usageFields)
-	quota := quotaFromUsage(usage, time.Now().UTC())
-	remaining := remainingQuotaHint(quota)
-	hasQuotaWindow := quota.Hourly.Present || quota.Weekly.Present
 	now := time.Now().UTC()
-	planRaw := chooseString(usage.PlanType, usage.SubscriptionPlan)
-	plan := normalizePlanType(chooseString(planRaw, accountCopy.PlanType))
-	planLimit := cleanPlanLimit(planRaw)
+	quota := quotaFromUsage(usage, now)
+	planRaw := cleanRawPlanType(chooseString(usage.PlanType, usage.SubscriptionPlan))
+	plan := planFamilyFromRaw(planRaw)
+	planLimit := planLimitFromMap(usageFields)
 	if planLimit == "" {
-		planLimit = planLimitFromMap(usageFields)
-	}
-	if planLimit == "" {
-		planLimit = cleanPlanLimit(chooseString(auth.PlanLimit, accountCopy.PlanLimit))
+		planLimit = cleanPlanLimit(auth.PlanLimit)
 	}
 	organizationName := cleanOrganizationName(organizationNameFromMap(usageFields))
 	if organizationName == "" && auth.OrganizationName != "" {
 		organizationName = cleanOrganizationName(auth.OrganizationName)
 	}
-	if (plan == "pro" && planLimit == "") || organizationName == "" || organizationScopedPlan(plan) {
+	metadataResolved := false
+	if planRaw == "" || organizationName == "" || organizationScopedPlan(plan) {
 		if metadata, err := a.fetchCodexSubscriptionMetadata(ctx, auth); err == nil {
+			metadataResolved = true
 			if metadata.AccountID != "" {
 				auth.AccountID = metadata.AccountID
 				verifiedUpstreamAccountID = strings.TrimSpace(metadata.AccountID)
 			}
-			if metadata.PlanType != "" && metadata.PlanType != "unknown" {
-				plan = metadata.PlanType
+			if metadata.RawPlanType != "" {
+				planRaw = metadata.RawPlanType
+			}
+			if metadata.PlanFamily != "" && metadata.PlanFamily != "unknown" {
+				plan = metadata.PlanFamily
 			}
 			if planLimit == "" {
 				planLimit = metadata.PlanLimit
@@ -5285,10 +5747,7 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 			}
 		}
 	}
-	if plan == "pro" && planLimit == "" {
-		planLimit = "20x"
-	}
-	if !organizationScopedPlan(plan) {
+	if plan != "" && plan != "unknown" && !organizationScopedPlan(plan) {
 		organizationName = ""
 	}
 	if expectedUpstreamAccountID != "" && verifiedUpstreamAccountID != expectedUpstreamAccountID {
@@ -5297,8 +5756,6 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 		// mutation so a visitor cannot transfer a slot or its history.
 		return quotaSnapshot{}, errPublicRepairIdentityMismatch
 	}
-	snapshot := quotaSnapshot{AccountID: accountID, OrganizationName: organizationName, PlanType: plan, PlanLimit: planLimit, Quota: &quota, UsageUpdatedAt: now}
-
 	a.mu.Lock()
 	if a.state.Quotas == nil {
 		a.state.Quotas = map[string]quotaSnapshot{}
@@ -5308,12 +5765,60 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 		a.mu.Unlock()
 		return quotaSnapshot{}, errors.New("account no longer exists")
 	}
+	prior := a.state.Quotas[accountID]
+	quota = mergeSparseQuota(prior.Quota, quota, usage)
+	snapshot := quotaSnapshot{
+		AccountID:               accountID,
+		OrganizationName:        prior.OrganizationName,
+		RawPlanType:             prior.RawPlanType,
+		PlanFamily:              prior.PlanFamily,
+		PlanType:                prior.PlanType,
+		PlanLimit:               prior.PlanLimit,
+		SeatType:                prior.SeatType,
+		SeatTypeRaw:             prior.SeatTypeRaw,
+		QuotaPolicy:             append([]string(nil), prior.QuotaPolicy...),
+		Quota:                   &quota,
+		ObservedAt:              now,
+		LastSuccessfulRefreshAt: now,
+		UsageUpdatedAt:          now,
+		Freshness:               "fresh",
+		Provenance:              "chatgpt_wham_usage",
+	}
+	if snapshot.RawPlanType == "" {
+		snapshot.RawPlanType = cleanRawPlanType(item.RawPlanType)
+	}
+	if snapshot.PlanFamily == "" {
+		snapshot.PlanFamily = effectivePlanFamily(*item)
+	}
+	if snapshot.PlanType == "" {
+		snapshot.PlanType = snapshot.PlanFamily
+	}
+	if snapshot.PlanLimit == "" {
+		snapshot.PlanLimit = cleanPlanLimit(item.PlanLimit)
+	}
+	if snapshot.OrganizationName == "" {
+		snapshot.OrganizationName = cleanOrganizationName(item.OrganizationName)
+	}
 	if planRaw != "" {
+		snapshot.RawPlanType = planRaw
+		snapshot.PlanFamily = plan
+		snapshot.PlanType = plan
+		// A generic Pro plan is not multiplier evidence. An exact multiplier may
+		// still arrive from its own supported field in this same full refresh.
+		snapshot.PlanLimit = planLimit
+		item.RawPlanType = planRaw
+		item.PlanFamily = plan
 		item.PlanType = plan
 		item.PlanRank = planRank(plan)
+	} else if planLimit != "" {
+		snapshot.PlanLimit = planLimit
 	}
-	if planLimit != "" {
-		item.PlanLimit = planLimit
+	item.PlanLimit = snapshot.PlanLimit
+	item.SeatType = snapshot.SeatType
+	item.SeatTypeRaw = snapshot.SeatTypeRaw
+	item.QuotaPolicy = append([]string(nil), snapshot.QuotaPolicy...)
+	if organizationName != "" || metadataResolved || (planRaw != "" && !organizationScopedPlan(plan)) {
+		snapshot.OrganizationName = organizationName
 	}
 	if auth.Email != "" {
 		item.Email = normalizeEmail(auth.Email)
@@ -5321,13 +5826,25 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 	if auth.AccountID != "" {
 		item.AccountID = auth.AccountID
 	}
-	if organizationScopedPlan(plan) {
-		item.OrganizationName = organizationName
+	if organizationScopedPlan(snapshot.PlanFamily) {
+		item.OrganizationName = snapshot.OrganizationName
 	} else {
 		item.OrganizationName = ""
+		snapshot.OrganizationName = ""
 	}
 	item.Label = accountDisplayName(*item)
+	hasQuotaWindow := false
+	for _, window := range quotaReportedWindows(quota) {
+		if window.Present {
+			hasQuotaWindow = true
+			break
+		}
+	}
 	if hasQuotaWindow {
+		remaining := remainingQuotaHint(quota)
+		item.RemainingQuota = &remaining
+	} else if quota.Exhausted {
+		remaining := 0
 		item.RemainingQuota = &remaining
 	} else {
 		item.RemainingQuota = nil
@@ -5410,58 +5927,240 @@ func nestedString(payload map[string]any, objectName, key string) string {
 }
 
 func quotaFromUsage(usage codexUsageResponse, now time.Time) accountQuota {
-	var primary, secondary *codexWindowInfo
-	if usage.RateLimit != nil {
-		primary = usage.RateLimit.PrimaryWindow
-		secondary = usage.RateLimit.SecondaryWindow
-	}
+	base := quotaLimitFromRateLimit("codex", "", usage.RateLimit, now)
 	quota := accountQuota{
-		Hourly: normalizeQuotaWindow(primary, now),
-		Weekly: normalizeQuotaWindow(secondary, now),
+		LimitID:          base.LimitID,
+		LimitName:        base.LimitName,
+		Primary:          base.Primary,
+		Secondary:        base.Secondary,
+		Windows:          base.Windows,
+		Allowed:          base.Allowed,
+		LimitReached:     base.LimitReached,
+		Exhausted:        base.Exhausted,
+		ExhaustionReason: base.ExhaustionReason,
+		Provenance:       "chatgpt_wham_usage",
+		ObservedAt:       now,
 	}
-	if usage.RateLimit != nil && !quota.Hourly.Present && !quota.Weekly.Present {
-		limitReached := usage.RateLimit.LimitReached != nil && *usage.RateLimit.LimitReached
-		notAllowed := usage.RateLimit.Allowed != nil && !*usage.RateLimit.Allowed
-		if limitReached || notAllowed {
-			quota.Hourly = quotaWindow{Percentage: 0, Present: true}
+	if usage.Credits != nil {
+		credits := &quotaCredits{}
+		if usage.Credits.HasCredits != nil {
+			credits.HasCredits = *usage.Credits.HasCredits
+		}
+		if usage.Credits.Unlimited != nil {
+			credits.Unlimited = *usage.Credits.Unlimited
+		}
+		if usage.Credits.Balance != nil {
+			value := cleanMetadataText(*usage.Credits.Balance, 80)
+			if value != "" {
+				credits.Balance = &value
+			}
+		}
+		quota.Credits = credits
+	}
+	if usage.SpendControl != nil {
+		limit := &quotaSpendControl{}
+		if usage.SpendControl.Reached != nil {
+			limit.Reached = *usage.SpendControl.Reached
+		}
+		if details := usage.SpendControl.IndividualLimit; details != nil {
+			limit.Source = cleanMetadataToken(details.Source)
+			limit.Limit = cleanMetadataText(details.Limit, 80)
+			limit.Used = cleanMetadataText(details.Used, 80)
+			limit.Remaining = cleanMetadataText(details.Remaining, 80)
+			if details.RemainingPercent != nil {
+				value := clampInt(*details.RemainingPercent, 0, 100)
+				limit.RemainingPercent = &value
+			}
+			limit.ResetAt = normalizedResetAt(details.ResetAt, details.ResetAfterSeconds, now)
+		}
+		quota.IndividualLimit = limit
+		if limit.Reached {
+			quota.Exhausted = true
+			quota.ExhaustionReason = "spend_control_reached"
 		}
 	}
+	quota.RateLimitReachedType = cleanMetadataToken(usage.RateLimitReachedType.Type)
+	if quota.RateLimitReachedType != "" {
+		quota.Exhausted = true
+		quota.ExhaustionReason = quota.RateLimitReachedType
+	}
+	if usage.AdditionalRateLimits != nil {
+		for _, additional := range *usage.AdditionalRateLimits {
+			quota.AdditionalLimits = append(quota.AdditionalLimits, quotaLimitFromRateLimit(
+				cleanMetadataToken(additional.MeteredFeature),
+				cleanMetadataText(additional.LimitName, 120),
+				additional.RateLimit,
+				now,
+			))
+		}
+	}
+	if usage.CodeReviewRateLimit != nil {
+		quota.AdditionalLimits = append(quota.AdditionalLimits, quotaLimitFromRateLimit(
+			"code_review",
+			"Code review",
+			usage.CodeReviewRateLimit,
+			now,
+		))
+	}
+	if usage.ResetCredits != nil {
+		quota.ResetCredits = &quotaResetCredits{AvailableCount: usage.ResetCredits.AvailableCount}
+	}
+	quota.Hourly = quotaWindowByDuration(quota, 300)
+	quota.Weekly = quotaWindowByDuration(quota, 10080)
 	return quota
 }
 
-func normalizeQuotaWindow(window *codexWindowInfo, now time.Time) quotaWindow {
+func mergeSparseQuota(prior *accountQuota, current accountQuota, usage codexUsageResponse) accountQuota {
+	if prior == nil {
+		return current
+	}
+	// Codex rolling snapshots may omit optional metadata while still providing
+	// fresh windows. Missing/null credits, spend control, reset credits, and
+	// additional limits are not clear signals, so retain the last verified value.
+	if usage.Credits == nil {
+		current.Credits = prior.Credits
+	}
+	if usage.SpendControl == nil {
+		current.IndividualLimit = prior.IndividualLimit
+	}
+	if usage.ResetCredits == nil {
+		current.ResetCredits = prior.ResetCredits
+	}
+	if usage.AdditionalRateLimits == nil && usage.CodeReviewRateLimit == nil {
+		current.AdditionalLimits = append([]quotaLimit(nil), prior.AdditionalLimits...)
+	}
+	return current
+}
+
+func quotaLimitFromRateLimit(limitID, limitName string, rateLimit *codexRateLimitInfo, now time.Time) quotaLimit {
+	result := quotaLimit{LimitID: limitID, LimitName: limitName}
+	if rateLimit == nil {
+		return result
+	}
+	result.Allowed = cloneBool(rateLimit.Allowed)
+	result.LimitReached = cloneBool(rateLimit.LimitReached)
+	result.Primary = normalizeQuotaWindow("primary", rateLimit.PrimaryWindow, now)
+	result.Secondary = normalizeQuotaWindow("secondary", rateLimit.SecondaryWindow, now)
+	for _, window := range []quotaWindow{result.Primary, result.Secondary} {
+		if window.Observed || window.Present {
+			result.Windows = append(result.Windows, window)
+		}
+	}
+	if rateLimit.LimitReached != nil && *rateLimit.LimitReached {
+		result.Exhausted = true
+		result.ExhaustionReason = "rate_limit_reached"
+	} else if rateLimit.Allowed != nil && !*rateLimit.Allowed {
+		result.Exhausted = true
+		result.ExhaustionReason = "not_allowed"
+	}
+	return result
+}
+
+func normalizeQuotaWindow(role string, window *codexWindowInfo, now time.Time) quotaWindow {
 	if window == nil {
-		return quotaWindow{Percentage: 100, Present: false}
+		return quotaWindow{Role: role}
 	}
-	used := 0
-	if window.UsedPercent != nil {
-		used = clampInt(*window.UsedPercent, 0, 100)
-	}
-	var resetAt *int64
-	if window.ResetAt != nil {
-		value := *window.ResetAt
-		resetAt = &value
-	} else if window.ResetAfterSeconds != nil && *window.ResetAfterSeconds >= 0 {
-		value := now.Add(time.Duration(*window.ResetAfterSeconds) * time.Second).Unix()
-		resetAt = &value
-	}
-	var windowMinutes *int64
+	result := quotaWindow{Role: role, Observed: true}
 	if window.LimitWindowSeconds != nil && *window.LimitWindowSeconds > 0 {
 		value := (*window.LimitWindowSeconds + 59) / 60
-		windowMinutes = &value
+		result.WindowMinutes = &value
 	}
-	return quotaWindow{Percentage: 100 - used, ResetAt: resetAt, WindowMinutes: windowMinutes, Present: true}
+	result.Label = quotaWindowLabel(result.WindowMinutes)
+	result.ResetAt = normalizedResetAt(window.ResetAt, window.ResetAfterSeconds, now)
+	if window.UsedPercent.Reported && window.UsedPercent.Valid {
+		used := clampFloat(window.UsedPercent.Value, 0, 100)
+		remaining := 100 - used
+		result.UsedPercent = &used
+		result.RemainingPercent = &remaining
+		result.Percentage = int(remaining)
+		result.Present = true
+	}
+	return result
+}
+
+func normalizedResetAt(resetAt, resetAfterSeconds *int64, now time.Time) *int64 {
+	if resetAt != nil && *resetAt > 0 {
+		value := *resetAt
+		return &value
+	}
+	if resetAfterSeconds != nil && *resetAfterSeconds >= 0 {
+		value := now.Add(time.Duration(*resetAfterSeconds) * time.Second).Unix()
+		return &value
+	}
+	return nil
+}
+
+func quotaWindowLabel(minutes *int64) string {
+	if minutes == nil || *minutes <= 0 {
+		return "Window"
+	}
+	switch *minutes {
+	case 300:
+		return "5h"
+	case 10080:
+		return "Week"
+	}
+	if *minutes < 60 {
+		return fmt.Sprintf("%dm", *minutes)
+	}
+	if *minutes%1440 == 0 {
+		return fmt.Sprintf("%dd", *minutes/1440)
+	}
+	if *minutes%60 == 0 {
+		return fmt.Sprintf("%dh", *minutes/60)
+	}
+	return fmt.Sprintf("%dh %dm", *minutes/60, *minutes%60)
+}
+
+func quotaWindowRemaining(window quotaWindow) float64 {
+	if window.RemainingPercent != nil {
+		return clampFloat(*window.RemainingPercent, 0, 100)
+	}
+	return float64(clampInt(window.Percentage, 0, 100))
+}
+
+func quotaWindowByDuration(quota accountQuota, minutes int64) quotaWindow {
+	for _, window := range quotaReportedWindows(quota) {
+		if window.WindowMinutes != nil && *window.WindowMinutes == minutes {
+			return window
+		}
+	}
+	return quotaWindow{Label: quotaWindowLabel(&minutes)}
+}
+
+func quotaReportedWindows(quota accountQuota) []quotaWindow {
+	if len(quota.Windows) > 0 {
+		return quota.Windows
+	}
+	result := make([]quotaWindow, 0, 2)
+	for _, window := range []quotaWindow{quota.Primary, quota.Secondary} {
+		if window.Observed || window.Present || window.WindowMinutes != nil {
+			result = append(result, window)
+		}
+	}
+	if len(result) > 0 {
+		return result
+	}
+	// Persisted snapshots from older releases may only contain these aliases.
+	for _, window := range []quotaWindow{quota.Hourly, quota.Weekly} {
+		if window.Observed || window.Present || window.WindowMinutes != nil {
+			result = append(result, window)
+		}
+	}
+	return result
 }
 
 func remainingQuotaHint(quota accountQuota) int {
 	values := make([]int, 0, 2)
-	if quota.Hourly.Present {
-		values = append(values, quota.Hourly.Percentage)
-	}
-	if quota.Weekly.Present {
-		values = append(values, quota.Weekly.Percentage)
+	for _, window := range quotaReportedWindows(quota) {
+		if window.Present {
+			values = append(values, int(quotaWindowRemaining(window)))
+		}
 	}
 	if len(values) == 0 {
+		if quota.Exhausted {
+			return 0
+		}
 		return 100
 	}
 	result := values[0]
@@ -5471,6 +6170,84 @@ func remainingQuotaHint(quota accountQuota) int {
 		}
 	}
 	return clampInt(result, 0, 100)
+}
+
+func quotaWindowEvidenceActive(window quotaWindow, now time.Time) bool {
+	if window.ResetAt == nil {
+		return true
+	}
+	return now.Unix() < *window.ResetAt
+}
+
+func quotaExplicitlyBlocksRouting(quota accountQuota, model string, now time.Time) bool {
+	if quota.Exhausted {
+		return true
+	}
+	for _, window := range quotaReportedWindows(quota) {
+		if window.Present && quotaWindowRemaining(window) <= 0 && quotaWindowEvidenceActive(window, now) {
+			return true
+		}
+	}
+	for _, additional := range quota.AdditionalLimits {
+		// Unknown/model-specific buckets are display metadata unless the limit id
+		// exactly names the requested model. Do not turn a new future meter into
+		// an account-wide authorization rule.
+		if additional.LimitID != model {
+			continue
+		}
+		if additional.Exhausted {
+			return true
+		}
+		for _, window := range additional.Windows {
+			if window.Present && quotaWindowRemaining(window) <= 0 && quotaWindowEvidenceActive(window, now) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func quotaTelemetryState(snapshot quotaSnapshot, now time.Time) string {
+	if snapshot.QuotaError != nil {
+		return "refresh_unavailable"
+	}
+	observedAt := snapshot.LastSuccessfulRefreshAt
+	if observedAt.IsZero() {
+		observedAt = snapshot.UsageUpdatedAt
+	}
+	if observedAt.IsZero() {
+		return "not_reported"
+	}
+	if now.Sub(observedAt) <= quotaTelemetryFreshness {
+		return "fresh"
+	}
+	return "stale"
+}
+
+func quotaSnapshotForDisplay(snapshot quotaSnapshot, now time.Time) quotaSnapshot {
+	snapshot.Freshness = quotaTelemetryState(snapshot, now)
+	if snapshot.Provenance == "" && snapshot.Quota != nil {
+		snapshot.Provenance = snapshot.Quota.Provenance
+	}
+	return snapshot
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func clampFloat(value, min, max float64) float64 {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
 }
 
 func clampInt(value, min, max int) int {
@@ -5921,9 +6698,14 @@ func (a *app) applyCompletedDeviceAuthLocked(item *account, auth codexAuthInfo, 
 		item.Email = normalizeEmail(auth.Email)
 		item.AccountID = strings.TrimSpace(auth.AccountID)
 		item.OrganizationName = cleanOrganizationName(auth.OrganizationName)
-		item.PlanType = normalizePlanType(auth.PlanType)
+		item.RawPlanType = cleanRawPlanType(auth.PlanType)
+		item.PlanFamily = planFamilyFromRaw(item.RawPlanType)
+		item.PlanType = item.PlanFamily
 		item.PlanLimit = cleanPlanLimit(auth.PlanLimit)
-		item.PlanRank = planRank(item.PlanType)
+		item.PlanRank = planRank(item.PlanFamily)
+		item.SeatType = ""
+		item.SeatTypeRaw = ""
+		item.QuotaPolicy = nil
 	} else {
 		if auth.Email != "" {
 			item.Email = normalizeEmail(auth.Email)
@@ -5935,8 +6717,10 @@ func (a *app) applyCompletedDeviceAuthLocked(item *account, auth codexAuthInfo, 
 			item.OrganizationName = cleanOrganizationName(auth.OrganizationName)
 		}
 		if auth.PlanType != "" {
-			item.PlanType = normalizePlanType(auth.PlanType)
-			item.PlanRank = planRank(item.PlanType)
+			item.RawPlanType = cleanRawPlanType(auth.PlanType)
+			item.PlanFamily = planFamilyFromRaw(item.RawPlanType)
+			item.PlanType = item.PlanFamily
+			item.PlanRank = planRank(item.PlanFamily)
 		}
 		if auth.PlanLimit != "" {
 			item.PlanLimit = cleanPlanLimit(auth.PlanLimit)
@@ -6257,6 +7041,8 @@ func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
 		"total":          len(a.config.Accounts),
 		"ready":          0,
 		"low":            0,
+		"protected":      0,
+		"exhausted":      0,
 		"cooldown":       0,
 		"standby":        0,
 		"duplicate":      0,
@@ -6275,7 +7061,7 @@ func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
 			continue
 		}
 		switch status {
-		case "error", "missing_auth", "authenticating", "disabled":
+		case "protected", "exhausted", "error", "missing_auth", "authenticating", "disabled":
 			summary["unavailable"]++
 		}
 	}
@@ -6288,11 +7074,11 @@ func (a *app) publicDashboardSummaryLocked(now time.Time) map[string]int {
 	summary := map[string]int{
 		"total":       detailed["total"],
 		"ready":       detailed["ready"],
-		"low":         detailed["low"],
+		"low":         detailed["low"] + detailed["protected"] + detailed["exhausted"],
 		"cooldown":    detailed["cooldown"],
 		"standby":     detailed["standby"],
 		"duplicate":   detailed["duplicate"],
-		"unavailable": detailed["unavailable"],
+		"unavailable": detailed["unavailable"] - detailed["protected"] - detailed["exhausted"],
 	}
 	return summary
 }
@@ -6333,6 +7119,7 @@ func (a *app) routingCacheEventViewsLocked(now time.Time) []map[string]any {
 			"agentKind": event.AgentKind, "threadIdHash": event.ThreadIDHash, "lineageRootIdHash": event.LineageRootIDHash,
 			"stickyKeyHash": event.StickyKeyHash, "promptCacheKeyHash": event.PromptCacheKeyHash,
 			"routingOutcome": event.RoutingOutcome, "routingSource": event.RoutingSource, "parentAffinity": event.ParentAffinity,
+			"terminalEvent": event.TerminalEvent, "terminalFailureClass": event.TerminalFailureClass, "terminalErrorCode": event.TerminalErrorCode,
 			"failoverFromAccountLabel": failoverFromLabel, "failoverFromAccountRef": operationalIdentifierHash("account", event.FailoverFromAccountID),
 			"usageObserved": event.UsageObserved, "inputTokens": event.InputTokens, "cachedTokens": event.CachedTokens,
 			"cacheWriteTokens": event.CacheWriteTokens, "uncachedInputTokens": event.UncachedInputTokens,
@@ -6739,9 +7526,9 @@ func (a *app) accountHealthItemLocked(item account, now time.Time) map[string]an
 	cooldowns := activeCooldowns(a.state.Cooldowns[item.ID], now)
 	status, reason := a.accountStatusLocked(item, now)
 	health := a.state.Health[item.ID]
-	quota := a.state.Quotas[item.ID]
+	quota := quotaSnapshotForDisplay(a.state.Quotas[item.ID], now)
 	cacheInput, cacheCached, cacheRequests := a.promptCacheStatsForAccountLocked(item.ID)
-	result := map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "activeRouteCount": a.activeRouteCountLocked(item.ID, now), "cacheInputTokens": cacheInput, "cacheCachedTokens": cacheCached, "cacheRequestCount": cacheRequests, "cacheWindow": a.promptCacheWindowForAccountLocked(item.ID), "throughput": a.throughputSnapshotLocked(item.ID, now), "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "quotaError": quota.QuotaError}
+	result := map[string]any{"accountId": item.ID, "available": status == "ready" || status == "low", "status": status, "statusReason": reason, "cooldowns": cooldowns, "lastSuccessAt": health.LastSuccessAt, "lastFailureAt": health.LastFailureAt, "lastFailureReason": health.LastFailureReason, "consecutiveFailure": health.ConsecutiveFailure, "active": accountActiveLocked(health, now), "activeRouteCount": a.activeRouteCountLocked(item.ID, now), "cacheInputTokens": cacheInput, "cacheCachedTokens": cacheCached, "cacheRequestCount": cacheRequests, "cacheWindow": a.promptCacheWindowForAccountLocked(item.ID), "throughput": a.throughputSnapshotLocked(item.ID, now), "remainingQuota": item.RemainingQuota, "quota": quota.Quota, "usageUpdatedAt": quota.UsageUpdatedAt, "lastSuccessfulRefreshAt": quota.LastSuccessfulRefreshAt, "quotaFreshness": quota.Freshness, "quotaProvenance": quota.Provenance, "quotaError": quota.QuotaError, "quotaProtection": a.quotaProtectionStatusLocked(item, quota, now), "quotaMetering": quotaMeteringKind(item)}
 	if job := a.activeLoginJobForAccountLocked(item.ID); job != nil {
 		// This endpoint is management-only. Returning the active job lets a page
 		// reload recover the device URL/code instead of orphaning a live login.
@@ -6762,18 +7549,23 @@ func (a *app) activeRouteCountLocked(accountID string, now time.Time) int {
 
 func (a *app) currentAccountStatusLocked(item account, index int, now time.Time) map[string]any {
 	status, reason := a.accountStatusLocked(item, now)
-	quota := a.state.Quotas[item.ID]
+	quota := quotaSnapshotForDisplay(a.state.Quotas[item.ID], now)
 	displayItem := item
 	if quota.OrganizationName != "" {
 		displayItem.OrganizationName = quota.OrganizationName
 	}
 	if quota.PlanType != "" {
 		displayItem.PlanType = quota.PlanType
+		displayItem.PlanFamily = quota.PlanFamily
+		displayItem.RawPlanType = quota.RawPlanType
 		displayItem.PlanRank = planRank(quota.PlanType)
 	}
 	if quota.PlanLimit != "" {
 		displayItem.PlanLimit = quota.PlanLimit
 	}
+	displayItem.SeatType = quota.SeatType
+	displayItem.SeatTypeRaw = quota.SeatTypeRaw
+	displayItem.QuotaPolicy = append([]string(nil), quota.QuotaPolicy...)
 	remainingQuota := displayItem.RemainingQuota
 	if remainingQuota == nil && quota.Quota != nil {
 		remaining := remainingQuotaHint(*quota.Quota)
@@ -6781,22 +7573,27 @@ func (a *app) currentAccountStatusLocked(item account, index int, now time.Time)
 	}
 	metadata := credentialMetadata(displayItem)
 	return map[string]any{
-		"label":              currentAccountDisplayName(displayItem, index),
-		"displayName":        currentAccountDisplayName(displayItem, index),
-		"credentialMetadata": metadata,
-		"email":              metadata["email"],
-		"organizationName":   metadata["organizationName"],
-		"planType":           metadata["planType"],
-		"planLimit":          metadata["planLimit"],
-		"planDisplayName":    metadata["planDisplayName"],
-		"planRank":           metadata["planRank"],
-		"status":             status,
-		"statusReason":       reason,
-		"available":          status == "ready" || status == "low",
-		"remainingQuota":     remainingQuota,
-		"quota":              quota.Quota,
-		"usageUpdatedAt":     quota.UsageUpdatedAt,
-		"quotaError":         quota.QuotaError,
+		"label":                   currentAccountDisplayName(displayItem, index),
+		"displayName":             currentAccountDisplayName(displayItem, index),
+		"credentialMetadata":      metadata,
+		"email":                   metadata["email"],
+		"organizationName":        metadata["organizationName"],
+		"planType":                metadata["planType"],
+		"planLimit":               metadata["planLimit"],
+		"planDisplayName":         metadata["planDisplayName"],
+		"planRank":                metadata["planRank"],
+		"status":                  status,
+		"statusReason":            reason,
+		"available":               status == "ready" || status == "low",
+		"remainingQuota":          remainingQuota,
+		"quota":                   quota.Quota,
+		"usageUpdatedAt":          quota.UsageUpdatedAt,
+		"lastSuccessfulRefreshAt": quota.LastSuccessfulRefreshAt,
+		"quotaFreshness":          quota.Freshness,
+		"quotaProvenance":         quota.Provenance,
+		"quotaError":              quota.QuotaError,
+		"quotaProtection":         a.quotaProtectionStatusLocked(item, quota, now),
+		"quotaMetering":           quotaMeteringKind(item),
 	}
 }
 
@@ -6855,13 +7652,28 @@ func (a *app) accountStatusLocked(item account, now time.Time) (string, string) 
 	// outage can hide a healthy Pro fallback and create a false 503 exactly when a
 	// non-Pro account runs out.
 	if quotaSnapshot.Quota != nil {
+		if quotaExplicitlyBlocksRouting(*quotaSnapshot.Quota, "", now) {
+			reason := "Quota exhausted"
+			if quotaSnapshot.Quota.ExhaustionReason != "" {
+				reason += ": " + quotaSnapshot.Quota.ExhaustionReason
+			}
+			return "exhausted", reason
+		}
+		if protection := a.quotaProtectionStatusLocked(item, quotaSnapshot, now); protection.Blocked {
+			return "protected", protection.Message
+		}
 		remaining := remainingQuotaHint(*quotaSnapshot.Quota)
 		if remaining <= 20 {
 			return "low", "Quota window is at or below 20%"
 		}
 	}
-	if item.RemainingQuota != nil && *item.RemainingQuota <= 20 {
-		return "low", "Remaining quota is at or below 20%"
+	if item.RemainingQuota != nil {
+		if *item.RemainingQuota <= 0 {
+			return "exhausted", "Remaining quota is exhausted"
+		}
+		if *item.RemainingQuota <= 20 {
+			return "low", "Remaining quota is at or below 20%"
+		}
 	}
 	return "ready", "Ready"
 }
@@ -6875,23 +7687,28 @@ func publicAccounts(values []account) []map[string]any {
 func publicAccount(item account, index int) map[string]any {
 	displayName := managementCredentialDisplayName(item)
 	metadata := credentialMetadata(item)
-	return map[string]any{"id": item.ID, "label": displayName, "displayName": displayName, "ownerNote": item.OwnerNote, "credentialMetadata": metadata, "email": metadata["email"], "organizationName": metadata["organizationName"], "planType": metadata["planType"], "planLimit": metadata["planLimit"], "planDisplayName": metadata["planDisplayName"], "planRank": metadata["planRank"], "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
+	return map[string]any{"id": item.ID, "label": displayName, "displayName": displayName, "ownerNote": item.OwnerNote, "credentialMetadata": metadata, "email": metadata["email"], "organizationName": metadata["organizationName"], "rawPlanType": metadata["rawPlanType"], "planFamily": metadata["planFamily"], "planType": metadata["planType"], "planLimit": metadata["planLimit"], "seatType": metadata["seatType"], "seatTypeRaw": metadata["seatTypeRaw"], "seatTypeDisplay": metadata["seatTypeDisplay"], "quotaPolicy": metadata["quotaPolicy"], "planDisplayName": metadata["planDisplayName"], "planRank": metadata["planRank"], "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "quotaProtectionEnabled": item.QuotaProtectionEnabled, "quotaProtectionThreshold": item.QuotaProtectionThreshold, "quotaMetering": quotaMeteringKind(item), "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
 }
 
 func (a *app) publicDashboardAccountLocked(item account, index int, now time.Time) map[string]any {
 	status, _ := a.accountStatusLocked(item, now)
-	quota := a.state.Quotas[item.ID]
+	quota := quotaSnapshotForDisplay(a.state.Quotas[item.ID], now)
 	displayItem := item
 	if quota.OrganizationName != "" {
 		displayItem.OrganizationName = quota.OrganizationName
 	}
 	if quota.PlanType != "" {
 		displayItem.PlanType = quota.PlanType
+		displayItem.PlanFamily = quota.PlanFamily
+		displayItem.RawPlanType = quota.RawPlanType
 		displayItem.PlanRank = planRank(quota.PlanType)
 	}
 	if quota.PlanLimit != "" {
 		displayItem.PlanLimit = quota.PlanLimit
 	}
+	displayItem.SeatType = quota.SeatType
+	displayItem.SeatTypeRaw = quota.SeatTypeRaw
+	displayItem.QuotaPolicy = append([]string(nil), quota.QuotaPolicy...)
 	statusTone, statusLabel := publicDashboardStatus(status)
 	remainingQuota := displayItem.RemainingQuota
 	if remainingQuota == nil && quota.Quota != nil {
@@ -6901,23 +7718,26 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 	cacheInput, cacheCached, cacheRequests := a.promptCacheStatsForAccountLocked(item.ID)
 	repairAvailable := a.publicRepairAvailableLocked(item)
 	return map[string]any{
-		"displayName":       publicDashboardAccountLabel(displayItem, index),
-		"detail":            publicDashboardAccountDetail(displayItem),
-		"ownerNote":         item.OwnerNote,
-		"statusTone":        statusTone,
-		"statusLabel":       statusLabel,
-		"poolLabel":         publicPoolLabel(item),
-		"poolRef":           a.publicAccountRefLocked(item.ID),
-		"poolAction":        publicPoolAction(item, repairAvailable),
-		"poolActionLabel":   publicPoolActionLabel(item, repairAvailable, a.publicRepairJobActiveLocked(item.ID)),
-		"remainingQuota":    remainingQuota,
-		"quota":             quota.Quota,
-		"quotaUnavailable":  quota.QuotaError != nil,
-		"active":            accountActiveLocked(a.state.Health[item.ID], now),
-		"cacheInputTokens":  cacheInput,
-		"cacheCachedTokens": cacheCached,
-		"cacheRequestCount": cacheRequests,
-		"cacheWindow":       a.promptCacheWindowForAccountLocked(item.ID),
+		"displayName":             publicDashboardAccountLabel(displayItem, index),
+		"detail":                  publicDashboardAccountDetail(displayItem),
+		"ownerNote":               item.OwnerNote,
+		"statusTone":              statusTone,
+		"statusLabel":             statusLabel,
+		"poolLabel":               publicPoolLabel(item),
+		"poolRef":                 a.publicAccountRefLocked(item.ID),
+		"poolAction":              publicPoolAction(item, repairAvailable),
+		"poolActionLabel":         publicPoolActionLabel(item, repairAvailable, a.publicRepairJobActiveLocked(item.ID)),
+		"remainingQuota":          remainingQuota,
+		"quota":                   quota.Quota,
+		"quotaUnavailable":        quota.QuotaError != nil,
+		"quotaFreshness":          quota.Freshness,
+		"lastSuccessfulRefreshAt": quota.LastSuccessfulRefreshAt,
+		"quotaMetering":           quotaMeteringKind(item),
+		"active":                  accountActiveLocked(a.state.Health[item.ID], now),
+		"cacheInputTokens":        cacheInput,
+		"cacheCachedTokens":       cacheCached,
+		"cacheRequestCount":       cacheRequests,
+		"cacheWindow":             a.promptCacheWindowForAccountLocked(item.ID),
 	}
 }
 
@@ -6934,6 +7754,10 @@ func publicDashboardStatus(status string) (string, string) {
 		return "ready", "Ready"
 	case "low":
 		return "low", "Limited"
+	case "protected":
+		return "low", "Protected"
+	case "exhausted":
+		return "low", "Exhausted"
 	case "cooldown":
 		return "cooldown", "Cooling down"
 	case "standby":
@@ -7057,13 +7881,29 @@ func effectiveOrganizationName(item account) string {
 }
 
 func credentialMetadata(item account) map[string]any {
+	planFamily := effectivePlanFamily(item)
+	seatType := cleanMetadataToken(item.SeatType)
+	seatDisplay := "Not reported"
+	if seatType == "standard" {
+		seatDisplay = "Standard"
+	} else if seatType == "premium" {
+		seatDisplay = "Premium"
+	} else if raw := cleanMetadataToken(item.SeatTypeRaw); raw != "" {
+		seatDisplay = raw
+	}
 	return map[string]any{
 		"email":            maskedPublicEmail(item.Email),
 		"organizationName": publicOrganizationName(effectiveOrganizationName(item)),
-		"planType":         normalizePlanType(item.PlanType),
+		"rawPlanType":      cleanRawPlanType(item.RawPlanType),
+		"planFamily":       planFamily,
+		"planType":         planFamily,
 		"planLimit":        cleanPlanLimit(item.PlanLimit),
 		"planDisplayName":  accountPlanDisplayName(item, false),
 		"planRank":         item.PlanRank,
+		"seatType":         seatType,
+		"seatTypeRaw":      cleanMetadataToken(item.SeatTypeRaw),
+		"seatTypeDisplay":  seatDisplay,
+		"quotaPolicy":      append([]string(nil), item.QuotaPolicy...),
 	}
 }
 
@@ -7239,16 +8079,13 @@ func organizationNameFromNestedMap(values map[string]any) string {
 }
 
 func cleanPlanLimit(value string) string {
-	compact := compactPlanLimitText(value)
-	if compact == "" {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "5x", "10x", "20x":
+		return value
+	default:
 		return ""
 	}
-	for _, limit := range []string{"20x", "10x", "5x"} {
-		if compact == limit || strings.Contains(compact, limit) {
-			return limit
-		}
-	}
-	return ""
 }
 
 func compactPlanLimitText(value string) string {
@@ -7269,9 +8106,6 @@ func planLimitFromMap(values map[string]any) string {
 		"plan_limit", "planLimit", "codex_plan_limit", "codexPlanLimit",
 		"usage_tier", "usageTier", "quota_tier", "quotaTier",
 		"rate_limit_tier", "rateLimitTier", "plan_tier", "planTier", "pro_tier", "proTier",
-		"subscription_plan", "subscriptionPlan", "plan_type", "planType", "plan_name", "planName",
-		"plan_display_name", "planDisplayName", "sku", "sku_name", "product", "product_name",
-		"entitlement", "entitlement_name",
 	} {
 		if limit := planLimitFromValue(values[key]); limit != "" {
 			return limit
@@ -7336,7 +8170,7 @@ func normalizePlanType(value string) string {
 	value = strings.ReplaceAll(value, "-", "_")
 	value = strings.ReplaceAll(value, " ", "_")
 	switch value {
-	case "free", "plus", "pro", "team", "business", "enterprise", "edu":
+	case "free", "go", "plus", "pro", "pro_lite", "team", "business", "enterprise", "edu":
 		return value
 	case "chatgpt_plus":
 		return "plus"
@@ -7364,6 +8198,100 @@ func normalizePlanType(value string) string {
 	}
 }
 
+func cleanMetadataText(value string, maxRunes int) string {
+	var builder strings.Builder
+	for _, character := range strings.TrimSpace(value) {
+		if unicode.IsControl(character) {
+			continue
+		}
+		builder.WriteRune(character)
+	}
+	value = strings.Join(strings.Fields(builder.String()), " ")
+	runes := []rune(value)
+	if maxRunes > 0 && len(runes) > maxRunes {
+		value = string(runes[:maxRunes])
+	}
+	return value
+}
+
+func cleanMetadataToken(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || len(value) > 80 {
+		return ""
+	}
+	for _, character := range value {
+		if !(character >= 'a' && character <= 'z') &&
+			!(character >= '0' && character <= '9') &&
+			character != '_' && character != '-' && character != '.' {
+			return ""
+		}
+	}
+	return value
+}
+
+func cleanRawPlanType(value string) string {
+	return cleanMetadataToken(value)
+}
+
+func planFamilyFromRaw(value string) string {
+	switch cleanRawPlanType(value) {
+	case "free":
+		return "free"
+	case "go":
+		return "go"
+	case "plus", "chatgptplus", "chatgpt_plus":
+		return "plus"
+	case "pro", "chatgptpro", "chatgpt_pro", "chatgptproplan":
+		return "pro"
+	case "prolite":
+		return "pro_lite"
+	case "team", "chatgptteam", "chatgpt_team", "chatgptteamplan", "self_serve_business_usage_based":
+		return "business"
+	case "business", "enterprise_cbp_usage_based", "enterprise", "hc":
+		return "enterprise"
+	case "education", "edu":
+		return "edu"
+	default:
+		return "unknown"
+	}
+}
+
+func normalizeAccountPlanMetadata(item *account) {
+	item.RawPlanType = cleanRawPlanType(item.RawPlanType)
+	if item.RawPlanType != "" {
+		item.PlanFamily = planFamilyFromRaw(item.RawPlanType)
+	} else if strings.TrimSpace(item.PlanFamily) != "" {
+		item.PlanFamily = normalizePlanType(item.PlanFamily)
+	} else {
+		// Legacy config stored only the already-normalized planType. Do not apply
+		// raw-wire remapping here or an old Business family would become
+		// Enterprise merely because the new rawPlanType field was absent.
+		item.PlanFamily = normalizePlanType(item.PlanType)
+	}
+	item.PlanType = item.PlanFamily
+	switch cleanMetadataToken(item.SeatType) {
+	case "standard", "premium":
+		item.SeatType = cleanMetadataToken(item.SeatType)
+	default:
+		item.SeatType = ""
+	}
+	item.SeatTypeRaw = cleanMetadataToken(item.SeatTypeRaw)
+	policies := make([]string, 0, len(item.QuotaPolicy))
+	for _, policy := range item.QuotaPolicy {
+		if value := cleanMetadataToken(policy); value != "" {
+			policies = append(policies, value)
+		}
+	}
+	item.QuotaPolicy = policies
+}
+
+func effectivePlanFamily(item account) string {
+	if family := strings.TrimSpace(item.PlanFamily); family != "" {
+		return normalizePlanType(family)
+	}
+	return normalizePlanType(item.PlanType)
+}
+
 func planRank(plan string) int {
 	switch normalizePlanType(plan) {
 	case "enterprise":
@@ -7372,6 +8300,8 @@ func planRank(plan string) int {
 		return 400
 	case "pro":
 		return 300
+	case "pro_lite":
+		return 250
 	case "plus":
 		return 200
 	case "edu":
@@ -7392,6 +8322,10 @@ func planDisplayName(plan string) string {
 		return "Plus"
 	case "pro":
 		return "Pro"
+	case "pro_lite":
+		return "Pro Lite"
+	case "go":
+		return "Go"
 	case "team":
 		return "Team"
 	case "business":
@@ -7416,7 +8350,7 @@ func publicDashboardAccountLabel(item account, index int) string {
 }
 
 func accountPlanDisplayName(item account, withAccountSuffix bool) string {
-	plan := normalizePlanType(item.PlanType)
+	plan := effectivePlanFamily(item)
 	name := planDisplayName(plan)
 	if plan == "pro" {
 		if limit := cleanPlanLimit(item.PlanLimit); limit != "" {
