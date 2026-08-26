@@ -1973,6 +1973,10 @@ column.
 The quota cell must keep every upstream-reported quota window visible as its
 own labeled progress bar. Distinct subscription, Pro/Spark, and additional
 limit windows must not be merged, hidden, or treated as duplicate renderings.
+Out-of-pool accounts keep the same quota values and independent windows, but
+those bars use a visually muted fill and pink frame. This styling communicates
+pool membership only; it must not alter quota health colors, percentages, or
+routing semantics.
 Supporting text belongs below the bars in compact labeled facts: reset
 countdowns pair a `Reset` label with the remaining time. The primary view must
 use flat, aligned rows rather than a nested card for every fact; credits, spend
