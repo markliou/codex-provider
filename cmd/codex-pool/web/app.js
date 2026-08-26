@@ -695,7 +695,6 @@
         ? quota.windows
         : [quota.primary, quota.secondary].filter((window) => window && (window.observed || window.present));
       const windows = sourceWindows.map((window) => quotaWindowMarkup(window.label, window)).filter(Boolean).join("");
-      const blocked = quota.exhausted ? `<div class="quota-blocked">Blocked: ${escapeHTML(quota.exhaustionReason || "quota exhausted")}</div>` : "";
       const reached = quota.rateLimitReachedType ? `<div class="quota-fact quota-fact-warning"><span class="quota-fact-label">Reached type:</span><strong class="quota-fact-value">${escapeHTML(quota.rateLimitReachedType.replaceAll("_", " "))}</strong></div>` : "";
       const resetCredits = quota.resetCredits?.availableCount !== null && quota.resetCredits?.availableCount !== undefined
         ? `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(quota.resetCredits.availableCount))}</strong></div>`
@@ -705,7 +704,10 @@
       // supporting text is grouped so operators can scan bars first, then read
       // reset/credit/telemetry facts without losing any quota semantics.
       const details = quotaDetailsMarkup(`${reached}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
-      return `<div class="quota quota-detailed">${windows ? `<div class="quota-windows">${windows}</div>` : '<div class="quota-detail">Quota windows: Not reported</div>'}${blocked}${additionalLimitsMarkup(quota.additionalLimits)}${details}${refreshError}</div>`;
+      // Exhaustion is already visible in the 0%/critical bar, percentage, and
+      // account status. Do not add a second red "Blocked" sentence below the
+      // bars; it duplicates the signal and makes multi-window rows harder to scan.
+      return `<div class="quota quota-detailed">${windows ? `<div class="quota-windows">${windows}</div>` : '<div class="quota-detail">Quota windows: Not reported</div>'}${additionalLimitsMarkup(quota.additionalLimits)}${details}${refreshError}</div>`;
     }
     if (quotaError) return refreshError;
     if (value === null || value === undefined) return '<span class="quota-unknown">Not reported</span>';
@@ -876,6 +878,7 @@
     parent_affinity_fallback: "Affinity fallback",
     quota_failover: "Quota failover",
     rate_limit_failover: "Rate-limit failover",
+    stream_capacity_failover: "Stream capacity failover",
     auth_failover: "Auth failover",
     transport_failover: "Transport failover",
     repeated_5xx_failover: "Repeated 5xx failover",

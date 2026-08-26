@@ -275,8 +275,10 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - `POST /v1/responses` and `/v1/responses/compact`, with streaming passthrough
   and terminal SSE classification. HTTP `200` streams ending in
   `response.failed` or `response.incomplete` preserve reported usage but do not
-  refresh success, sticky/thread, or response-binding state; committed streams
-  are never retried on another account.
+  refresh success, sticky/thread, or response-binding state. A bounded
+  lifecycle-only SSE preamble may fail over to a different upstream identity
+  when it ends in a capacity-class `response.failed` before any client-visible
+  byte; committed or semantically active streams are never retried.
 - `POST /v1/chat/completions`, including translation to a Responses upstream.
 - Model aliases and `(thinking-tier)` suffix translation.
 - Thread-aware sticky balancing and failover with idle TTL, soft parent-account affinity, independent prompt-cache-key policy, per-model cooldowns, optional Pro-quota preservation, response-id continuation binding, and JSON persistence in `/data`. New sessions distribute across equal-priority healthy accounts; when an upstream account returns `429` or repeated server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.

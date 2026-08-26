@@ -1615,7 +1615,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if !strings.Contains(jsRecorder.Body.String(), "sticky_balanced") || !strings.Contains(jsRecorder.Body.String(), "activeRouteCount") {
 		t.Fatal("admin JS does not expose balanced routing state and per-account active routes")
 	}
-	for _, expected := range []string{"parentAffinityHitCount", "parentAffinityFallbackCount", "lineageFailoverCount", "usageObservedRequestCount", "win.subagent", "renderRoutingCacheEvents", `cacheColumnHeader("Main cache")`, `cacheColumnHeader("Subagent cache")`, `poolColumnHeader("Affinity/Fallback")`, "cache-token-row", "cache-rate", "Rate-limit failover"} {
+	for _, expected := range []string{"parentAffinityHitCount", "parentAffinityFallbackCount", "lineageFailoverCount", "usageObservedRequestCount", "win.subagent", "renderRoutingCacheEvents", `cacheColumnHeader("Main cache")`, `cacheColumnHeader("Subagent cache")`, `poolColumnHeader("Affinity/Fallback")`, "cache-token-row", "cache-rate", "Rate-limit failover", "Stream capacity failover"} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS omitted subagent cache metric %q", expected)
 		}
@@ -1650,6 +1650,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS omitted normalized entitlement/quota/protection text %q", expected)
 		}
 	}
+	for _, forbidden := range []string{"quota-blocked", "Blocked: ${"} {
+		if strings.Contains(jsRecorder.Body.String(), forbidden) {
+			t.Fatalf("admin JS still renders redundant quota exhaustion text %q", forbidden)
+		}
+	}
 	if strings.Contains(jsRecorder.Body.String(), "toast") {
 		t.Fatal("admin JS still renders bottom-right toast notifications")
 	}
@@ -1663,6 +1668,14 @@ func TestAdminDashboardAssets(t *testing.T) {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS does not preserve the warm-to-red quota warning ramp %q", expected)
 		}
+	}
+	for _, expected := range []string{"tr:has(.badge.standby) .quota-track", "border-style: dashed", "#c4819d", "color-mix(in srgb, var(--quota-start) 46%", "color-mix(in srgb, var(--quota-end) 46%"} {
+		if !strings.Contains(cssRecorder.Body.String(), expected) {
+			t.Fatalf("admin CSS does not keep health-tinted out-of-pool quota styling %q", expected)
+		}
+	}
+	if strings.Contains(cssRecorder.Body.String(), ".quota-blocked") {
+		t.Fatal("admin CSS still styles removed redundant quota exhaustion text")
 	}
 	for _, expected := range []string{"#f2eee3", "#176b87", "#d95136", "#0d8f78", "#f2c14e"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
@@ -3566,6 +3579,26 @@ func TestCopyStreamingProxyResponseFlushesSSE(t *testing.T) {
 	}
 	if info.ResponseID != "resp_flushed" {
 		t.Fatalf("streaming response id = %q", info.ResponseID)
+	}
+}
+
+func TestStreamingPrecommitBlockLimitCommitsBeforeCapacityFailure(t *testing.T) {
+	var stream strings.Builder
+	for i := 0; i < streamingPrecommitMaxBlocks+1; i++ {
+		_, _ = fmt.Fprintf(&stream, "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_%d\"}}\n\n", i)
+	}
+	_, _ = io.WriteString(&stream, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+	recorder := httptest.NewRecorder()
+	commits := 0
+	result := copyStreamingProxyResponseWithPrecommit(recorder, strings.NewReader(stream.String()), func() {
+		commits++
+		recorder.WriteHeader(http.StatusOK)
+	})
+	if result.RetryableCapacityFailure {
+		t.Fatal("capacity failure remained retryable after precommit block limit")
+	}
+	if commits != 1 || !recorder.Flushed || !strings.Contains(recorder.Body.String(), "response.failed") {
+		t.Fatalf("bounded precommit stream was not committed once: commits=%d flushed=%t body=%s", commits, recorder.Flushed, recorder.Body.String())
 	}
 }
 
@@ -5900,11 +5933,77 @@ func TestResponseInfoFromSSEBlockClassifiesTerminalEvents(t *testing.T) {
 	}
 }
 
-func TestStreamingResponseFailedDoesNotRefreshRoutingStateOrRetry(t *testing.T) {
+func TestEarlyCapacityStreamingFailureRetriesBeforeCommit(t *testing.T) {
 	firstHits := 0
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		firstHits++
 		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_failed\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"secret upstream detail\"},\"usage\":{\"input_tokens\":2048,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":1024}}}}\n\n")
+	}))
+	defer first.Close()
+	secondHits := 0
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_second\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_second\",\"usage\":{\"input_tokens\":4096,\"output_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":2048}}}}\n\n")
+	}))
+	defer second.Close()
+
+	a := testApp(t, []account{
+		{ID: "first", Label: "Primary", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL},
+		{ID: "second", Label: "Backup", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: second.URL},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "failed-stream")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "recovered") || !strings.Contains(recorder.Body.String(), "resp_second") {
+		t.Fatalf("backup SSE was not forwarded: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "resp_failed") || strings.Contains(recorder.Body.String(), "response.failed") || strings.Contains(recorder.Body.String(), "secret upstream detail") {
+		t.Fatalf("abandoned pre-commit stream leaked downstream: %s", recorder.Body.String())
+	}
+	if firstHits != 1 || secondHits != 1 {
+		t.Fatalf("early capacity failure did not retry backup: first=%d second=%d", firstHits, secondHits)
+	}
+	if recorder.Header().Get("X-Codex-Pool-Account") != "Backup" {
+		t.Fatalf("response headers describe abandoned account: %#v", recorder.Header())
+	}
+	if a.state.RequestCount != 1 || a.state.SuccessCount != 1 || a.state.FailureCount != 1 || a.state.UpstreamResponseFailedCount != 1 {
+		t.Fatalf("recovered stream counters = requests:%d success:%d failure:%d response_failed:%d", a.state.RequestCount, a.state.SuccessCount, a.state.FailureCount, a.state.UpstreamResponseFailedCount)
+	}
+	if !a.state.Health["first"].LastSuccessAt.IsZero() || a.state.Health["first"].ConsecutiveFailure != 1 || a.state.Health["second"].LastSuccessAt.IsZero() {
+		t.Fatalf("recovered stream health = first:%#v second:%#v", a.state.Health["first"], a.state.Health["second"])
+	}
+	if len(a.state.StickySessions) != 1 || len(a.state.ResponseBindings) != 1 || a.state.ResponseBindings["resp_second"].AccountID != "second" {
+		t.Fatalf("recovered stream bindings: sticky=%#v response=%#v", a.state.StickySessions, a.state.ResponseBindings)
+	}
+	if len(a.state.Cooldowns["first"]) != 1 {
+		t.Fatalf("capacity terminal failure did not set cooldown: %#v", a.state.Cooldowns["first"])
+	}
+	if _, exists := a.state.PromptCache["first:gpt-test:main"]; exists {
+		t.Fatalf("abandoned attempt created request-level cache stats: %#v", a.state.PromptCache["first:gpt-test:main"])
+	}
+	if stat := a.state.PromptCache["second:gpt-test:main"]; stat.InputTokens != 4096 || stat.CachedTokens != 2048 || stat.RoutingFailoverCount != 1 {
+		t.Fatalf("recovered stream cache stats = %#v", stat)
+	}
+	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].RoutingOutcome != "stream_capacity_failover" || a.state.RoutingCacheEvents[0].FailoverFromAccountID != "first" || a.state.RoutingCacheEvents[0].TerminalEvent != "response.completed" {
+		t.Fatalf("recovered stream routing event = %#v", a.state.RoutingCacheEvents)
+	}
+}
+
+func TestCommittedStreamingResponseFailedDoesNotRetry(t *testing.T) {
+	firstHits := 0
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"visible\"}\n\n")
 		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"secret upstream detail\"},\"usage\":{\"input_tokens\":2048,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":1024}}}}\n\n")
 	}))
 	defer first.Close()
@@ -5922,17 +6021,17 @@ func TestStreamingResponseFailedDoesNotRefreshRoutingStateOrRetry(t *testing.T) 
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
 	req.Header.Set("Authorization", "Bearer client-key")
-	req.Header.Set("X-Codex-Pool-Session", "failed-stream")
+	req.Header.Set("X-Codex-Pool-Session", "committed-failed-stream")
 	recorder := httptest.NewRecorder()
 	a.publicMux().ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "response.failed") {
-		t.Fatalf("failed SSE was not forwarded: %d %s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "visible") || !strings.Contains(recorder.Body.String(), "response.failed") {
+		t.Fatalf("committed failed SSE was not forwarded: %d %s", recorder.Code, recorder.Body.String())
 	}
 	if firstHits != 1 || secondHits != 0 {
-		t.Fatalf("proxy retried after committed failed stream: first=%d second=%d", firstHits, secondHits)
+		t.Fatalf("proxy retried after semantic stream commit: first=%d second=%d", firstHits, secondHits)
 	}
-	if a.state.SuccessCount != 0 || a.state.FailureCount != 1 || a.state.UpstreamResponseFailedCount != 1 {
-		t.Fatalf("failed stream counters = success:%d failure:%d response_failed:%d", a.state.SuccessCount, a.state.FailureCount, a.state.UpstreamResponseFailedCount)
+	if a.state.RequestCount != 1 || a.state.SuccessCount != 0 || a.state.FailureCount != 1 || a.state.UpstreamResponseFailedCount != 1 {
+		t.Fatalf("failed stream counters = requests:%d success:%d failure:%d response_failed:%d", a.state.RequestCount, a.state.SuccessCount, a.state.FailureCount, a.state.UpstreamResponseFailedCount)
 	}
 	if !a.state.Health["first"].LastSuccessAt.IsZero() || a.state.Health["first"].ConsecutiveFailure != 1 {
 		t.Fatalf("failed stream refreshed success state: %#v", a.state.Health["first"])
@@ -5948,6 +6047,28 @@ func TestStreamingResponseFailedDoesNotRefreshRoutingStateOrRetry(t *testing.T) 
 	}
 	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].TerminalFailureClass != "capacity" || a.state.RoutingCacheEvents[0].TerminalErrorCode != "rate_limit_exceeded" {
 		t.Fatalf("failed stream diagnostics were not sanitized/classified: %#v", a.state.RoutingCacheEvents)
+	}
+}
+
+func TestEarlyCapacityStreamingFailureWithoutFallbackPreservesUpstreamSSE(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_only\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_only\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"selected model is at capacity\"}}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if hits != 1 || recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "resp_only") || !strings.Contains(recorder.Body.String(), "selected model is at capacity") {
+		t.Fatalf("single-account capacity failure was not preserved: hits=%d code=%d body=%s", hits, recorder.Code, recorder.Body.String())
+	}
+	if a.state.RequestCount != 1 || a.state.SuccessCount != 0 || a.state.FailureCount != 1 || a.state.UpstreamResponseFailedCount != 1 {
+		t.Fatalf("single-account capacity counters = requests:%d success:%d failure:%d response_failed:%d", a.state.RequestCount, a.state.SuccessCount, a.state.FailureCount, a.state.UpstreamResponseFailedCount)
 	}
 }
 
