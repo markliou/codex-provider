@@ -650,6 +650,14 @@
     return `<div class="quota-fact quota-fact-telemetry" title="${escapeHTML(title)}"><span class="quota-fact-label">Telemetry:</span><strong class="quota-fact-value">${escapeHTML(label)}</strong>${updated ? `<span class="quota-fact-note">${escapeHTML(updated)}</span>` : ""}</div>`;
   }
 
+  function quotaDetailsMarkup(content) {
+    if (!content) return "";
+    // Progressive disclosure is intentional here: the progress bars are the
+    // operator's first-glance signal, while credits and telemetry are useful
+    // diagnostic context. Keep every quota window open in the primary view,
+    // but do not make secondary facts compete with those bars.
+    return `<details class="quota-details"><summary>More details</summary><div class="quota-facts">${content}</div></details>`;
+  }
   function quotaCreditsMarkup(credits) {
     if (!credits) return '<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">Not reported</strong></div>';
     if (credits.unlimited) return '<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">Unlimited</strong><span class="quota-fact-note">separate credits</span></div>';
@@ -666,14 +674,15 @@
 
   function additionalLimitsMarkup(limits) {
     if (!Array.isArray(limits) || !limits.length) return "";
-    return limits.map((limit) => {
+    const entries = limits.map((limit) => {
       const windows = Array.isArray(limit.windows) ? limit.windows : [limit.primary, limit.secondary].filter(Boolean);
       const detail = windows.map((window) => quotaWindowMarkup(limit.limitName || limit.limitId || "Additional", window)).join("");
-      const blocked = limit.exhausted ? `<div class="quota-blocked">Additional limit reached: ${escapeHTML(limit.limitName || limit.limitId || "Reported limit")}</div>` : "";
-      return `<div class="quota-additional"><div class="quota-additional-heading"><span class="quota-fact-label">Additional limit</span><strong>${escapeHTML(limit.limitName || limit.limitId || "Reported limit")}</strong></div>${detail || '<div class="quota-detail">Window: Not reported</div>'}${blocked}</div>`;
+      const name = limit.limitName || limit.limitId || "Reported limit";
+      const reached = limit.exhausted ? '<span class="quota-additional-status">Reached</span>' : "";
+      return `<div class="quota-additional-limit"><div class="quota-additional-heading"><strong>${escapeHTML(name)}</strong>${reached}</div><div class="quota-windows">${detail || '<div class="quota-detail">Window: Not reported</div>'}</div></div>`;
     }).join("");
+    return `<div class="quota-additional-group"><div class="quota-section-label">Additional limits</div>${entries}</div>`;
   }
-
   function quotaMarkup(value, quota, quotaError, usageUpdatedAt, freshness, lastSuccessfulRefreshAt, metering) {
     const refreshError = quotaError ? `<span class="quota-error" title="${escapeHTML(quotaError.message)}">Quota update unavailable</span>` : "";
     if (metering === "api_metered" && !quota) {
@@ -695,7 +704,8 @@
       // are distinct upstream limits, not duplicate renderings. Only the
       // supporting text is grouped so operators can scan bars first, then read
       // reset/credit/telemetry facts without losing any quota semantics.
-      return `<div class="quota quota-detailed">${windows || '<div class="quota-detail">Quota windows: Not reported</div>'}${blocked}${additionalLimitsMarkup(quota.additionalLimits)}<div class="quota-facts">${reached}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}</div>${refreshError}</div>`;
+      const details = quotaDetailsMarkup(`${reached}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
+      return `<div class="quota quota-detailed">${windows ? `<div class="quota-windows">${windows}</div>` : '<div class="quota-detail">Quota windows: Not reported</div>'}${blocked}${additionalLimitsMarkup(quota.additionalLimits)}${details}${refreshError}</div>`;
     }
     if (quotaError) return refreshError;
     if (value === null || value === undefined) return '<span class="quota-unknown">Not reported</span>';
@@ -752,23 +762,27 @@
 
   function quotaProtectionMarkup(account, health) {
     const protection = health.quotaProtection;
-    if (!protection?.supported) return '<div class="quota-protection"><span>Protection: Unavailable for API-key account</span></div>';
+    if (!protection?.supported) {
+      return `<div class="quota-protection quota-protection-unavailable" title="Not available for API-key account"><span>Protection</span><strong>Unavailable</strong></div>`;
+    }
     const protectionMessage = protection.message || (protection.blocked ? "Protected: threshold reached" : protection.enabled ? "Protection active" : "Protection disabled");
     const window = protection.effectiveWindow;
     const windowDetail = window?.present
       ? ` · ${window.label || "Window"} ${quotaPercent(window.remainingPercent ?? window.percentage)}% left`
       : "";
-    return `<div class="quota-protection">
-      <div><strong>${escapeHTML(protectionMessage)}</strong>${escapeHTML(windowDetail)}</div>
-      <div class="quota-protection-controls">
-        <label><input type="checkbox" data-quota-protection-enabled="${escapeHTML(account.id)}"${protection.enabled ? " checked" : ""}> Protect quota</label>
-        <label>Threshold <input class="quota-threshold-input" type="number" min="0" max="100" step="1" value="${quotaPercent(protection.threshold)}" data-quota-protection-threshold="${escapeHTML(account.id)}">%</label>
-        <button class="button quiet" type="button" data-quota-protection-save="${escapeHTML(account.id)}">Save</button>
+    const state = protection.blocked ? "Blocked" : protection.enabled ? "On" : "Off";
+    return `<details class="quota-protection"><summary><span>Protection</span><strong>${escapeHTML(state)}</strong></summary>
+      <div class="quota-protection-body">
+        <div class="quota-detail"><strong>${escapeHTML(protectionMessage)}</strong>${escapeHTML(windowDetail)}</div>
+        <div class="quota-protection-controls">
+          <label><input type="checkbox" data-quota-protection-enabled="${escapeHTML(account.id)}"${protection.enabled ? " checked" : ""}> Protect quota</label>
+          <label>Threshold <input class="quota-threshold-input" type="number" min="0" max="100" step="1" value="${quotaPercent(protection.threshold)}" data-quota-protection-threshold="${escapeHTML(account.id)}">%</label>
+          <button class="button quiet" type="button" data-quota-protection-save="${escapeHTML(account.id)}">Save</button>
+        </div>
+        <div class="quota-detail">Duplicate slots share upstream capacity; this threshold applies only to this local slot.</div>
       </div>
-      <div class="quota-detail">Duplicate slots share upstream capacity; this threshold applies only to this local slot.</div>
-    </div>`;
+    </details>`;
   }
-
   function ownerNoteInput(account, publicMode = false) {
     const ref = publicMode ? account.poolRef : account.id;
     if (!ref) return "";

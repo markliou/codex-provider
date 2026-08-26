@@ -1974,10 +1974,12 @@ The quota cell must keep every upstream-reported quota window visible as its
 own labeled progress bar. Distinct subscription, Pro/Spark, and additional
 limit windows must not be merged, hidden, or treated as duplicate renderings.
 Supporting text belongs below the bars in compact labeled facts: reset
-countdowns pair a `Reset` label with the remaining time, while credits, spend
-control, reset credits, telemetry freshness, and protection controls use
-visually grouped rows rather than an undifferentiated paragraph list. Exact
-reset and refresh timestamps may remain in tooltips so the table stays
+countdowns pair a `Reset` label with the remaining time. The primary view must
+use flat, aligned rows rather than a nested card for every fact; credits, spend
+control, reset credits, telemetry freshness, and protection controls are
+secondary context and stay behind a compact disclosure control by default.
+Blocked or unavailable states remain visible without opening the disclosure.
+Exact reset and refresh timestamps may remain in tooltips so the table stays
 scannable without discarding diagnostic detail.
 
 The pool-wide cache window must show the total request count since reset and
