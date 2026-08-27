@@ -629,6 +629,7 @@ parent_affinity
 parent_affinity_fallback
 quota_failover
 rate_limit_failover
+stream_capacity_failover
 auth_failover
 transport_failover
 repeated_5xx_failover
@@ -638,7 +639,10 @@ The first four describe selection without an upstream retry. A `*_failover`
 outcome identifies why the successful request moved away from the prior or
 failed account. Routing counters and request diagnostics must use these stable
 values so operators can distinguish healthy distribution from cache-breaking
-failover.
+failover. `stream_capacity_failover` specifically means an upstream
+`response.failed` capacity event was detected and discarded before any SSE
+bytes became client-visible, then a different upstream identity completed the
+same client request.
 
 ### 6.4 Failback behavior
 
@@ -1687,7 +1691,15 @@ If using provider gateway with `wireApi=chat_completions`, forward as Chat Compl
 For streaming responses:
 
 - Preserve `text/event-stream` semantics.
-- Flush chunks immediately.
+- Flush complete SSE blocks immediately after the response becomes
+  client-visible.
+- Before the first client-visible byte, Pool may buffer only a bounded
+  lifecycle-only preamble consisting of `response.created`,
+  `response.in_progress`, `response.queued`, and SSE keepalive/reconnection
+  metadata. The buffer is limited to 64 KiB and eight complete SSE blocks.
+  Reaching either limit, receiving an unknown event/data block, or receiving
+  any output, reasoning, tool, hosted-tool, or other semantic event commits the
+  buffered prefix immediately.
 - Parse complete SSE event blocks and retain terminal
   `response.completed`, `response.failed`, and `response.incomplete` state.
 - HTTP `200` plus `response.failed`/`response.incomplete` is a failed client
@@ -1697,8 +1709,21 @@ For streaming responses:
   failures may quarantine the credential. Context length, invalid prompt, and
   policy failures do not penalize account health. Unknown codes remain a
   sanitized generic failure instead of being guessed as quota/auth.
+- A capacity-class `response.failed` received entirely inside the bounded
+  lifecycle-only preamble may be discarded and retried only when another
+  eligible account with a different upstream identity and another configured
+  proxy attempt are available. The failed attempt updates upstream
+  failure/cooldown counters but does not create a client failure, sticky/thread
+  binding, response binding, or request-level throughput result. The eventual
+  successful response is classified as `stream_capacity_failover`.
+- If no distinct fallback is available, preserve and forward the original
+  buffered upstream failure instead of replacing it with a synthetic pool
+  error.
 - Once any SSE bytes are committed downstream, never retry another account or
-  splice a second response stream.
+  splice a second response stream. In particular, never retry after any output,
+  reasoning, tool, hosted-tool, unknown semantic event, or a preamble forced to
+  commit by its bounds; doing so could duplicate work or side effects and
+  corrupt response IDs and SSE ordering.
 - Detect stream idle timeout.
 - On stream error, emit SSE `error` event where possible.
 - Track incomplete streams separately.
@@ -1973,12 +1998,23 @@ column.
 The quota cell must keep every upstream-reported quota window visible as its
 own labeled progress bar. Distinct subscription, Pro/Spark, and additional
 limit windows must not be merged, hidden, or treated as duplicate renderings.
+Out-of-pool accounts keep the same quota values and independent windows, but
+each bar mixes its own green/gold/orange/red health gradient toward a neutral
+gray and uses a dusty-pink dashed frame. Do not replace every health level with
+one pink fill: a muted healthy bar must remain distinguishable from a muted
+critical bar, while the dashed membership frame keeps an out-of-pool 0% track
+distinct from the solid dark-red exhausted track of a routable account. This
+styling communicates pool membership only; it must not alter quota
+percentages or routing semantics.
 Supporting text belongs below the bars in compact labeled facts: reset
 countdowns pair a `Reset` label with the remaining time. The primary view must
 use flat, aligned rows rather than a nested card for every fact; credits, spend
 control, reset credits, telemetry freshness, and protection controls are
 secondary context and stay behind a compact disclosure control by default.
-Blocked or unavailable states remain visible without opening the disclosure.
+Quota exhaustion is already represented by the zero/critical bar, percentage,
+and account status; do not repeat it as a red `Blocked: ...` sentence below the
+bars. Quota-protection blocked/unavailable state remains visible in its compact
+control without opening the disclosure.
 Exact reset and refresh timestamps may remain in tooltips so the table stays
 scannable without discarding diagnostic detail.
 

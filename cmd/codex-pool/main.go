@@ -87,6 +87,12 @@ const (
 	upstream5xxCooldown      = 10 * time.Second
 	upstream5xxFailoverAfter = 3
 	upstream5xxFailureWindow = 2 * time.Minute
+	// Pool may hold only the small lifecycle-only prefix of an SSE response so
+	// an upstream capacity rejection can be retried before anything becomes
+	// client-visible. These hard bounds prevent a changed or malformed upstream
+	// event sequence from turning pre-commit failover into general buffering.
+	streamingPrecommitMaxBytes  = 64 << 10
+	streamingPrecommitMaxBlocks = 8
 	// Codex treats remote model metadata as authoritative for ChatGPT-backed
 	// providers. This fallback must remain non-empty or a schema-only fix would
 	// silently remove the coding-agent instructions after a successful refresh.
@@ -1201,7 +1207,8 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	failoverFromAccountID := ""
 	failoverOutcome := ""
 	excluded := map[string]bool{}
-	for attempt := 0; attempt < a.proxyAttemptLimit(); attempt++ {
+	attemptLimit := a.proxyAttemptLimit()
+	for attempt := 0; attempt < attemptLimit; attempt++ {
 		candidate, err := a.selectAccountForRoute(route, model, excluded)
 		if err != nil {
 			if errors.Is(err, errAccountAuthRepairPending) {
@@ -1306,15 +1313,40 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			a.markFailure(candidate.ID, model, reason, wait)
 			continue
 		}
-		defer response.Body.Close()
-		a.addCurrentAccountResponseHeaders(w, candidate.ID)
 		var info proxyResponseInfo
 		ok := true
-		if convertResponse {
+		if !convertResponse && isStreamingProxyResponse(response) {
+			result := copyStreamingProxyResponseWithPrecommit(w, response.Body, func() {
+				a.addCurrentAccountResponseHeaders(w, candidate.ID)
+				commitProxyResponseHeaders(w, response)
+			})
+			info = result.Info
+			if result.RetryableCapacityFailure {
+				excluded[candidate.ID] = true
+				// The buffered prefix has not changed the client-visible
+				// response. Retry only when another real routing candidate and
+				// another configured attempt remain; otherwise preserve the
+				// original upstream SSE failure instead of replacing it with a
+				// synthetic pool error.
+				if attempt+1 < attemptLimit && a.hasPreferredAccount(model, excluded) {
+					_ = response.Body.Close()
+					failoverFromAccountID = candidate.ID
+					failoverOutcome = "stream_capacity_failover"
+					a.markRetryableTerminalResponseFailure(candidate.ID, model, info)
+					continue
+				}
+				a.addCurrentAccountResponseHeaders(w, candidate.ID)
+				commitProxyResponseHeaders(w, response)
+				writeStreamingBytes(w, result.Buffered)
+			}
+		} else if convertResponse {
+			a.addCurrentAccountResponseHeaders(w, candidate.ID)
 			info, ok = a.writeChatFromResponse(w, response, model)
 		} else {
+			a.addCurrentAccountResponseHeaders(w, candidate.ID)
 			info, ok = copyProxyResponse(w, response)
 		}
+		_ = response.Body.Close()
 		if !ok {
 			a.markFailure(candidate.ID, model, "upstream_response_error", 30*time.Second)
 			return
@@ -1325,9 +1357,10 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		throughput.CompletedAt = info.CompletedAt
 		throughput.Usage = info.Usage
 		if info.TerminalEvent == "response.failed" || info.TerminalEvent == "response.incomplete" {
-			// Bytes have already been forwarded. Never retry another account here:
-			// splicing a second stream could duplicate work and corrupt the SSE
-			// sequence. Record the terminal failure without refreshing affinity.
+			// A capacity failure can reach here only after the pre-commit path
+			// found no real fallback or after semantic SSE output was committed.
+			// Never retry at this point: splicing a second stream could duplicate
+			// work, tool effects, or response IDs and corrupt the SSE sequence.
 			throughput.Success = false
 			a.markTerminalResponseFailureWithMeasurement(route, model, candidate.ID, info, throughput)
 			return
@@ -1532,6 +1565,12 @@ type proxyResponseInfo struct {
 	FailoverOutcome       string
 }
 
+type streamingProxyResult struct {
+	Info                     proxyResponseInfo
+	Buffered                 []byte
+	RetryableCapacityFailure bool
+}
+
 func (a *app) writeChatFromResponse(w http.ResponseWriter, response *http.Response, model string) (proxyResponseInfo, bool) {
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		return copyProxyResponse(w, response)
@@ -1632,13 +1671,25 @@ func safeHeaderValue(value string) string {
 	}, strings.TrimSpace(value))
 }
 
-func copyProxyResponse(w http.ResponseWriter, response *http.Response) (proxyResponseInfo, bool) {
+func copyProxyResponseHeaders(w http.ResponseWriter, response *http.Response) {
 	for _, header := range []string{"Content-Type", "Cache-Control", "X-Request-Id"} {
 		if value := response.Header.Get(header); value != "" {
 			w.Header().Set(header, value)
 		}
 	}
+}
+
+func commitProxyResponseHeaders(w http.ResponseWriter, response *http.Response) {
+	copyProxyResponseHeaders(w, response)
 	w.WriteHeader(response.StatusCode)
+}
+
+func isStreamingProxyResponse(response *http.Response) bool {
+	return response != nil && strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream")
+}
+
+func copyProxyResponse(w http.ResponseWriter, response *http.Response) (proxyResponseInfo, bool) {
+	commitProxyResponseHeaders(w, response)
 	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
 		return copyStreamingProxyResponse(w, response.Body), true
 	}
@@ -1657,40 +1708,150 @@ func copyProxyResponse(w http.ResponseWriter, response *http.Response) (proxyRes
 }
 
 func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResponseInfo {
+	result := copyStreamingProxyResponseWithPrecommit(w, body, nil)
+	if result.RetryableCapacityFailure {
+		// This compatibility wrapper is used only after callers have already
+		// committed headers. It must preserve the upstream failure verbatim;
+		// only the main proxy loop can discard an uncommitted prefix and retry.
+		writeStreamingBytes(w, result.Buffered)
+	}
+	return result.Info
+}
+
+func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Reader, beforeCommit func()) streamingProxyResult {
 	var info proxyResponseInfo
 	reader := bufio.NewReader(body)
-	flusher, _ := w.(http.Flusher)
-	var eventBlock strings.Builder
-	mergeBlock := func() {
-		if eventBlock.Len() == 0 {
+	var buffered strings.Builder
+	bufferedBlocks := 0
+	committed := false
+	commit := func() {
+		if committed {
 			return
 		}
-		info.merge(responseInfoFromSSEBlock(eventBlock.String()))
-		eventBlock.Reset()
+		committed = true
+		if beforeCommit != nil {
+			beforeCommit()
+		}
+		if buffered.Len() > 0 {
+			writeStreamingBytes(w, []byte(buffered.String()))
+			buffered.Reset()
+		}
 	}
 	for {
-		line, err := reader.ReadString('\n')
-		if line != "" {
-			_, _ = io.WriteString(w, line)
-			eventBlock.WriteString(line)
-			if strings.TrimRight(line, "\r\n") == "" {
-				mergeBlock()
-			}
-			if flusher != nil {
-				flusher.Flush()
+		block, err := readSSEBlock(reader)
+		if block != "" {
+			next := responseInfoFromSSEBlock(block)
+			info.merge(next)
+			if committed {
+				writeStreamingBytes(w, []byte(block))
+			} else {
+				buffered.WriteString(block)
+				bufferedBlocks++
+				withinBounds := buffered.Len() <= streamingPrecommitMaxBytes && bufferedBlocks <= streamingPrecommitMaxBlocks
+				if next.TerminalEvent == "response.failed" && next.TerminalFailureClass == "capacity" && withinBounds {
+					// No headers, lifecycle event, response id, model output, or
+					// tool activity has reached the client. Return the exact
+					// buffered failure so the caller can either discard it for a
+					// distinct-identity retry or forward it when no backup exists.
+					info.CompletedAt = time.Now().UTC()
+					return streamingProxyResult{
+						Info:                     info,
+						Buffered:                 []byte(buffered.String()),
+						RetryableCapacityFailure: true,
+					}
+				}
+				if !withinBounds || !precommitLifecycleSSEBlock(block) {
+					commit()
+				}
 			}
 		}
 		if errors.Is(err, io.EOF) {
-			mergeBlock()
+			commit()
 			break
 		}
 		if err != nil {
-			mergeBlock()
+			commit()
 			break
 		}
 	}
 	info.CompletedAt = time.Now().UTC()
-	return info
+	return streamingProxyResult{Info: info}
+}
+
+func writeStreamingBytes(w http.ResponseWriter, data []byte) {
+	if len(data) > 0 {
+		_, _ = w.Write(data)
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func readSSEBlock(reader *bufio.Reader) (string, error) {
+	var block strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			block.WriteString(line)
+			if strings.TrimRight(line, "\r\n") == "" {
+				return block.String(), err
+			}
+		}
+		if err != nil {
+			return block.String(), err
+		}
+	}
+}
+
+func precommitLifecycleSSEBlock(block string) bool {
+	switch responseEventTypeFromSSEBlock(block) {
+	case "response.created", "response.in_progress", "response.queued":
+		return true
+	case "":
+		// SSE keepalive comments and reconnection metadata are not semantic
+		// model output. Unknown event/data blocks fail closed and commit
+		// immediately so a future upstream event cannot be silently discarded.
+		for _, line := range strings.Split(block, "\n") {
+			line = strings.TrimSuffix(line, "\r")
+			if line == "" || strings.HasPrefix(line, ":") || strings.HasPrefix(line, "id:") || strings.HasPrefix(line, "retry:") {
+				continue
+			}
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func responseEventTypeFromSSEBlock(block string) string {
+	eventType, data := sseBlockEventAndData(block)
+	if data == "" || data == "[DONE]" {
+		return eventType
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		return eventType
+	}
+	if payloadType, _ := payload["type"].(string); cleanMetadataToken(payloadType) != "" {
+		return cleanMetadataToken(payloadType)
+	}
+	return eventType
+}
+
+func sseBlockEventAndData(block string) (string, string) {
+	var eventType string
+	dataLines := make([]string, 0, 1)
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		switch {
+		case strings.HasPrefix(line, "event:"):
+			eventType = cleanMetadataToken(strings.TrimSpace(strings.TrimPrefix(line, "event:")))
+		case strings.HasPrefix(line, "data:"):
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	return eventType, strings.Join(dataLines, "\n")
 }
 
 func (info *proxyResponseInfo) merge(next proxyResponseInfo) {
@@ -1726,18 +1887,7 @@ func responseInfoFromSSELine(line string) proxyResponseInfo {
 }
 
 func responseInfoFromSSEBlock(block string) proxyResponseInfo {
-	var eventType string
-	dataLines := make([]string, 0, 1)
-	for _, line := range strings.Split(block, "\n") {
-		line = strings.TrimSuffix(line, "\r")
-		switch {
-		case strings.HasPrefix(line, "event:"):
-			eventType = cleanMetadataToken(strings.TrimSpace(strings.TrimPrefix(line, "event:")))
-		case strings.HasPrefix(line, "data:"):
-			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-		}
-	}
-	data := strings.Join(dataLines, "\n")
+	eventType, data := sseBlockEventAndData(block)
 	if data == "" || data == "[DONE]" {
 		if isTerminalResponseEvent(eventType) && eventType != "response.completed" {
 			return proxyResponseInfo{TerminalEvent: eventType, TerminalFailureClass: terminalFailureClass(eventType, "")}
@@ -3476,6 +3626,30 @@ func (a *app) markSuccess(route routingDecision, model, accountID string, info p
 	a.markSuccessWithMeasurement(route, model, accountID, info, nil)
 }
 
+func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info proxyResponseInfo) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now().UTC()
+	reason := codeOr(sanitizedErrorCode(info.TerminalErrorCode), "upstream_response_failed")
+	health := a.state.Health[accountID]
+	health.LastFailureAt = now
+	health.LastFailureReason = reason
+	health.ConsecutiveFailure++
+	a.state.Health[accountID] = health
+	duration := 30 * time.Second
+	if reason == "server_is_overloaded" || reason == "slow_down" {
+		duration = upstream5xxCooldown
+	}
+	a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
+	// This is an upstream failed attempt recovered inside one client request.
+	// Count the upstream failure and protect the account, but do not finish the
+	// request-level throughput measurement, increment RequestCount, or create a
+	// failed routing event; the eventual final response owns those records.
+	a.state.FailureCount++
+	a.state.UpstreamResponseFailedCount++
+	_ = a.saveLocked()
+}
+
 func (a *app) markTerminalResponseFailureWithMeasurement(route routingDecision, model, accountID string, info proxyResponseInfo, measurement *throughputMeasurement) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -3678,7 +3852,7 @@ func (a *app) routingOutcomeLocked(route routingDecision, model, accountID strin
 
 func normalizedRoutingOutcome(value string) string {
 	switch value {
-	case "sticky_reuse", "new_route_assignment", "parent_affinity", "parent_affinity_fallback", "quota_failover", "rate_limit_failover", "auth_failover", "transport_failover", "repeated_5xx_failover":
+	case "sticky_reuse", "new_route_assignment", "parent_affinity", "parent_affinity_fallback", "quota_failover", "rate_limit_failover", "stream_capacity_failover", "auth_failover", "transport_failover", "repeated_5xx_failover":
 		return value
 	default:
 		return ""
