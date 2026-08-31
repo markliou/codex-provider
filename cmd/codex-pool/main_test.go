@@ -462,6 +462,17 @@ func TestDashboardSummariesPartitionVisibleAccountStates(t *testing.T) {
 			t.Fatalf("public summary exposed auth-specific bucket %q: %#v", privateKey, public)
 		}
 	}
+	duplicate := a.publicDashboardAccountLocked(a.config.Accounts[7], 7, now)
+	if duplicate["statusTone"] != "standby" || duplicate["statusLabel"] != "Duplicate" {
+		t.Fatalf("duplicate public status presentation changed unexpectedly: %#v", duplicate)
+	}
+	if duplicate["outOfPool"] != false {
+		t.Fatalf("duplicate public account was marked out of pool: %#v", duplicate)
+	}
+	standby := a.publicDashboardAccountLocked(a.config.Accounts[3], 3, now)
+	if standby["outOfPool"] != true {
+		t.Fatalf("real out-of-pool public account was not marked: %#v", standby)
+	}
 }
 
 func TestMissingCodexAuthClassifiesWithoutRetry(t *testing.T) {
@@ -1645,6 +1656,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS does not render clear quota state %q", expected)
 		}
 	}
+	for _, expected := range []string{"poolMembershipAttribute", "account.inPool === false", "account.outOfPool === true", `data-pool-membership="out"`} {
+		if !strings.Contains(jsRecorder.Body.String(), expected) {
+			t.Fatalf("admin JS does not keep quota styling tied to explicit pool membership %q", expected)
+		}
+	}
 	for _, expected := range []string{"Seat type: Not reported", "Usage: ${metadata.planLimit", "5-hour policy:", "Flexible credits:", "Spend control:", "Telemetry:", "API-metered · ChatGPT quota not applicable", "Protected: threshold reached", "quota-protection/set", "Duplicate slots share upstream capacity", "quota.windows", "quota.additionalLimits"} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS omitted normalized entitlement/quota/protection text %q", expected)
@@ -1669,10 +1685,13 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin CSS does not preserve the warm-to-red quota warning ramp %q", expected)
 		}
 	}
-	for _, expected := range []string{"tr:has(.badge.standby) .quota-track", "border-style: dashed", "#c4819d", "color-mix(in srgb, var(--quota-start) 46%", "color-mix(in srgb, var(--quota-end) 46%"} {
+	for _, expected := range []string{`tr[data-pool-membership="out"] .quota-track`, "border-style: dashed", "#c4819d", "color-mix(in srgb, var(--quota-start) 46%", "color-mix(in srgb, var(--quota-end) 46%"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS does not keep health-tinted out-of-pool quota styling %q", expected)
 		}
+	}
+	if strings.Contains(cssRecorder.Body.String(), "tr:has(.badge.standby) .quota-track") {
+		t.Fatal("admin CSS still infers pool membership from the standby badge")
 	}
 	if strings.Contains(cssRecorder.Body.String(), ".quota-blocked") {
 		t.Fatal("admin CSS still styles removed redundant quota exhaustion text")

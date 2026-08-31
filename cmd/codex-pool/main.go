@@ -7892,11 +7892,16 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 	cacheInput, cacheCached, cacheRequests := a.promptCacheStatsForAccountLocked(item.ID)
 	repairAvailable := a.publicRepairAvailableLocked(item)
 	return map[string]any{
-		"displayName":             publicDashboardAccountLabel(displayItem, index),
-		"detail":                  publicDashboardAccountDetail(displayItem),
-		"ownerNote":               item.OwnerNote,
-		"statusTone":              statusTone,
-		"statusLabel":             statusLabel,
+		"displayName": publicDashboardAccountLabel(displayItem, index),
+		"detail":      publicDashboardAccountDetail(displayItem),
+		"ownerNote":   item.OwnerNote,
+		"statusTone":  statusTone,
+		"statusLabel": statusLabel,
+		// Keep this explicit membership bit separate from statusTone. Duplicate
+		// slots intentionally use the neutral standby presentation while their
+		// local slot remains in the pool; the public UI must not style them as
+		// manually removed accounts.
+		"outOfPool":               !item.InPool,
 		"poolLabel":               publicPoolLabel(item),
 		"poolRef":                 a.publicAccountRefLocked(item.ID),
 		"poolAction":              publicPoolAction(item, repairAvailable),

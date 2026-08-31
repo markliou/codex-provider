@@ -621,6 +621,11 @@
     return `<progress class="quota-track ${tone}" value="${remaining}" max="100" aria-label="${escapeHTML(label)} quota remaining">${remaining}%</progress>`;
   }
 
+  // Pool membership is a semantic account property, not a badge tone. In
+  // particular, public Duplicate rows intentionally reuse the neutral standby
+  // tone; only an explicit out-of-pool marker may mute their quota bars.
+  const poolMembershipAttribute = (outOfPool) => outOfPool ? ' data-pool-membership="out"' : "";
+
   function quotaWindowMarkup(label, window) {
     if (!window || (!window.observed && !window.present)) return "";
     const durationLabel = window.label || label || "Window";
@@ -823,7 +828,7 @@
       const cacheWindow = health.cacheWindow || {};
       const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
-      return `<tr data-account-row="${escapeHTML(account.id)}">
+      return `<tr data-account-row="${escapeHTML(account.id)}"${poolMembershipAttribute(account.inPool === false)}>
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${accountEntitlementMarkup(account)}${ownerNoteInput(account)}</div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt, health.quotaFreshness, health.lastSuccessfulRefreshAt, health.quotaMetering)}${quotaProtectionMarkup(account, health)}</td>
@@ -858,7 +863,7 @@
       const cacheWindow = account.cacheWindow || {};
       const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
-      return `<tr>
+      return `<tr${poolMembershipAttribute(account.outOfPool === true)}>
       <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${ownerNoteInput(account, true)}</div></td>
       <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span>${activeBadge(account.active)}</div></td>
       <td>${quota}</td>

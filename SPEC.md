@@ -2004,8 +2004,11 @@ gray and uses a dusty-pink dashed frame. Do not replace every health level with
 one pink fill: a muted healthy bar must remain distinguishable from a muted
 critical bar, while the dashed membership frame keeps an out-of-pool 0% track
 distinct from the solid dark-red exhausted track of a routable account. This
-styling communicates pool membership only; it must not alter quota
-percentages or routing semantics.
+styling communicates pool membership only and is driven by explicit membership,
+not by a status badge or presentation tone. Duplicate slots remain in-pool and
+retain their normal quota health styling unless that local slot is independently
+out of pool; Duplicate must never imply that an operator manually removed the
+slot. It must not alter quota percentages or routing semantics.
 Supporting text belongs below the bars in compact labeled facts: reset
 countdowns pair a `Reset` label with the remaining time. The primary view must
 use flat, aligned rows rather than a nested card for every fact; credits, spend
