@@ -1538,6 +1538,9 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if recorder.Header().Get("X-Codex-Pool-Version") != "vtest+abcdef12" {
 		t.Fatalf("admin version header = %q", recorder.Header().Get("X-Codex-Pool-Version"))
 	}
+	if recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("admin page cache control = %q, want no-store", recorder.Header().Get("Cache-Control"))
+	}
 	if strings.Contains(recorder.Body.String(), adminVersionPlaceholder) || !strings.Contains(recorder.Body.String(), "vtest+abcdef12") {
 		t.Fatal("admin page did not inject build metadata version")
 	}
@@ -1573,6 +1576,13 @@ func TestAdminDashboardAssets(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), `class="throughput-panel management-only"`) {
 		t.Fatal("admin page still hides pool throughput from public mode")
+	}
+	stateRequest := httptest.NewRequest(http.MethodGet, "/admin/api/state", nil)
+	stateRequest.AddCookie(&http.Cookie{Name: "codex_pool_session", Value: a.signSession(a.adminUser, time.Now().Add(time.Hour))})
+	stateRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(stateRecorder, stateRequest)
+	if stateRecorder.Code != http.StatusOK || stateRecorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("admin state cache behavior = status %d, cache-control %q", stateRecorder.Code, stateRecorder.Header().Get("Cache-Control"))
 	}
 	for _, forbidden := range []string{`id="cache-window-read"`, `id="cache-window-write"`, "cache-window-write-rate", `id="cache-window-affinity"`, ">Cache write<", ">Parent affinity<", "metric-source-chip upstream", "metric-source-group upstream", "OPENAI"} {
 		if strings.Contains(recorder.Body.String(), forbidden) {
@@ -1612,8 +1622,18 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if !strings.Contains(jsRecorder.Body.String(), "codeExpiresAt") {
 		t.Fatal("admin JS does not render the device-auth expiry countdown")
 	}
-	if !strings.Contains(jsRecorder.Body.String(), "5 * 60 * 1000") {
-		t.Fatal("admin JS does not use the 5 minute dashboard refresh interval")
+	for _, expected := range []string{"dashboardRefreshIntervalMs = 30 * 1000", "scheduleDashboardRefresh", `cache: "no-store"`} {
+		if !strings.Contains(jsRecorder.Body.String(), expected) {
+			t.Fatalf("admin JS does not keep low-frequency fresh dashboard reads %q", expected)
+		}
+	}
+	if strings.Contains(jsRecorder.Body.String(), "state.refreshTimer = window.setInterval") {
+		t.Fatal("admin JS still uses overlapping fixed-interval dashboard refreshes")
+	}
+	for _, forbidden := range []string{"foregroundRefreshIntervalMs", "backgroundRefreshIntervalMs", `document.addEventListener("visibilitychange"`} {
+		if strings.Contains(jsRecorder.Body.String(), forbidden) {
+			t.Fatalf("admin JS still performs elevated foreground/background refresh behavior %q", forbidden)
+		}
 	}
 	if !strings.Contains(jsRecorder.Body.String(), "preserveProQuota") {
 		t.Fatal("admin JS does not render the Pro quota preservation switch")
@@ -1905,6 +1925,9 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 	a.adminMux().ServeHTTP(publicRecorder, publicRequest)
 	if publicRecorder.Code != http.StatusOK {
 		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
+	}
+	if publicRecorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("public dashboard cache control = %q, want no-store", publicRecorder.Header().Get("Cache-Control"))
 	}
 	publicBody := publicRecorder.Body.String()
 	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "Private private@example.test", "upstream.example.test", "upstream-secret-value", "gpt-test", "credentialMetadata", "statusReason", "allowedModels", "planType", "planLimit", "email", "routingCacheEvents", "sticky_reuse", "throughputBuckets"} {

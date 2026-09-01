@@ -2049,6 +2049,7 @@ func uint64Field(values map[string]any, name string) (uint64, bool) {
 }
 
 func (a *app) handleAdminPage(w http.ResponseWriter, _ *http.Request) {
+	setNoStore(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 	w.Header().Set("X-Codex-Pool-Version", adminDisplayVersion())
@@ -2056,6 +2057,7 @@ func (a *app) handleAdminPage(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *app) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	setNoStore(w)
 	key := adminLoginKey(r)
 	if retryAt, locked := a.adminLoginLockedOut(key); locked {
 		w.Header().Set("Retry-After", strconv.Itoa(int(time.Until(retryAt).Seconds())))
@@ -2132,6 +2134,7 @@ func (a *app) adminStateLocked(now time.Time) map[string]any {
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
+	setNoStore(w)
 	if !a.publicDashboard {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "not found")
 		return
@@ -2154,6 +2157,7 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) {
+	setNoStore(w)
 	if !a.publicDashboard {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "not found")
 		return
@@ -2673,6 +2677,10 @@ func (a *app) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
 
 func (a *app) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Admin responses contain live operational state and, in some cases,
+		// session-bound data. Never let a browser or reverse proxy reuse them
+		// after a reload; a user-initiated refresh must query current state.
+		setNoStore(w)
 		cookie, err := r.Cookie("codex_pool_session")
 		if err != nil || !a.validSession(cookie.Value) {
 			writeOpenAIError(w, http.StatusUnauthorized, "admin_unauthorized", "admin login required")
@@ -2687,6 +2695,10 @@ func (a *app) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+func setNoStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
 }
 
 func (a *app) cookieSecure(r *http.Request) bool {

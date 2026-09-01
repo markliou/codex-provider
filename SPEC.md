@@ -1440,7 +1440,16 @@ automatic prompt caching can work when the compatible upstream write field is
 zero or unavailable. Per-account cache cells are source-neutral and use one
 green treatment for their cache-read token values and ratio. The backend must
 continue preserving an absent upstream cache-write field as unavailable rather
-than a confirmed zero.
+than a confirmed zero. Exact token counters advance only after compatible
+upstream usage is observed, normally when a response completes; the dashboard
+must not invent an in-progress token estimate that can disagree with or
+double-count the terminal usage. Automatic dashboard refresh remains on a
+low-frequency 30-second cadence, and scheduled refreshes must wait for the prior
+refresh to finish rather than overlap. Loading/reloading the page and the
+management Refresh action must issue a new no-store dashboard query so the
+latest recorded usage appears immediately without increasing background
+polling. Dashboard reads use current provider state and must not trigger an
+upstream quota or inference request.
 
 ### 10.1 Usage stats object
 

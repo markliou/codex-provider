@@ -13,7 +13,11 @@
   const $$ = (selector) => document.querySelectorAll(selector);
   const loginView = $("#login-view");
   const dashboardView = $("#dashboard-view");
-  const refreshIntervalMs = 30 * 1000;
+  // Exact token usage is committed only after the upstream response reports
+  // usage, normally at response completion. Keep the original low-frequency
+  // automatic refresh; page reloads and the management Refresh button bypass
+  // caches and query current provider state immediately.
+  const dashboardRefreshIntervalMs = 30 * 1000;
 
   // Theme is intentionally browser-local presentation state. It helps an
   // operator tell pool tabs apart without changing routing, authentication,
@@ -454,7 +458,7 @@
     const headers = new Headers(options.headers || {});
     if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     if (options.method && options.method !== "GET") headers.set("X-CSRF-Token", state.csrfToken);
-    const response = await fetch(`/admin/api${path}`, { credentials: "same-origin", ...options, headers });
+    const response = await fetch(`/admin/api${path}`, { credentials: "same-origin", ...options, cache: "no-store", headers });
     if (response.status === 401) { showPublicDashboard(); throw new Error("Your session has expired"); }
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
@@ -464,7 +468,7 @@
   async function publicApi(path, options = {}) {
     const headers = new Headers(options.headers || {});
     if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-    const response = await fetch(`/admin/api/public-dashboard${path}`, { credentials: "same-origin", ...options, headers });
+    const response = await fetch(`/admin/api/public-dashboard${path}`, { credentials: "same-origin", ...options, cache: "no-store", headers });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
     return body;
@@ -476,7 +480,23 @@
     $$(".management-only, .public-only").forEach((element) => { element.hidden = true; });
     $("#login-error").textContent = message;
     $("#login-error").hidden = !message;
-    window.clearInterval(state.refreshTimer);
+    window.clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
+  }
+
+  function scheduleDashboardRefresh(mode = state.mode) {
+    window.clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
+    if (dashboardView.hidden || state.mode !== mode) return;
+    state.refreshTimer = window.setTimeout(async () => {
+      if (dashboardView.hidden || state.mode !== mode) return;
+      if (mode === "management") {
+        await refresh(true);
+      } else {
+        await refreshPublic(true);
+      }
+      scheduleDashboardRefresh(mode);
+    }, dashboardRefreshIntervalMs);
   }
 
   function showDashboard() {
@@ -487,9 +507,9 @@
     $$(".public-only").forEach((element) => { element.hidden = true; });
     $("#dashboard-eyebrow").textContent = "MANAGE";
     $("#dashboard-title").textContent = "Account pool";
-    refresh();
-    window.clearInterval(state.refreshTimer);
-    state.refreshTimer = window.setInterval(() => refresh(true), refreshIntervalMs);
+    window.clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
+    refresh().finally(() => scheduleDashboardRefresh("management"));
   }
 
   async function showPublicDashboard() {
@@ -499,7 +519,8 @@
     state.mode = "public";
     $("#dashboard-eyebrow").textContent = "SERVICE STATUS";
     $("#dashboard-title").textContent = "Pool status";
-    window.clearInterval(state.refreshTimer);
+    window.clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
     const ok = await refreshPublic(true);
     if (!ok && state.mode === "public") {
       showLogin();
@@ -509,7 +530,7 @@
     dashboardView.hidden = false;
     $$(".management-only").forEach((element) => { element.hidden = true; });
     $$(".public-only").forEach((element) => { element.hidden = false; });
-    state.refreshTimer = window.setInterval(() => refreshPublic(true), refreshIntervalMs);
+    scheduleDashboardRefresh("public");
   }
 
   // Pool status cards. The aggregate cache hit rate lives in its own
@@ -990,7 +1011,7 @@
 
   async function refreshPublic(silent = false) {
     try {
-      const response = await fetch("/admin/api/public-dashboard", { credentials: "same-origin" });
+      const response = await fetch("/admin/api/public-dashboard", { credentials: "same-origin", cache: "no-store" });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
       const accounts = body.dashboard.accounts || [];
@@ -1214,7 +1235,7 @@
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     try {
-      const response = await fetch("/admin/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: form.get("password") }) });
+      const response = await fetch("/admin/api/login", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: form.get("password") }) });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error?.message || "Unable to sign in");
       state.csrfToken = body.csrfToken;
