@@ -462,6 +462,17 @@ func TestDashboardSummariesPartitionVisibleAccountStates(t *testing.T) {
 			t.Fatalf("public summary exposed auth-specific bucket %q: %#v", privateKey, public)
 		}
 	}
+	duplicate := a.publicDashboardAccountLocked(a.config.Accounts[7], 7, now)
+	if duplicate["statusTone"] != "standby" || duplicate["statusLabel"] != "Duplicate" {
+		t.Fatalf("duplicate public status presentation changed unexpectedly: %#v", duplicate)
+	}
+	if duplicate["outOfPool"] != false {
+		t.Fatalf("duplicate public account was marked out of pool: %#v", duplicate)
+	}
+	standby := a.publicDashboardAccountLocked(a.config.Accounts[3], 3, now)
+	if standby["outOfPool"] != true {
+		t.Fatalf("real out-of-pool public account was not marked: %#v", standby)
+	}
 }
 
 func TestMissingCodexAuthClassifiesWithoutRetry(t *testing.T) {
@@ -1527,6 +1538,9 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if recorder.Header().Get("X-Codex-Pool-Version") != "vtest+abcdef12" {
 		t.Fatalf("admin version header = %q", recorder.Header().Get("X-Codex-Pool-Version"))
 	}
+	if recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("admin page cache control = %q, want no-store", recorder.Header().Get("Cache-Control"))
+	}
 	if strings.Contains(recorder.Body.String(), adminVersionPlaceholder) || !strings.Contains(recorder.Body.String(), "vtest+abcdef12") {
 		t.Fatal("admin page did not inject build metadata version")
 	}
@@ -1562,6 +1576,13 @@ func TestAdminDashboardAssets(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), `class="throughput-panel management-only"`) {
 		t.Fatal("admin page still hides pool throughput from public mode")
+	}
+	stateRequest := httptest.NewRequest(http.MethodGet, "/admin/api/state", nil)
+	stateRequest.AddCookie(&http.Cookie{Name: "codex_pool_session", Value: a.signSession(a.adminUser, time.Now().Add(time.Hour))})
+	stateRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(stateRecorder, stateRequest)
+	if stateRecorder.Code != http.StatusOK || stateRecorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("admin state cache behavior = status %d, cache-control %q", stateRecorder.Code, stateRecorder.Header().Get("Cache-Control"))
 	}
 	for _, forbidden := range []string{`id="cache-window-read"`, `id="cache-window-write"`, "cache-window-write-rate", `id="cache-window-affinity"`, ">Cache write<", ">Parent affinity<", "metric-source-chip upstream", "metric-source-group upstream", "OPENAI"} {
 		if strings.Contains(recorder.Body.String(), forbidden) {
@@ -1601,8 +1622,18 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if !strings.Contains(jsRecorder.Body.String(), "codeExpiresAt") {
 		t.Fatal("admin JS does not render the device-auth expiry countdown")
 	}
-	if !strings.Contains(jsRecorder.Body.String(), "5 * 60 * 1000") {
-		t.Fatal("admin JS does not use the 5 minute dashboard refresh interval")
+	for _, expected := range []string{"dashboardRefreshIntervalMs = 30 * 1000", "scheduleDashboardRefresh", `cache: "no-store"`} {
+		if !strings.Contains(jsRecorder.Body.String(), expected) {
+			t.Fatalf("admin JS does not keep low-frequency fresh dashboard reads %q", expected)
+		}
+	}
+	if strings.Contains(jsRecorder.Body.String(), "state.refreshTimer = window.setInterval") {
+		t.Fatal("admin JS still uses overlapping fixed-interval dashboard refreshes")
+	}
+	for _, forbidden := range []string{"foregroundRefreshIntervalMs", "backgroundRefreshIntervalMs", `document.addEventListener("visibilitychange"`} {
+		if strings.Contains(jsRecorder.Body.String(), forbidden) {
+			t.Fatalf("admin JS still performs elevated foreground/background refresh behavior %q", forbidden)
+		}
 	}
 	if !strings.Contains(jsRecorder.Body.String(), "preserveProQuota") {
 		t.Fatal("admin JS does not render the Pro quota preservation switch")
@@ -1645,6 +1676,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS does not render clear quota state %q", expected)
 		}
 	}
+	for _, expected := range []string{"poolMembershipAttribute", "account.inPool === false", "account.outOfPool === true", `data-pool-membership="out"`} {
+		if !strings.Contains(jsRecorder.Body.String(), expected) {
+			t.Fatalf("admin JS does not keep quota styling tied to explicit pool membership %q", expected)
+		}
+	}
 	for _, expected := range []string{"Seat type: Not reported", "Usage: ${metadata.planLimit", "5-hour policy:", "Flexible credits:", "Spend control:", "Telemetry:", "API-metered · ChatGPT quota not applicable", "Protected: threshold reached", "quota-protection/set", "Duplicate slots share upstream capacity", "quota.windows", "quota.additionalLimits"} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS omitted normalized entitlement/quota/protection text %q", expected)
@@ -1669,10 +1705,13 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin CSS does not preserve the warm-to-red quota warning ramp %q", expected)
 		}
 	}
-	for _, expected := range []string{"tr:has(.badge.standby) .quota-track", "border-style: dashed", "#c4819d", "color-mix(in srgb, var(--quota-start) 46%", "color-mix(in srgb, var(--quota-end) 46%"} {
+	for _, expected := range []string{`tr[data-pool-membership="out"] .quota-track`, "border-style: dashed", "#c4819d", "color-mix(in srgb, var(--quota-start) 46%", "color-mix(in srgb, var(--quota-end) 46%"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS does not keep health-tinted out-of-pool quota styling %q", expected)
 		}
+	}
+	if strings.Contains(cssRecorder.Body.String(), "tr:has(.badge.standby) .quota-track") {
+		t.Fatal("admin CSS still infers pool membership from the standby badge")
 	}
 	if strings.Contains(cssRecorder.Body.String(), ".quota-blocked") {
 		t.Fatal("admin CSS still styles removed redundant quota exhaustion text")
@@ -1886,6 +1925,9 @@ func TestPublicDashboardRedactsAccountSecrets(t *testing.T) {
 	a.adminMux().ServeHTTP(publicRecorder, publicRequest)
 	if publicRecorder.Code != http.StatusOK {
 		t.Fatalf("public dashboard returned %d", publicRecorder.Code)
+	}
+	if publicRecorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("public dashboard cache control = %q, want no-store", publicRecorder.Header().Get("Cache-Control"))
 	}
 	publicBody := publicRecorder.Body.String()
 	for _, forbidden := range []string{"private-account-id", "private@example.test", "chatgpt-private-id", "Private private@example.test", "upstream.example.test", "upstream-secret-value", "gpt-test", "credentialMetadata", "statusReason", "allowedModels", "planType", "planLimit", "email", "routingCacheEvents", "sticky_reuse", "throughputBuckets"} {
@@ -6064,11 +6106,60 @@ func TestEarlyCapacityStreamingFailureWithoutFallbackPreservesUpstreamSSE(t *tes
 	req.Header.Set("Authorization", "Bearer client-key")
 	recorder := httptest.NewRecorder()
 	a.publicMux().ServeHTTP(recorder, req)
-	if hits != 1 || recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "resp_only") || !strings.Contains(recorder.Body.String(), "selected model is at capacity") {
+	// With no other identity to fail over to, the same account is retried behind
+	// a backoff before the caller ever sees the upstream refusal. The refusal
+	// must still be preserved verbatim once that budget is spent.
+	if hits != 1+streamingCapacityRetryLimit || recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "resp_only") || !strings.Contains(recorder.Body.String(), "selected model is at capacity") {
 		t.Fatalf("single-account capacity failure was not preserved: hits=%d code=%d body=%s", hits, recorder.Code, recorder.Body.String())
 	}
-	if a.state.RequestCount != 1 || a.state.SuccessCount != 0 || a.state.FailureCount != 1 || a.state.UpstreamResponseFailedCount != 1 {
+	// One client request, but every failed upstream attempt is a real upstream
+	// failure and is counted as such.
+	if a.state.RequestCount != 1 || a.state.SuccessCount != 0 || a.state.FailureCount != 1+streamingCapacityRetryLimit || a.state.UpstreamResponseFailedCount != 1+streamingCapacityRetryLimit {
 		t.Fatalf("single-account capacity counters = requests:%d success:%d failure:%d response_failed:%d", a.state.RequestCount, a.state.SuccessCount, a.state.FailureCount, a.state.UpstreamResponseFailedCount)
+	}
+	// Exactly one cooldown: the final terminal failure owns it. The in-place
+	// retries must not add their own, or they would strand the retry by making
+	// the account unselectable on a pool with no other eligible identity.
+	if len(a.state.Cooldowns["only"]) != 1 {
+		t.Fatalf("in-place capacity retries changed cooldown accounting: %#v", a.state.Cooldowns["only"])
+	}
+}
+
+// The pool has no spare identity, so a transient capacity refusal must be
+// absorbed by retrying the same account instead of being handed to the caller.
+func TestEarlyCapacityStreamingFailureRetriesSameAccountWithoutFallback(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_busy\"}}\n\n")
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_busy\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"selected model is at capacity\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"usage\":{\"input_tokens\":4096,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":2048}}}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 2 || recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("single-account capacity failure was not retried: hits=%d code=%d body=%s", hits, recorder.Code, recorder.Body.String())
+	}
+	// The abandoned pre-commit prefix must never reach the caller.
+	if strings.Contains(recorder.Body.String(), "resp_busy") || strings.Contains(recorder.Body.String(), "at capacity") {
+		t.Fatalf("abandoned capacity prefix leaked downstream: %s", recorder.Body.String())
+	}
+	if a.state.RequestCount != 1 || a.state.SuccessCount != 1 || a.state.FailureCount != 1 || a.state.UpstreamResponseFailedCount != 1 {
+		t.Fatalf("retried capacity counters = requests:%d success:%d failure:%d response_failed:%d", a.state.RequestCount, a.state.SuccessCount, a.state.FailureCount, a.state.UpstreamResponseFailedCount)
+	}
+	if len(a.state.Cooldowns["only"]) != 0 {
+		t.Fatalf("recovered capacity retry left a cooldown: %#v", a.state.Cooldowns["only"])
 	}
 }
 

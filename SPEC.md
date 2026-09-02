@@ -1440,7 +1440,16 @@ automatic prompt caching can work when the compatible upstream write field is
 zero or unavailable. Per-account cache cells are source-neutral and use one
 green treatment for their cache-read token values and ratio. The backend must
 continue preserving an absent upstream cache-write field as unavailable rather
-than a confirmed zero.
+than a confirmed zero. Exact token counters advance only after compatible
+upstream usage is observed, normally when a response completes; the dashboard
+must not invent an in-progress token estimate that can disagree with or
+double-count the terminal usage. Automatic dashboard refresh remains on a
+low-frequency 30-second cadence, and scheduled refreshes must wait for the prior
+refresh to finish rather than overlap. Loading/reloading the page and the
+management Refresh action must issue a new no-store dashboard query so the
+latest recorded usage appears immediately without increasing background
+polling. Dashboard reads use current provider state and must not trigger an
+upstream quota or inference request.
 
 ### 10.1 Usage stats object
 
@@ -1716,9 +1725,20 @@ For streaming responses:
   failure/cooldown counters but does not create a client failure, sticky/thread
   binding, response binding, or request-level throughput result. The eventual
   successful response is classified as `stream_capacity_failover`.
-- If no distinct fallback is available, preserve and forward the original
-  buffered upstream failure instead of replacing it with a synthetic pool
-  error.
+- If no distinct fallback is available, the same account is retried in place
+  behind a short linear backoff, up to a bounded retry budget, before the
+  refusal is surfaced. Upstream capacity is a transient model-level condition
+  rather than proof that the account is unhealthy, and nothing client-visible
+  has been written yet. These in-place retries must not set a cooldown on the
+  account being retried, or it would become unselectable for its own retry, and
+  they must not consume the per-account attempt budget, or a single-account pool
+  could never retry. Each failed upstream attempt still counts as an upstream
+  failure. A pool that still has a distinct eligible identity fails over instead
+  and must not pay this backoff.
+- Once that retry budget is spent, preserve and forward the original buffered
+  upstream failure instead of replacing it with a synthetic pool error. The
+  final terminal failure owns the client failure record and the account
+  cooldown.
 - Once any SSE bytes are committed downstream, never retry another account or
   splice a second response stream. In particular, never retry after any output,
   reasoning, tool, hosted-tool, unknown semantic event, or a preamble forced to
@@ -2004,8 +2024,11 @@ gray and uses a dusty-pink dashed frame. Do not replace every health level with
 one pink fill: a muted healthy bar must remain distinguishable from a muted
 critical bar, while the dashed membership frame keeps an out-of-pool 0% track
 distinct from the solid dark-red exhausted track of a routable account. This
-styling communicates pool membership only; it must not alter quota
-percentages or routing semantics.
+styling communicates pool membership only and is driven by explicit membership,
+not by a status badge or presentation tone. Duplicate slots remain in-pool and
+retain their normal quota health styling unless that local slot is independently
+out of pool; Duplicate must never imply that an operator manually removed the
+slot. It must not alter quota percentages or routing semantics.
 Supporting text belongs below the bars in compact labeled facts: reset
 countdowns pair a `Reset` label with the remaining time. The primary view must
 use flat, aligned rows rather than a nested card for every fact; credits, spend
