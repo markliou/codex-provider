@@ -363,33 +363,39 @@ type promptCacheStat struct {
 // event is persisted; prompt bodies, tool arguments, credentials, emails, and
 // upstream account identities must never be added here.
 type routingCacheEvent struct {
-	Timestamp             time.Time `json:"timestamp"`
-	RequestIDHash         string    `json:"requestIdHash,omitempty"`
-	ResponseIDHash        string    `json:"responseIdHash,omitempty"`
-	ModelID               string    `json:"modelId"`
-	AccountID             string    `json:"accountId"`
-	AgentKind             string    `json:"agentKind"`
-	ThreadIDHash          string    `json:"threadIdHash,omitempty"`
-	LineageRootIDHash     string    `json:"lineageRootIdHash,omitempty"`
-	StickyKeyHash         string    `json:"stickyKeyHash,omitempty"`
-	PromptCacheKeyHash    string    `json:"promptCacheKeyHash,omitempty"`
-	RoutingOutcome        string    `json:"routingOutcome"`
-	RoutingSource         string    `json:"routingSource"`
-	TerminalEvent         string    `json:"terminalEvent,omitempty"`
-	TerminalFailureClass  string    `json:"terminalFailureClass,omitempty"`
-	TerminalErrorCode     string    `json:"terminalErrorCode,omitempty"`
-	ParentAffinity        string    `json:"parentAffinity"`
-	FailoverFromAccountID string    `json:"failoverFromAccountId,omitempty"`
-	UsageObserved         bool      `json:"usageObserved"`
-	InputTokens           uint64    `json:"inputTokens"`
-	CachedTokens          uint64    `json:"cachedTokens"`
-	CacheWriteTokens      *uint64   `json:"cacheWriteTokens,omitempty"`
-	UncachedInputTokens   uint64    `json:"uncachedInputTokens"`
-	CacheReadRate         *float64  `json:"cacheReadRate,omitempty"`
-	CacheWriteRate        *float64  `json:"cacheWriteRate,omitempty"`
-	CacheReuseBalance     *int64    `json:"cacheReuseBalance,omitempty"`
-	CacheHit              bool      `json:"cacheHit"`
-	ColdCacheEligible     bool      `json:"coldCacheEligible"`
+	Timestamp            time.Time `json:"timestamp"`
+	RequestIDHash        string    `json:"requestIdHash,omitempty"`
+	ResponseIDHash       string    `json:"responseIdHash,omitempty"`
+	ModelID              string    `json:"modelId"`
+	AccountID            string    `json:"accountId"`
+	AgentKind            string    `json:"agentKind"`
+	ThreadIDHash         string    `json:"threadIdHash,omitempty"`
+	LineageRootIDHash    string    `json:"lineageRootIdHash,omitempty"`
+	StickyKeyHash        string    `json:"stickyKeyHash,omitempty"`
+	PromptCacheKeyHash   string    `json:"promptCacheKeyHash,omitempty"`
+	RoutingOutcome       string    `json:"routingOutcome"`
+	RoutingSource        string    `json:"routingSource"`
+	TerminalEvent        string    `json:"terminalEvent,omitempty"`
+	TerminalFailureClass string    `json:"terminalFailureClass,omitempty"`
+	TerminalErrorCode    string    `json:"terminalErrorCode,omitempty"`
+	// PrecommitCommitted reports whether SSE bytes had already been released
+	// to the client when the stream ended, and PrecommitCloseReason names the
+	// event type (or "bounds") that released them. Together they show whether
+	// a terminal capacity failure was eligible for retry at all.
+	PrecommitCommitted    bool     `json:"precommitCommitted,omitempty"`
+	PrecommitCloseReason  string   `json:"precommitCloseReason,omitempty"`
+	ParentAffinity        string   `json:"parentAffinity"`
+	FailoverFromAccountID string   `json:"failoverFromAccountId,omitempty"`
+	UsageObserved         bool     `json:"usageObserved"`
+	InputTokens           uint64   `json:"inputTokens"`
+	CachedTokens          uint64   `json:"cachedTokens"`
+	CacheWriteTokens      *uint64  `json:"cacheWriteTokens,omitempty"`
+	UncachedInputTokens   uint64   `json:"uncachedInputTokens"`
+	CacheReadRate         *float64 `json:"cacheReadRate,omitempty"`
+	CacheWriteRate        *float64 `json:"cacheWriteRate,omitempty"`
+	CacheReuseBalance     *int64   `json:"cacheReuseBalance,omitempty"`
+	CacheHit              bool     `json:"cacheHit"`
+	ColdCacheEligible     bool     `json:"coldCacheEligible"`
 }
 
 // throughputBucket is an in-memory aggregate used for the 48-hour chart and
@@ -1598,6 +1604,12 @@ type proxyResponseInfo struct {
 	RequestID             string
 	FailoverFromAccountID string
 	FailoverOutcome       string
+	// Diagnostics for why a terminal failure could not be retried. A capacity
+	// failure is retryable only while the lifecycle-only preamble is still
+	// buffered, so these record whether that window had already closed and what
+	// closed it. Streaming responses only; other paths leave them zero.
+	PrecommitCommitted   bool
+	PrecommitCloseReason string
 }
 
 type streamingProxyResult struct {
@@ -1796,6 +1808,19 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 					}
 				}
 				if !withinBounds || !precommitLifecycleSSEBlock(block) {
+					// Record what closed the retry window before committing. A capacity
+					// failure arriving after this point cannot be retried at all, so this
+					// is the only signal that separates "no eligible fallback" from "the
+					// retry window was already shut".
+					if info.PrecommitCloseReason == "" {
+						if !withinBounds {
+							info.PrecommitCloseReason = "bounds"
+						} else if eventType := responseEventTypeFromSSEBlock(block); eventType != "" {
+							info.PrecommitCloseReason = cleanMetadataToken(eventType)
+						} else {
+							info.PrecommitCloseReason = "unknown_event"
+						}
+					}
 					commit()
 				}
 			}
@@ -1810,6 +1835,7 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 		}
 	}
 	info.CompletedAt = time.Now().UTC()
+	info.PrecommitCommitted = committed
 	return streamingProxyResult{Info: info}
 }
 
@@ -4004,6 +4030,8 @@ func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accoun
 		TerminalEvent:         info.TerminalEvent,
 		TerminalFailureClass:  info.TerminalFailureClass,
 		TerminalErrorCode:     sanitizedErrorCode(info.TerminalErrorCode),
+		PrecommitCommitted:    info.PrecommitCommitted,
+		PrecommitCloseReason:  info.PrecommitCloseReason,
 		ParentAffinity:        parentAffinity,
 		FailoverFromAccountID: failoverFromAccountID,
 		UsageObserved:         usage.Present,
@@ -7360,6 +7388,7 @@ func (a *app) routingCacheEventViewsLocked(now time.Time) []map[string]any {
 			"stickyKeyHash": event.StickyKeyHash, "promptCacheKeyHash": event.PromptCacheKeyHash,
 			"routingOutcome": event.RoutingOutcome, "routingSource": event.RoutingSource, "parentAffinity": event.ParentAffinity,
 			"terminalEvent": event.TerminalEvent, "terminalFailureClass": event.TerminalFailureClass, "terminalErrorCode": event.TerminalErrorCode,
+			"precommitCommitted": event.PrecommitCommitted, "precommitCloseReason": event.PrecommitCloseReason,
 			"failoverFromAccountLabel": failoverFromLabel, "failoverFromAccountRef": operationalIdentifierHash("account", event.FailoverFromAccountID),
 			"usageObserved": event.UsageObserved, "inputTokens": event.InputTokens, "cachedTokens": event.CachedTokens,
 			"cacheWriteTokens": event.CacheWriteTokens, "uncachedInputTokens": event.UncachedInputTokens,

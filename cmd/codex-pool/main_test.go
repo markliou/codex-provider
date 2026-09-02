@@ -3642,6 +3642,9 @@ func TestStreamingPrecommitBlockLimitCommitsBeforeCapacityFailure(t *testing.T) 
 	if commits != 1 || !recorder.Flushed || !strings.Contains(recorder.Body.String(), "response.failed") {
 		t.Fatalf("bounded precommit stream was not committed once: commits=%d flushed=%t body=%s", commits, recorder.Flushed, recorder.Body.String())
 	}
+	if !result.Info.PrecommitCommitted || result.Info.PrecommitCloseReason != "bounds" {
+		t.Fatalf("bounded precommit stream did not record why retry closed: committed=%v reason=%q", result.Info.PrecommitCommitted, result.Info.PrecommitCloseReason)
+	}
 }
 
 func TestPromptCacheUsageParsesReadWriteVariantsAndAbsence(t *testing.T) {
@@ -5126,8 +5129,10 @@ func TestRoutingCacheEventRedactionAndPruning(t *testing.T) {
 		},
 	}
 	a.markSuccess(route, "gpt-test", "private-account-id", proxyResponseInfo{
-		ResponseID: "raw-response-id",
-		RequestID:  "raw-request-id",
+		ResponseID:           "raw-response-id",
+		RequestID:            "raw-request-id",
+		PrecommitCommitted:   true,
+		PrecommitCloseReason: "response.output_text.delta",
 		Usage: promptCacheUsage{
 			InputTokens:      2048,
 			CachedTokens:     1536,
@@ -5145,6 +5150,9 @@ func TestRoutingCacheEventRedactionAndPruning(t *testing.T) {
 	encoded, err := json.Marshal(a.routingCacheEventViewsLocked(time.Now().UTC()))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"precommitCommitted":true`)) || !bytes.Contains(encoded, []byte(`"precommitCloseReason":"response.output_text.delta"`)) {
+		t.Fatalf("browser event omitted precommit diagnostics: %s", encoded)
 	}
 	for _, raw := range []string{"raw-thread-id", "raw-lineage-id", "raw-prompt-cache-key", "raw-response-id", "raw-request-id", "private-account-id"} {
 		if bytes.Contains(encoded, []byte(raw)) {
@@ -6089,6 +6097,69 @@ func TestCommittedStreamingResponseFailedDoesNotRetry(t *testing.T) {
 	}
 	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].TerminalFailureClass != "capacity" || a.state.RoutingCacheEvents[0].TerminalErrorCode != "rate_limit_exceeded" {
 		t.Fatalf("failed stream diagnostics were not sanitized/classified: %#v", a.state.RoutingCacheEvents)
+	}
+}
+
+// The retry window closes as soon as a non-lifecycle event is forwarded. When a
+// capacity failure lands after that, no failover is even attempted, so the
+// routing event must record that the window was already shut and what shut it.
+// Without this, a committed failure and a genuine "no eligible fallback" are
+// indistinguishable in diagnostics.
+func TestCommittedCapacityFailureRecordsPrecommitCloseReason(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_c\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"visible\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_c\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"at capacity\"}}}\n\n")
+	}))
+	defer upstream.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_backup","output":[]}`))
+	}))
+	defer backup.Close()
+	a := testApp(t, []account{
+		{ID: "first", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL},
+		{ID: "second", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: backup.URL},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if len(a.state.RoutingCacheEvents) != 1 {
+		t.Fatalf("expected one routing event: %#v", a.state.RoutingCacheEvents)
+	}
+	event := a.state.RoutingCacheEvents[0]
+	if event.TerminalFailureClass != "capacity" {
+		t.Fatalf("capacity failure was not classified: %#v", event)
+	}
+	if !event.PrecommitCommitted || event.PrecommitCloseReason != "response.output_text.delta" {
+		t.Fatalf("committed capacity failure did not record why the retry window closed: committed=%v reason=%q", event.PrecommitCommitted, event.PrecommitCloseReason)
+	}
+}
+
+// A capacity failure that arrives while only lifecycle events are buffered is
+// still retryable, so the window must be recorded as open.
+func TestUncommittedCapacityFailureRecordsOpenPrecommitWindow(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_u\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_u\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"at capacity\"}}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if len(a.state.RoutingCacheEvents) != 1 {
+		t.Fatalf("expected one routing event: %#v", a.state.RoutingCacheEvents)
+	}
+	event := a.state.RoutingCacheEvents[0]
+	if event.PrecommitCommitted || event.PrecommitCloseReason != "" {
+		t.Fatalf("uncommitted capacity failure reported a closed retry window: committed=%v reason=%q", event.PrecommitCommitted, event.PrecommitCloseReason)
 	}
 }
 
