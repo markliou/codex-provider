@@ -1718,11 +1718,18 @@ For streaming responses:
   client-visible.
 - Before the first client-visible byte, Pool may buffer only a bounded
   lifecycle-only preamble consisting of `response.created`,
-  `response.in_progress`, `response.queued`, and SSE keepalive/reconnection
-  metadata. The buffer is limited to 64 KiB and eight complete SSE blocks.
-  Reaching either limit, receiving an unknown event/data block, or receiving
-  any output, reasoning, tool, hosted-tool, or other semantic event commits the
-  buffered prefix immediately.
+  `response.in_progress`, `response.queued`, a bare `error` event, and SSE
+  keepalive/reconnection metadata. The buffer is limited to 64 KiB and eight
+  complete SSE blocks. Reaching either limit, receiving an unknown event/data
+  block, or receiving any output, reasoning, tool, hosted-tool, or other
+  semantic event commits the buffered prefix immediately.
+- A bare `error` event is buffered rather than committed because the Codex
+  backend emits it immediately before the `response.failed` that classifies the
+  refusal. Committing on the `error` event would close the retry window one
+  block before the failure could be recognised and make the retry paths below
+  unreachable. The `error` event is never dropped on its own: if the stream
+  ends, or any event other than a retryable terminal failure follows, the
+  buffered prefix including the `error` event is forwarded verbatim.
 - Parse complete SSE event blocks and retain terminal
   `response.completed`, `response.failed`, and `response.incomplete` state.
 - HTTP `200` plus `response.failed`/`response.incomplete` is a failed client

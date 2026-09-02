@@ -1882,6 +1882,17 @@ func precommitLifecycleSSEBlock(block string) bool {
 	switch responseEventTypeFromSSEBlock(block) {
 	case "response.created", "response.in_progress", "response.queued":
 		return true
+	case "error":
+		// The Codex backend announces a refusal as a bare `error` event and only
+		// then sends the `response.failed` that carries the classification. The
+		// error block is not model output, so it stays buffered and keeps the
+		// retry window open for the terminal event behind it. In production every
+		// capacity refusal arrived this way, and treating the error as an unknown
+		// event committed the stream one block before the failure could be
+		// classified, so the retry path was never reachable. If anything other
+		// than a retryable failure follows, that event closes the window and the
+		// buffered error is forwarded verbatim rather than dropped.
+		return true
 	case "":
 		// SSE keepalive comments and reconnection metadata are not semantic
 		// model output. Unknown event/data blocks fail closed and commit
