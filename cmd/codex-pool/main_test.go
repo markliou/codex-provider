@@ -6163,6 +6163,83 @@ func TestUncommittedCapacityFailureRecordsOpenPrecommitWindow(t *testing.T) {
 	}
 }
 
+// A transient overload cooldown is a probabilistic hint, not proof the account
+// will refuse again. When it is the only thing blocking every candidate, the
+// request must still be attempted instead of failing closed with 503.
+func TestOverloadCooldownIsSoftenedAsLastResort(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_ok","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	a.state.Cooldowns["only"] = []cooldown{{ModelID: "gpt-test", NextRetryAt: time.Now().UTC().Add(30 * time.Second), Reason: "server_is_overloaded"}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK || hits != 1 {
+		t.Fatalf("overload cooldown was not softened: code=%d hits=%d body=%s", recorder.Code, hits, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "all_accounts_cooling_down") {
+		t.Fatalf("request failed closed while only an overload cooldown was active: %s", recorder.Body.String())
+	}
+}
+
+// A rate-limit cooldown carries an upstream instruction to wait. Ignoring it can
+// deepen the limit, so the last-resort path must leave it alone.
+func TestRateLimitCooldownIsNotSoftened(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_ok","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	a.state.Cooldowns["only"] = []cooldown{{ModelID: "gpt-test", NextRetryAt: time.Now().UTC().Add(30 * time.Second), Reason: "rate_limited"}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 0 || recorder.Code == http.StatusOK {
+		t.Fatalf("rate-limit cooldown was bypassed: code=%d hits=%d body=%s", recorder.Code, hits, recorder.Body.String())
+	}
+}
+
+// A mixed cooldown set must be judged by its strictest member: one rate-limit
+// entry disqualifies the account even when an overload entry expires sooner.
+func TestMixedCooldownKeepsAccountBlocked(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_ok","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	now := time.Now().UTC()
+	a.state.Cooldowns["only"] = []cooldown{
+		{ModelID: "gpt-test", NextRetryAt: now.Add(5 * time.Second), Reason: "server_is_overloaded"},
+		{ModelID: "gpt-test", NextRetryAt: now.Add(10 * time.Minute), Reason: "rate_limited"},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 0 || recorder.Code == http.StatusOK {
+		t.Fatalf("mixed cooldown was bypassed: code=%d hits=%d body=%s", recorder.Code, hits, recorder.Body.String())
+	}
+}
+
 func TestEarlyCapacityStreamingFailureWithoutFallbackPreservesUpstreamSSE(t *testing.T) {
 	hits := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

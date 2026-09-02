@@ -2970,9 +2970,82 @@ func (a *app) selectAccountWithPreference(stickyKey, model, preferredParentAccou
 	}
 	selected, ok := a.preferredAccountForStickyLocked(stickyKey, model, excluded, now)
 	if !ok {
+		// Every candidate is blocked. A transient upstream-overload cooldown is a
+		// probabilistic hint, not proof the account will refuse again, so failing
+		// the request outright wastes a real chance of success. Retry the account
+		// whose overload cooldown expires soonest instead. This must stay a last
+		// resort reached only after normal selection found nothing, and it must
+		// never bypass quota, auth, duplicate-identity, pool membership, or a
+		// rate-limit cooldown, where retrying early is harmful rather than merely
+		// unlucky.
+		if fallback, ok := a.overloadedFallbackAccountLocked(model, excluded, now); ok {
+			return fallback, nil
+		}
 		return account{}, errors.New("no eligible account is available for the requested model")
 	}
 	return selected, nil
+}
+
+// overloadedOnlyCooldownLocked reports the soonest expiry when every active
+// cooldown for this account/model is a transient upstream overload. A single
+// rate-limit or auth cooldown disqualifies the account: those carry an upstream
+// instruction to wait, and ignoring them can deepen the limit.
+func (a *app) overloadedOnlyCooldownLocked(accountID, model string, now time.Time) (time.Time, bool) {
+	var soonest time.Time
+	found := false
+	for _, cd := range a.state.Cooldowns[accountID] {
+		if model != "" && cd.ModelID != model {
+			continue
+		}
+		if !cd.NextRetryAt.After(now) {
+			continue
+		}
+		switch cd.Reason {
+		case "server_is_overloaded", "slow_down", "upstream_5xx":
+		default:
+			return time.Time{}, false
+		}
+		if !found || cd.NextRetryAt.Before(soonest) {
+			soonest = cd.NextRetryAt
+			found = true
+		}
+	}
+	return soonest, found
+}
+
+// overloadedFallbackAccountLocked picks the account closest to leaving a
+// transient overload cooldown. Every other eligibility gate still applies: it
+// reuses selectableAccountLocked with the cooldown check neutralised only for
+// overload reasons.
+func (a *app) overloadedFallbackAccountLocked(model string, excluded map[string]bool, now time.Time) (account, bool) {
+	var best account
+	var bestAt time.Time
+	found := false
+	excludedIdentities := a.excludedUpstreamIdentitiesLocked(excluded)
+	for _, item := range a.config.Accounts {
+		if excluded[item.ID] {
+			continue
+		}
+		retryAt, ok := a.overloadedOnlyCooldownLocked(item.ID, model, now)
+		if !ok {
+			continue
+		}
+		// Same gates as normal selection, evaluated at a time past this
+		// account's overload cooldown so only that cooldown is neutralised.
+		if !a.usableLocked(item, model, retryAt) {
+			continue
+		}
+		identity := a.upstreamIdentityKeyLocked(item)
+		if identity != "" && excludedIdentities[identity] {
+			continue
+		}
+		if !found || retryAt.Before(bestAt) || (retryAt.Equal(bestAt) && a.preferredBeforeLocked(item, best)) {
+			best = item
+			bestAt = retryAt
+			found = true
+		}
+	}
+	return best, found
 }
 
 func (a *app) selectableAccountLocked(item account, model string, excluded map[string]bool, now time.Time) bool {
