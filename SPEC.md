@@ -1739,6 +1739,14 @@ For streaming responses:
   upstream failure instead of replacing it with a synthetic pool error. The
   final terminal failure owns the client failure record and the account
   cooldown.
+- The routing event records whether the pre-commit window was still open when
+  the stream ended (`precommitCommitted`) and, when it had closed, the SSE event
+  type that closed it or `bounds` for the size/block limits
+  (`precommitCloseReason`). A committed stream can never be retried, so without
+  these two fields a terminal capacity failure that was never eligible for retry
+  is indistinguishable in diagnostics from one that had no eligible fallback.
+  Both are bounded operational metadata: an event type or `bounds`, never
+  upstream payload text.
 - Once any SSE bytes are committed downstream, never retry another account or
   splice a second response stream. In particular, never retry after any output,
   reasoning, tool, hosted-tool, unknown semantic event, or a preamble forced to
