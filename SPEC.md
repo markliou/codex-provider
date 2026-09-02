@@ -1725,9 +1725,20 @@ For streaming responses:
   failure/cooldown counters but does not create a client failure, sticky/thread
   binding, response binding, or request-level throughput result. The eventual
   successful response is classified as `stream_capacity_failover`.
-- If no distinct fallback is available, preserve and forward the original
-  buffered upstream failure instead of replacing it with a synthetic pool
-  error.
+- If no distinct fallback is available, the same account is retried in place
+  behind a short linear backoff, up to a bounded retry budget, before the
+  refusal is surfaced. Upstream capacity is a transient model-level condition
+  rather than proof that the account is unhealthy, and nothing client-visible
+  has been written yet. These in-place retries must not set a cooldown on the
+  account being retried, or it would become unselectable for its own retry, and
+  they must not consume the per-account attempt budget, or a single-account pool
+  could never retry. Each failed upstream attempt still counts as an upstream
+  failure. A pool that still has a distinct eligible identity fails over instead
+  and must not pay this backoff.
+- Once that retry budget is spent, preserve and forward the original buffered
+  upstream failure instead of replacing it with a synthetic pool error. The
+  final terminal failure owns the client failure record and the account
+  cooldown.
 - Once any SSE bytes are committed downstream, never retry another account or
   splice a second response stream. In particular, never retry after any output,
   reasoning, tool, hosted-tool, unknown semantic event, or a preamble forced to

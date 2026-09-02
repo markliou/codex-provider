@@ -93,6 +93,13 @@ const (
 	// event sequence from turning pre-commit failover into general buffering.
 	streamingPrecommitMaxBytes  = 64 << 10
 	streamingPrecommitMaxBlocks = 8
+	// An upstream capacity rejection is transient model-level overload, not
+	// proof that the selected account is unhealthy. When no other upstream
+	// identity is eligible, the same account is retried this many times behind a
+	// linear backoff before the upstream refusal is forwarded, so a pool with no
+	// spare identity does not surface "model is at capacity" on first refusal.
+	streamingCapacityRetryLimit   = 2
+	streamingCapacityRetryBackoff = 250 * time.Millisecond
 	// Codex treats remote model metadata as authoritative for ChatGPT-backed
 	// providers. This fallback must remain non-empty or a schema-only fix would
 	// silently remove the coding-agent instructions after a successful refresh.
@@ -1207,6 +1214,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	failoverFromAccountID := ""
 	failoverOutcome := ""
 	excluded := map[string]bool{}
+	capacityRetries := 0
 	attemptLimit := a.proxyAttemptLimit()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
 		candidate, err := a.selectAccountForRoute(route, model, excluded)
@@ -1332,7 +1340,34 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 					_ = response.Body.Close()
 					failoverFromAccountID = candidate.ID
 					failoverOutcome = "stream_capacity_failover"
-					a.markRetryableTerminalResponseFailure(candidate.ID, model, info)
+					a.markRetryableTerminalResponseFailure(candidate.ID, model, info, true)
+					continue
+				}
+				// No other upstream identity can serve this request. Capacity is a
+				// transient model-level condition, so retry the same account behind
+				// a short backoff rather than handing the caller the upstream "at
+				// capacity" refusal on its first occurrence; nothing client-visible
+				// has been written yet. A pool that still has a healthy backup fails
+				// over above and never reaches here, so this must not add latency to
+				// a pool with spare identities.
+				//
+				// The retry budget is deliberately separate from the per-account
+				// attempt budget: retrying the same account is not another account
+				// attempt, so it must not consume attemptLimit, or a single-account
+				// pool (attemptLimit 1) could never retry at all.
+				if capacityRetries < streamingCapacityRetryLimit {
+					capacityRetries++
+					delete(excluded, candidate.ID)
+					_ = response.Body.Close()
+					// Deliberately no cooldown: cooling the account down here would
+					// make it unselectable for its own retry and strand the request
+					// on an empty pool.
+					a.markRetryableTerminalResponseFailure(candidate.ID, model, info, false)
+					if !sleepForRetry(r.Context(), time.Duration(capacityRetries)*streamingCapacityRetryBackoff) {
+						throughput.Cancelled = true
+						return
+					}
+					attempt--
 					continue
 				}
 				a.addCurrentAccountResponseHeaders(w, candidate.ID)
@@ -1776,6 +1811,20 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 	}
 	info.CompletedAt = time.Now().UTC()
 	return streamingProxyResult{Info: info}
+}
+
+// sleepForRetry waits out an in-request backoff. It reports false when the
+// request context finished first so the caller abandons the retry instead of
+// spending upstream capacity on a caller that already gave up.
+func sleepForRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func writeStreamingBytes(w http.ResponseWriter, data []byte) {
@@ -3638,7 +3687,10 @@ func (a *app) markSuccess(route routingDecision, model, accountID string, info p
 	a.markSuccessWithMeasurement(route, model, accountID, info, nil)
 }
 
-func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info proxyResponseInfo) {
+// coolDown must be false when the caller intends to retry this same account
+// inside the current request: a cooldown would remove it from selection and the
+// retry could never be routed back to it.
+func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info proxyResponseInfo, coolDown bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
@@ -3648,11 +3700,13 @@ func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info
 	health.LastFailureReason = reason
 	health.ConsecutiveFailure++
 	a.state.Health[accountID] = health
-	duration := 30 * time.Second
-	if reason == "server_is_overloaded" || reason == "slow_down" {
-		duration = upstream5xxCooldown
+	if coolDown {
+		duration := 30 * time.Second
+		if reason == "server_is_overloaded" || reason == "slow_down" {
+			duration = upstream5xxCooldown
+		}
+		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
 	}
-	a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
 	// This is an upstream failed attempt recovered inside one client request.
 	// Count the upstream failure and protect the account, but do not finish the
 	// request-level throughput measurement, increment RequestCount, or create a
