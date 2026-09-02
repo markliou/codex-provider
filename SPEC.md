@@ -710,6 +710,20 @@ not in model-level cooldown for requested model
 
 Dashboard availability must mirror the same active routing gates. Historical health fields such as `LastFailureReason` and `ConsecutiveFailure` are diagnostic after their cooldown expires; they must not keep a slot labeled unavailable when auth, quota metadata, pool membership, model filters, and cooldown state are otherwise eligible.
 
+When that filter selects nothing, a transient upstream-overload cooldown may be
+softened as a last resort rather than failing the request with
+`all_accounts_cooling_down`. Such a cooldown (`server_is_overloaded`,
+`slow_down`, `upstream_5xx`) is a probabilistic hint, not proof the account will
+refuse again, so the account whose overload cooldown expires soonest is retried.
+
+This path is reached only after normal selection found nothing, and it relaxes
+nothing else: enabled, in-pool, authentication, quota, model filters,
+duplicate-identity, and per-request exclusions all still apply. A `rate_limited`
+or authentication cooldown is never softened, because those carry an upstream
+instruction to wait and retrying early can deepen the limit. An account whose
+active cooldowns mix an overload entry with any non-overload entry stays
+blocked; the strictest entry decides.
+
 ---
 
 ## 7. Account Lifecycle
