@@ -1718,16 +1718,29 @@ For streaming responses:
   client-visible.
 - Before the first client-visible byte, Pool may buffer only a bounded
   lifecycle-only preamble consisting of `response.created`,
-  `response.in_progress`, `response.queued`, and SSE keepalive/reconnection
-  metadata. The buffer is limited to 64 KiB and eight complete SSE blocks.
-  Reaching either limit, receiving an unknown event/data block, or receiving
-  any output, reasoning, tool, hosted-tool, or other semantic event commits the
-  buffered prefix immediately.
+  `response.in_progress`, `response.queued`, a bare `error` event, and SSE
+  keepalive/reconnection metadata. The buffer is limited to 64 KiB and eight
+  complete SSE blocks. Reaching either limit, receiving an unknown event/data
+  block, or receiving any output, reasoning, tool, hosted-tool, or other
+  semantic event commits the buffered prefix immediately.
+- A bare `error` event is buffered rather than committed because the Codex
+  backend emits it immediately before the `response.failed` that classifies the
+  refusal. Committing on the `error` event would close the retry window one
+  block before the failure could be recognised and make the retry paths below
+  unreachable. The `error` event is never dropped on its own: if the stream
+  ends, or any event other than a retryable terminal failure follows, the
+  buffered prefix including the `error` event is forwarded verbatim. The event
+  is also a terminal-failure signal in its own right: if no later successful
+  terminal event supersedes it, the request must not be recorded as successful.
+  A standalone capacity-class `error` may use the same bounded pre-commit retry
+  path after EOF proves that no later classifying event follows.
 - Parse complete SSE event blocks and retain terminal
-  `response.completed`, `response.failed`, and `response.incomplete` state.
-- HTTP `200` plus `response.failed`/`response.incomplete` is a failed client
-  request. Preserve reported usage, but do not record success, clear consecutive
-  failures, refresh sticky/thread affinity, or create a response binding.
+  `error`, `response.completed`, `response.failed`, and `response.incomplete`
+  state.
+- HTTP `200` plus a terminal `error`, `response.failed`, or
+  `response.incomplete` is a failed client request. Preserve reported usage, but
+  do not record success, clear consecutive failures, refresh sticky/thread
+  affinity, or create a response binding.
 - Capacity/retryable terminal failures may set cooldown; authentication
   failures may quarantine the credential. Context length, invalid prompt, and
   policy failures do not penalize account health. Unknown codes remain a

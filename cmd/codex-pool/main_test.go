@@ -5981,6 +5981,10 @@ func TestResponseInfoFromSSEBlockClassifiesTerminalEvents(t *testing.T) {
 	if malformed.TerminalEvent != "response.failed" || malformed.TerminalFailureClass != "unknown" {
 		t.Fatalf("malformed terminal event was treated as success: %#v", malformed)
 	}
+	standalone := responseInfoFromSSEBlock("event: error\ndata: {\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"not persisted\"}\n\n")
+	if standalone.TerminalEvent != "error" || standalone.TerminalErrorCode != "server_is_overloaded" || standalone.TerminalFailureClass != "capacity" {
+		t.Fatalf("standalone error event was not classified: %#v", standalone)
+	}
 }
 
 func TestEarlyCapacityStreamingFailureRetriesBeforeCommit(t *testing.T) {
@@ -6308,6 +6312,145 @@ func TestEarlyCapacityStreamingFailureRetriesSameAccountWithoutFallback(t *testi
 	}
 	if len(a.state.Cooldowns["only"]) != 0 {
 		t.Fatalf("recovered capacity retry left a cooldown: %#v", a.state.Cooldowns["only"])
+	}
+}
+
+// The Codex backend emits a bare `error` event before the `response.failed`
+// that classifies a capacity refusal. That error block must keep the retry
+// window open, or every real-world capacity failure commits one block too early
+// and the in-place retry can never fire.
+func TestErrorEventBeforeCapacityFailureKeepsRetryWindowOpen(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_busy\"}}\n\n")
+			_, _ = io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity\"}\n\n")
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_busy\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"usage\":{\"input_tokens\":4096,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":2048}}}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 2 || recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("capacity failure announced by an error event was not retried: hits=%d code=%d body=%s", hits, recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "resp_busy") || strings.Contains(recorder.Body.String(), "at capacity") {
+		t.Fatalf("abandoned error/failure prefix leaked downstream: %s", recorder.Body.String())
+	}
+	if len(a.state.RoutingCacheEvents) != 1 {
+		t.Fatalf("expected one routing event: %#v", a.state.RoutingCacheEvents)
+	}
+	if event := a.state.RoutingCacheEvents[0]; event.PrecommitCloseReason == "error" {
+		t.Fatalf("bare error event still closed the retry window: %#v", event)
+	}
+}
+
+// A bare `error` event is buffered, never swallowed. When the stream continues
+// with model output instead of a retryable failure, the output closes the window
+// and the buffered error must reach the caller exactly as upstream sent it.
+func TestBufferedErrorEventIsForwardedWhenStreamContinues(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_warn\"}}\n\n")
+		_, _ = io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"code\":\"upstream_warning\",\"message\":\"non-fatal notice\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"still streaming\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_warn\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, "non-fatal notice") || !strings.Contains(body, "still streaming") {
+		t.Fatalf("buffered error event was dropped or reordered: code=%d body=%s", recorder.Code, body)
+	}
+	if strings.Index(body, "non-fatal notice") > strings.Index(body, "still streaming") {
+		t.Fatalf("buffered error event was forwarded out of order: %s", body)
+	}
+	if len(a.state.RoutingCacheEvents) != 1 {
+		t.Fatalf("expected one routing event: %#v", a.state.RoutingCacheEvents)
+	}
+	if event := a.state.RoutingCacheEvents[0]; !event.PrecommitCommitted || event.PrecommitCloseReason != "response.output_text.delta" {
+		t.Fatalf("output after a buffered error did not close the window: committed=%v reason=%q", event.PrecommitCommitted, event.PrecommitCloseReason)
+	}
+}
+
+// The Responses schema defines a standalone streaming error event. If upstream
+// closes immediately after one without a response.failed wrapper, it is still a
+// failed request and must not refresh success or routing affinity merely because
+// the HTTP status was 200.
+func TestStandaloneErrorEventIsNotRecordedAsSuccess(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_error\"}}\n\n")
+		_, _ = io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"request rejected\"}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "standalone-error")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "request rejected") {
+		t.Fatalf("standalone error event was not forwarded: code=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if a.state.RequestCount != 1 || a.state.SuccessCount != 0 || a.state.FailureCount != 1 {
+		t.Fatalf("standalone error counters = requests:%d success:%d failure:%d", a.state.RequestCount, a.state.SuccessCount, a.state.FailureCount)
+	}
+	if len(a.state.StickySessions) != 0 || len(a.state.ResponseBindings) != 0 || !a.state.Health["only"].LastSuccessAt.IsZero() {
+		t.Fatalf("standalone error refreshed success routing state: sticky=%#v responses=%#v health=%#v", a.state.StickySessions, a.state.ResponseBindings, a.state.Health["only"])
+	}
+	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].TerminalEvent != "error" || a.state.RoutingCacheEvents[0].TerminalFailureClass != "request" {
+		t.Fatalf("standalone error diagnostics = %#v", a.state.RoutingCacheEvents)
+	}
+}
+
+// If the standalone error itself carries a capacity code, EOF closes the
+// classification wait and the still-uncommitted prefix can use the same
+// bounded retry path as response.failed.
+func TestStandaloneCapacityErrorRetriesAtEOF(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"at capacity\"}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 2 || recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("standalone capacity error was not retried: hits=%d code=%d body=%s", hits, recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "at capacity") {
+		t.Fatalf("abandoned standalone error leaked downstream: %s", recorder.Body.String())
+	}
+	if a.state.RequestCount != 1 || a.state.SuccessCount != 1 || a.state.FailureCount != 1 {
+		t.Fatalf("standalone capacity retry counters = requests:%d success:%d failure:%d", a.state.RequestCount, a.state.SuccessCount, a.state.FailureCount)
 	}
 }
 

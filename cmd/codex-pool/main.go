@@ -1397,11 +1397,12 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		info.FailoverOutcome = failoverOutcome
 		throughput.CompletedAt = info.CompletedAt
 		throughput.Usage = info.Usage
-		if info.TerminalEvent == "response.failed" || info.TerminalEvent == "response.incomplete" {
-			// A capacity failure can reach here only after the pre-commit path
-			// found no real fallback or after semantic SSE output was committed.
-			// Never retry at this point: splicing a second stream could duplicate
-			// work, tool effects, or response IDs and corrupt the SSE sequence.
+		if info.TerminalEvent == "error" || info.TerminalEvent == "response.failed" || info.TerminalEvent == "response.incomplete" {
+			// A terminal error can reach here only after the pre-commit path
+			// found no real fallback, after semantic SSE output was committed, or
+			// when a standalone error was not capacity-retryable. Never retry at
+			// this point: splicing a second stream could duplicate work, tool
+			// effects, or response IDs and corrupt the SSE sequence.
 			throughput.Success = false
 			a.markTerminalResponseFailureWithMeasurement(route, model, candidate.ID, info, throughput)
 			return
@@ -1826,6 +1827,19 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 			}
 		}
 		if errors.Is(err, io.EOF) {
+			if !committed && info.TerminalEvent == "error" && info.TerminalFailureClass == "capacity" {
+				// If a Responses stream ends with the error event itself instead
+				// of a following response.failed, EOF is the point at which that
+				// sequence is known. Wait until then before treating it as
+				// retryable so an error followed by normal output is still
+				// forwarded in order rather than discarded.
+				info.CompletedAt = time.Now().UTC()
+				return streamingProxyResult{
+					Info:                     info,
+					Buffered:                 []byte(buffered.String()),
+					RetryableCapacityFailure: true,
+				}
+			}
 			commit()
 			break
 		}
@@ -1881,6 +1895,17 @@ func readSSEBlock(reader *bufio.Reader) (string, error) {
 func precommitLifecycleSSEBlock(block string) bool {
 	switch responseEventTypeFromSSEBlock(block) {
 	case "response.created", "response.in_progress", "response.queued":
+		return true
+	case "error":
+		// The Codex backend announces a refusal as a bare `error` event and only
+		// then sends the `response.failed` that carries the classification. The
+		// error block is not model output, so it stays buffered and keeps the
+		// retry window open for the terminal event behind it. In production every
+		// capacity refusal arrived this way, and treating the error as an unknown
+		// event committed the stream one block before the failure could be
+		// classified, so the retry path was never reachable. If anything other
+		// than a retryable failure follows, that event closes the window and the
+		// buffered error is forwarded verbatim rather than dropped.
 		return true
 	case "":
 		// SSE keepalive comments and reconnection metadata are not semantic
@@ -1991,6 +2016,15 @@ func responseInfoFromSSEBlock(block string) proxyResponseInfo {
 			info.TerminalErrorCode = sanitizedErrorCode(claimString(errorPayload, "code"))
 		}
 	}
+	if eventType == "error" {
+		// The standalone Responses streaming error shape carries code/message at
+		// the event root rather than inside response.error. Retain only the same
+		// bounded code token used for response.failed; the message remains solely
+		// in the client-bound SSE bytes and is never persisted.
+		if code := sanitizedErrorCode(claimString(payload, "code")); code != "" {
+			info.TerminalErrorCode = code
+		}
+	}
 	if isTerminalResponseEvent(eventType) {
 		info.TerminalEvent = eventType
 		info.TerminalFailureClass = terminalFailureClass(eventType, info.TerminalErrorCode)
@@ -2000,7 +2034,7 @@ func responseInfoFromSSEBlock(block string) proxyResponseInfo {
 
 func isTerminalResponseEvent(value string) bool {
 	switch value {
-	case "response.completed", "response.failed", "response.incomplete":
+	case "error", "response.completed", "response.failed", "response.incomplete":
 		return true
 	default:
 		return false
@@ -2011,7 +2045,7 @@ func terminalFailureClass(eventType, code string) string {
 	if eventType == "response.incomplete" {
 		return "incomplete"
 	}
-	if eventType != "response.failed" {
+	if eventType != "error" && eventType != "response.failed" {
 		return ""
 	}
 	switch sanitizedErrorCode(code) {
