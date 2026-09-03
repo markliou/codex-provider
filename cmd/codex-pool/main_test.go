@@ -1507,6 +1507,39 @@ func TestPoolParticipationCannotChangeDuringAuthRepair(t *testing.T) {
 	}
 }
 
+// Quota windows are AND-gated: an account is routable only while every reported
+// window still has headroom. Without a per-window routing marker, a 5h window
+// that reset to 100% reads as available capacity next to an exhausted weekly
+// window, which is exactly the misreading operators hit in production.
+func TestAdminAssetsMarkTheRoutingGateOnQuotaWindows(t *testing.T) {
+	a := testApp(t, nil)
+	checks := map[string][]string{
+		"/admin/assets/app.js":  {"quota-window-constraint", "unavailable (", "exhausted", "windowBlocksRouting", "Date.now() / 1000 < resetAt", "blocking ? [] : gatingLabels"},
+		"/admin/assets/app.css": {".quota-window-held .quota-track", ".quota-window-constraint"},
+	}
+	for path, expected := range checks {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		recorder := httptest.NewRecorder()
+		a.adminMux().ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("GET %s returned %d", path, recorder.Code)
+		}
+		for _, want := range expected {
+			if !strings.Contains(recorder.Body.String(), want) {
+				t.Fatalf("GET %s did not include %q", path, want)
+			}
+		}
+	}
+	jsReq := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
+	jsRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(jsRecorder, jsReq)
+	for _, forbidden := range []string{"Rate gate", "Budget", "blocking this account", "quota-window-gate", "quota-window-role"} {
+		if strings.Contains(jsRecorder.Body.String(), forbidden) {
+			t.Fatalf("admin quota assets retained unsupported or redundant marker %q", forbidden)
+		}
+	}
+}
+
 func TestAdminDashboardAssets(t *testing.T) {
 	oldVersion, oldCommit, oldBuiltAt := buildVersion, buildCommit, buildBuiltAt
 	buildVersion, buildCommit, buildBuiltAt = "vtest", "abcdef123456", "2026-06-25T02:30:00Z"

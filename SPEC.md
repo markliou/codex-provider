@@ -2050,9 +2050,14 @@ Pool-observed `hit/fallback` count. Per-account routing-failover totals remain
 available in backend state but must not appear as a separate account-table
 column.
 
-The quota cell must keep every upstream-reported quota window visible as its
-own labeled progress bar. Distinct subscription, Pro/Spark, and additional
-limit windows must not be merged, hidden, or treated as duplicate renderings.
+The quota cell must keep every upstream-reported subscription quota window
+visible as its own labeled progress bar in the primary view. Distinct
+subscription, Pro/Spark, and additional limit windows must not be merged or
+treated as duplicate renderings. Additional limits are model- or feature-scoped
+meters rather than the account-wide subscription allowance, so their group stays
+behind the same disclosure control as the other secondary facts; each one is
+still rendered individually with its own windows and reached state, never
+summarised away.
 Out-of-pool accounts keep the same quota values and independent windows, but
 each bar mixes its own green/gold/orange/red health gradient toward a neutral
 gray and uses a dusty-pink dashed frame. Do not replace every health level with
@@ -2064,11 +2069,28 @@ not by a status badge or presentation tone. Duplicate slots remain in-pool and
 retain their normal quota health styling unless that local slot is independently
 out of pool; Duplicate must never imply that an operator manually removed the
 slot. It must not alter quota percentages or routing semantics.
+Reported quota windows are AND-gated: an account is routable only while every
+present window still has active zero-percent evidence. When one or more
+reported windows are at zero and their reported reset time has not passed,
+every other present window is unavailable: its bar is muted and its existing
+label carries one compact inline note naming the exhausted reported window or
+windows. A zero-percent observation whose reset time has passed no longer
+constrains routing and must not mute a sibling, matching the server's evidence
+expiry rule. Do not add another red `Blocked`/`blocking` sentence below the
+bars; the zero percentage, critical track, and account status already
+communicate exhaustion, and repeating that message makes the row harder to
+scan. Do not infer semantic roles such as `Rate gate` or `Budget` merely from a
+window's duration, order, or primary/secondary position; upstream-reported
+duration labels are the evidence available. Only a window upstream actually
+reported may constrain a sibling, so an absent or unreported window never mutes
+a healthy one. These markers must not change quota percentages, window
+ordering, or routing semantics.
 Supporting text belongs below the bars in compact labeled facts: reset
 countdowns pair a `Reset` label with the remaining time. The primary view must
-use flat, aligned rows rather than a nested card for every fact; credits, spend
-control, reset credits, telemetry freshness, and protection controls are
-secondary context and stay behind a compact disclosure control by default.
+use flat, aligned rows rather than a nested card for every fact; additional
+limits, credits, spend control, reset credits, telemetry freshness, and
+protection controls are secondary context and stay behind a compact disclosure
+control by default.
 Quota exhaustion is already represented by the zero/critical bar, percentage,
 and account status; do not repeat it as a red `Blocked: ...` sentence below the
 bars. Quota-protection blocked/unavailable state remains visible in its compact

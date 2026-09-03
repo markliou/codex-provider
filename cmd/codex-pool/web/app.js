@@ -647,7 +647,12 @@
   // tone; only an explicit out-of-pool marker may mute their quota bars.
   const poolMembershipAttribute = (outOfPool) => outOfPool ? ' data-pool-membership="out"' : "";
 
-  function quotaWindowMarkup(label, window) {
+  // Reported quota windows are AND-gated: a nonzero sibling is unavailable
+  // while another reported window is exhausted. Keep that relationship inline
+  // with the held window instead of adding another red status row below every
+  // bar; the zero percentage, critical track, and account status already show
+  // which window is exhausted.
+  function quotaWindowMarkup(label, window, blockedBy = []) {
     if (!window || (!window.observed && !window.present)) return "";
     const durationLabel = window.label || label || "Window";
     if (!window.present) {
@@ -660,7 +665,12 @@
     if (value === null) {
       return `<div class="quota-window quota-window-unreported"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>Not reported</strong></div>${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
     }
-    return `<div class="quota-window"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>${quotaPercent(value)}% left</strong></div>${quotaTrackMarkup(value, durationLabel)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
+    const blockers = Array.isArray(blockedBy) ? blockedBy.filter(Boolean) : [];
+    const held = blockers.length > 0;
+    const constraint = held
+      ? ` <em class="quota-window-constraint">\u00b7 unavailable (${blockers.map((item) => `${escapeHTML(item)} exhausted`).join(" + ")})</em>`
+      : "";
+    return `<div class="quota-window${held ? " quota-window-held" : ""}"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota${constraint}</span><strong>${quotaPercent(value)}% left</strong></div>${quotaTrackMarkup(value, durationLabel)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
   }
 
   function quotaFreshnessMarkup(freshness, updatedAt) {
@@ -720,7 +730,24 @@
       const sourceWindows = Array.isArray(quota.windows) && quota.windows.length
         ? quota.windows
         : [quota.primary, quota.secondary].filter((window) => window && (window.observed || window.present));
-      const windows = sourceWindows.map((window) => quotaWindowMarkup(window.label, window)).filter(Boolean).join("");
+      // A window is only exhausted when upstream actually reported it. An absent
+      // window carries no evidence and must never be treated as a gate, or an
+      // unreported bucket would mute every healthy window on the account.
+      const windowRemaining = (entry) => entry && entry.present ? finiteMetric(entry.remainingPercent ?? entry.percentage) : null;
+      // Match quotaExplicitlyBlocksRouting: zero-percent evidence stops gating
+      // once its reported reset time has passed. Otherwise stale display data
+      // would claim a sibling is unavailable after routing has already failed
+      // open pending the next authoritative refresh.
+      const windowBlocksRouting = (entry) => {
+        if (windowRemaining(entry) !== 0) return false;
+        const resetAt = finiteMetric(entry && entry.resetAt);
+        return resetAt === null || Date.now() / 1000 < resetAt;
+      };
+      const gatingLabels = sourceWindows.filter(windowBlocksRouting).map((entry) => entry.label || "Window");
+      const windows = sourceWindows.map((window) => {
+        const blocking = windowBlocksRouting(window);
+        return quotaWindowMarkup(window.label, window, blocking ? [] : gatingLabels);
+      }).filter(Boolean).join("");
       const reached = quota.rateLimitReachedType ? `<div class="quota-fact quota-fact-warning"><span class="quota-fact-label">Reached type:</span><strong class="quota-fact-value">${escapeHTML(quota.rateLimitReachedType.replaceAll("_", " "))}</strong></div>` : "";
       const resetCredits = quota.resetCredits?.availableCount !== null && quota.resetCredits?.availableCount !== undefined
         ? `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(quota.resetCredits.availableCount))}</strong></div>`
@@ -729,11 +756,16 @@
       // are distinct upstream limits, not duplicate renderings. Only the
       // supporting text is grouped so operators can scan bars first, then read
       // reset/credit/telemetry facts without losing any quota semantics.
-      const details = quotaDetailsMarkup(`${reached}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
+      // Additional limits are model- or feature-scoped meters that rarely decide
+      // anything at a glance, and rendering their nested window group beside the
+      // subscription bars crowds the row that operators actually scan. They stay
+      // individually rendered and unmerged, just behind the same disclosure as
+      // the other secondary facts.
+      const details = quotaDetailsMarkup(`${reached}${additionalLimitsMarkup(quota.additionalLimits)}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
       // Exhaustion is already visible in the 0%/critical bar, percentage, and
       // account status. Do not add a second red "Blocked" sentence below the
       // bars; it duplicates the signal and makes multi-window rows harder to scan.
-      return `<div class="quota quota-detailed">${windows ? `<div class="quota-windows">${windows}</div>` : '<div class="quota-detail">Quota windows: Not reported</div>'}${additionalLimitsMarkup(quota.additionalLimits)}${details}${refreshError}</div>`;
+      return `<div class="quota quota-detailed">${windows ? `<div class="quota-windows">${windows}</div>` : '<div class="quota-detail">Quota windows: Not reported</div>'}${details}${refreshError}</div>`;
     }
     if (quotaError) return refreshError;
     if (value === null || value === undefined) return '<span class="quota-unknown">Not reported</span>';
