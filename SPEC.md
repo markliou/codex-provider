@@ -2044,9 +2044,14 @@ Pool-observed `hit/fallback` count. Per-account routing-failover totals remain
 available in backend state but must not appear as a separate account-table
 column.
 
-The quota cell must keep every upstream-reported quota window visible as its
-own labeled progress bar. Distinct subscription, Pro/Spark, and additional
-limit windows must not be merged, hidden, or treated as duplicate renderings.
+The quota cell must keep every upstream-reported subscription quota window
+visible as its own labeled progress bar in the primary view. Distinct
+subscription, Pro/Spark, and additional limit windows must not be merged or
+treated as duplicate renderings. Additional limits are model- or feature-scoped
+meters rather than the account-wide subscription allowance, so their group stays
+behind the same disclosure control as the other secondary facts; each one is
+still rendered individually with its own windows and reached state, never
+summarised away.
 Out-of-pool accounts keep the same quota values and independent windows, but
 each bar mixes its own green/gold/orange/red health gradient toward a neutral
 gray and uses a dusty-pink dashed frame. Do not replace every health level with
@@ -2082,9 +2087,10 @@ markers annotate the existing bars and must not change quota percentages, window
 ordering, or routing semantics.
 Supporting text belongs below the bars in compact labeled facts: reset
 countdowns pair a `Reset` label with the remaining time. The primary view must
-use flat, aligned rows rather than a nested card for every fact; credits, spend
-control, reset credits, telemetry freshness, and protection controls are
-secondary context and stay behind a compact disclosure control by default.
+use flat, aligned rows rather than a nested card for every fact; additional
+limits, credits, spend control, reset credits, telemetry freshness, and
+protection controls are secondary context and stay behind a compact disclosure
+control by default.
 Quota exhaustion is already represented by the zero/critical bar, percentage,
 and account status; do not repeat it as a red `Blocked: ...` sentence below the
 bars. Quota-protection blocked/unavailable state remains visible in its compact

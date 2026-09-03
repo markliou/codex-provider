@@ -768,11 +768,16 @@
       // are distinct upstream limits, not duplicate renderings. Only the
       // supporting text is grouped so operators can scan bars first, then read
       // reset/credit/telemetry facts without losing any quota semantics.
-      const details = quotaDetailsMarkup(`${reached}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
+      // Additional limits are model- or feature-scoped meters that rarely decide
+      // anything at a glance, and rendering their nested window group beside the
+      // subscription bars crowds the row that operators actually scan. They stay
+      // individually rendered and unmerged, just behind the same disclosure as
+      // the other secondary facts.
+      const details = quotaDetailsMarkup(`${reached}${additionalLimitsMarkup(quota.additionalLimits)}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
       // Exhaustion is already visible in the 0%/critical bar, percentage, and
       // account status. Do not add a second red "Blocked" sentence below the
       // bars; it duplicates the signal and makes multi-window rows harder to scan.
-      return `<div class="quota quota-detailed">${windows ? `<div class="quota-windows">${windows}</div>` : '<div class="quota-detail">Quota windows: Not reported</div>'}${additionalLimitsMarkup(quota.additionalLimits)}${details}${refreshError}</div>`;
+      return `<div class="quota quota-detailed">${windows ? `<div class="quota-windows">${windows}</div>` : '<div class="quota-detail">Quota windows: Not reported</div>'}${details}${refreshError}</div>`;
     }
     if (quotaError) return refreshError;
     if (value === null || value === undefined) return '<span class="quota-unknown">Not reported</span>';
