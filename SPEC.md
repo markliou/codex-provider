@@ -1729,12 +1729,18 @@ For streaming responses:
   block before the failure could be recognised and make the retry paths below
   unreachable. The `error` event is never dropped on its own: if the stream
   ends, or any event other than a retryable terminal failure follows, the
-  buffered prefix including the `error` event is forwarded verbatim.
+  buffered prefix including the `error` event is forwarded verbatim. The event
+  is also a terminal-failure signal in its own right: if no later successful
+  terminal event supersedes it, the request must not be recorded as successful.
+  A standalone capacity-class `error` may use the same bounded pre-commit retry
+  path after EOF proves that no later classifying event follows.
 - Parse complete SSE event blocks and retain terminal
-  `response.completed`, `response.failed`, and `response.incomplete` state.
-- HTTP `200` plus `response.failed`/`response.incomplete` is a failed client
-  request. Preserve reported usage, but do not record success, clear consecutive
-  failures, refresh sticky/thread affinity, or create a response binding.
+  `error`, `response.completed`, `response.failed`, and `response.incomplete`
+  state.
+- HTTP `200` plus a terminal `error`, `response.failed`, or
+  `response.incomplete` is a failed client request. Preserve reported usage, but
+  do not record success, clear consecutive failures, refresh sticky/thread
+  affinity, or create a response binding.
 - Capacity/retryable terminal failures may set cooldown; authentication
   failures may quarantine the credential. Context length, invalid prompt, and
   policy failures do not penalize account health. Unknown codes remain a
