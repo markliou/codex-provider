@@ -1514,8 +1514,8 @@ func TestPoolParticipationCannotChangeDuringAuthRepair(t *testing.T) {
 func TestAdminAssetsMarkTheRoutingGateOnQuotaWindows(t *testing.T) {
 	a := testApp(t, nil)
 	checks := map[string][]string{
-		"/admin/assets/app.js":  {"quota-window-gate", "Held by", "Blocking", "gatingLabels"},
-		"/admin/assets/app.css": {".quota-window-gate", ".quota-window-held .quota-track"},
+		"/admin/assets/app.js":  {"quota-window-gate", "quota-window-role", "Rate gate", "Budget", "blocking this account", "Unusable until", "gatingLabels"},
+		"/admin/assets/app.css": {".quota-window-gate", ".quota-window-held .quota-track", ".quota-window-role"},
 	}
 	for path, expected := range checks {
 		req := httptest.NewRequest(http.MethodGet, path, nil)

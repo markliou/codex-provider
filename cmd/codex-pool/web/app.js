@@ -667,12 +667,20 @@
       return `<div class="quota-window quota-window-unreported"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>Not reported</strong></div>${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
     }
     const heldBy = gate && !gate.blocking ? gate.heldBy || "" : "";
+    // Say what the window does to this account in a full sentence. "0% left" is
+    // a reading; "blocking this account" is the consequence, and only the
+    // consequence answers the question an operator is actually asking.
     const gateLine = gate && gate.blocking
-      ? '<div class="quota-window-gate"><span>Routing</span><strong>Blocking</strong></div>'
+      ? '<div class="quota-window-gate">Exhausted, blocking this account</div>'
       : heldBy
-        ? `<div class="quota-window-gate quota-window-gate-held"><span>Held by</span><strong>${escapeHTML(heldBy)}</strong></div>`
+        ? `<div class="quota-window-gate quota-window-gate-held">Unusable until ${escapeHTML(heldBy)} resets</div>`
         : "";
-    return `<div class="quota-window${heldBy ? " quota-window-held" : ""}"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>${quotaPercent(value)}% left</strong></div>${quotaTrackMarkup(value, durationLabel)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}${gateLine}</div>`;
+    // The role names which kind of limit this window is. It is derived from the
+    // relative window durations on the same account, never hardcoded to 5h or
+    // Week, so a plan reporting different windows still gets a truthful label.
+    const role = (gate && gate.role) || "";
+    const roleMarkup = role ? ` <em class="quota-window-role">\u00b7 ${escapeHTML(role)}</em>` : "";
+    return `<div class="quota-window${heldBy ? " quota-window-held" : ""}"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota${roleMarkup}</span><strong>${quotaPercent(value)}% left</strong></div>${quotaTrackMarkup(value, durationLabel)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}${gateLine}</div>`;
   }
 
   function quotaFreshnessMarkup(freshness, updatedAt) {
@@ -737,9 +745,17 @@
       // unreported bucket would mute every healthy window on the account.
       const windowRemaining = (entry) => entry && entry.present ? finiteMetric(entry.remainingPercent ?? entry.percentage) : null;
       const gatingLabels = sourceWindows.filter((entry) => windowRemaining(entry) === 0).map((entry) => entry.label || "Window");
+      // A single window is the whole limit, so it is neither a burst gate nor a
+      // separate budget and gets no role. Roles only mean something once two
+      // windows of different lengths constrain the same account.
+      const timed = sourceWindows.filter((entry) => entry && entry.present && finiteMetric(entry.windowMinutes) !== null);
+      const ordered = timed.slice().sort((a, b) => finiteMetric(a.windowMinutes) - finiteMetric(b.windowMinutes));
+      const shortest = ordered.length > 1 && finiteMetric(ordered[0].windowMinutes) !== finiteMetric(ordered[ordered.length - 1].windowMinutes) ? ordered[0] : null;
+      const longest = shortest ? ordered[ordered.length - 1] : null;
       const windows = sourceWindows.map((window) => {
         const blocking = windowRemaining(window) === 0;
-        return quotaWindowMarkup(window.label, window, { blocking, heldBy: blocking ? "" : gatingLabels.join(" · ") });
+        const role = window === shortest ? "Rate gate" : window === longest ? "Budget" : "";
+        return quotaWindowMarkup(window.label, window, { blocking, role, heldBy: blocking ? "" : gatingLabels.join(" · ") });
       }).filter(Boolean).join("");
       const reached = quota.rateLimitReachedType ? `<div class="quota-fact quota-fact-warning"><span class="quota-fact-label">Reached type:</span><strong class="quota-fact-value">${escapeHTML(quota.rateLimitReachedType.replaceAll("_", " "))}</strong></div>` : "";
       const resetCredits = quota.resetCredits?.availableCount !== null && quota.resetCredits?.availableCount !== undefined

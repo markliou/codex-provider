@@ -2060,14 +2060,24 @@ out of pool; Duplicate must never imply that an operator manually removed the
 slot. It must not alter quota percentages or routing semantics.
 Reported quota windows are AND-gated: an account is routable only while every
 present window still has headroom. The cell must therefore name which window
-gates the account. A present window at zero remaining is marked as blocking
-routing, and every other present window on the same account is marked as held
-by the blocking window and has its bar muted. Only a window upstream actually
-reported may act as a gate, so an absent or unreported window never mutes a
-healthy one. Without this, a short window that has just reset to 100% renders
-as available capacity beside an exhausted longer window and is read as quota
-the pool is refusing to spend. These markers annotate the existing bars and
-must not change quota percentages, window ordering, or routing semantics.
+gates the account, in plain sentences rather than bare status tokens. A present
+window at zero remaining states that it is exhausted and blocking the account;
+every other present window states that it is unusable until the blocking window
+resets, and its bar is muted. Only a window upstream actually reported may act
+as a gate, so an absent or unreported window never mutes a healthy one. Without
+this, a short window that has just reset to 100% renders as available capacity
+beside an exhausted longer window and is read as quota the pool is refusing to
+spend.
+
+Each window also carries the role it plays for the account, so an operator can
+tell a burst limit from an allowance without knowing what a given duration
+means. The role is derived from the relative window durations reported on that
+account: the shortest present window is the rate gate and the longest is the
+budget. It must never be hardcoded to a specific duration, and an account whose
+present windows do not differ in length, including an account reporting a single
+window, carries no role at all because one window is the entire limit. These
+markers annotate the existing bars and must not change quota percentages, window
+ordering, or routing semantics.
 Supporting text belongs below the bars in compact labeled facts: reset
 countdowns pair a `Reset` label with the remaining time. The primary view must
 use flat, aligned rows rather than a nested card for every fact; credits, spend
