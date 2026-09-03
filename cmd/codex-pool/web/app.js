@@ -647,12 +647,12 @@
   // tone; only an explicit out-of-pool marker may mute their quota bars.
   const poolMembershipAttribute = (outOfPool) => outOfPool ? ' data-pool-membership="out"' : "";
 
-  // Reported quota windows are AND-gated: a nonzero sibling is unavailable
-  // while another reported window is exhausted. Keep that relationship inline
-  // with the held window instead of adding another red status row below every
-  // bar; the zero percentage, critical track, and account status already show
-  // which window is exhausted.
-  function quotaWindowMarkup(label, window, blockedBy = []) {
+  // Reported quota windows are AND-gated. Keep both consequences attached to
+  // the relevant labels: the active zero-percent window gets a compact red
+  // Exhausted marker, while a nonzero sibling names the window holding it.
+  // Do not turn either signal into a separate status row; that previously made
+  // multi-window accounts harder to scan and obscured which window was decisive.
+  function quotaWindowMarkup(label, window, gate = {}) {
     if (!window || (!window.observed && !window.present)) return "";
     const durationLabel = window.label || label || "Window";
     if (!window.present) {
@@ -665,11 +665,14 @@
     if (value === null) {
       return `<div class="quota-window quota-window-unreported"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>Not reported</strong></div>${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
     }
-    const blockers = Array.isArray(blockedBy) ? blockedBy.filter(Boolean) : [];
+    const exhausted = Boolean(gate.exhausted);
+    const blockers = Array.isArray(gate.blockedBy) ? gate.blockedBy.filter(Boolean) : [];
     const held = blockers.length > 0;
-    const constraint = held
-      ? ` <em class="quota-window-constraint">\u00b7 unavailable (${blockers.map((item) => `${escapeHTML(item)} exhausted`).join(" + ")})</em>`
-      : "";
+    const constraint = exhausted
+      ? ' <em class="quota-window-exhausted">\u00b7 Exhausted</em>'
+      : held
+        ? ` <em class="quota-window-constraint">\u00b7 unavailable (${blockers.map((item) => `${escapeHTML(item)} exhausted`).join(" + ")})</em>`
+        : "";
     return `<div class="quota-window${held ? " quota-window-held" : ""}"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota${constraint}</span><strong>${quotaPercent(value)}% left</strong></div>${quotaTrackMarkup(value, durationLabel)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
   }
 
@@ -746,7 +749,10 @@
       const gatingLabels = sourceWindows.filter(windowBlocksRouting).map((entry) => entry.label || "Window");
       const windows = sourceWindows.map((window) => {
         const blocking = windowBlocksRouting(window);
-        return quotaWindowMarkup(window.label, window, blocking ? [] : gatingLabels);
+        return quotaWindowMarkup(window.label, window, {
+          exhausted: blocking,
+          blockedBy: blocking ? [] : gatingLabels,
+        });
       }).filter(Boolean).join("");
       const reached = quota.rateLimitReachedType ? `<div class="quota-fact quota-fact-warning"><span class="quota-fact-label">Reached type:</span><strong class="quota-fact-value">${escapeHTML(quota.rateLimitReachedType.replaceAll("_", " "))}</strong></div>` : "";
       const resetCredits = quota.resetCredits?.availableCount !== null && quota.resetCredits?.availableCount !== undefined
@@ -762,9 +768,9 @@
       // individually rendered and unmerged, just behind the same disclosure as
       // the other secondary facts.
       const details = quotaDetailsMarkup(`${reached}${additionalLimitsMarkup(quota.additionalLimits)}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
-      // Exhaustion is already visible in the 0%/critical bar, percentage, and
-      // account status. Do not add a second red "Blocked" sentence below the
-      // bars; it duplicates the signal and makes multi-window rows harder to scan.
+      // Keep the decisive red Exhausted signal beside its window label. Do not
+      // add a second account-level "Blocked" sentence below the bars; that
+      // duplicates the signal and makes multi-window rows harder to scan.
       return `<div class="quota quota-detailed">${windows ? `<div class="quota-windows">${windows}</div>` : '<div class="quota-detail">Quota windows: Not reported</div>'}${details}${refreshError}</div>`;
     }
     if (quotaError) return refreshError;
