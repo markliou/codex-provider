@@ -2063,7 +2063,9 @@ present window still has headroom. The cell must therefore name which window
 gates the account, in plain sentences rather than bare status tokens. A present
 window at zero remaining states that it is exhausted and blocking the account;
 every other present window states that it is unusable until the blocking window
-resets, and its bar is muted. Only a window upstream actually reported may act
+resets, and its bar is muted. Both sentences carry the same alert styling: a
+window held open by an exhausted sibling is exactly as unusable as the exhausted
+window itself, so neither sentence may be muted relative to the other. Only a window upstream actually reported may act
 as a gate, so an absent or unreported window never mutes a healthy one. Without
 this, a short window that has just reset to 100% renders as available capacity
 beside an exhausted longer window and is read as quota the pool is refusing to

@@ -669,11 +669,14 @@
     const heldBy = gate && !gate.blocking ? gate.heldBy || "" : "";
     // Say what the window does to this account in a full sentence. "0% left" is
     // a reading; "blocking this account" is the consequence, and only the
-    // consequence answers the question an operator is actually asking.
+    // consequence answers the question an operator is actually asking. Both
+    // sentences carry the same alert styling: a window held open by an
+    // exhausted sibling is just as unusable as the exhausted window itself, so
+    // muting one of them would reintroduce the "this half looks fine" reading.
     const gateLine = gate && gate.blocking
       ? '<div class="quota-window-gate">Exhausted, blocking this account</div>'
       : heldBy
-        ? `<div class="quota-window-gate quota-window-gate-held">Unusable until ${escapeHTML(heldBy)} resets</div>`
+        ? `<div class="quota-window-gate">Unusable until ${escapeHTML(heldBy)} resets</div>`
         : "";
     // The role names which kind of limit this window is. It is derived from the
     // relative window durations on the same account, never hardcoded to 5h or
