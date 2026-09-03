@@ -1509,13 +1509,14 @@ func TestPoolParticipationCannotChangeDuringAuthRepair(t *testing.T) {
 
 // Quota windows are AND-gated: an account is routable only while every reported
 // window still has headroom. Keep the decisive exhausted marker beside the
-// zero-percent window label, and name that window beside muted siblings. A
-// separate account-level Blocked row would duplicate both signals.
+// zero-percent window label, and name that window in the same alert color beside
+// muted siblings. A separate account-level Blocked row would duplicate both
+// signals.
 func TestAdminAssetsMarkTheRoutingGateOnQuotaWindows(t *testing.T) {
 	a := testApp(t, nil)
 	checks := map[string][]string{
 		"/admin/assets/app.js":  {"quota-window-exhausted", `\u00b7 Exhausted`, "quota-window-constraint", "unavailable (", "windowBlocksRouting", "Date.now() / 1000 < resetAt", "exhausted: blocking", "blockedBy: blocking ? [] : gatingLabels"},
-		"/admin/assets/app.css": {".quota-window-held .quota-track", ".quota-window-exhausted", ".quota-window-constraint", "color: var(--red)"},
+		"/admin/assets/app.css": {".quota-window-held .quota-track", ".quota-window-exhausted { color: var(--red); }", ".quota-window-constraint { color: var(--red);"},
 	}
 	for path, expected := range checks {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
