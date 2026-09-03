@@ -647,13 +647,12 @@
   // tone; only an explicit out-of-pool marker may mute their quota bars.
   const poolMembershipAttribute = (outOfPool) => outOfPool ? ' data-pool-membership="out"' : "";
 
-  // Reported quota windows are AND-gated: the account is routable only while
-  // every window still has headroom. A window at 100% is therefore not spare
-  // capacity while a sibling window sits at zero, and rendering both as plain
-  // independent bars invites the reading that the full one is available. Name
-  // the window that actually gates the account, and mark the others as held so
-  // a reset 5h window can never be mistaken for usable quota.
-  function quotaWindowMarkup(label, window, gate) {
+  // Reported quota windows are AND-gated: a nonzero sibling is unavailable
+  // while another reported window is exhausted. Keep that relationship inline
+  // with the held window instead of adding another red status row below every
+  // bar; the zero percentage, critical track, and account status already show
+  // which window is exhausted.
+  function quotaWindowMarkup(label, window, blockedBy = []) {
     if (!window || (!window.observed && !window.present)) return "";
     const durationLabel = window.label || label || "Window";
     if (!window.present) {
@@ -666,24 +665,12 @@
     if (value === null) {
       return `<div class="quota-window quota-window-unreported"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>Not reported</strong></div>${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
     }
-    const heldBy = gate && !gate.blocking ? gate.heldBy || "" : "";
-    // Say what the window does to this account in a full sentence. "0% left" is
-    // a reading; "blocking this account" is the consequence, and only the
-    // consequence answers the question an operator is actually asking. Both
-    // sentences carry the same alert styling: a window held open by an
-    // exhausted sibling is just as unusable as the exhausted window itself, so
-    // muting one of them would reintroduce the "this half looks fine" reading.
-    const gateLine = gate && gate.blocking
-      ? '<div class="quota-window-gate">Exhausted, blocking this account</div>'
-      : heldBy
-        ? `<div class="quota-window-gate">Unusable until ${escapeHTML(heldBy)} resets</div>`
-        : "";
-    // The role names which kind of limit this window is. It is derived from the
-    // relative window durations on the same account, never hardcoded to 5h or
-    // Week, so a plan reporting different windows still gets a truthful label.
-    const role = (gate && gate.role) || "";
-    const roleMarkup = role ? ` <em class="quota-window-role">\u00b7 ${escapeHTML(role)}</em>` : "";
-    return `<div class="quota-window${heldBy ? " quota-window-held" : ""}"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota${roleMarkup}</span><strong>${quotaPercent(value)}% left</strong></div>${quotaTrackMarkup(value, durationLabel)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}${gateLine}</div>`;
+    const blockers = Array.isArray(blockedBy) ? blockedBy.filter(Boolean) : [];
+    const held = blockers.length > 0;
+    const constraint = held
+      ? ` <em class="quota-window-constraint">\u00b7 unavailable (${blockers.map((item) => `${escapeHTML(item)} exhausted`).join(" + ")})</em>`
+      : "";
+    return `<div class="quota-window${held ? " quota-window-held" : ""}"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota${constraint}</span><strong>${quotaPercent(value)}% left</strong></div>${quotaTrackMarkup(value, durationLabel)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
   }
 
   function quotaFreshnessMarkup(freshness, updatedAt) {
@@ -747,18 +734,19 @@
       // window carries no evidence and must never be treated as a gate, or an
       // unreported bucket would mute every healthy window on the account.
       const windowRemaining = (entry) => entry && entry.present ? finiteMetric(entry.remainingPercent ?? entry.percentage) : null;
-      const gatingLabels = sourceWindows.filter((entry) => windowRemaining(entry) === 0).map((entry) => entry.label || "Window");
-      // A single window is the whole limit, so it is neither a burst gate nor a
-      // separate budget and gets no role. Roles only mean something once two
-      // windows of different lengths constrain the same account.
-      const timed = sourceWindows.filter((entry) => entry && entry.present && finiteMetric(entry.windowMinutes) !== null);
-      const ordered = timed.slice().sort((a, b) => finiteMetric(a.windowMinutes) - finiteMetric(b.windowMinutes));
-      const shortest = ordered.length > 1 && finiteMetric(ordered[0].windowMinutes) !== finiteMetric(ordered[ordered.length - 1].windowMinutes) ? ordered[0] : null;
-      const longest = shortest ? ordered[ordered.length - 1] : null;
+      // Match quotaExplicitlyBlocksRouting: zero-percent evidence stops gating
+      // once its reported reset time has passed. Otherwise stale display data
+      // would claim a sibling is unavailable after routing has already failed
+      // open pending the next authoritative refresh.
+      const windowBlocksRouting = (entry) => {
+        if (windowRemaining(entry) !== 0) return false;
+        const resetAt = finiteMetric(entry && entry.resetAt);
+        return resetAt === null || Date.now() / 1000 < resetAt;
+      };
+      const gatingLabels = sourceWindows.filter(windowBlocksRouting).map((entry) => entry.label || "Window");
       const windows = sourceWindows.map((window) => {
-        const blocking = windowRemaining(window) === 0;
-        const role = window === shortest ? "Rate gate" : window === longest ? "Budget" : "";
-        return quotaWindowMarkup(window.label, window, { blocking, role, heldBy: blocking ? "" : gatingLabels.join(" · ") });
+        const blocking = windowBlocksRouting(window);
+        return quotaWindowMarkup(window.label, window, blocking ? [] : gatingLabels);
       }).filter(Boolean).join("");
       const reached = quota.rateLimitReachedType ? `<div class="quota-fact quota-fact-warning"><span class="quota-fact-label">Reached type:</span><strong class="quota-fact-value">${escapeHTML(quota.rateLimitReachedType.replaceAll("_", " "))}</strong></div>` : "";
       const resetCredits = quota.resetCredits?.availableCount !== null && quota.resetCredits?.availableCount !== undefined

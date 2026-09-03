@@ -2070,26 +2070,20 @@ retain their normal quota health styling unless that local slot is independently
 out of pool; Duplicate must never imply that an operator manually removed the
 slot. It must not alter quota percentages or routing semantics.
 Reported quota windows are AND-gated: an account is routable only while every
-present window still has headroom. The cell must therefore name which window
-gates the account, in plain sentences rather than bare status tokens. A present
-window at zero remaining states that it is exhausted and blocking the account;
-every other present window states that it is unusable until the blocking window
-resets, and its bar is muted. Both sentences carry the same alert styling: a
-window held open by an exhausted sibling is exactly as unusable as the exhausted
-window itself, so neither sentence may be muted relative to the other. Only a window upstream actually reported may act
-as a gate, so an absent or unreported window never mutes a healthy one. Without
-this, a short window that has just reset to 100% renders as available capacity
-beside an exhausted longer window and is read as quota the pool is refusing to
-spend.
-
-Each window also carries the role it plays for the account, so an operator can
-tell a burst limit from an allowance without knowing what a given duration
-means. The role is derived from the relative window durations reported on that
-account: the shortest present window is the rate gate and the longest is the
-budget. It must never be hardcoded to a specific duration, and an account whose
-present windows do not differ in length, including an account reporting a single
-window, carries no role at all because one window is the entire limit. These
-markers annotate the existing bars and must not change quota percentages, window
+present window still has active zero-percent evidence. When one or more
+reported windows are at zero and their reported reset time has not passed,
+every other present window is unavailable: its bar is muted and its existing
+label carries one compact inline note naming the exhausted reported window or
+windows. A zero-percent observation whose reset time has passed no longer
+constrains routing and must not mute a sibling, matching the server's evidence
+expiry rule. Do not add another red `Blocked`/`blocking` sentence below the
+bars; the zero percentage, critical track, and account status already
+communicate exhaustion, and repeating that message makes the row harder to
+scan. Do not infer semantic roles such as `Rate gate` or `Budget` merely from a
+window's duration, order, or primary/secondary position; upstream-reported
+duration labels are the evidence available. Only a window upstream actually
+reported may constrain a sibling, so an absent or unreported window never mutes
+a healthy one. These markers must not change quota percentages, window
 ordering, or routing semantics.
 Supporting text belongs below the bars in compact labeled facts: reset
 countdowns pair a `Reset` label with the remaining time. The primary view must

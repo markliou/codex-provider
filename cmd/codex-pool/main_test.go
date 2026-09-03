@@ -1514,8 +1514,8 @@ func TestPoolParticipationCannotChangeDuringAuthRepair(t *testing.T) {
 func TestAdminAssetsMarkTheRoutingGateOnQuotaWindows(t *testing.T) {
 	a := testApp(t, nil)
 	checks := map[string][]string{
-		"/admin/assets/app.js":  {"quota-window-gate", "quota-window-role", "Rate gate", "Budget", "blocking this account", "Unusable until", "gatingLabels"},
-		"/admin/assets/app.css": {".quota-window-gate", ".quota-window-held .quota-track", ".quota-window-role"},
+		"/admin/assets/app.js":  {"quota-window-constraint", "unavailable (", "exhausted", "windowBlocksRouting", "Date.now() / 1000 < resetAt", "blocking ? [] : gatingLabels"},
+		"/admin/assets/app.css": {".quota-window-held .quota-track", ".quota-window-constraint"},
 	}
 	for path, expected := range checks {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -1528,6 +1528,14 @@ func TestAdminAssetsMarkTheRoutingGateOnQuotaWindows(t *testing.T) {
 			if !strings.Contains(recorder.Body.String(), want) {
 				t.Fatalf("GET %s did not include %q", path, want)
 			}
+		}
+	}
+	jsReq := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
+	jsRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(jsRecorder, jsReq)
+	for _, forbidden := range []string{"Rate gate", "Budget", "blocking this account", "quota-window-gate", "quota-window-role"} {
+		if strings.Contains(jsRecorder.Body.String(), forbidden) {
+			t.Fatalf("admin quota assets retained unsupported or redundant marker %q", forbidden)
 		}
 	}
 }
