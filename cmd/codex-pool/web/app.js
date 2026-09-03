@@ -649,9 +649,10 @@
 
   // Reported quota windows are AND-gated. Keep both consequences attached to
   // the relevant labels: the active zero-percent window gets a compact red
-  // Exhausted marker, while a nonzero sibling names the window holding it.
-  // Do not turn either signal into a separate status row; that previously made
-  // multi-window accounts harder to scan and obscured which window was decisive.
+  // Exhausted marker, while a nonzero sibling names the window holding it. Both
+  // notes use the alert color because the held sibling is unusable despite its
+  // apparent headroom. Do not turn either signal into a separate status row;
+  // that previously made multi-window accounts harder to scan.
   function quotaWindowMarkup(label, window, gate = {}) {
     if (!window || (!window.observed && !window.present)) return "";
     const durationLabel = window.label || label || "Window";
