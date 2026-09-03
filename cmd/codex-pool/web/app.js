@@ -647,7 +647,13 @@
   // tone; only an explicit out-of-pool marker may mute their quota bars.
   const poolMembershipAttribute = (outOfPool) => outOfPool ? ' data-pool-membership="out"' : "";
 
-  function quotaWindowMarkup(label, window) {
+  // Reported quota windows are AND-gated: the account is routable only while
+  // every window still has headroom. A window at 100% is therefore not spare
+  // capacity while a sibling window sits at zero, and rendering both as plain
+  // independent bars invites the reading that the full one is available. Name
+  // the window that actually gates the account, and mark the others as held so
+  // a reset 5h window can never be mistaken for usable quota.
+  function quotaWindowMarkup(label, window, gate) {
     if (!window || (!window.observed && !window.present)) return "";
     const durationLabel = window.label || label || "Window";
     if (!window.present) {
@@ -660,7 +666,13 @@
     if (value === null) {
       return `<div class="quota-window quota-window-unreported"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>Not reported</strong></div>${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
     }
-    return `<div class="quota-window"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>${quotaPercent(value)}% left</strong></div>${quotaTrackMarkup(value, durationLabel)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}</div>`;
+    const heldBy = gate && !gate.blocking ? gate.heldBy || "" : "";
+    const gateLine = gate && gate.blocking
+      ? '<div class="quota-window-gate"><span>Routing</span><strong>Blocking</strong></div>'
+      : heldBy
+        ? `<div class="quota-window-gate quota-window-gate-held"><span>Held by</span><strong>${escapeHTML(heldBy)}</strong></div>`
+        : "";
+    return `<div class="quota-window${heldBy ? " quota-window-held" : ""}"><div class="quota-line"><span>${escapeHTML(durationLabel)} quota</span><strong>${quotaPercent(value)}% left</strong></div>${quotaTrackMarkup(value, durationLabel)}${reset ? `<div class="quota-reset" title="${escapeHTML(reset)}"><span>Resets in</span><strong>${escapeHTML(countdown || "soon")}</strong></div>` : ""}${gateLine}</div>`;
   }
 
   function quotaFreshnessMarkup(freshness, updatedAt) {
@@ -720,7 +732,15 @@
       const sourceWindows = Array.isArray(quota.windows) && quota.windows.length
         ? quota.windows
         : [quota.primary, quota.secondary].filter((window) => window && (window.observed || window.present));
-      const windows = sourceWindows.map((window) => quotaWindowMarkup(window.label, window)).filter(Boolean).join("");
+      // A window is only exhausted when upstream actually reported it. An absent
+      // window carries no evidence and must never be treated as a gate, or an
+      // unreported bucket would mute every healthy window on the account.
+      const windowRemaining = (entry) => entry && entry.present ? finiteMetric(entry.remainingPercent ?? entry.percentage) : null;
+      const gatingLabels = sourceWindows.filter((entry) => windowRemaining(entry) === 0).map((entry) => entry.label || "Window");
+      const windows = sourceWindows.map((window) => {
+        const blocking = windowRemaining(window) === 0;
+        return quotaWindowMarkup(window.label, window, { blocking, heldBy: blocking ? "" : gatingLabels.join(" · ") });
+      }).filter(Boolean).join("");
       const reached = quota.rateLimitReachedType ? `<div class="quota-fact quota-fact-warning"><span class="quota-fact-label">Reached type:</span><strong class="quota-fact-value">${escapeHTML(quota.rateLimitReachedType.replaceAll("_", " "))}</strong></div>` : "";
       const resetCredits = quota.resetCredits?.availableCount !== null && quota.resetCredits?.availableCount !== undefined
         ? `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(quota.resetCredits.availableCount))}</strong></div>`

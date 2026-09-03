@@ -1507,6 +1507,31 @@ func TestPoolParticipationCannotChangeDuringAuthRepair(t *testing.T) {
 	}
 }
 
+// Quota windows are AND-gated: an account is routable only while every reported
+// window still has headroom. Without a per-window routing marker, a 5h window
+// that reset to 100% reads as available capacity next to an exhausted weekly
+// window, which is exactly the misreading operators hit in production.
+func TestAdminAssetsMarkTheRoutingGateOnQuotaWindows(t *testing.T) {
+	a := testApp(t, nil)
+	checks := map[string][]string{
+		"/admin/assets/app.js":  {"quota-window-gate", "Held by", "Blocking", "gatingLabels"},
+		"/admin/assets/app.css": {".quota-window-gate", ".quota-window-held .quota-track"},
+	}
+	for path, expected := range checks {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		recorder := httptest.NewRecorder()
+		a.adminMux().ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("GET %s returned %d", path, recorder.Code)
+		}
+		for _, want := range expected {
+			if !strings.Contains(recorder.Body.String(), want) {
+				t.Fatalf("GET %s did not include %q", path, want)
+			}
+		}
+	}
+}
+
 func TestAdminDashboardAssets(t *testing.T) {
 	oldVersion, oldCommit, oldBuiltAt := buildVersion, buildCommit, buildBuiltAt
 	buildVersion, buildCommit, buildBuiltAt = "vtest", "abcdef123456", "2026-06-25T02:30:00Z"

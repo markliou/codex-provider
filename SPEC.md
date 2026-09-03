@@ -2058,6 +2058,16 @@ not by a status badge or presentation tone. Duplicate slots remain in-pool and
 retain their normal quota health styling unless that local slot is independently
 out of pool; Duplicate must never imply that an operator manually removed the
 slot. It must not alter quota percentages or routing semantics.
+Reported quota windows are AND-gated: an account is routable only while every
+present window still has headroom. The cell must therefore name which window
+gates the account. A present window at zero remaining is marked as blocking
+routing, and every other present window on the same account is marked as held
+by the blocking window and has its bar muted. Only a window upstream actually
+reported may act as a gate, so an absent or unreported window never mutes a
+healthy one. Without this, a short window that has just reset to 100% renders
+as available capacity beside an exhausted longer window and is read as quota
+the pool is refusing to spend. These markers annotate the existing bars and
+must not change quota percentages, window ordering, or routing semantics.
 Supporting text belongs below the bars in compact labeled facts: reset
 countdowns pair a `Reset` label with the remaining time. The primary view must
 use flat, aligned rows rather than a nested card for every fact; credits, spend
