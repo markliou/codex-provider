@@ -1705,7 +1705,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS still uses crowded cache-cell markup %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"displayResetCountdown", "quotaTone", "quotaTrackMarkup", `"critical"`, `"watch"`, "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
+	for _, expected := range []string{"displayResetCountdown", "displayUnixDate", "resetCreditsMarkup", "Expires ${escapeHTML(expires)}", "quotaTone", "quotaTrackMarkup", `"critical"`, `"watch"`, "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS does not render clear quota state %q", expected)
 		}
@@ -4853,7 +4853,9 @@ func TestDeviceAuthZeroQuotaAccountIsNotSelected(t *testing.T) {
 
 func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 	resetAt := time.Now().UTC().Add(7 * time.Hour).Unix()
+	resetCreditExpires := time.Now().UTC().Add(14 * 24 * time.Hour).Truncate(time.Second)
 	var sawAccountHeader bool
+	var resetCreditDetailHits int
 	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/backend-api/wham/usage":
@@ -4872,8 +4874,22 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 				"limit_reached":false,
 				"primary_window":{"used_percent":30,"limit_window_seconds":18000,"reset_after_seconds":60},
 				"secondary_window":{"used_percent":80,"limit_window_seconds":604800,"reset_at":%d}
-			}
+			},
+			"rate_limit_reset_credits":{"available_count":1}
 		}`, resetAt)
+		case "/backend-api/wham/rate-limit-reset-credits":
+			resetCreditDetailHits++
+			if r.Header.Get("Authorization") == "" || r.Header.Get("ChatGPT-Account-Id") != "acct-chatgpt" {
+				t.Fatal("reset-credit details request omitted account authorization context")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{
+				"available_count":1,
+				"credits":[
+					{"status":"used","expires_at":%q},
+					{"status":"available","expires_at":%q}
+				]
+			}`, resetCreditExpires.Add(-time.Hour).Format(time.RFC3339), resetCreditExpires.Format(time.RFC3339))
 		case "/backend-api/accounts/check/v4-2023-04-27":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"accounts":{"acct-chatgpt":{"account":{"account_id":"acct-chatgpt","name":"Acme Workspace","plan_type":"team"},"entitlement":{"subscription_plan":"chatgptteamplan"}}},"account_ordering":["acct-chatgpt"]}`))
@@ -4925,6 +4941,22 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 	if snapshot.Quota.Weekly.Percentage != 20 || snapshot.Quota.Weekly.ResetAt == nil || *snapshot.Quota.Weekly.ResetAt != resetAt {
 		t.Fatalf("unexpected weekly quota: %#v", snapshot.Quota.Weekly)
 	}
+	if snapshot.Quota.ResetCredits == nil || snapshot.Quota.ResetCredits.ExpiresAt == nil || *snapshot.Quota.ResetCredits.ExpiresAt != resetCreditExpires.Unix() {
+		t.Fatalf("reset-credit expiry was not normalized: %#v", snapshot.Quota.ResetCredits)
+	}
+	if resetCreditDetailHits != 1 {
+		t.Fatalf("reset-credit details hits = %d, want 1", resetCreditDetailHits)
+	}
+	cachedSnapshot, err := a.refreshAccountQuota(context.Background(), "codex-quota")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cachedSnapshot.Quota == nil || cachedSnapshot.Quota.ResetCredits == nil || cachedSnapshot.Quota.ResetCredits.ExpiresAt == nil || *cachedSnapshot.Quota.ResetCredits.ExpiresAt != resetCreditExpires.Unix() {
+		t.Fatalf("cached reset-credit expiry was not retained: %#v", cachedSnapshot.Quota)
+	}
+	if resetCreditDetailHits != 1 {
+		t.Fatalf("unchanged reset-credit count triggered %d details requests, want 1", resetCreditDetailHits)
+	}
 	if a.config.Accounts[0].RemainingQuota == nil || *a.config.Accounts[0].RemainingQuota != 20 {
 		t.Fatalf("remaining quota hint not updated: %#v", a.config.Accounts[0].RemainingQuota)
 	}
@@ -4940,7 +4972,7 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 		t.Fatalf("public dashboard returned %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	if !strings.Contains(body, `"hourly"`) || !strings.Contains(body, `"weekly"`) {
+	if !strings.Contains(body, `"hourly"`) || !strings.Contains(body, `"weekly"`) || !strings.Contains(body, fmt.Sprintf(`"expiresAt":%d`, resetCreditExpires.Unix())) {
 		t.Fatalf("public dashboard did not include quota windows: %s", body)
 	}
 	if strings.Contains(body, "acct-chatgpt") || strings.Contains(body, "<refresh-token>") {
@@ -5818,19 +5850,68 @@ func TestQuotaNormalizationIncludesCreditsSpendAdditionalAndResetCredits(t *test
 	}
 }
 
+func TestNearestAvailableResetCreditExpiration(t *testing.T) {
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	nearest := now.Add(24 * time.Hour)
+	details := codexResetCreditDetailsResponse{Credits: []codexResetCreditDetail{
+		{Status: "used", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)},
+		{Status: "available", ExpiresAt: now.Add(-time.Hour).Format(time.RFC3339)},
+		{Status: "available", ExpiresAt: now.Add(72 * time.Hour).Format(time.RFC3339)},
+		{Status: "AVAILABLE", ExpiresAt: nearest.Format(time.RFC3339Nano)},
+		{Status: "available", ExpiresAt: "not-a-date"},
+	}}
+	got := nearestAvailableResetCreditExpiration(details, now)
+	if got == nil || *got != nearest.Unix() {
+		t.Fatalf("nearest reset-credit expiry = %v, want %d", got, nearest.Unix())
+	}
+}
+
+func TestResetCreditDetailsFailureRetainsKnownDateWithoutBlockingQuota(t *testing.T) {
+	var hits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	a := testApp(t, nil)
+	a.codexBaseURL = server.URL
+	now := time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+	count := int64(1)
+	expiresAt := now.Add(24 * time.Hour).Unix()
+	current := accountQuota{ResetCredits: &quotaResetCredits{AvailableCount: &count}}
+	prior := &quotaResetCredits{
+		AvailableCount:    &count,
+		ExpiresAt:         &expiresAt,
+		DetailsObservedAt: now.Add(-resetCreditDetailsRefreshInterval),
+	}
+
+	a.enrichResetCreditExpiration(context.Background(), codexAuthInfo{AccessToken: "<access-token>"}, &current, prior, now)
+	if hits != 1 {
+		t.Fatalf("reset-credit details hits = %d, want 1", hits)
+	}
+	if current.ResetCredits.ExpiresAt == nil || *current.ResetCredits.ExpiresAt != expiresAt {
+		t.Fatalf("optional details failure discarded known expiry: %#v", current.ResetCredits)
+	}
+	if len(a.state.Quotas) != 0 {
+		t.Fatalf("optional details failure changed quota state: %#v", a.state.Quotas)
+	}
+}
+
 func TestSparseQuotaMergeRetainsOptionalMetadata(t *testing.T) {
 	balance := "9.00"
 	remaining := 60
 	count := int64(3)
+	expiresAt := int64(1_800_000_500)
 	prior := &accountQuota{
 		Credits:          &quotaCredits{HasCredits: true, Balance: &balance},
 		IndividualLimit:  &quotaSpendControl{Limit: "100", RemainingPercent: &remaining},
 		AdditionalLimits: []quotaLimit{{LimitID: "gpt-review"}},
-		ResetCredits:     &quotaResetCredits{AvailableCount: &count},
+		ResetCredits:     &quotaResetCredits{AvailableCount: &count, ExpiresAt: &expiresAt},
 	}
 	current := accountQuota{LimitID: "codex"}
 	merged := mergeSparseQuota(prior, current, codexUsageResponse{})
-	if merged.Credits == nil || merged.Credits.Balance == nil || *merged.Credits.Balance != balance || merged.IndividualLimit == nil || len(merged.AdditionalLimits) != 1 || merged.ResetCredits == nil {
+	if merged.Credits == nil || merged.Credits.Balance == nil || *merged.Credits.Balance != balance || merged.IndividualLimit == nil || len(merged.AdditionalLimits) != 1 || merged.ResetCredits == nil || merged.ResetCredits.ExpiresAt == nil || *merged.ResetCredits.ExpiresAt != expiresAt {
 		t.Fatalf("sparse update erased prior metadata: %#v", merged)
 	}
 }

@@ -608,6 +608,12 @@
     return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
   }
 
+  function displayUnixDate(value) {
+    if (!value) return "";
+    const date = new Date(Number(value) * 1000);
+    return Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  }
+
   function displayResetCountdown(value) {
     const seconds = Math.max(0, Math.ceil(Number(value) - Date.now() / 1000));
     if (!Number.isFinite(seconds)) return "";
@@ -705,6 +711,19 @@
     return `<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">${escapeHTML(credits.balance || "Available")}</strong></div>`;
   }
 
+  function resetCreditsMarkup(resetCredits) {
+    if (resetCredits?.availableCount === null || resetCredits?.availableCount === undefined) return "";
+    // OpenAI exposes each reset credit's expiry through a separate details
+    // endpoint. Show only the nearest available expiry date: a full list or a
+    // live countdown would add noise without changing the operator's decision.
+    const expires = displayUnixDate(resetCredits.expiresAt);
+    const exact = displayUnixTime(resetCredits.expiresAt);
+    const note = expires
+      ? `<span class="quota-fact-note"${exact ? ` title="${escapeHTML(`Expires ${exact}`)}"` : ""}>Expires ${escapeHTML(expires)}</span>`
+      : "";
+    return `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(resetCredits.availableCount))}</strong>${note}</div>`;
+  }
+
   function spendControlMarkup(limit) {
     if (!limit) return '<div class="quota-fact"><span class="quota-fact-label">Spend control:</span><strong class="quota-fact-value">Not reported</strong></div>';
     const amount = limit.limit ? `${limit.used || "0"} / ${limit.limit}` : "Reported";
@@ -756,9 +775,7 @@
         });
       }).filter(Boolean).join("");
       const reached = quota.rateLimitReachedType ? `<div class="quota-fact quota-fact-warning"><span class="quota-fact-label">Reached type:</span><strong class="quota-fact-value">${escapeHTML(quota.rateLimitReachedType.replaceAll("_", " "))}</strong></div>` : "";
-      const resetCredits = quota.resetCredits?.availableCount !== null && quota.resetCredits?.availableCount !== undefined
-        ? `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(quota.resetCredits.availableCount))}</strong></div>`
-        : "";
+      const resetCredits = resetCreditsMarkup(quota.resetCredits);
       // Keep every reported quota window visible: Pro/Spark and other windows
       // are distinct upstream limits, not duplicate renderings. Only the
       // supporting text is grouped so operators can scan bars first, then read

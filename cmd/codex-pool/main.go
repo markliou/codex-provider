@@ -77,6 +77,10 @@ const (
 	promptCacheBucketsDefault = 4
 	quotaRefreshInterval      = 5 * time.Minute
 	quotaRefreshTimeout       = 30 * time.Second
+	// Reset-credit expiry is descriptive metadata from a separate endpoint, not
+	// routing evidence. Refresh it far less often than quota windows so the
+	// dashboard can show the date without doubling five-minute upstream polling.
+	resetCreditDetailsRefreshInterval = 6 * time.Hour
 	// Quota telemetry is refreshed every five minutes. Give one missed poll a
 	// grace interval for display, but do not use freshness itself as a routing
 	// gate: SPEC section 6.4 deliberately keeps telemetry failures fail-open.
@@ -239,6 +243,11 @@ type quotaLimit struct {
 
 type quotaResetCredits struct {
 	AvailableCount *int64 `json:"availableCount,omitempty"`
+	// ExpiresAt is the earliest expiry among currently available reset credits.
+	// DetailsObservedAt is process-local fetch throttling and must not add
+	// diagnostic noise to the dashboard or persisted runtime JSON.
+	ExpiresAt         *int64    `json:"expiresAt,omitempty"`
+	DetailsObservedAt time.Time `json:"-"`
 }
 
 type accountQuota struct {
@@ -5223,6 +5232,19 @@ type codexResetCreditInfo struct {
 	AvailableCount *int64 `json:"available_count"`
 }
 
+type codexResetCreditDetailsResponse struct {
+	AvailableCount *int64                   `json:"available_count"`
+	Credits        []codexResetCreditDetail `json:"credits"`
+}
+
+// Reset-credit records can contain identifiers and descriptive metadata that
+// the dashboard does not need. Decode only availability and expiry so no
+// upstream credit identifier enters runtime state or a public response.
+type codexResetCreditDetail struct {
+	Status    string `json:"status"`
+	ExpiresAt string `json:"expires_at"`
+}
+
 func (a *app) codexAuth(item account) (codexAuthInfo, error) {
 	auth, err := a.readCodexAuthFile(item)
 	if err != nil {
@@ -5592,6 +5614,13 @@ func (a *app) codexUsageURL() string {
 		return value
 	}
 	return strings.TrimRight(a.codexBaseURL, "/") + "/wham/usage"
+}
+
+func (a *app) codexResetCreditsURL() string {
+	if value := strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_RESET_CREDITS_URL")); value != "" {
+		return value
+	}
+	return strings.TrimRight(a.codexBaseURL, "/") + "/wham/rate-limit-reset-credits"
 }
 
 func (a *app) codexSubscriptionsURL() string {
@@ -6015,6 +6044,10 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 		return quotaSnapshot{}, errors.New("account not found")
 	}
 	accountCopy := *item
+	var priorResetCredits *quotaResetCredits
+	if prior := a.state.Quotas[accountID]; prior.Quota != nil {
+		priorResetCredits = cloneQuotaResetCredits(prior.Quota.ResetCredits)
+	}
 	a.mu.RUnlock()
 
 	if !isCodexDeviceAuth(accountCopy) {
@@ -6088,6 +6121,7 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 	_ = json.Unmarshal(body, &usageFields)
 	now := time.Now().UTC()
 	quota := quotaFromUsage(usage, now)
+	a.enrichResetCreditExpiration(ctx, auth, &quota, priorResetCredits, now)
 	planRaw := cleanRawPlanType(chooseString(usage.PlanType, usage.SubscriptionPlan))
 	plan := planFamilyFromRaw(planRaw)
 	planLimit := planLimitFromMap(usageFields)
@@ -6385,6 +6419,100 @@ func quotaFromUsage(usage codexUsageResponse, now time.Time) accountQuota {
 	return quota
 }
 
+func cloneQuotaResetCredits(value *quotaResetCredits) *quotaResetCredits {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	if value.AvailableCount != nil {
+		count := *value.AvailableCount
+		cloned.AvailableCount = &count
+	}
+	if value.ExpiresAt != nil {
+		expiresAt := *value.ExpiresAt
+		cloned.ExpiresAt = &expiresAt
+	}
+	return &cloned
+}
+
+func (a *app) enrichResetCreditExpiration(ctx context.Context, auth codexAuthInfo, quota *accountQuota, prior *quotaResetCredits, now time.Time) {
+	if quota == nil || quota.ResetCredits == nil || quota.ResetCredits.AvailableCount == nil || *quota.ResetCredits.AvailableCount <= 0 {
+		return
+	}
+	current := quota.ResetCredits
+	sameCount := prior != nil && prior.AvailableCount != nil && *prior.AvailableCount == *current.AvailableCount
+	detailsFresh := sameCount &&
+		!prior.DetailsObservedAt.IsZero() &&
+		now.Sub(prior.DetailsObservedAt) < resetCreditDetailsRefreshInterval &&
+		prior.ExpiresAt != nil &&
+		*prior.ExpiresAt > now.Unix()
+	if detailsFresh {
+		current.ExpiresAt = cloneInt64(prior.ExpiresAt)
+		current.DetailsObservedAt = prior.DetailsObservedAt
+		return
+	}
+
+	expiresAt, err := a.fetchCodexResetCreditExpiration(ctx, auth, now)
+	if err == nil {
+		current.ExpiresAt = expiresAt
+		current.DetailsObservedAt = now
+		return
+	}
+	// Expiry lookup is optional display metadata. A transient failure must not
+	// fail quota refresh or affect routing; retain a still-future date and retry
+	// on the next ordinary refresh instead of creating a new polling loop.
+	if sameCount && prior.ExpiresAt != nil && *prior.ExpiresAt > now.Unix() {
+		current.ExpiresAt = cloneInt64(prior.ExpiresAt)
+		current.DetailsObservedAt = prior.DetailsObservedAt
+	}
+}
+
+func (a *app) fetchCodexResetCreditExpiration(ctx context.Context, auth codexAuthInfo, now time.Time) (*int64, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, a.codexResetCreditsURL(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create reset-credit details request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+auth.AccessToken)
+	request.Header.Set("Accept", "application/json")
+	if auth.AccountID != "" {
+		request.Header.Set("ChatGPT-Account-Id", auth.AccountID)
+	}
+	if auth.FedRAMP {
+		request.Header.Set("X-OpenAI-Fedramp", "true")
+	}
+	response, err := a.client.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("fetch reset-credit details: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return nil, fmt.Errorf("reset-credit details returned status %d", response.StatusCode)
+	}
+	var details codexResetCreditDetailsResponse
+	if err := json.NewDecoder(io.LimitReader(response.Body, maxRequestBody)).Decode(&details); err != nil {
+		return nil, fmt.Errorf("decode reset-credit details: %w", err)
+	}
+	return nearestAvailableResetCreditExpiration(details, now), nil
+}
+
+func nearestAvailableResetCreditExpiration(details codexResetCreditDetailsResponse, now time.Time) *int64 {
+	var nearest *int64
+	for _, credit := range details.Credits {
+		if !strings.EqualFold(strings.TrimSpace(credit.Status), "available") {
+			continue
+		}
+		expiresAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(credit.ExpiresAt))
+		if err != nil || !expiresAt.After(now) {
+			continue
+		}
+		value := expiresAt.Unix()
+		if nearest == nil || value < *nearest {
+			nearest = &value
+		}
+	}
+	return nearest
+}
+
 func mergeSparseQuota(prior *accountQuota, current accountQuota, usage codexUsageResponse) accountQuota {
 	if prior == nil {
 		return current
@@ -6608,6 +6736,14 @@ func quotaSnapshotForDisplay(snapshot quotaSnapshot, now time.Time) quotaSnapsho
 }
 
 func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneInt64(value *int64) *int64 {
 	if value == nil {
 		return nil
 	}
