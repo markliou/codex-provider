@@ -158,6 +158,7 @@ docker run -d \
 | `CODEX_POOL_DEFAULT_MODEL` | no | `gpt-5.5(xhigh)` | Default model when request omits model. |
 | `CODEX_POOL_CODEX_BASE_URL` | no | `https://chatgpt.com/backend-api` | Codex/ChatGPT backend base URL used for quota reads and the legacy direct gateway. |
 | `CODEX_POOL_CODEX_USAGE_URL` | no | `CODEX_POOL_CODEX_BASE_URL + /wham/usage` | Optional quota endpoint override for tests or compatible backends. |
+| `CODEX_POOL_CODEX_RESET_CREDITS_URL` | no | `CODEX_POOL_CODEX_BASE_URL + /wham/rate-limit-reset-credits` | Optional reset-credit details endpoint override for tests or compatible backends. |
 | `CODEX_POOL_CODEX_GATEWAY_MODE` | no | `sidecar` | `sidecar` routes device-auth inference through the bundled loopback-only CLIProxyAPI executor. `direct` is a compatibility/test override. |
 | `CODEX_POOL_ROUTING_STRATEGY` | no | `sticky_balanced` | `sticky_balanced` deterministically distributes new sessions across the highest-priority eligible account tier. `sticky_failover` preserves the legacy behavior that sends new sessions to the first preferred account. |
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
@@ -1184,6 +1185,29 @@ Expected upstream fields:
 }
 ```
 
+The usage response reports only the reset-credit count. When
+`available_count` is positive, the optional display-only expiry comes from one
+authenticated `GET /wham/rate-limit-reset-credits` details response:
+
+```json
+{
+  "available_count": 2,
+  "credits": [
+    {"status": "available", "expires_at": "2026-09-20T17:16:00-07:00"},
+    {"status": "used", "expires_at": "2026-09-27T17:16:00-07:00"}
+  ]
+}
+```
+
+Normalize only the earliest future `expires_at` whose status is `available`.
+This date is presentation metadata and must never affect routing or turn a
+successful quota refresh into an error. Cache a successful details lookup for
+six hours while the available count is unchanged and the saved expiry is still
+future. Query immediately when no cached details exist, the count changes, or
+the saved expiry passes. A transient details failure retains a still-future
+known date and retries through the ordinary five-minute quota refresh; it must
+not create another polling loop.
+
 ### 9.3 Normalized quota object
 
 Compute:
@@ -1244,7 +1268,10 @@ Response object:
     },
     "individualLimit": {},
     "additionalLimits": [],
-    "resetCredits": {"availableCount": 2},
+    "resetCredits": {
+      "availableCount": 2,
+      "expiresAt": 1789949760
+    },
     "exhausted": false,
     "provenance": "chatgpt_wham_usage",
     "hourly": {
@@ -2092,7 +2119,10 @@ countdowns pair a `Reset` label with the remaining time. The primary view must
 use flat, aligned rows rather than a nested card for every fact; additional
 limits, credits, spend control, reset credits, telemetry freshness, and
 protection controls are secondary context and stay behind a compact disclosure
-control by default.
+control by default. The `Reset credits` fact shows its count and, when reported,
+one visible local-calendar `Expires` date for the earliest currently available
+credit. Do not render every credit, a countdown, or quota-window reset times in
+that fact; the exact timestamp may remain in its tooltip.
 Quota exhaustion is represented by the zero/critical bar, percentage, account
 status, and compact inline red markers on the exhausted window and any siblings
 it makes unavailable; do not repeat it as a separate red `Blocked: ...`

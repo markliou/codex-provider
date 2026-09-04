@@ -112,13 +112,17 @@ Quota is read from the authenticated Codex/ChatGPT backend after login and then
 refreshed every five minutes. The dashboard labels every reported base or
 additional window from its actual duration, shows independent percentages and
 reset times, flexible credits, spend control, explicit exhaustion reason,
-reset credits, and server-derived telemetry freshness. Missing
+reset credits with the nearest available credit's expiry date, and
+server-derived telemetry freshness. Reset-credit details are cached for six
+hours while the count is unchanged so this display does not double the regular
+five-minute quota polling rate. Missing
 `used_percent` remains `Not reported`; one exhausted window never overwrites
 another window. API-key providers are labeled API-metered and do not receive
 ChatGPT subscription-window semantics. The optional
-`CODEX_POOL_CODEX_USAGE_URL` override exists for tests or backend
-compatibility; normal deployments use
-`CODEX_POOL_CODEX_BASE_URL + /wham/usage`.
+`CODEX_POOL_CODEX_USAGE_URL` and
+`CODEX_POOL_CODEX_RESET_CREDITS_URL` overrides exist for tests or backend
+compatibility; normal deployments derive both `/wham/usage` and
+`/wham/rate-limit-reset-credits` from `CODEX_POOL_CODEX_BASE_URL`.
 
 Raw upstream plan, normalized plan family, Business seat, numeric multiplier,
 and quota policy are separate metadata. The pinned Codex account-check response
@@ -285,7 +289,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - Main/subagent cache-read, cache-write, request-hit, cold-start, affinity, and failover observability, a bounded and redacted 24-hour request correlation panel, a public 48-hour in-memory throughput/prompt-cache-hit time series, and management-only per-account throughput.
 - Bundled, loopback-only CLIProxyAPI sidecar for Codex device-auth requests. Pool pins each request to the selected account through a sidecar model prefix, while the sidecar owns OAuth refreshes.
 - Public pool participation toggles, strict same-identity repair for invalid in-pool credentials, and editable owner notes on `/admin`, plus authenticated owner controls for add/remove account, broader same-slot device-auth repair jobs, per-slot quota protection, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Protected`, `Exhausted`, `Cooldown`, `Error`, `Login needed`, `Signing in`, `Duplicate`, `Disabled`, or `Standby`.
-- Codex quota refresh from `/backend-api/wham/usage`, including duration-bearing primary/secondary/additional windows, credits, spend controls, reset credits, reached reason, raw/normalized plan metadata, freshness, sanitized quota errors, and five-minute dashboard refresh.
+- Codex quota refresh from `/backend-api/wham/usage`, including duration-bearing primary/secondary/additional windows, credits, spend controls, reset credits, the separately cached nearest reset-credit expiry date, reached reason, raw/normalized plan metadata, freshness, sanitized quota errors, and five-minute dashboard refresh.
 
 Codex accounts are created through the admin UI/API as empty device-auth slots, staged out of the pool, then authenticated with device auth before they become routable. The UI does not ask for email, subscription tier, or model selection during onboarding; account metadata is read from the authenticated Codex token after login. A legacy provider API-key gateway path remains for testing and advanced OpenAI-compatible providers, but it is not the default runtime path.
 
