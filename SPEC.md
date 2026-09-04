@@ -2122,7 +2122,10 @@ protection controls are secondary context and stay behind a compact disclosure
 control by default. The `Reset credits` fact shows its count and, when reported,
 one visible local-calendar `Expires` date for the earliest currently available
 credit. Do not render every credit, a countdown, or quota-window reset times in
-that fact; the exact timestamp may remain in its tooltip.
+that fact; the exact timestamp may remain in its tooltip. When the exact expiry
+is still future but strictly less than seven 24-hour days away, render the
+`Expires` date in bold alert red. An expiry exactly seven days away retains the
+normal secondary-text treatment.
 Quota exhaustion is represented by the zero/critical bar, percentage, account
 status, and compact inline red markers on the exhausted window and any siblings
 it makes unavailable; do not repeat it as a separate red `Blocked: ...`

@@ -1705,7 +1705,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS still uses crowded cache-cell markup %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"displayResetCountdown", "displayUnixDate", "resetCreditsMarkup", "Expires ${escapeHTML(expires)}", "quotaTone", "quotaTrackMarkup", `"critical"`, `"watch"`, "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
+	for _, expected := range []string{"displayResetCountdown", "displayUnixDate", "resetCreditExpiresSoon", "resetCreditExpiryWarningWindowMs = 7 * 24 * 60 * 60 * 1000", "expiresAt - now < resetCreditExpiryWarningWindowMs", "resetCreditsMarkup", `reset-credit-expiry${expiresSoon ? " expiring-soon" : ""}`, "Expires ${escapeHTML(expires)}", "quotaTone", "quotaTrackMarkup", `"critical"`, `"watch"`, "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS does not render clear quota state %q", expected)
 		}
@@ -1731,6 +1731,11 @@ func TestAdminDashboardAssets(t *testing.T) {
 	cssRequest := httptest.NewRequest(http.MethodGet, "/admin/assets/app.css", nil)
 	cssRecorder := httptest.NewRecorder()
 	a.adminMux().ServeHTTP(cssRecorder, cssRequest)
+	for _, expected := range []string{".reset-credit-expiry.expiring-soon", "color: var(--red)", "font-weight: 800"} {
+		if !strings.Contains(cssRecorder.Body.String(), expected) {
+			t.Fatalf("admin CSS does not render urgent reset-credit expiry %q", expected)
+		}
+	}
 	if !strings.Contains(cssRecorder.Body.String(), "::-webkit-progress-value") || !strings.Contains(cssRecorder.Body.String(), "background: #e1e6dc") || !strings.Contains(cssRecorder.Body.String(), "border: 1px solid #a8b9b0") {
 		t.Fatal("admin CSS does not provide a visible unfilled quota track")
 	}
