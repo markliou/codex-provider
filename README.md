@@ -115,7 +115,8 @@ reset times, flexible credits, spend control, explicit exhaustion reason,
 reset credits with the nearest available credit's expiry date, and
 server-derived telemetry freshness. Reset-credit details are cached for six
 hours while the count is unchanged so this display does not double the regular
-five-minute quota polling rate. Missing
+five-minute quota polling rate; an expiry less than seven days away is shown in
+bold alert red. Missing
 `used_percent` remains `Not reported`; one exhausted window never overwrites
 another window. API-key providers are labeled API-metered and do not receive
 ChatGPT subscription-window semantics. The optional

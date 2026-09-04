@@ -614,6 +614,13 @@
     return Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   }
 
+  const resetCreditExpiryWarningWindowMs = 7 * 24 * 60 * 60 * 1000;
+
+  function resetCreditExpiresSoon(value, now = Date.now()) {
+    const expiresAt = Number(value) * 1000;
+    return Number.isFinite(expiresAt) && expiresAt > now && expiresAt - now < resetCreditExpiryWarningWindowMs;
+  }
+
   function displayResetCountdown(value) {
     const seconds = Math.max(0, Math.ceil(Number(value) - Date.now() / 1000));
     if (!Number.isFinite(seconds)) return "";
@@ -716,10 +723,13 @@
     // OpenAI exposes each reset credit's expiry through a separate details
     // endpoint. Show only the nearest available expiry date: a full list or a
     // live countdown would add noise without changing the operator's decision.
+    // The strict seven-day warning uses the exact timestamp, not the rounded
+    // calendar label, so only genuinely urgent credits become bold red.
     const expires = displayUnixDate(resetCredits.expiresAt);
     const exact = displayUnixTime(resetCredits.expiresAt);
+    const expiresSoon = resetCreditExpiresSoon(resetCredits.expiresAt);
     const note = expires
-      ? `<span class="quota-fact-note"${exact ? ` title="${escapeHTML(`Expires ${exact}`)}"` : ""}>Expires ${escapeHTML(expires)}</span>`
+      ? `<span class="quota-fact-note reset-credit-expiry${expiresSoon ? " expiring-soon" : ""}"${exact ? ` title="${escapeHTML(`Expires ${exact}`)}"` : ""}>Expires ${escapeHTML(expires)}</span>`
       : "";
     return `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(resetCredits.availableCount))}</strong>${note}</div>`;
   }
