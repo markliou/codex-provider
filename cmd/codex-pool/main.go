@@ -1019,7 +1019,7 @@ type codexModelInfo struct {
 	MultiAgentVersion                 any                   `json:"multi_agent_version"`
 }
 
-// defaultCodexModelSlugs is the current Codex model lineup (July 2026),
+// defaultCodexModelSlugs is the current Codex model lineup (September 2026),
 // ordered the way the picker should rank them. These are merged into the
 // advertised catalog so a stock Codex client can select any current model
 // without its requested model falling off this pool's catalog. A model that
@@ -1030,6 +1030,7 @@ type codexModelInfo struct {
 // routing, and upstream still enforces plan access (for example
 // gpt-5.3-codex-spark is Pro-only).
 var defaultCodexModelSlugs = []string{
+	"gpt-6-astra",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
@@ -1049,13 +1050,22 @@ func codexReasoningLevels() []codexReasoningLevel {
 	}
 }
 
+// codexExtendedReasoningModel reports whether a model family documents the
+// extended `max` and `ultra` tiers. Codex documents both for gpt-6 and for the
+// gpt-5.6 family; older families stop at xhigh. This is a family prefix rather
+// than a slug list so a new sibling in a documented family is covered without a
+// code change, while an undocumented older family stays conservative.
+func codexExtendedReasoningModel(model string) bool {
+	return strings.HasPrefix(model, "gpt-6") || strings.HasPrefix(model, "gpt-5.6")
+}
+
 // codexReasoningLevelsForModel returns the reasoning levels a model may
-// advertise. Only the gpt-5.6 family documents `max` and `ultra`; advertising
-// them on older models would let the client submit an effort upstream rejects,
-// so the extended tiers stay gated to that family.
+// advertise. Advertising the extended tiers on a family that does not document
+// them would let the client submit an effort upstream rejects, so they stay
+// gated to the families that do.
 func codexReasoningLevelsForModel(model string) []codexReasoningLevel {
 	levels := codexReasoningLevels()
-	if strings.HasPrefix(model, "gpt-5.6") {
+	if codexExtendedReasoningModel(model) {
 		levels = append(levels,
 			codexReasoningLevel{Effort: "max", Description: "Maximum reasoning depth for the hardest problems"},
 			codexReasoningLevel{Effort: "ultra", Description: "Deepest reasoning for ambiguous, high-value work"},
