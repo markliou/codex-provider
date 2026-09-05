@@ -711,6 +711,26 @@
     // but do not make secondary facts compete with those bars.
     return `<details class="quota-details"><summary>More details</summary><div class="quota-facts">${content}</div></details>`;
   }
+  // rate_limit_reached_type is a raw upstream enum. Printed with its underscores
+  // swapped for spaces it names neither what ran out nor who can restore it,
+  // which is the one thing an operator needs when a workspace account stops
+  // serving. Map the documented values to that, and keep the raw token both as
+  // the fallback text for an unrecognised value and as the tooltip, so a new
+  // upstream value degrades to the old rendering instead of disappearing.
+  const reachedTypeReasons = {
+    workspace_owner_credits_depleted: ["Workspace credits are empty", "Only the workspace owner can add credits"],
+    workspace_member_credits_depleted: ["This member's credit allocation is used up", "The workspace owner can raise this member's allocation"],
+    workspace_owner_usage_limit_reached: ["The workspace usage limit was reached", "The workspace owner can raise the limit"],
+  };
+
+  function reachedTypeMarkup(value) {
+    if (!value) return "";
+    const known = reachedTypeReasons[value];
+    const summary = known ? known[0] : value.replaceAll("_", " ");
+    const note = known ? `<span class="quota-fact-note">${escapeHTML(known[1])}</span>` : "";
+    return `<div class="quota-fact quota-fact-warning" title="${escapeHTML(value)}"><span class="quota-fact-label">Blocked because:</span><strong class="quota-fact-value">${escapeHTML(summary)}</strong>${note}</div>`;
+  }
+
   function quotaCreditsMarkup(credits) {
     if (!credits) return '<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">Not reported</strong></div>';
     if (credits.unlimited) return '<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">Unlimited</strong><span class="quota-fact-note">separate credits</span></div>';
@@ -784,7 +804,7 @@
           blockedBy: blocking ? [] : gatingLabels,
         });
       }).filter(Boolean).join("");
-      const reached = quota.rateLimitReachedType ? `<div class="quota-fact quota-fact-warning"><span class="quota-fact-label">Reached type:</span><strong class="quota-fact-value">${escapeHTML(quota.rateLimitReachedType.replaceAll("_", " "))}</strong></div>` : "";
+      const reached = reachedTypeMarkup(quota.rateLimitReachedType);
       const resetCredits = resetCreditsMarkup(quota.resetCredits);
       // Keep every reported quota window visible: Pro/Spark and other windows
       // are distinct upstream limits, not duplicate renderings. Only the

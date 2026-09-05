@@ -1228,6 +1228,12 @@ minutes is `Week`, and all other durations use a truthful generic label.
 
 `limit_reached`, `allowed=false`, reached type, and reached spend control are
 separate exhaustion state. They must never fabricate a zero-percent 5h window.
+The reached type is an upstream enum, so the quota cell must render the
+documented values as what ran out and who can restore it rather than as the
+identifier itself; a workspace member cannot act on a message that does not say
+the owner holds the remedy. An unrecognised value falls back to the raw token so
+a new upstream value degrades to a readable identifier instead of vanishing, and
+the exact token stays available as a tooltip.
 Credits-scoped `unlimited=true` means only flexible credits are unlimited; it
 does not mean unlimited runtime rate, model access, spend, or policy.
 
