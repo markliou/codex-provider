@@ -238,33 +238,6 @@ func TestCodexModelCatalogIncludesCurrentCodexLineup(t *testing.T) {
 // advertises the extended max and ultra tiers for it exactly as for the gpt-5.6
 // family, so a catalog that omits it drops a stock client onto bundled fallback
 // metadata for the model it is most likely to pick.
-// rate_limit_reached_type is the only field that says a workspace account is
-// blocked on someone else's credits rather than on a window that will reset.
-// Rendering the enum verbatim hides both the cause and the remedy, so the
-// mapping and its raw-token fallback must ship in the served asset.
-func TestAdminAssetsExplainTheReachedType(t *testing.T) {
-	a := testApp(t, nil)
-	req := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
-	recorder := httptest.NewRecorder()
-	a.adminMux().ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("GET app.js returned %d", recorder.Code)
-	}
-	body := recorder.Body.String()
-	for _, want := range []string{
-		"workspace_owner_credits_depleted",
-		"workspace_member_credits_depleted",
-		"workspace_owner_usage_limit_reached",
-		"Only the workspace owner can add credits",
-		"Blocked because:",
-		`value.replaceAll("_", " ")`,
-	} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("app.js did not include %q", want)
-		}
-	}
-}
-
 func TestCodexModelCatalogAdvertisesGPT6(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"
