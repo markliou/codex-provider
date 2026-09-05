@@ -377,9 +377,10 @@ Optional hidden models must include:
 
 #### 5.2.1 Built-in Codex model lineup
 
-The advertised catalog must always include the current Codex model lineup in addition to the configured default model, per-account `allowedModels`, and aliases. As of July 2026 that lineup, in picker order, is:
+The advertised catalog must always include the current Codex model lineup in addition to the configured default model, per-account `allowedModels`, and aliases. As of September 2026 that lineup, in picker order, is:
 
 ```text
+gpt-6-astra
 gpt-5.6-sol
 gpt-5.6-terra
 gpt-5.6-luna
@@ -392,7 +393,7 @@ gpt-5.2-codex
 
 This keeps a stock Codex client from falling back to bundled model metadata (with its startup warning and conflicting-tool behavior, see 6.4.2) when the user selects a current model this pool was not explicitly configured for. Advertising a model is not an access grant: per-account model filters and upstream plan enforcement still apply (`gpt-5.3-codex-spark` is Pro-only upstream). Catalog `priority` ranks the configured default model first, then the lineup above, then operator-configured extras.
 
-Reasoning levels are per model family: the `gpt-5.6` family additionally advertises `max` and `ultra`; older families must stay at `low`–`xhigh` so the client cannot submit an effort upstream rejects.
+Reasoning levels are per model family: the `gpt-6` and `gpt-5.6` families additionally advertise `max` and `ultra`; older families must stay at `low`–`xhigh` so the client cannot submit an effort upstream rejects. The extended tiers are gated by family prefix rather than an exact slug list, so a new sibling in a documented family is covered without a code change while an undocumented family stays conservative.
 
 ### 5.3 Thinking tier model suffix
 
@@ -425,7 +426,7 @@ max
 ultra
 ```
 
-`max` and `ultra` are only advertised as catalog capability for the `gpt-5.6` family, but remain accepted as request-input suffixes for any model; upstream is the authority on whether the effort is valid.
+`max` and `ultra` are only advertised as catalog capability for the `gpt-6` and `gpt-5.6` families, but remain accepted as request-input suffixes for any model; upstream is the authority on whether the effort is valid.
 
 For Codex/OpenAI Responses requests, translate suffix into nested `reasoning.effort`:
 
@@ -1227,6 +1228,10 @@ minutes is `Week`, and all other durations use a truthful generic label.
 
 `limit_reached`, `allowed=false`, reached type, and reached spend control are
 separate exhaustion state. They must never fabricate a zero-percent 5h window.
+The reached type is an upstream enum that drives exhaustion and reaches the
+operator through the account status reason. The quota cell must not render it as
+its own row: repeating the identifier there names a condition without saying
+what to do about it, and costs a row in the cell operators scan.
 Credits-scoped `unlimited=true` means only flexible credits are unlimited; it
 does not mean unlimited runtime rate, model access, spend, or policy.
 

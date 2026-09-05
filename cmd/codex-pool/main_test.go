@@ -234,6 +234,34 @@ func TestCodexModelCatalogIncludesCurrentCodexLineup(t *testing.T) {
 	}
 }
 
+// gpt-6-astra is the current flagship and the only model in its family. Codex
+// advertises the extended max and ultra tiers for it exactly as for the gpt-5.6
+// family, so a catalog that omits it drops a stock client onto bundled fallback
+// metadata for the model it is most likely to pick.
+func TestCodexModelCatalogAdvertisesGPT6(t *testing.T) {
+	a := testApp(t, nil)
+	a.config.DefaultModel = "gpt-5.5(xhigh)"
+	models := a.codexModelCatalogLocked(a.modelsLocked())
+	bySlug := map[string]codexModelInfo{}
+	for _, model := range models {
+		bySlug[model.Slug] = model
+	}
+	astra, ok := bySlug["gpt-6-astra"]
+	if !ok {
+		t.Fatalf("catalog missing gpt-6-astra: %#v", models)
+	}
+	efforts := make([]string, 0, len(astra.SupportedReasoningLevels))
+	for _, level := range astra.SupportedReasoningLevels {
+		efforts = append(efforts, level.Effort)
+	}
+	if strings.Join(efforts, ",") != "low,medium,high,xhigh,max,ultra" {
+		t.Fatalf("gpt-6 reasoning levels = %v", efforts)
+	}
+	if astra.Priority >= bySlug["gpt-5.6-sol"].Priority {
+		t.Fatalf("gpt-6 must outrank the gpt-5.6 family: astra=%d sol=%d", astra.Priority, bySlug["gpt-5.6-sol"].Priority)
+	}
+}
+
 func TestCodexModelCatalogKeepsExtendedDefaultReasoningTierOn56(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.6-sol(ultra)"

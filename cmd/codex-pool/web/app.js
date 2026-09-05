@@ -784,7 +784,6 @@
           blockedBy: blocking ? [] : gatingLabels,
         });
       }).filter(Boolean).join("");
-      const reached = quota.rateLimitReachedType ? `<div class="quota-fact quota-fact-warning"><span class="quota-fact-label">Reached type:</span><strong class="quota-fact-value">${escapeHTML(quota.rateLimitReachedType.replaceAll("_", " "))}</strong></div>` : "";
       const resetCredits = resetCreditsMarkup(quota.resetCredits);
       // Keep every reported quota window visible: Pro/Spark and other windows
       // are distinct upstream limits, not duplicate renderings. Only the
@@ -795,7 +794,11 @@
       // subscription bars crowds the row that operators actually scan. They stay
       // individually rendered and unmerged, just behind the same disclosure as
       // the other secondary facts.
-      const details = quotaDetailsMarkup(`${reached}${additionalLimitsMarkup(quota.additionalLimits)}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
+      // The upstream reached type stays out of the quota cell. It still drives
+      // exhaustion and still reaches the operator through the account status
+      // reason; repeating the enum here added a row that named a condition
+      // without telling anyone what to do about it.
+      const details = quotaDetailsMarkup(`${additionalLimitsMarkup(quota.additionalLimits)}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
       // Keep the decisive red Exhausted signal beside its window label. Do not
       // add a second account-level "Blocked" sentence below the bars; that
       // duplicates the signal and makes multi-window rows harder to scan.
