@@ -8170,9 +8170,16 @@ func (a *app) currentAccountStatusLocked(item account, index int, now time.Time)
 	if quota.PlanLimit != "" {
 		displayItem.PlanLimit = quota.PlanLimit
 	}
-	displayItem.SeatType = quota.SeatType
-	displayItem.SeatTypeRaw = quota.SeatTypeRaw
-	displayItem.SeatTypeInferred = quota.SeatTypeInferred
+	// The snapshot is authoritative once it carries a seat, but before the first
+	// successful refresh it carries none. Overwriting unconditionally would then
+	// erase the seat already persisted on the slot and blank the row.
+	if quota.SeatType != "" {
+		displayItem.SeatType = quota.SeatType
+		displayItem.SeatTypeInferred = quota.SeatTypeInferred
+	}
+	if quota.SeatTypeRaw != "" {
+		displayItem.SeatTypeRaw = quota.SeatTypeRaw
+	}
 	displayItem.QuotaPolicy = append([]string(nil), quota.QuotaPolicy...)
 	remainingQuota := displayItem.RemainingQuota
 	if remainingQuota == nil && quota.Quota != nil {
@@ -8314,9 +8321,16 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 	if quota.PlanLimit != "" {
 		displayItem.PlanLimit = quota.PlanLimit
 	}
-	displayItem.SeatType = quota.SeatType
-	displayItem.SeatTypeRaw = quota.SeatTypeRaw
-	displayItem.SeatTypeInferred = quota.SeatTypeInferred
+	// The snapshot is authoritative once it carries a seat, but before the first
+	// successful refresh it carries none. Overwriting unconditionally would then
+	// erase the seat already persisted on the slot and blank the row.
+	if quota.SeatType != "" {
+		displayItem.SeatType = quota.SeatType
+		displayItem.SeatTypeInferred = quota.SeatTypeInferred
+	}
+	if quota.SeatTypeRaw != "" {
+		displayItem.SeatTypeRaw = quota.SeatTypeRaw
+	}
 	displayItem.QuotaPolicy = append([]string(nil), quota.QuotaPolicy...)
 	statusTone, statusLabel := publicDashboardStatus(status)
 	remainingQuota := displayItem.RemainingQuota
@@ -8329,9 +8343,14 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 	return map[string]any{
 		"displayName": publicDashboardAccountLabel(displayItem, index),
 		"detail":      publicDashboardAccountDetail(displayItem),
-		"ownerNote":   item.OwnerNote,
-		"statusTone":  statusTone,
-		"statusLabel": statusLabel,
+		// The seat tier travels beside the plan detail rather than inside it. It
+		// is a distinct entitlement fact, and an inferred one must never read as
+		// part of the plan name upstream actually reported.
+		"seatType":         cleanMetadataToken(displayItem.SeatType),
+		"seatTypeInferred": displayItem.SeatTypeInferred && cleanMetadataToken(displayItem.SeatType) != "",
+		"ownerNote":        item.OwnerNote,
+		"statusTone":       statusTone,
+		"statusLabel":      statusLabel,
 		// Keep this explicit membership bit separate from statusTone. Duplicate
 		// slots intentionally use the neutral standby presentation while their
 		// local slot remains in the pool; the public UI must not style them as

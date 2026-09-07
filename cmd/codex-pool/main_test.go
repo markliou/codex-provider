@@ -303,6 +303,36 @@ func TestBusinessSeatInferenceNeverOverridesAuthoritativeSeat(t *testing.T) {
 	}
 }
 
+// The public dashboard is the page most operators actually watch, so the seat
+// tier has to reach it too, carrying its inferred marker and staying out of the
+// plan detail string.
+func TestPublicDashboardExposesSeatTier(t *testing.T) {
+	a := testApp(t, []account{{ID: "biz", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, PlanFamily: "business", PlanType: "business", OrganizationName: "acme", SeatType: "premium", SeatTypeInferred: true}})
+	a.mu.RLock()
+	payload := a.publicDashboardAccountLocked(a.config.Accounts[0], 0, time.Now().UTC())
+	a.mu.RUnlock()
+	if payload["seatType"] != "premium" {
+		t.Fatalf("public dashboard dropped the seat tier: %#v", payload["seatType"])
+	}
+	if payload["seatTypeInferred"] != true {
+		t.Fatalf("public dashboard dropped the inferred marker: %#v", payload["seatTypeInferred"])
+	}
+	if detail, _ := payload["detail"].(string); strings.Contains(strings.ToLower(detail), "premium") {
+		t.Fatalf("inferred seat leaked into the plan detail: %q", detail)
+	}
+}
+
+// An account with no seat evidence must not carry a stray inferred marker.
+func TestPublicDashboardOmitsUnknownSeatTier(t *testing.T) {
+	a := testApp(t, []account{{ID: "plus", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, PlanFamily: "plus", PlanType: "plus"}})
+	a.mu.RLock()
+	payload := a.publicDashboardAccountLocked(a.config.Accounts[0], 0, time.Now().UTC())
+	a.mu.RUnlock()
+	if payload["seatType"] != "" || payload["seatTypeInferred"] != false {
+		t.Fatalf("non-business account reported a seat: %#v %#v", payload["seatType"], payload["seatTypeInferred"])
+	}
+}
+
 // The dashboard must never present a derived seat as an upstream fact.
 func TestAdminAssetsLabelInferredSeat(t *testing.T) {
 	a := testApp(t, nil)
@@ -313,7 +343,7 @@ func TestAdminAssetsLabelInferredSeat(t *testing.T) {
 		t.Fatalf("GET app.js returned %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"seatTypeInferred", "(inferred)"} {
+	for _, want := range []string{"seatTypeInferred", "(inferred)", "publicSeatMarkup", "account-seat"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("app.js did not include %q", want)
 		}

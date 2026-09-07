@@ -941,6 +941,18 @@
     }).join("");
   }
 
+  // The public row shows the seat tier on its own line rather than folded into
+  // the plan detail: Standard and Premium are otherwise indistinguishable there,
+  // and an inferred tier must stay visibly separate from the plan name upstream
+  // reported. Anything other than the two known tiers renders nothing.
+  function publicSeatMarkup(account) {
+    const seat = account.seatType;
+    if (seat !== "standard" && seat !== "premium") return "";
+    const name = seat === "premium" ? "Premium" : "Standard";
+    const suffix = account.seatTypeInferred ? " (inferred)" : "";
+    return `<span class="account-seat">Seat: ${escapeHTML(name + suffix)}</span>`;
+  }
+
   function renderPublicAccounts(accounts) {
     $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity/Fallback")}</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} visible`;
@@ -962,7 +974,7 @@
       const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
       return `<tr${poolMembershipAttribute(account.outOfPool === true)}>
-      <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${ownerNoteInput(account, true)}</div></td>
+      <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${publicSeatMarkup(account)}${ownerNoteInput(account, true)}</div></td>
       <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span>${activeBadge(account.active)}</div></td>
       <td>${quota}</td>
       <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong></div></td>

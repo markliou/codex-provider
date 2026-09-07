@@ -1142,7 +1142,10 @@ premium result. Requiring at least one reported window keeps a sparse or failed
 refresh from promoting a Standard seat.
 
 Any seat derived this way must set `seatTypeInferred` and be labeled as inferred
-wherever it is shown; it must never appear as the entitlement headline. An
+wherever it is shown; it must never appear as the entitlement headline. The seat
+tier is shown on both the management view and the public dashboard, in each case
+on its own line beside the plan detail rather than folded into the plan name, so
+a derived tier is never read as part of what upstream reported. An
 authoritative upstream seat value always wins and is never overwritten by the
 inference. A derived seat is display evidence only: it must never grant models,
 capacity, routing preference, or any change in selection order. When a refresh
