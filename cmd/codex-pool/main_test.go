@@ -238,6 +238,88 @@ func TestCodexModelCatalogIncludesCurrentCodexLineup(t *testing.T) {
 // advertises the extended max and ultra tiers for it exactly as for the gpt-5.6
 // family, so a catalog that omits it drops a stock client onto bundled fallback
 // metadata for the model it is most likely to pick.
+// A Business Premium seat carries no five-hour usage limit, which is the only
+// difference upstream exposes: Standard and Premium both report plan type
+// chatgptteamplan and no seat field at all. The inference must read the reported
+// window shape, never the absence of metadata, and must stay display-only.
+func TestBusinessSeatInferenceFromQuotaWindows(t *testing.T) {
+	minutes := func(value int64) *int64 { return &value }
+	window := func(windowMinutes int64) quotaWindow {
+		return quotaWindow{WindowMinutes: minutes(windowMinutes), Present: true, Observed: true}
+	}
+	for _, testCase := range []struct {
+		name         string
+		planFamily   string
+		quota        accountQuota
+		wantSeat     string
+		wantInferred bool
+	}{
+		{"premium has no five hour window", "business", accountQuota{Windows: []quotaWindow{window(10080)}}, "premium", true},
+		{"standard still reports it", "business", accountQuota{Windows: []quotaWindow{window(300), window(10080)}}, "standard", true},
+		{"no reported window is not evidence", "business", accountQuota{Windows: []quotaWindow{{WindowMinutes: minutes(10080)}}}, "", false},
+		{"pro is never a business seat", "pro", accountQuota{Windows: []quotaWindow{window(10080)}}, "", false},
+		{"plus is never a business seat", "plus", accountQuota{Windows: []quotaWindow{window(10080)}}, "", false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			seat, inferred := businessSeatInferenceFromQuota(testCase.planFamily, testCase.quota)
+			if seat != testCase.wantSeat || inferred != testCase.wantInferred {
+				t.Fatalf("seat inference = (%q, %v), want (%q, %v)", seat, inferred, testCase.wantSeat, testCase.wantInferred)
+			}
+		})
+	}
+}
+
+func TestBusinessSeatInferenceNeverOverridesAuthoritativeSeat(t *testing.T) {
+	minutes := func(value int64) *int64 { return &value }
+	weekOnly := accountQuota{Windows: []quotaWindow{{WindowMinutes: minutes(10080), Present: true, Observed: true}}}
+
+	// An authoritative seat must survive a refresh whose window shape disagrees.
+	snapshot := quotaSnapshot{PlanFamily: "business", SeatType: "standard"}
+	applyBusinessSeatInference(&snapshot, weekOnly)
+	if snapshot.SeatType != "standard" || snapshot.SeatTypeInferred {
+		t.Fatalf("authoritative seat was overwritten: %q inferred=%v", snapshot.SeatType, snapshot.SeatTypeInferred)
+	}
+
+	// A previous inference is refreshed, and the premium policy travels with it.
+	inferredSnapshot := quotaSnapshot{PlanFamily: "business", SeatType: "standard", SeatTypeInferred: true}
+	applyBusinessSeatInference(&inferredSnapshot, weekOnly)
+	if inferredSnapshot.SeatType != "premium" || !inferredSnapshot.SeatTypeInferred {
+		t.Fatalf("inferred seat was not refreshed: %q inferred=%v", inferredSnapshot.SeatType, inferredSnapshot.SeatTypeInferred)
+	}
+	if len(inferredSnapshot.QuotaPolicy) != 1 || inferredSnapshot.QuotaPolicy[0] != "no_five_hour_cap" {
+		t.Fatalf("premium seat did not record the five-hour policy: %#v", inferredSnapshot.QuotaPolicy)
+	}
+
+	// Downgrading back to standard must drop the policy rather than accumulate it.
+	applyBusinessSeatInference(&inferredSnapshot, accountQuota{Windows: []quotaWindow{{WindowMinutes: minutes(300), Present: true, Observed: true}}})
+	if inferredSnapshot.SeatType != "standard" || len(inferredSnapshot.QuotaPolicy) != 0 {
+		t.Fatalf("standard seat kept the five-hour policy: %q %#v", inferredSnapshot.SeatType, inferredSnapshot.QuotaPolicy)
+	}
+
+	// A refresh that reports nothing keeps the last inference instead of flapping.
+	applyBusinessSeatInference(&inferredSnapshot, accountQuota{})
+	if inferredSnapshot.SeatType != "standard" || !inferredSnapshot.SeatTypeInferred {
+		t.Fatalf("sparse refresh cleared the inferred seat: %q inferred=%v", inferredSnapshot.SeatType, inferredSnapshot.SeatTypeInferred)
+	}
+}
+
+// The dashboard must never present a derived seat as an upstream fact.
+func TestAdminAssetsLabelInferredSeat(t *testing.T) {
+	a := testApp(t, nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET app.js returned %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"seatTypeInferred", "(inferred)"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("app.js did not include %q", want)
+		}
+	}
+}
+
 func TestCodexModelCatalogAdvertisesGPT6(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"

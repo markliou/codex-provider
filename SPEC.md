@@ -1118,18 +1118,36 @@ Account metadata keeps these concepts separate:
 - `planFamily`: explicit normalized display family;
 - `seatType`: authoritative Business `standard`/`premium`, if supported;
 - `seatTypeRaw`: sanitized unknown authoritative seat value, display-only;
+- `seatTypeInferred`: marks a `seatType` this pool derived rather than read;
 - `planLimit`: exact reported `5x`, `10x`, or `20x` multiplier only;
 - `quotaPolicy`: explicit policy such as `no_five_hour_cap`.
 
 For the pinned Codex client, raw `team` and
 `self_serve_business_usage_based` map to the Business family, while raw
 `business` and `enterprise_cbp_usage_based` map to Enterprise. These mappings
-do not prove a Business seat. The pinned `AccountsCheckResponse` has no
-Standard/Premium field, so this release does not enable a seat mapping:
-Business rows show `Seat type: Not reported`. Workspace name, default account,
+do not prove a Business seat. No endpoint this pool calls carries a
+Standard/Premium field, and the pinned `AccountsCheckResponse` has none either,
+so no authoritative seat mapping is available. Workspace name, default account,
 record order, plan name, and absence of Premium metadata are never seat
 evidence. Generic Pro does not imply `20x`, and plan text containing a supported
 substring is not multiplier evidence.
+
+One derived signal is permitted, because it rests on reported quota shape rather
+than on missing metadata. OpenAI documents that a Business Premium seat carries
+no five-hour usage limit. A Business account whose refresh reports at least one
+quota window, none of which is the 300-minute window, is therefore inferred to be
+`premium`, and one that still reports that window is inferred to be `standard`.
+The inference additionally records `no_five_hour_cap` in `quotaPolicy` for a
+premium result. Requiring at least one reported window keeps a sparse or failed
+refresh from promoting a Standard seat.
+
+Any seat derived this way must set `seatTypeInferred` and be labeled as inferred
+wherever it is shown; it must never appear as the entitlement headline. An
+authoritative upstream seat value always wins and is never overwritten by the
+inference. A derived seat is display evidence only: it must never grant models,
+capacity, routing preference, or any change in selection order. When a refresh
+reports no window at all, the previous inference is retained rather than cleared,
+so one sparse refresh cannot make the displayed seat flap.
 
 ### 9.2 Upstream usage response shape
 

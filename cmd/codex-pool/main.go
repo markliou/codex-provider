@@ -156,14 +156,18 @@ type account struct {
 	SeatType    string `json:"seatType,omitempty"`
 	// SeatTypeRaw is display-only forward compatibility for an authoritative but
 	// not-yet-recognized seat value. It must never grant models or capacity.
-	SeatTypeRaw    string   `json:"seatTypeRaw,omitempty"`
-	QuotaPolicy    []string `json:"quotaPolicy,omitempty"`
-	AuthType       string   `json:"authType"`
-	CodexHome      string   `json:"codexHome,omitempty"`
-	Enabled        bool     `json:"enabled"`
-	InPool         bool     `json:"inPool"`
-	Priority       int      `json:"priority"`
-	RemainingQuota *int     `json:"remainingQuota,omitempty"`
+	SeatTypeRaw string `json:"seatTypeRaw,omitempty"`
+	// SeatTypeInferred marks a SeatType this pool derived from observed quota
+	// shape rather than read from an authoritative upstream field. It is display
+	// evidence only and must never grant models, capacity, or routing preference.
+	SeatTypeInferred bool     `json:"seatTypeInferred,omitempty"`
+	QuotaPolicy      []string `json:"quotaPolicy,omitempty"`
+	AuthType         string   `json:"authType"`
+	CodexHome        string   `json:"codexHome,omitempty"`
+	Enabled          bool     `json:"enabled"`
+	InPool           bool     `json:"inPool"`
+	Priority         int      `json:"priority"`
+	RemainingQuota   *int     `json:"remainingQuota,omitempty"`
 	// Quota protection is local-slot policy, not upstream-account capacity.
 	// Missing fields load as disabled so upgrades preserve fail-open routing.
 	QuotaProtectionEnabled   bool     `json:"quotaProtectionEnabled,omitempty"`
@@ -288,6 +292,7 @@ type quotaSnapshot struct {
 	PlanLimit               string          `json:"planLimit,omitempty"`
 	SeatType                string          `json:"seatType,omitempty"`
 	SeatTypeRaw             string          `json:"seatTypeRaw,omitempty"`
+	SeatTypeInferred        bool            `json:"seatTypeInferred,omitempty"`
 	QuotaPolicy             []string        `json:"quotaPolicy,omitempty"`
 	Quota                   *accountQuota   `json:"quota,omitempty"`
 	ObservedAt              time.Time       `json:"observedAt,omitempty"`
@@ -2450,6 +2455,7 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		input.PlanLimit = ""
 		input.SeatType = ""
 		input.SeatTypeRaw = ""
+		input.SeatTypeInferred = false
 		input.QuotaPolicy = nil
 		input.PlanRank = 0
 		if input.QuotaProtectionThreshold < 0 || input.QuotaProtectionThreshold > 100 {
@@ -2467,6 +2473,7 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		input.PlanRank = planRank(effectivePlanFamily(input))
 		input.SeatType = ""
 		input.SeatTypeRaw = ""
+		input.SeatTypeInferred = false
 		input.QuotaPolicy = nil
 		input.QuotaProtectionEnabled = false
 		input.QuotaProtectionThreshold = 0
@@ -6195,6 +6202,7 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 		PlanLimit:               prior.PlanLimit,
 		SeatType:                prior.SeatType,
 		SeatTypeRaw:             prior.SeatTypeRaw,
+		SeatTypeInferred:        prior.SeatTypeInferred,
 		QuotaPolicy:             append([]string(nil), prior.QuotaPolicy...),
 		Quota:                   &quota,
 		ObservedAt:              now,
@@ -6232,9 +6240,11 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 	} else if planLimit != "" {
 		snapshot.PlanLimit = planLimit
 	}
+	applyBusinessSeatInference(&snapshot, quota)
 	item.PlanLimit = snapshot.PlanLimit
 	item.SeatType = snapshot.SeatType
 	item.SeatTypeRaw = snapshot.SeatTypeRaw
+	item.SeatTypeInferred = snapshot.SeatTypeInferred
 	item.QuotaPolicy = append([]string(nil), snapshot.QuotaPolicy...)
 	if organizationName != "" || metadataResolved || (planRaw != "" && !organizationScopedPlan(plan)) {
 		snapshot.OrganizationName = organizationName
@@ -6639,6 +6649,80 @@ func quotaWindowByDuration(quota accountQuota, minutes int64) quotaWindow {
 		}
 	}
 	return quotaWindow{Label: quotaWindowLabel(&minutes)}
+}
+
+// fiveHourWindowMinutes is the reported duration of the Codex five-hour window.
+const fiveHourWindowMinutes = 300
+
+// businessSeatInferenceFromQuota derives a Business seat tier from the reported
+// quota windows. No endpoint this pool calls carries a Standard/Premium field,
+// and the pinned Codex client model has none either, but OpenAI documents that a
+// Premium seat carries no five-hour usage limit. A Business account that reports
+// quota windows and none of them is the five-hour window is therefore Premium;
+// one that still reports it is Standard.
+//
+// The result is always marked inferred. It is display evidence only: it must
+// never grant models, capacity, or routing preference, and an authoritative
+// upstream seat value always wins. Requiring at least one reported window keeps
+// a sparse or failed refresh, which reports nothing at all, from silently
+// promoting a Standard seat to Premium.
+func businessSeatInferenceFromQuota(planFamily string, quota accountQuota) (string, bool) {
+	if planFamily != "business" {
+		return "", false
+	}
+	reported := false
+	for _, window := range quotaReportedWindows(quota) {
+		if !window.Present {
+			continue
+		}
+		reported = true
+		if window.WindowMinutes != nil && *window.WindowMinutes == fiveHourWindowMinutes {
+			return "standard", true
+		}
+	}
+	if !reported {
+		return "", false
+	}
+	return "premium", true
+}
+
+// applyBusinessSeatInference refreshes an inferred seat without ever overwriting
+// an authoritative one. When this refresh reports no window at all the previous
+// inference is kept rather than cleared, so a single sparse refresh does not make
+// the seat flap between values on the dashboard.
+func applyBusinessSeatInference(snapshot *quotaSnapshot, quota accountQuota) {
+	if snapshot == nil {
+		return
+	}
+	if snapshot.SeatType != "" && !snapshot.SeatTypeInferred {
+		return
+	}
+	seat, inferred := businessSeatInferenceFromQuota(snapshot.PlanFamily, quota)
+	if !inferred {
+		return
+	}
+	snapshot.SeatType = seat
+	snapshot.SeatTypeInferred = true
+	snapshot.QuotaPolicy = withQuotaPolicy(snapshot.QuotaPolicy, "no_five_hour_cap", seat == "premium")
+}
+
+// withQuotaPolicy adds or removes a single policy token while preserving any
+// other policy already recorded, so a future upstream-provided policy is not
+// dropped by this pool's own derived one.
+func withQuotaPolicy(policies []string, policy string, present bool) []string {
+	result := make([]string, 0, len(policies)+1)
+	for _, existing := range policies {
+		if existing != policy {
+			result = append(result, existing)
+		}
+	}
+	if present {
+		result = append(result, policy)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func quotaReportedWindows(quota accountQuota) []quotaWindow {
@@ -7226,6 +7310,7 @@ func (a *app) applyCompletedDeviceAuthLocked(item *account, auth codexAuthInfo, 
 		item.PlanRank = planRank(item.PlanFamily)
 		item.SeatType = ""
 		item.SeatTypeRaw = ""
+		item.SeatTypeInferred = false
 		item.QuotaPolicy = nil
 	} else {
 		if auth.Email != "" {
@@ -8087,6 +8172,7 @@ func (a *app) currentAccountStatusLocked(item account, index int, now time.Time)
 	}
 	displayItem.SeatType = quota.SeatType
 	displayItem.SeatTypeRaw = quota.SeatTypeRaw
+	displayItem.SeatTypeInferred = quota.SeatTypeInferred
 	displayItem.QuotaPolicy = append([]string(nil), quota.QuotaPolicy...)
 	remainingQuota := displayItem.RemainingQuota
 	if remainingQuota == nil && quota.Quota != nil {
@@ -8209,7 +8295,7 @@ func publicAccounts(values []account) []map[string]any {
 func publicAccount(item account, index int) map[string]any {
 	displayName := managementCredentialDisplayName(item)
 	metadata := credentialMetadata(item)
-	return map[string]any{"id": item.ID, "label": displayName, "displayName": displayName, "ownerNote": item.OwnerNote, "credentialMetadata": metadata, "email": metadata["email"], "organizationName": metadata["organizationName"], "rawPlanType": metadata["rawPlanType"], "planFamily": metadata["planFamily"], "planType": metadata["planType"], "planLimit": metadata["planLimit"], "seatType": metadata["seatType"], "seatTypeRaw": metadata["seatTypeRaw"], "seatTypeDisplay": metadata["seatTypeDisplay"], "quotaPolicy": metadata["quotaPolicy"], "planDisplayName": metadata["planDisplayName"], "planRank": metadata["planRank"], "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "quotaProtectionEnabled": item.QuotaProtectionEnabled, "quotaProtectionThreshold": item.QuotaProtectionThreshold, "quotaMetering": quotaMeteringKind(item), "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
+	return map[string]any{"id": item.ID, "label": displayName, "displayName": displayName, "ownerNote": item.OwnerNote, "credentialMetadata": metadata, "email": metadata["email"], "organizationName": metadata["organizationName"], "rawPlanType": metadata["rawPlanType"], "planFamily": metadata["planFamily"], "planType": metadata["planType"], "planLimit": metadata["planLimit"], "seatType": metadata["seatType"], "seatTypeRaw": metadata["seatTypeRaw"], "seatTypeDisplay": metadata["seatTypeDisplay"], "seatTypeInferred": metadata["seatTypeInferred"], "quotaPolicy": metadata["quotaPolicy"], "planDisplayName": metadata["planDisplayName"], "planRank": metadata["planRank"], "authType": item.AuthType, "enabled": item.Enabled, "inPool": item.InPool, "priority": item.Priority, "remainingQuota": item.RemainingQuota, "quotaProtectionEnabled": item.QuotaProtectionEnabled, "quotaProtectionThreshold": item.QuotaProtectionThreshold, "quotaMetering": quotaMeteringKind(item), "allowedModels": item.AllowedModels, "excludedModels": item.ExcludedModels, "wireApi": item.WireAPI, "hasUpstreamApiKey": item.UpstreamAPIKey != "", "lastLoginAt": item.LastLoginAt}
 }
 
 func (a *app) publicDashboardAccountLocked(item account, index int, now time.Time) map[string]any {
@@ -8230,6 +8316,7 @@ func (a *app) publicDashboardAccountLocked(item account, index int, now time.Tim
 	}
 	displayItem.SeatType = quota.SeatType
 	displayItem.SeatTypeRaw = quota.SeatTypeRaw
+	displayItem.SeatTypeInferred = quota.SeatTypeInferred
 	displayItem.QuotaPolicy = append([]string(nil), quota.QuotaPolicy...)
 	statusTone, statusLabel := publicDashboardStatus(status)
 	remainingQuota := displayItem.RemainingQuota
@@ -8430,6 +8517,7 @@ func credentialMetadata(item account) map[string]any {
 		"seatType":         seatType,
 		"seatTypeRaw":      cleanMetadataToken(item.SeatTypeRaw),
 		"seatTypeDisplay":  seatDisplay,
+		"seatTypeInferred": item.SeatTypeInferred && seatType != "",
 		"quotaPolicy":      append([]string(nil), item.QuotaPolicy...),
 	}
 }
@@ -8801,6 +8889,7 @@ func normalizeAccountPlanMetadata(item *account) {
 		item.SeatType = cleanMetadataToken(item.SeatType)
 	default:
 		item.SeatType = ""
+		item.SeatTypeInferred = false
 	}
 	item.SeatTypeRaw = cleanMetadataToken(item.SeatTypeRaw)
 	policies := make([]string, 0, len(item.QuotaPolicy))

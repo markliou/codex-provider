@@ -844,8 +844,16 @@
     if (family === "business") {
       const seat = metadata.seatType;
       if (seat === "standard" || seat === "premium") {
-        lines.push(`Business ${seat === "premium" ? "Premium" : "Standard"}`);
-        lines.push(`Seat type: ${seat === "premium" ? "Premium" : "Standard"}`);
+        const name = seat === "premium" ? "Premium" : "Standard";
+        // An inferred seat is derived from the reported quota shape, not read
+        // from an upstream field. Keep it out of the entitlement headline and
+        // always carry the marker, so it can never be read as authoritative.
+        if (metadata.seatTypeInferred) {
+          lines.push(`Seat type: ${name} (inferred)`);
+        } else {
+          lines.push(`Business ${name}`);
+          lines.push(`Seat type: ${name}`);
+        }
       } else {
         lines.push("Seat type: Not reported");
       }
