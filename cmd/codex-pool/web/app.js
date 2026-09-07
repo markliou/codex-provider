@@ -784,7 +784,6 @@
           blockedBy: blocking ? [] : gatingLabels,
         });
       }).filter(Boolean).join("");
-      const reached = quota.rateLimitReachedType ? `<div class="quota-fact quota-fact-warning"><span class="quota-fact-label">Reached type:</span><strong class="quota-fact-value">${escapeHTML(quota.rateLimitReachedType.replaceAll("_", " "))}</strong></div>` : "";
       const resetCredits = resetCreditsMarkup(quota.resetCredits);
       // Keep every reported quota window visible: Pro/Spark and other windows
       // are distinct upstream limits, not duplicate renderings. Only the
@@ -795,7 +794,11 @@
       // subscription bars crowds the row that operators actually scan. They stay
       // individually rendered and unmerged, just behind the same disclosure as
       // the other secondary facts.
-      const details = quotaDetailsMarkup(`${reached}${additionalLimitsMarkup(quota.additionalLimits)}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
+      // The upstream reached type stays out of the quota cell. It still drives
+      // exhaustion and still reaches the operator through the account status
+      // reason; repeating the enum here added a row that named a condition
+      // without telling anyone what to do about it.
+      const details = quotaDetailsMarkup(`${additionalLimitsMarkup(quota.additionalLimits)}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
       // Keep the decisive red Exhausted signal beside its window label. Do not
       // add a second account-level "Blocked" sentence below the bars; that
       // duplicates the signal and makes multi-window rows harder to scan.
@@ -841,8 +844,16 @@
     if (family === "business") {
       const seat = metadata.seatType;
       if (seat === "standard" || seat === "premium") {
-        lines.push(`Business ${seat === "premium" ? "Premium" : "Standard"}`);
-        lines.push(`Seat type: ${seat === "premium" ? "Premium" : "Standard"}`);
+        const name = seat === "premium" ? "Premium" : "Standard";
+        // An inferred seat is derived from the reported quota shape, not read
+        // from an upstream field. Keep it out of the entitlement headline and
+        // always carry the marker, so it can never be read as authoritative.
+        if (metadata.seatTypeInferred) {
+          lines.push(`Seat type: ${name} (inferred)`);
+        } else {
+          lines.push(`Business ${name}`);
+          lines.push(`Seat type: ${name}`);
+        }
       } else {
         lines.push("Seat type: Not reported");
       }
@@ -930,6 +941,18 @@
     }).join("");
   }
 
+  // The public row shows the seat tier on its own line rather than folded into
+  // the plan detail: Standard and Premium are otherwise indistinguishable there,
+  // and an inferred tier must stay visibly separate from the plan name upstream
+  // reported. Anything other than the two known tiers renders nothing.
+  function publicSeatMarkup(account) {
+    const seat = account.seatType;
+    if (seat !== "standard" && seat !== "premium") return "";
+    const name = seat === "premium" ? "Premium" : "Standard";
+    const suffix = account.seatTypeInferred ? " (inferred)" : "";
+    return `<span class="account-seat">Seat: ${escapeHTML(name + suffix)}</span>`;
+  }
+
   function renderPublicAccounts(accounts) {
     $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity/Fallback")}</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} visible`;
@@ -951,7 +974,7 @@
       const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
       return `<tr${poolMembershipAttribute(account.outOfPool === true)}>
-      <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${ownerNoteInput(account, true)}</div></td>
+      <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${publicSeatMarkup(account)}${ownerNoteInput(account, true)}</div></td>
       <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span>${activeBadge(account.active)}</div></td>
       <td>${quota}</td>
       <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong></div></td>

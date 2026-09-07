@@ -377,9 +377,10 @@ Optional hidden models must include:
 
 #### 5.2.1 Built-in Codex model lineup
 
-The advertised catalog must always include the current Codex model lineup in addition to the configured default model, per-account `allowedModels`, and aliases. As of July 2026 that lineup, in picker order, is:
+The advertised catalog must always include the current Codex model lineup in addition to the configured default model, per-account `allowedModels`, and aliases. As of September 2026 that lineup, in picker order, is:
 
 ```text
+gpt-6-astra
 gpt-5.6-sol
 gpt-5.6-terra
 gpt-5.6-luna
@@ -392,7 +393,7 @@ gpt-5.2-codex
 
 This keeps a stock Codex client from falling back to bundled model metadata (with its startup warning and conflicting-tool behavior, see 6.4.2) when the user selects a current model this pool was not explicitly configured for. Advertising a model is not an access grant: per-account model filters and upstream plan enforcement still apply (`gpt-5.3-codex-spark` is Pro-only upstream). Catalog `priority` ranks the configured default model first, then the lineup above, then operator-configured extras.
 
-Reasoning levels are per model family: the `gpt-5.6` family additionally advertises `max` and `ultra`; older families must stay at `low`–`xhigh` so the client cannot submit an effort upstream rejects.
+Reasoning levels are per model family: the `gpt-6` and `gpt-5.6` families additionally advertise `max` and `ultra`; older families must stay at `low`–`xhigh` so the client cannot submit an effort upstream rejects. The extended tiers are gated by family membership rather than an exact slug list, so a new sibling in a documented family is covered without a code change while any other family stays conservative. Membership requires a family boundary: the family slug itself, or a slug continuing with a hyphen. A bare textual prefix is not membership, or an unrelated slug such as `gpt-60-legacy` would inherit capabilities its upstream never promised.
 
 ### 5.3 Thinking tier model suffix
 
@@ -425,7 +426,7 @@ max
 ultra
 ```
 
-`max` and `ultra` are only advertised as catalog capability for the `gpt-5.6` family, but remain accepted as request-input suffixes for any model; upstream is the authority on whether the effort is valid.
+`max` and `ultra` are only advertised as catalog capability for the `gpt-6` and `gpt-5.6` families, but remain accepted as request-input suffixes for any model; upstream is the authority on whether the effort is valid.
 
 For Codex/OpenAI Responses requests, translate suffix into nested `reasoning.effort`:
 
@@ -1117,18 +1118,39 @@ Account metadata keeps these concepts separate:
 - `planFamily`: explicit normalized display family;
 - `seatType`: authoritative Business `standard`/`premium`, if supported;
 - `seatTypeRaw`: sanitized unknown authoritative seat value, display-only;
+- `seatTypeInferred`: marks a `seatType` this pool derived rather than read;
 - `planLimit`: exact reported `5x`, `10x`, or `20x` multiplier only;
 - `quotaPolicy`: explicit policy such as `no_five_hour_cap`.
 
 For the pinned Codex client, raw `team` and
 `self_serve_business_usage_based` map to the Business family, while raw
 `business` and `enterprise_cbp_usage_based` map to Enterprise. These mappings
-do not prove a Business seat. The pinned `AccountsCheckResponse` has no
-Standard/Premium field, so this release does not enable a seat mapping:
-Business rows show `Seat type: Not reported`. Workspace name, default account,
+do not prove a Business seat. No endpoint this pool calls carries a
+Standard/Premium field, and the pinned `AccountsCheckResponse` has none either,
+so no authoritative seat mapping is available. Workspace name, default account,
 record order, plan name, and absence of Premium metadata are never seat
 evidence. Generic Pro does not imply `20x`, and plan text containing a supported
 substring is not multiplier evidence.
+
+One derived signal is permitted, because it rests on reported quota shape rather
+than on missing metadata. OpenAI documents that a Business Premium seat carries
+no five-hour usage limit. A Business account whose refresh reports at least one
+quota window, none of which is the 300-minute window, is therefore inferred to be
+`premium`, and one that still reports that window is inferred to be `standard`.
+The inference additionally records `no_five_hour_cap` in `quotaPolicy` for a
+premium result. Requiring at least one reported window keeps a sparse or failed
+refresh from promoting a Standard seat.
+
+Any seat derived this way must set `seatTypeInferred` and be labeled as inferred
+wherever it is shown; it must never appear as the entitlement headline. The seat
+tier is shown on both the management view and the public dashboard, in each case
+on its own line beside the plan detail rather than folded into the plan name, so
+a derived tier is never read as part of what upstream reported. An
+authoritative upstream seat value always wins and is never overwritten by the
+inference. A derived seat is display evidence only: it must never grant models,
+capacity, routing preference, or any change in selection order. When a refresh
+reports no window at all, the previous inference is retained rather than cleared,
+so one sparse refresh cannot make the displayed seat flap.
 
 ### 9.2 Upstream usage response shape
 
@@ -1227,6 +1249,10 @@ minutes is `Week`, and all other durations use a truthful generic label.
 
 `limit_reached`, `allowed=false`, reached type, and reached spend control are
 separate exhaustion state. They must never fabricate a zero-percent 5h window.
+The reached type is an upstream enum that drives exhaustion and reaches the
+operator through the account status reason. The quota cell must not render it as
+its own row: repeating the identifier there names a condition without saying
+what to do about it, and costs a row in the cell operators scan.
 Credits-scoped `unlimited=true` means only flexible credits are unlimited; it
 does not mean unlimited runtime rate, model access, spend, or policy.
 

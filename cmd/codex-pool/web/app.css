@@ -380,7 +380,8 @@ th, td { padding: 13px 14px; text-align: left; border-bottom: 1px solid var(--ro
 th { color: var(--muted-strong); background: var(--table-head-bg); font-size: 11px; font-weight: 780; letter-spacing: .06em; text-transform: uppercase; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: var(--row-hover-bg); }
-.account-name { display: grid; min-width: 190px; gap: 3px; font-weight: 720; }.account-id { color: #74817c; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }.account-entitlement { color: var(--muted-strong); font-size: 11px; font-weight: 560; line-height: 1.45; }
+.account-name { display: grid; min-width: 190px; gap: 3px; font-weight: 720; }.account-id { color: #74817c; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }.account-seat { color: var(--muted-strong); font-size: 11px; font-weight: 620; }
+.account-entitlement { color: var(--muted-strong); font-size: 11px; font-weight: 560; line-height: 1.45; }
 .account-owner-note { width: min(220px, 100%); min-height: 28px; margin-top: 5px; padding: 5px 8px; border-color: color-mix(in srgb, var(--violet) 30%, transparent); border-radius: 6px; color: var(--muted-strong); background: var(--stat-bg); font-size: 11px; font-weight: 560; }
 .account-owner-note::placeholder { color: var(--muted); }
 .account-owner-note:disabled { cursor: progress; opacity: .72; }
