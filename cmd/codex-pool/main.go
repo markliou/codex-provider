@@ -1055,13 +1055,21 @@ func codexReasoningLevels() []codexReasoningLevel {
 	}
 }
 
+// codexModelInFamily reports whether a slug is the family itself or one of its
+// hyphen-separated members. The boundary matters: a bare prefix test would pull
+// unrelated slugs such as gpt-60-legacy or gpt-5.61 into a documented family and
+// advertise capabilities their upstream never promised.
+func codexModelInFamily(model, family string) bool {
+	return model == family || strings.HasPrefix(model, family+"-")
+}
+
 // codexExtendedReasoningModel reports whether a model family documents the
 // extended `max` and `ultra` tiers. Codex documents both for gpt-6 and for the
-// gpt-5.6 family; older families stop at xhigh. This is a family prefix rather
+// gpt-5.6 family; older families stop at xhigh. This is a family test rather
 // than a slug list so a new sibling in a documented family is covered without a
-// code change, while an undocumented older family stays conservative.
+// code change, while any other family stays conservative.
 func codexExtendedReasoningModel(model string) bool {
-	return strings.HasPrefix(model, "gpt-6") || strings.HasPrefix(model, "gpt-5.6")
+	return codexModelInFamily(model, "gpt-6") || codexModelInFamily(model, "gpt-5.6")
 }
 
 // codexReasoningLevelsForModel returns the reasoning levels a model may

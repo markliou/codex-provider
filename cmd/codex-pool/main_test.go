@@ -350,6 +350,22 @@ func TestAdminAssetsLabelInferredSeat(t *testing.T) {
 	}
 }
 
+// Extended tiers are advertised as catalog capability, so a slug that merely
+// starts with the same letters must not inherit them: the client would offer an
+// effort the upstream for that model rejects.
+func TestExtendedReasoningRequiresFamilyBoundary(t *testing.T) {
+	for _, model := range []string{"gpt-6", "gpt-6-astra", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra"} {
+		if !codexExtendedReasoningModel(model) {
+			t.Fatalf("%q is a documented extended-tier family member", model)
+		}
+	}
+	for _, model := range []string{"gpt-60-legacy", "gpt-6preview", "gpt-5.61", "gpt-5.6x", "gpt-5.5", "gpt-5.2-codex", "gpt-61"} {
+		if codexExtendedReasoningModel(model) {
+			t.Fatalf("%q must not inherit the extended tiers", model)
+		}
+	}
+}
+
 func TestCodexModelCatalogAdvertisesGPT6(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"

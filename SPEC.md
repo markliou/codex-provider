@@ -393,7 +393,7 @@ gpt-5.2-codex
 
 This keeps a stock Codex client from falling back to bundled model metadata (with its startup warning and conflicting-tool behavior, see 6.4.2) when the user selects a current model this pool was not explicitly configured for. Advertising a model is not an access grant: per-account model filters and upstream plan enforcement still apply (`gpt-5.3-codex-spark` is Pro-only upstream). Catalog `priority` ranks the configured default model first, then the lineup above, then operator-configured extras.
 
-Reasoning levels are per model family: the `gpt-6` and `gpt-5.6` families additionally advertise `max` and `ultra`; older families must stay at `low`–`xhigh` so the client cannot submit an effort upstream rejects. The extended tiers are gated by family prefix rather than an exact slug list, so a new sibling in a documented family is covered without a code change while an undocumented family stays conservative.
+Reasoning levels are per model family: the `gpt-6` and `gpt-5.6` families additionally advertise `max` and `ultra`; older families must stay at `low`–`xhigh` so the client cannot submit an effort upstream rejects. The extended tiers are gated by family membership rather than an exact slug list, so a new sibling in a documented family is covered without a code change while any other family stays conservative. Membership requires a family boundary: the family slug itself, or a slug continuing with a hyphen. A bare textual prefix is not membership, or an unrelated slug such as `gpt-60-legacy` would inherit capabilities its upstream never promised.
 
 ### 5.3 Thinking tier model suffix
 
