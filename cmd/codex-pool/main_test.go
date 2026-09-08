@@ -566,6 +566,91 @@ func TestQuotaWindowPrimeSkipsAnchoredAndIneligibleAccounts(t *testing.T) {
 	}
 }
 
+// Upstream names a per-model meter by an internal codename in the id and puts
+// the model in the display name, so matching the id alone ignores every meter it
+// actually sends.
+func TestAdditionalLimitNamesModel(t *testing.T) {
+	spark := quotaLimit{LimitID: "codex_bengalfox", LimitName: "GPT-5.3-Codex-Spark"}
+	if !additionalLimitNamesModel(spark, "gpt-5.3-codex-spark") {
+		t.Fatal("meter display name must identify the model it meters")
+	}
+	if additionalLimitNamesModel(spark, "gpt-6-astra") {
+		t.Fatal("meter must not claim an unrelated model")
+	}
+	if additionalLimitNamesModel(quotaLimit{LimitID: "base_model_inference", LimitName: "gpt-reserve"}, "gpt-5.3-codex-spark") {
+		t.Fatal("an unrelated meter must stay display metadata")
+	}
+	// Forward compatibility: an id that already names the model still counts.
+	if !additionalLimitNamesModel(quotaLimit{LimitID: "gpt-5.3-codex-spark"}, "gpt-5.3-codex-spark") {
+		t.Fatal("meter id naming the model must still match")
+	}
+}
+
+// A model sold as a separate allowance must route to the account holding that
+// allowance, not to whichever account selection would otherwise pick.
+func TestModelMeterRestrictsRoutingToEntitledAccounts(t *testing.T) {
+	meter := func(model string) []quotaLimit {
+		return []quotaLimit{{LimitID: "codex_bengalfox", LimitName: model}}
+	}
+	a := testApp(t, []account{
+		{ID: "plain", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://plain.example.test"},
+		{ID: "entitled", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://entitled.example.test"},
+	})
+	a.state.Quotas["entitled"] = quotaSnapshot{AccountID: "entitled", Quota: &accountQuota{AdditionalLimits: meter("GPT-5.3-Codex-Spark")}}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	plain := a.accountLocked("plain")
+	entitled := a.accountLocked("entitled")
+	if a.modelMeterAllowsLocked(*plain, "gpt-5.3-codex-spark") {
+		t.Fatal("an account without the meter must not receive the metered model")
+	}
+	if !a.modelMeterAllowsLocked(*entitled, "gpt-5.3-codex-spark") {
+		t.Fatal("the account holding the meter must receive the metered model")
+	}
+	// An ordinary subscription model is metered by nobody and stays unrestricted.
+	for _, item := range []*account{plain, entitled} {
+		if !a.modelMeterAllowsLocked(*item, "gpt-6-astra") {
+			t.Fatalf("%s was excluded from an unmetered model", item.ID)
+		}
+	}
+}
+
+// If no account reports the meter, which is what a pool with a broken quota
+// refresh looks like, the restriction must not fail every request closed.
+func TestModelMeterWithoutEvidenceDoesNotRestrict(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "one", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://one.example.test"},
+		{ID: "two", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://two.example.test"},
+	})
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, id := range []string{"one", "two"} {
+		if !a.modelMeterAllowsLocked(*a.accountLocked(id), "gpt-5.3-codex-spark") {
+			t.Fatalf("%s was excluded with no meter evidence anywhere", id)
+		}
+	}
+}
+
+// An exhausted per-model meter must stop routing that model, which never
+// happened while only the codename id was compared.
+func TestExhaustedModelMeterBlocksRouting(t *testing.T) {
+	now := time.Now().UTC()
+	zero := 0.0
+	resetAt := now.Add(time.Hour).Unix()
+	quota := accountQuota{AdditionalLimits: []quotaLimit{{
+		LimitID:   "codex_bengalfox",
+		LimitName: "GPT-5.3-Codex-Spark",
+		Windows:   []quotaWindow{{Label: "5h", RemainingPercent: &zero, ResetAt: &resetAt, Present: true, Observed: true}},
+	}}}
+	if !quotaExplicitlyBlocksRouting(quota, "gpt-5.3-codex-spark", now) {
+		t.Fatal("an exhausted per-model meter must block that model")
+	}
+	if quotaExplicitlyBlocksRouting(quota, "gpt-6-astra", now) {
+		t.Fatal("an exhausted per-model meter must not block an unrelated model")
+	}
+}
+
 func TestCodexModelCatalogAdvertisesGPT6(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"

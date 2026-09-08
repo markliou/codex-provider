@@ -3696,6 +3696,9 @@ func (a *app) usableLocked(item account, model string, now time.Time) bool {
 	if !a.quotaAvailableLocked(item, model, now) {
 		return false
 	}
+	if !a.modelMeterAllowsLocked(item, model) {
+		return false
+	}
 	if isCodexDeviceAuth(item) {
 		if _, err := a.codexAuth(item); err != nil {
 			return false
@@ -7004,6 +7007,61 @@ func quotaWindowEvidenceActive(window quotaWindow, now time.Time) bool {
 	return now.Unix() < *window.ResetAt
 }
 
+// additionalLimitNamesModel reports whether a per-model meter describes exactly
+// the requested model. Upstream identifies these meters by an internal codename
+// in the id, such as codex_bengalfox, and puts the model in the display name, so
+// matching the id alone silently ignores every meter upstream actually sends.
+// Both sides are compared as sanitized tokens, and a meter that names anything
+// other than this model stays display metadata.
+func additionalLimitNamesModel(limit quotaLimit, model string) bool {
+	model = cleanMetadataToken(model)
+	if model == "" {
+		return false
+	}
+	return cleanMetadataToken(limit.LimitID) == model || cleanMetadataToken(limit.LimitName) == model
+}
+
+// accountMetersModelLocked reports whether upstream currently tells this account
+// it holds a meter for exactly this model.
+func (a *app) accountMetersModelLocked(accountID, model string) bool {
+	quota := a.state.Quotas[accountID].Quota
+	if quota == nil {
+		return false
+	}
+	for _, additional := range quota.AdditionalLimits {
+		if additionalLimitNamesModel(additional, model) {
+			return true
+		}
+	}
+	return false
+}
+
+// modelMeterAllowsLocked keeps a model-scoped entitlement on the accounts that
+// actually hold it. Some models are sold as a separate allowance on top of the
+// subscription, and upstream advertises that allowance as a per-model meter on
+// the accounts entitled to it. Routing such a model to an account without the
+// meter spends an attempt on a request upstream will refuse, while the entitled
+// account's allowance goes unused.
+//
+// The restriction only applies once some account reports the meter. A model no
+// account meters, which is every ordinary subscription model, is unrestricted,
+// and a pool whose quota refresh is failing everywhere reports no meters at all
+// and therefore falls back to plain selection rather than failing closed.
+func (a *app) modelMeterAllowsLocked(item account, model string) bool {
+	if a.accountMetersModelLocked(item.ID, model) {
+		return true
+	}
+	for _, candidate := range a.config.Accounts {
+		if candidate.ID == item.ID || !candidate.Enabled || !candidate.InPool {
+			continue
+		}
+		if a.accountMetersModelLocked(candidate.ID, model) {
+			return false
+		}
+	}
+	return true
+}
+
 func quotaExplicitlyBlocksRouting(quota accountQuota, model string, now time.Time) bool {
 	if quota.Exhausted {
 		return true
@@ -7014,10 +7072,10 @@ func quotaExplicitlyBlocksRouting(quota accountQuota, model string, now time.Tim
 		}
 	}
 	for _, additional := range quota.AdditionalLimits {
-		// Unknown/model-specific buckets are display metadata unless the limit id
-		// exactly names the requested model. Do not turn a new future meter into
-		// an account-wide authorization rule.
-		if additional.LimitID != model {
+		// Unknown/model-specific buckets are display metadata unless the meter
+		// names the requested model. Do not turn a new future meter into an
+		// account-wide authorization rule.
+		if !additionalLimitNamesModel(additional, model) {
 			continue
 		}
 		if additional.Exhausted {

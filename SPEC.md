@@ -391,7 +391,27 @@ gpt-5.3-codex-spark
 gpt-5.2-codex
 ```
 
-This keeps a stock Codex client from falling back to bundled model metadata (with its startup warning and conflicting-tool behavior, see 6.4.2) when the user selects a current model this pool was not explicitly configured for. Advertising a model is not an access grant: per-account model filters and upstream plan enforcement still apply (`gpt-5.3-codex-spark` is Pro-only upstream). Catalog `priority` ranks the configured default model first, then the lineup above, then operator-configured extras.
+This keeps a stock Codex client from falling back to bundled model metadata (with its startup warning and conflicting-tool behavior, see 6.4.2) when the user selects a current model this pool was not explicitly configured for. Advertising a model is not an access grant: per-account model filters, the model-meter routing rule below, and upstream plan enforcement still apply (`gpt-5.3-codex-spark` is Pro-only upstream).
+
+##### Model-meter routing
+
+Some models are sold as a separate allowance on top of the subscription, and
+upstream advertises that allowance as a per-model entry in `additionalRateLimits`
+on the accounts entitled to it. A meter identifies its model by sanitized token
+match on either the limit id or the limit display name, because upstream puts an
+internal codename in the id (`codex_bengalfox`) and the model in the name
+(`GPT-5.3-Codex-Spark`); comparing the id alone ignores every meter upstream
+actually sends.
+
+When any enabled in-pool account reports a meter for the requested model, only
+accounts reporting that meter are eligible for it. Routing the model elsewhere
+would spend an attempt on a request upstream refuses while the entitled
+account's allowance goes unused. The restriction is evidence-driven, never a
+hardcoded plan rule: a model that no account meters, which is every ordinary
+subscription model, stays unrestricted, and a pool whose quota refresh is failing
+reports no meters at all and falls back to plain selection rather than failing
+closed. An exhausted meter blocks its own model on that account by the same name
+match, and never blocks any other model. Catalog `priority` ranks the configured default model first, then the lineup above, then operator-configured extras.
 
 Reasoning levels are per model family: the `gpt-6` and `gpt-5.6` families additionally advertise `max` and `ultra`; older families must stay at `low`–`xhigh` so the client cannot submit an effort upstream rejects. The extended tiers are gated by family membership rather than an exact slug list, so a new sibling in a documented family is covered without a code change while any other family stays conservative. Membership requires a family boundary: the family slug itself, or a slug continuing with a hyphen. A bare textual prefix is not membership, or an unrelated slug such as `gpt-60-legacy` would inherit capabilities its upstream never promised.
 
