@@ -1415,10 +1415,14 @@ or routing events, and must not change account health or client request
 counters. It bypasses the proxy handler, not the account's transport: the request
 travels the upstream path that slot normally routes over, including the cliproxy
 sidecar when the gateway mode selects it, because reaching past that transport
-would authenticate differently and would not charge the identity being primed. It applies only to an enabled, in-pool slot that owns its upstream
-identity, is not awaiting auth verification, is not cooling down for the chosen
-model, and whose refresh succeeded; a duplicate slot is skipped so one upstream
-workspace is not charged twice for one window. The model named must be one the
+would authenticate differently and would not charge the identity being primed. It applies to any enabled slot that owns its upstream identity, is not awaiting
+auth verification, is not cooling down for the chosen model, and whose refresh
+succeeded. Pool membership is not a condition: a slot held out of the pool still
+owns a window that must start counting down, or that window is still pinned when
+the slot is put back into rotation. Where several slots hold credentials for one
+upstream workspace only one of them may prime it, so one workspace is never
+charged twice for the same window; that owner is chosen independently of the
+routing duplicate guard, which considers only in-pool slots. The model named must be one the
 slot is allowed to route. Attempts are recorded and floored to at most one per
 account per hour, and the attempt is recorded before it is made so a failing
 account cannot be retried on every sweep.

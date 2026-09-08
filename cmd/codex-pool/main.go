@@ -938,6 +938,36 @@ func unanchoredBudgetWindow(quota accountQuota, now time.Time) (quotaWindow, boo
 	return budget, true
 }
 
+// quotaPrimeIdentityOwnerLocked names the single slot allowed to prime a shared
+// upstream identity. The routing duplicate guard cannot be reused here: it
+// deliberately ignores out-of-pool slots, while priming covers every enabled
+// slot, so relying on it would let two copies of one workspace each spend a
+// prime for the same window. The lowest slot id wins so the choice is stable
+// across refreshes and restarts, and a slot whose identity cannot be determined
+// owns itself rather than being silently skipped.
+func (a *app) quotaPrimeIdentityOwnerLocked(item account) string {
+	identity := a.upstreamIdentityKeyLocked(item)
+	if identity == "" {
+		return item.ID
+	}
+	owner := ""
+	for _, candidate := range a.config.Accounts {
+		if !candidate.Enabled || !a.hasUsableAuthLocked(candidate) {
+			continue
+		}
+		if a.upstreamIdentityKeyLocked(candidate) != identity {
+			continue
+		}
+		if owner == "" || candidate.ID < owner {
+			owner = candidate.ID
+		}
+	}
+	if owner == "" {
+		return item.ID
+	}
+	return owner
+}
+
 // quotaPrimeModelLocked picks the model a priming request should name. The
 // account's own filters decide it, because a prime must never reach for a model
 // this slot is not allowed to route.
@@ -979,13 +1009,16 @@ func (a *app) primeUnanchoredQuotaWindow(ctx context.Context, accountID string, 
 		return
 	}
 	candidate := *item
-	if !candidate.Enabled || !candidate.InPool || a.accountAuthVerificationPendingLocked(candidate) {
+	// Pool membership is not a condition. A slot kept out of the pool still owns a
+	// quota window that has to start counting down, and if it never does the
+	// window is still pinned whenever that slot is put back into rotation.
+	if !candidate.Enabled || a.accountAuthVerificationPendingLocked(candidate) {
 		a.mu.Unlock()
 		return
 	}
-	// A duplicate slot shares one upstream workspace with its primary, so priming
-	// through it would spend the same upstream quota twice for one window.
-	if primary := a.duplicateUpstreamAccountPrimaryLocked(candidate, now); primary != "" {
+	// Several slots can hold credentials for one upstream workspace, and priming
+	// spends that workspace's quota, so only one slot may spend it per window.
+	if owner := a.quotaPrimeIdentityOwnerLocked(candidate); owner != candidate.ID {
 		a.mu.Unlock()
 		return
 	}
