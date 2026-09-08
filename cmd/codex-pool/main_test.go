@@ -465,6 +465,63 @@ func TestQuotaWindowPrimeSpendsAndLeavesNoRoutingTrace(t *testing.T) {
 	}
 }
 
+// A slot held out of the pool still owns a window that has to start counting
+// down, or that window is still pinned the moment the slot returns to rotation.
+func TestQuotaWindowPrimeCoversOutOfPoolSlots(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_prime","output":[]}`))
+	}))
+	defer upstream.Close()
+	now := time.Now().UTC()
+	resetAt := now.Add(7 * 24 * time.Hour).Unix()
+	full := 100.0
+	snapshot := quotaSnapshot{AccountID: "only", Quota: &accountQuota{Windows: []quotaWindow{
+		{Label: "Week", WindowMinutes: func() *int64 { v := int64(10080); return &v }(), ResetAt: &resetAt, RemainingPercent: &full, Present: true, Observed: true},
+	}}}
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
+	a.primeUnanchoredQuotaWindow(context.Background(), "only", snapshot)
+	if hits != 1 {
+		t.Fatalf("out-of-pool slot was not primed: hits=%d", hits)
+	}
+}
+
+// Priming spends the upstream workspace's quota, so several local copies of one
+// workspace must not each spend a prime for the same window.
+func TestQuotaPrimeIdentityOwnerIsStableAcrossPoolMembership(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "slot-b", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "a@example.test"},
+		{ID: "slot-a", AuthType: "codex_device_auth", Enabled: true, InPool: false, Priority: 100, AccountID: "workspace-1", Email: "a@example.test"},
+		{ID: "slot-c", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-2", Email: "b@example.test"},
+	})
+	authJSON := `{"auth_mode":"chatgpt","tokens":{"id_token":"","access_token":"<access-token>","refresh_token":"<refresh-token>"}}`
+	for _, id := range []string{"slot-a", "slot-b", "slot-c"} {
+		home := a.accountCodexHome(id)
+		if err := os.MkdirAll(home, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// The out-of-pool copy still competes for ownership, which the routing
+	// duplicate guard would not have allowed.
+	for _, id := range []string{"slot-a", "slot-b"} {
+		item := a.accountLocked(id)
+		if owner := a.quotaPrimeIdentityOwnerLocked(*item); owner != "slot-a" {
+			t.Fatalf("identity owner for %s = %q, want slot-a", id, owner)
+		}
+	}
+	other := a.accountLocked("slot-c")
+	if owner := a.quotaPrimeIdentityOwnerLocked(*other); owner != "slot-c" {
+		t.Fatalf("separate workspace owner = %q, want slot-c", owner)
+	}
+}
+
 // An anchored window is already counting down and must never be primed.
 func TestQuotaWindowPrimeSkipsAnchoredAndIneligibleAccounts(t *testing.T) {
 	hits := 0
@@ -492,11 +549,11 @@ func TestQuotaWindowPrimeSkipsAnchoredAndIneligibleAccounts(t *testing.T) {
 		t.Fatalf("anchored window was primed: hits=%d", hits)
 	}
 
-	// A slot taken out of the pool is not this pool's quota to spend.
-	out := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
-	out.primeUnanchoredQuotaWindow(context.Background(), "only", snapshotFor(unanchored))
+	// A disabled slot is not in service at all, so nothing may be spent on it.
+	off := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: false, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
+	off.primeUnanchoredQuotaWindow(context.Background(), "only", snapshotFor(unanchored))
 	if hits != 0 {
-		t.Fatalf("out-of-pool slot was primed: hits=%d", hits)
+		t.Fatalf("disabled slot was primed: hits=%d", hits)
 	}
 
 	// A failed refresh carries no evidence about the window.
