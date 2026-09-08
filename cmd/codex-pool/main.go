@@ -959,10 +959,17 @@ func (a *app) quotaPrimeModelLocked(item account) string {
 // idle on one credential leaves that credential's window pinned a full period
 // ahead forever, and the quota never cycles back into usable capacity.
 //
-// This is deliberately not routed through the proxy: it must not create sticky
-// or thread affinity, response bindings, prompt-cache statistics, throughput
-// results, or routing events, and it must not touch account health, because it
-// is pool bookkeeping rather than a client request.
+// This deliberately skips the proxy handler, so it creates no sticky or thread
+// affinity, response bindings, prompt-cache statistics, throughput results, or
+// routing events, and does not touch account health: it is pool bookkeeping
+// rather than a client request.
+//
+// Skipping the handler is not the same as skipping the account's transport. The
+// request still goes out over whatever upstream path that slot normally uses,
+// including the cliproxy sidecar when the gateway mode selects it. Reaching past
+// the sidecar to the direct endpoint would authenticate differently and would
+// not exercise or charge the identity the slot actually routes as, which is the
+// very thing this request exists to spend.
 func (a *app) primeUnanchoredQuotaWindow(ctx context.Context, accountID string, snapshot quotaSnapshot) {
 	now := time.Now().UTC()
 	a.mu.Lock()
