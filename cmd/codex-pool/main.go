@@ -76,7 +76,24 @@ const (
 	// overflow; raise it if the dashboard shows a hot account with a low hit rate.
 	promptCacheBucketsDefault = 4
 	quotaRefreshInterval      = 5 * time.Minute
-	quotaRefreshTimeout       = 30 * time.Second
+	// A quota window that has reset but has not yet been spent against reports a
+	// reset time that slides forward with the wall clock instead of counting
+	// down, so the window never actually elapses. quotaWindowAnchorSlack is how
+	// much closer than a full window the reset may sit and still be read as
+	// unanchored. It must exceed the refresh interval, because the reported reset
+	// is only as fresh as the snapshot that carried it, and stay far below the
+	// smallest anchored gap observed in practice.
+	quotaWindowAnchorSlack = 10 * time.Minute
+	// quotaPrimeMinInterval floors the spacing between priming attempts on one
+	// account. A successful prime anchors the window and stops the detector on
+	// its own; this only bounds the cost when a prime fails or upstream does not
+	// anchor.
+	quotaPrimeMinInterval = time.Hour
+	// quotaPrimePrompt is deliberately trivial. The goal is to spend the smallest
+	// amount of quota that still registers as usage, never to obtain an answer.
+	quotaPrimePrompt    = "What day of the week is it today? Answer with one word."
+	quotaPrimeTimeout   = 90 * time.Second
+	quotaRefreshTimeout = 30 * time.Second
 	// Reset-credit expiry is descriptive metadata from a separate endpoint, not
 	// routing evidence. Refresh it far less often than quota windows so the
 	// dashboard can show the date without doubling five-minute upstream polling.
@@ -496,7 +513,10 @@ type state struct {
 	// PromptCacheResetAtByAccount records per-account window resets so a single
 	// account's hit rate can be recalculated independently of the pool-wide reset.
 	PromptCacheResetAtByAccount map[string]time.Time `json:"promptCacheResetAtByAccount,omitempty"`
-	RoutingCacheEvents          []routingCacheEvent  `json:"routingCacheEvents,omitempty"`
+	// QuotaWindowPrimes records the last priming attempt per account so a failed
+	// prime cannot turn into a retry loop against upstream.
+	QuotaWindowPrimes  map[string]time.Time `json:"quotaWindowPrimes,omitempty"`
+	RoutingCacheEvents []routingCacheEvent  `json:"routingCacheEvents,omitempty"`
 	// LegacyThroughputBuckets is read once when upgrading from the persisted
 	// 30-minute implementation, then migrated into app memory and cleared before
 	// the next runtime save. New throughput history must never be written here.
@@ -746,6 +766,9 @@ func (a *app) load() error {
 	if a.state.Quotas == nil {
 		a.state.Quotas = map[string]quotaSnapshot{}
 	}
+	if a.state.QuotaWindowPrimes == nil {
+		a.state.QuotaWindowPrimes = map[string]time.Time{}
+	}
 	if a.state.PromptCache == nil {
 		a.state.PromptCache = map[string]promptCacheStat{}
 	}
@@ -863,10 +886,167 @@ func (a *app) refreshAllCodexQuotas(ctx context.Context) {
 	}
 	a.mu.RUnlock()
 	for _, accountID := range accountIDs {
-		if _, err := a.refreshAccountQuota(ctx, accountID); err != nil {
+		snapshot, err := a.refreshAccountQuota(ctx, accountID)
+		if err != nil {
 			a.logger.Printf("quota refresh skipped for %s: %s", accountID, err)
+			continue
+		}
+		a.primeUnanchoredQuotaWindow(ctx, accountID, snapshot)
+	}
+}
+
+// unanchoredBudgetWindow reports the account's longest reported quota window
+// when that window has reset but has not started counting down.
+//
+// A window that has been spent against reports a fixed reset instant that draws
+// closer on every refresh. A window that reset and has seen no usage instead
+// reports a reset a full window ahead of the current instant, and that instant
+// slides forward with the wall clock, so the window never elapses and the quota
+// never actually cycles. The two are separated by how far the reset sits from a
+// full window ahead, allowing for the age of the snapshot that reported it.
+//
+// The longest window is the account's budget rather than its burst limit, and a
+// single request counts against every window at once, so anchoring the budget
+// window anchors the shorter ones too.
+func unanchoredBudgetWindow(quota accountQuota, now time.Time) (quotaWindow, bool) {
+	var budget quotaWindow
+	found := false
+	for _, window := range quotaReportedWindows(quota) {
+		if !window.Present || window.WindowMinutes == nil || *window.WindowMinutes <= 0 || window.ResetAt == nil {
+			continue
+		}
+		if !found || *window.WindowMinutes > *budget.WindowMinutes {
+			budget = window
+			found = true
 		}
 	}
+	if !found {
+		return quotaWindow{}, false
+	}
+	// Anything already spent has anchored the window by definition, so only an
+	// untouched window is a candidate. This also keeps a window that anchored
+	// moments ago, and therefore still sits close to a full window ahead, from
+	// being primed a second time.
+	if quotaWindowRemaining(budget) < 100 {
+		return quotaWindow{}, false
+	}
+	full := time.Duration(*budget.WindowMinutes) * time.Minute
+	remaining := time.Unix(*budget.ResetAt, 0).Sub(now)
+	if remaining < full-quotaWindowAnchorSlack {
+		return quotaWindow{}, false
+	}
+	return budget, true
+}
+
+// quotaPrimeModelLocked picks the model a priming request should name. The
+// account's own filters decide it, because a prime must never reach for a model
+// this slot is not allowed to route.
+func (a *app) quotaPrimeModelLocked(item account) string {
+	candidates := make([]string, 0, len(item.AllowedModels)+1)
+	candidates = append(candidates, item.AllowedModels...)
+	candidates = append(candidates, a.config.DefaultModel)
+	for _, candidate := range candidates {
+		base, _ := parseModel(candidate)
+		if base != "" && allowedModel(item, base) {
+			return base
+		}
+	}
+	return ""
+}
+
+// primeUnanchoredQuotaWindow spends a minimal amount of an account's quota so a
+// window that has reset actually starts counting down. Without it a pool that is
+// idle on one credential leaves that credential's window pinned a full period
+// ahead forever, and the quota never cycles back into usable capacity.
+//
+// This is deliberately not routed through the proxy: it must not create sticky
+// or thread affinity, response bindings, prompt-cache statistics, throughput
+// results, or routing events, and it must not touch account health, because it
+// is pool bookkeeping rather than a client request.
+func (a *app) primeUnanchoredQuotaWindow(ctx context.Context, accountID string, snapshot quotaSnapshot) {
+	now := time.Now().UTC()
+	a.mu.Lock()
+	item := a.accountLocked(accountID)
+	if item == nil || snapshot.Quota == nil || snapshot.QuotaError != nil {
+		a.mu.Unlock()
+		return
+	}
+	candidate := *item
+	if !candidate.Enabled || !candidate.InPool || a.accountAuthVerificationPendingLocked(candidate) {
+		a.mu.Unlock()
+		return
+	}
+	// A duplicate slot shares one upstream workspace with its primary, so priming
+	// through it would spend the same upstream quota twice for one window.
+	if primary := a.duplicateUpstreamAccountPrimaryLocked(candidate, now); primary != "" {
+		a.mu.Unlock()
+		return
+	}
+	window, unanchored := unanchoredBudgetWindow(*snapshot.Quota, now)
+	if !unanchored {
+		a.mu.Unlock()
+		return
+	}
+	model := a.quotaPrimeModelLocked(candidate)
+	if model == "" || a.accountCoolingDownLocked(candidate.ID, model, now) {
+		a.mu.Unlock()
+		return
+	}
+	if last, ok := a.state.QuotaWindowPrimes[accountID]; ok && now.Sub(last) < quotaPrimeMinInterval {
+		a.mu.Unlock()
+		return
+	}
+	// Record the attempt before making it. A prime that fails midway must still
+	// consume its interval, or a persistently failing account would be retried on
+	// every refresh sweep. The map is created here as well as at load, because a
+	// runtime file written before this field existed carries no map at all.
+	if a.state.QuotaWindowPrimes == nil {
+		a.state.QuotaWindowPrimes = map[string]time.Time{}
+	}
+	a.state.QuotaWindowPrimes[accountID] = now
+	if err := a.saveLocked(); err != nil {
+		a.logger.Printf("quota window prime state save failed for %s: %s", accountID, err)
+	}
+	a.mu.Unlock()
+
+	label := window.Label
+	if label == "" {
+		label = "budget"
+	}
+	if err := a.sendQuotaPrimeRequest(ctx, candidate, model); err != nil {
+		a.logger.Printf("quota window prime failed for %s (%s window, model %s): %s", accountID, label, model, err)
+		return
+	}
+	a.logger.Printf("quota window primed for %s (%s window, model %s)", accountID, label, model)
+}
+
+func (a *app) sendQuotaPrimeRequest(ctx context.Context, candidate account, model string) error {
+	body, err := json.Marshal(map[string]any{
+		"model":  model,
+		"input":  quotaPrimePrompt,
+		"stream": false,
+	})
+	if err != nil {
+		return err
+	}
+	endpoint, outbound, _, err := a.prepareUpstreamRequest(candidate, body, false)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, quotaPrimeTimeout)
+	defer cancel()
+	response, err := a.forward(ctx, candidate, endpoint, outbound, http.Header{})
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	// The answer is worthless; only the usage it recorded matters. Drain a bounded
+	// prefix so the connection can be reused, then discard it.
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("upstream returned %d", response.StatusCode)
+	}
+	return nil
 }
 
 func (a *app) mux() http.Handler {

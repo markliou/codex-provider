@@ -1393,6 +1393,33 @@ Response:
 }
 ```
 
+#### Quota window priming
+
+A quota window that has reset but has seen no usage reports a reset instant a
+full window ahead that slides forward with the wall clock rather than counting
+down. Such a window never elapses, so an idle credential's quota never cycles
+back into usable capacity. After each refresh the pool must detect this state on
+the account's longest reported window and spend a minimal amount of quota
+against that account to anchor it.
+
+The window is unanchored when it is present, reports a window duration and a
+reset instant, has full remaining percentage, and its reset sits no closer than
+one full window minus a slack allowance. The slack must exceed the refresh
+interval, because a reported reset is only as fresh as the snapshot carrying it.
+The longest window is chosen because it is the account's budget rather than its
+burst limit, and one request counts against every window at once.
+
+Priming is pool bookkeeping, not a client request. It must not create sticky or
+thread affinity, response bindings, prompt-cache statistics, throughput results,
+or routing events, and must not change account health or client request
+counters. It applies only to an enabled, in-pool slot that owns its upstream
+identity, is not awaiting auth verification, is not cooling down for the chosen
+model, and whose refresh succeeded; a duplicate slot is skipped so one upstream
+workspace is not charged twice for one window. The model named must be one the
+slot is allowed to route. Attempts are recorded and floored to at most one per
+account per hour, and the attempt is recorded before it is made so a failing
+account cannot be retried on every sweep.
+
 Quota refresh must not block normal `/v1` request handling. Run refresh jobs in background with bounded concurrency. The service refreshes Codex quotas once after a successful device-auth login, once during startup, and then every five minutes. `remainingQuota` is a routing hint derived from the lowest present quota window.
 
 API-key provider accounts are `api_metered`; they do not receive ChatGPT

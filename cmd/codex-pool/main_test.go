@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -35,8 +36,11 @@ func testApp(t *testing.T, accounts []account) *app {
 	// opt in explicitly so their assertions cover the new contract instead of
 	// accidentally rewriting unrelated priority/failover coverage.
 	return &app{
-		config:  config{DefaultModel: "gpt-test", ModelAliases: map[string]string{"alias": "gpt-test"}, Accounts: accounts},
-		state:   state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, ThreadBindings: map[string]threadBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}},
+		config: config{DefaultModel: "gpt-test", ModelAliases: map[string]string{"alias": "gpt-test"}, Accounts: accounts},
+		state:  state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, ThreadBindings: map[string]threadBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}},
+		// Production always supplies a logger, so the harness must too, or a test
+		// never reaches the code paths that log.
+		logger:  log.New(io.Discard, "", 0),
 		dataDir: dir, apiKeys: [][]byte{[]byte("client-key")}, adminUser: "admin", adminHash: []byte(hash),
 		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, routingStrategy: routingStrategyFailover, promptCacheKeyMode: "auto", publicDashboard: true, codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second}, streamClient: &http.Client{Timeout: time.Second},
 	}
@@ -363,6 +367,145 @@ func TestExtendedReasoningRequiresFamilyBoundary(t *testing.T) {
 		if codexExtendedReasoningModel(model) {
 			t.Fatalf("%q must not inherit the extended tiers", model)
 		}
+	}
+}
+
+// A reset window that has seen no usage reports a reset a full period ahead that
+// slides with the clock, so it never elapses. A window that has been spent
+// against reports a fixed reset drawing closer. Only the first is primeable.
+func TestUnanchoredBudgetWindowDetection(t *testing.T) {
+	now := time.Date(2026, 9, 8, 2, 0, 0, 0, time.UTC)
+	minutes := func(value int64) *int64 { return &value }
+	at := func(d time.Duration) *int64 { value := now.Add(d).Unix(); return &value }
+	week := func(remaining float64, resetAt *int64) quotaWindow {
+		return quotaWindow{Label: "Week", WindowMinutes: minutes(10080), ResetAt: resetAt, RemainingPercent: &remaining, Present: true, Observed: true}
+	}
+	for _, testCase := range []struct {
+		name  string
+		quota accountQuota
+		want  bool
+	}{
+		{"full window ahead and untouched", accountQuota{Windows: []quotaWindow{week(100, at(7*24*time.Hour))}}, true},
+		{"snapshot age stays within the slack", accountQuota{Windows: []quotaWindow{week(100, at(7*24*time.Hour-4*time.Minute))}}, true},
+		{"already counting down", accountQuota{Windows: []quotaWindow{week(100, at(7*24*time.Hour-50*time.Minute))}}, false},
+		{"untouched but well into the window", accountQuota{Windows: []quotaWindow{week(100, at(3*24*time.Hour))}}, false},
+		{"already spent against", accountQuota{Windows: []quotaWindow{week(96, at(7*24*time.Hour))}}, false},
+		{"no reset reported", accountQuota{Windows: []quotaWindow{week(100, nil)}}, false},
+		{"nothing reported", accountQuota{}, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, got := unanchoredBudgetWindow(testCase.quota, now); got != testCase.want {
+				t.Fatalf("unanchoredBudgetWindow = %v, want %v", got, testCase.want)
+			}
+		})
+	}
+}
+
+// One request counts against every window, so the budget window is the one worth
+// anchoring; picking the burst window instead would prime the wrong period.
+func TestUnanchoredBudgetWindowPrefersTheLongestWindow(t *testing.T) {
+	now := time.Date(2026, 9, 8, 2, 0, 0, 0, time.UTC)
+	minutes := func(value int64) *int64 { return &value }
+	at := func(d time.Duration) *int64 { value := now.Add(d).Unix(); return &value }
+	full := 100.0
+	quota := accountQuota{Windows: []quotaWindow{
+		{Label: "5h", WindowMinutes: minutes(300), ResetAt: at(5 * time.Hour), RemainingPercent: &full, Present: true, Observed: true},
+		{Label: "Week", WindowMinutes: minutes(10080), ResetAt: at(7 * 24 * time.Hour), RemainingPercent: &full, Present: true, Observed: true},
+	}}
+	window, ok := unanchoredBudgetWindow(quota, now)
+	if !ok || window.Label != "Week" {
+		t.Fatalf("budget window = %q ok=%v, want Week", window.Label, ok)
+	}
+}
+
+// The prime must actually reach upstream, name a model the slot may route, and
+// leave no client-request trace behind.
+func TestQuotaWindowPrimeSpendsAndLeavesNoRoutingTrace(t *testing.T) {
+	hits := 0
+	var seenModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		seenModel, _ = payload["model"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_prime","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
+
+	now := time.Now().UTC()
+	resetAt := now.Add(7 * 24 * time.Hour).Unix()
+	full := 100.0
+	snapshot := quotaSnapshot{AccountID: "only", Quota: &accountQuota{Windows: []quotaWindow{
+		{Label: "Week", WindowMinutes: func() *int64 { v := int64(10080); return &v }(), ResetAt: &resetAt, RemainingPercent: &full, Present: true, Observed: true},
+	}}}
+	a.primeUnanchoredQuotaWindow(context.Background(), "only", snapshot)
+
+	if hits != 1 {
+		t.Fatalf("prime request count = %d, want 1", hits)
+	}
+	if seenModel != "gpt-test" {
+		t.Fatalf("prime named model %q, want the slot's allowed model", seenModel)
+	}
+	if len(a.state.StickySessions) != 0 || len(a.state.ResponseBindings) != 0 || len(a.state.RoutingCacheEvents) != 0 {
+		t.Fatalf("prime left routing state behind: sticky=%d bindings=%d events=%d", len(a.state.StickySessions), len(a.state.ResponseBindings), len(a.state.RoutingCacheEvents))
+	}
+	if a.state.RequestCount != 0 || a.state.SuccessCount != 0 || a.state.FailureCount != 0 {
+		t.Fatalf("prime counted as a client request: %d/%d/%d", a.state.RequestCount, a.state.SuccessCount, a.state.FailureCount)
+	}
+	if health := a.state.Health["only"]; !health.LastSuccessAt.IsZero() || health.ConsecutiveFailure != 0 {
+		t.Fatalf("prime touched account health: %#v", health)
+	}
+
+	// The interval floor must stop a second prime on the same window.
+	a.primeUnanchoredQuotaWindow(context.Background(), "only", snapshot)
+	if hits != 1 {
+		t.Fatalf("prime repeated inside the interval floor: hits=%d", hits)
+	}
+}
+
+// An anchored window is already counting down and must never be primed.
+func TestQuotaWindowPrimeSkipsAnchoredAndIneligibleAccounts(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_prime","output":[]}`))
+	}))
+	defer upstream.Close()
+	now := time.Now().UTC()
+	full := 100.0
+	weekMinutes := func() *int64 { v := int64(10080); return &v }
+
+	anchored := now.Add(7*24*time.Hour - time.Hour).Unix()
+	unanchored := now.Add(7 * 24 * time.Hour).Unix()
+	snapshotFor := func(resetAt int64) quotaSnapshot {
+		return quotaSnapshot{AccountID: "only", Quota: &accountQuota{Windows: []quotaWindow{
+			{Label: "Week", WindowMinutes: weekMinutes(), ResetAt: &resetAt, RemainingPercent: &full, Present: true, Observed: true},
+		}}}
+	}
+
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
+	a.primeUnanchoredQuotaWindow(context.Background(), "only", snapshotFor(anchored))
+	if hits != 0 {
+		t.Fatalf("anchored window was primed: hits=%d", hits)
+	}
+
+	// A slot taken out of the pool is not this pool's quota to spend.
+	out := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
+	out.primeUnanchoredQuotaWindow(context.Background(), "only", snapshotFor(unanchored))
+	if hits != 0 {
+		t.Fatalf("out-of-pool slot was primed: hits=%d", hits)
+	}
+
+	// A failed refresh carries no evidence about the window.
+	errored := snapshotFor(unanchored)
+	errored.QuotaError = &quotaErrorInfo{Code: "token_expired"}
+	broken := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
+	broken.primeUnanchoredQuotaWindow(context.Background(), "only", errored)
+	if hits != 0 {
+		t.Fatalf("errored refresh was primed: hits=%d", hits)
 	}
 }
 
