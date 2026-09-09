@@ -343,6 +343,7 @@ input:focus, select:focus { border-color: var(--accent-hot); box-shadow: 0 0 0 3
 .capacity-label { color: var(--accent-hot); font-size: 11px; font-weight: 790; letter-spacing: .08em; }
 .capacity-value { font-size: 19px; font-weight: 780; line-height: 1; font-variant-numeric: tabular-nums; }
 .capacity-note { color: var(--muted); font-size: 10px; }
+.capacity-free { color: var(--green); font-weight: 700; }
 .summary-item { min-height: 78px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 13px; background: var(--summary-bg); box-shadow: 0 12px 30px color-mix(in srgb, var(--ink) 11%, transparent); }
 .summary-item:first-child { border-color: color-mix(in srgb, var(--accent-hot) 36%, transparent); background: var(--summary-featured-bg); }
 .summary-value { display: block; margin-top: 6px; font-size: 23px; font-weight: 780; line-height: 1; }

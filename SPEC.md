@@ -2220,12 +2220,19 @@ the page must roll up how much of each reported quota window the pool still
 holds, so an operator running many credentials can see whether the short window
 or the long one is the constraint without reading every row. One entry per
 reported window duration, ordered shortest first, each showing remaining
-headroom, how many accounts reported that window out of the routable total, and
-how many of them are exhausted. Both counts are required: a plan with no
-five-hour cap, such as Pro or a Business Premium seat, reports only its long
-window, so an uneven pair of counts is expected and must explain itself rather
-than read as missing data. Headroom is shown to one decimal place, the finest
-reading the underlying whole-percent windows support.
+headroom, how many accounts that window constrains, and how many of them are
+exhausted. Headroom is shown to one decimal place, the finest reading the
+underlying whole-percent windows support.
+
+A routable slot that reports no entry for a window is not missing data: no limit
+of that duration applies to it, which is how Pro and Business Premium seats
+report, having no five-hour cap. Such slots must be counted and shown as having
+no limit for that window, never silently dropped. A pool whose capped slots are
+spent can still hold an uncapped slot able to serve immediately, and a roll-up
+that hides it reports far less short-term capacity than the pool actually has.
+The percentage itself covers only the slots the window constrains, and the card
+must say so, because averaging an unconstrained slot in as a full one would
+present the absence of a limit as a limit that happens to be full.
 
 The reported headroom is the mean remaining percentage across the reporting
 slots, never a sum: percentages from different plans describe different absolute

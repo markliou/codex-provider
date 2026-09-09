@@ -7930,13 +7930,16 @@ type quotaCapacityWindow struct {
 	Label            string  `json:"label"`
 	WindowMinutes    int64   `json:"windowMinutes"`
 	RemainingPercent float64 `json:"remainingPercent"`
-	// ReportingAccounts can be lower than RoutableAccounts, and the difference is
-	// not a gap in the data. A plan without a five-hour cap, such as Pro or a
-	// Business Premium seat, reports only its long window, so it is counted in
-	// that window and legitimately absent from the short one. Carrying both
-	// numbers is what makes an uneven pair of counts self-explanatory.
+	// ReportingAccounts counts the slots this window actually constrains. The
+	// remainder is not missing data: a plan without a five-hour cap, such as Pro
+	// or a Business Premium seat, reports only its long window because no
+	// five-hour limit applies to it at all. Those slots are counted separately in
+	// UncappedAccounts rather than dropped, because a pool whose capped slots are
+	// spent can still have an uncapped slot able to serve immediately, and a
+	// roll-up that hides it reports far less short-term capacity than exists.
 	ReportingAccounts int `json:"reportingAccounts"`
 	RoutableAccounts  int `json:"routableAccounts"`
+	UncappedAccounts  int `json:"uncappedAccounts"`
 	ExhaustedAccounts int `json:"exhaustedAccounts"`
 }
 
@@ -8001,6 +8004,7 @@ func (a *app) quotaCapacityLocked(now time.Time) []quotaCapacityWindow {
 			RemainingPercent:  entry.total / float64(entry.reporting),
 			ReportingAccounts: entry.reporting,
 			RoutableAccounts:  routable,
+			UncappedAccounts:  routable - entry.reporting,
 			ExhaustedAccounts: entry.exhausted,
 		})
 	}

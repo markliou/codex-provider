@@ -554,17 +554,23 @@
       // A mean lands on long fractions that carry no real precision. One decimal
       // is the finest reading the underlying whole-percent windows can support.
       const remaining = Math.round(quotaPercent(window.remainingPercent) * 10) / 10;
+      const label = window.label || "Window";
       const reporting = Number(window.reportingAccounts) || 0;
-      const routable = Number(window.routableAccounts) || reporting;
       const exhausted = Number(window.exhaustedAccounts) || 0;
-      // Show both counts. A plan with no five-hour cap reports only its long
-      // window, so an uneven pair is expected and has to explain itself here
-      // rather than look like missing data.
-      const note = `${reporting} of ${routable} ${routable === 1 ? "account" : "accounts"} report this window${exhausted ? ` · ${exhausted} exhausted` : ""}`;
+      const uncapped = Number(window.uncappedAccounts) || 0;
+      // The percentage describes only the slots this window constrains. Say so,
+      // and name the uncapped slots on their own line: a pool whose capped slots
+      // are spent can still have an uncapped slot able to serve immediately, and
+      // a reader who cannot see that reads the low average as the whole story.
+      const note = `avg of ${reporting} ${reporting === 1 ? "account" : "accounts"} with a ${escapeHTML(label)} limit${exhausted ? ` · ${exhausted} exhausted` : ""}`;
+      const free = uncapped
+        ? `<span class="capacity-note capacity-free">${uncapped} ${uncapped === 1 ? "account has" : "accounts have"} no ${escapeHTML(label)} limit</span>`
+        : "";
       return `<div class="capacity-item">
-        <div class="capacity-head"><span class="capacity-label">${escapeHTML(window.label || "Window")} headroom</span><strong class="capacity-value">${remaining.toFixed(1)}%</strong></div>
-        ${quotaTrackMarkup(remaining, `${window.label || "Window"} pool headroom`)}
-        <span class="capacity-note">${escapeHTML(note)} · average remaining</span>
+        <div class="capacity-head"><span class="capacity-label">${escapeHTML(label)} headroom</span><strong class="capacity-value">${remaining.toFixed(1)}%</strong></div>
+        ${quotaTrackMarkup(remaining, `${label} pool headroom`)}
+        <span class="capacity-note">${note}</span>
+        ${free}
       </div>`;
     }).join("");
   }

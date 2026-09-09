@@ -723,8 +723,16 @@ func TestQuotaCapacityCountsOnlyWindowsAnAccountReports(t *testing.T) {
 	if windows[0].ReportingAccounts != 1 || windows[0].RoutableAccounts != 2 || windows[0].RemainingPercent != 40 {
 		t.Fatalf("5h roll-up = %#v, want 1 of 2 accounts at 40", windows[0])
 	}
+	// The uncapped slot must be counted, not dropped: a pool whose capped slots
+	// are spent can still have an uncapped slot able to serve immediately.
+	if windows[0].UncappedAccounts != 1 {
+		t.Fatalf("uncapped count = %d, want 1: %#v", windows[0].UncappedAccounts, windows[0])
+	}
 	if windows[1].ReportingAccounts != 2 || windows[1].RoutableAccounts != 2 || windows[1].RemainingPercent != 70 {
 		t.Fatalf("week roll-up = %#v, want 2 of 2 accounts at mean 70", windows[1])
+	}
+	if windows[1].UncappedAccounts != 0 {
+		t.Fatalf("week window must constrain every routable slot: %#v", windows[1])
 	}
 }
 
