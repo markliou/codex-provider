@@ -7927,11 +7927,17 @@ func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 
 // quotaCapacityWindow aggregates one reported window duration across the pool.
 type quotaCapacityWindow struct {
-	Label             string  `json:"label"`
-	WindowMinutes     int64   `json:"windowMinutes"`
-	RemainingPercent  float64 `json:"remainingPercent"`
-	ReportingAccounts int     `json:"reportingAccounts"`
-	ExhaustedAccounts int     `json:"exhaustedAccounts"`
+	Label            string  `json:"label"`
+	WindowMinutes    int64   `json:"windowMinutes"`
+	RemainingPercent float64 `json:"remainingPercent"`
+	// ReportingAccounts can be lower than RoutableAccounts, and the difference is
+	// not a gap in the data. A plan without a five-hour cap, such as Pro or a
+	// Business Premium seat, reports only its long window, so it is counted in
+	// that window and legitimately absent from the short one. Carrying both
+	// numbers is what makes an uneven pair of counts self-explanatory.
+	ReportingAccounts int `json:"reportingAccounts"`
+	RoutableAccounts  int `json:"routableAccounts"`
+	ExhaustedAccounts int `json:"exhaustedAccounts"`
 }
 
 // quotaCapacityLocked summarises how much of each reported quota window the pool
@@ -7953,6 +7959,7 @@ func (a *app) quotaCapacityLocked(now time.Time) []quotaCapacityWindow {
 		exhausted int
 	}
 	buckets := map[int64]*bucket{}
+	routable := 0
 	for _, item := range a.config.Accounts {
 		if !item.Enabled || !item.InPool {
 			continue
@@ -7964,6 +7971,7 @@ func (a *app) quotaCapacityLocked(now time.Time) []quotaCapacityWindow {
 		if snapshot.Quota == nil {
 			continue
 		}
+		routable++
 		for _, window := range quotaReportedWindows(*snapshot.Quota) {
 			if !window.Present || window.WindowMinutes == nil || *window.WindowMinutes <= 0 {
 				continue
@@ -7992,6 +8000,7 @@ func (a *app) quotaCapacityLocked(now time.Time) []quotaCapacityWindow {
 			WindowMinutes:     minutes,
 			RemainingPercent:  entry.total / float64(entry.reporting),
 			ReportingAccounts: entry.reporting,
+			RoutableAccounts:  routable,
 			ExhaustedAccounts: entry.exhausted,
 		})
 	}

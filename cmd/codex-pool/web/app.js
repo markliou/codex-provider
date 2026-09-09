@@ -551,12 +551,18 @@
       return;
     }
     container.innerHTML = rows.map((window) => {
-      const remaining = quotaPercent(window.remainingPercent);
-      const accounts = Number(window.reportingAccounts) || 0;
+      // A mean lands on long fractions that carry no real precision. One decimal
+      // is the finest reading the underlying whole-percent windows can support.
+      const remaining = Math.round(quotaPercent(window.remainingPercent) * 10) / 10;
+      const reporting = Number(window.reportingAccounts) || 0;
+      const routable = Number(window.routableAccounts) || reporting;
       const exhausted = Number(window.exhaustedAccounts) || 0;
-      const note = `${accounts} ${accounts === 1 ? "account" : "accounts"}${exhausted ? ` · ${exhausted} exhausted` : ""}`;
+      // Show both counts. A plan with no five-hour cap reports only its long
+      // window, so an uneven pair is expected and has to explain itself here
+      // rather than look like missing data.
+      const note = `${reporting} of ${routable} ${routable === 1 ? "account" : "accounts"} report this window${exhausted ? ` · ${exhausted} exhausted` : ""}`;
       return `<div class="capacity-item">
-        <div class="capacity-head"><span class="capacity-label">${escapeHTML(window.label || "Window")} headroom</span><strong class="capacity-value">${remaining}%</strong></div>
+        <div class="capacity-head"><span class="capacity-label">${escapeHTML(window.label || "Window")} headroom</span><strong class="capacity-value">${remaining.toFixed(1)}%</strong></div>
         ${quotaTrackMarkup(remaining, `${window.label || "Window"} pool headroom`)}
         <span class="capacity-note">${escapeHTML(note)} · average remaining</span>
       </div>`;

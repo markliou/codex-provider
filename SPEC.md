@@ -2220,8 +2220,12 @@ the page must roll up how much of each reported quota window the pool still
 holds, so an operator running many credentials can see whether the short window
 or the long one is the constraint without reading every row. One entry per
 reported window duration, ordered shortest first, each showing remaining
-headroom, how many accounts reported that window, and how many of them are
-exhausted.
+headroom, how many accounts reported that window out of the routable total, and
+how many of them are exhausted. Both counts are required: a plan with no
+five-hour cap, such as Pro or a Business Premium seat, reports only its long
+window, so an uneven pair of counts is expected and must explain itself rather
+than read as missing data. Headroom is shown to one decimal place, the finest
+reading the underlying whole-percent windows support.
 
 The reported headroom is the mean remaining percentage across the reporting
 slots, never a sum: percentages from different plans describe different absolute

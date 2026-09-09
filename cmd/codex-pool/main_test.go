@@ -688,6 +688,44 @@ func TestQuotaCapacitySummarisesRoutableWindows(t *testing.T) {
 	if windows[1].RemainingPercent != 70 || windows[1].ReportingAccounts != 2 || windows[1].ExhaustedAccounts != 0 {
 		t.Fatalf("week roll-up = %#v, want mean 70 over 2 accounts", windows[1])
 	}
+	for _, window := range windows {
+		if window.RoutableAccounts != 2 {
+			t.Fatalf("routable total = %d, want 2: %#v", window.RoutableAccounts, window)
+		}
+	}
+}
+
+// A plan with no five-hour cap reports only its long window, so the two counts
+// legitimately differ. The roll-up must never average a window an account did
+// not report, and must carry the routable total so the gap explains itself.
+func TestQuotaCapacityCountsOnlyWindowsAnAccountReports(t *testing.T) {
+	now := time.Now().UTC()
+	minutes := func(value int64) *int64 { return &value }
+	window := func(windowMinutes int64, remaining float64) quotaWindow {
+		value := remaining
+		return quotaWindow{Label: quotaWindowLabel(minutes(windowMinutes)), WindowMinutes: minutes(windowMinutes), RemainingPercent: &value, Present: true, Observed: true}
+	}
+	a := testApp(t, []account{
+		{ID: "capped", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "uncapped", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+	})
+	a.state.Quotas["capped"] = quotaSnapshot{AccountID: "capped", Quota: &accountQuota{Windows: []quotaWindow{window(300, 40), window(10080, 90)}}}
+	// No five-hour window at all, the shape a Pro or Business Premium seat reports.
+	a.state.Quotas["uncapped"] = quotaSnapshot{AccountID: "uncapped", Quota: &accountQuota{Windows: []quotaWindow{window(10080, 50)}}}
+
+	a.mu.Lock()
+	windows := a.quotaCapacityLocked(now)
+	a.mu.Unlock()
+
+	if len(windows) != 2 {
+		t.Fatalf("expected both window durations: %#v", windows)
+	}
+	if windows[0].ReportingAccounts != 1 || windows[0].RoutableAccounts != 2 || windows[0].RemainingPercent != 40 {
+		t.Fatalf("5h roll-up = %#v, want 1 of 2 accounts at 40", windows[0])
+	}
+	if windows[1].ReportingAccounts != 2 || windows[1].RoutableAccounts != 2 || windows[1].RemainingPercent != 70 {
+		t.Fatalf("week roll-up = %#v, want 2 of 2 accounts at mean 70", windows[1])
+	}
 }
 
 // A pool with no quota evidence must report no capacity rather than a fabricated
