@@ -2215,6 +2215,23 @@ control without opening the disclosure.
 Exact reset and refresh timestamps may remain in tooltips so the table stays
 scannable without discarding diagnostic detail.
 
+Above the account table the status cards count accounts. Separately from them,
+the page must roll up how much of each reported quota window the pool still
+holds, so an operator running many credentials can see whether the short window
+or the long one is the constraint without reading every row. One entry per
+reported window duration, ordered shortest first, each showing remaining
+headroom, how many accounts reported that window, and how many of them are
+exhausted.
+
+The reported headroom is the mean remaining percentage across the reporting
+slots, never a sum: percentages from different plans describe different absolute
+allowances, so they may be averaged into how full the pool is but must never be
+added into one larger total. Only routable slots count. An out-of-pool slot is
+not capacity this pool can spend, and a duplicate slot shares one upstream
+workspace with its primary, so counting both would report that workspace twice.
+A pool with no quota evidence reports no entries rather than a fabricated zero,
+which would read as total exhaustion.
+
 The pool-wide cache window must show the total request count since reset and
 must group and visibly label Pool-observed counters separately from calculated
 read, request-hit, and cold rates. It must not show an upstream raw-token group

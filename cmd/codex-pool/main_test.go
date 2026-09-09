@@ -651,6 +651,57 @@ func TestExhaustedModelMeterBlocksRouting(t *testing.T) {
 	}
 }
 
+// The capacity roll-up must average, never sum: percentages from different plans
+// describe different absolute allowances. It must also count each upstream
+// workspace once and ignore slots the pool cannot route.
+func TestQuotaCapacitySummarisesRoutableWindows(t *testing.T) {
+	now := time.Now().UTC()
+	minutes := func(value int64) *int64 { return &value }
+	window := func(windowMinutes int64, remaining float64) quotaWindow {
+		value := remaining
+		return quotaWindow{Label: quotaWindowLabel(minutes(windowMinutes)), WindowMinutes: minutes(windowMinutes), RemainingPercent: &value, Present: true, Observed: true}
+	}
+	a := testApp(t, []account{
+		{ID: "a", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "b", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+		{ID: "out", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: "https://out.example.test"},
+	})
+	a.state.Quotas["a"] = quotaSnapshot{AccountID: "a", Quota: &accountQuota{Windows: []quotaWindow{window(300, 100), window(10080, 80)}}}
+	a.state.Quotas["b"] = quotaSnapshot{AccountID: "b", Quota: &accountQuota{Windows: []quotaWindow{window(300, 0), window(10080, 60)}}}
+	// An out-of-pool slot is not capacity this pool can spend and must not lift
+	// the average.
+	a.state.Quotas["out"] = quotaSnapshot{AccountID: "out", Quota: &accountQuota{Windows: []quotaWindow{window(300, 100), window(10080, 100)}}}
+
+	a.mu.Lock()
+	windows := a.quotaCapacityLocked(now)
+	a.mu.Unlock()
+
+	if len(windows) != 2 {
+		t.Fatalf("expected one entry per reported window duration: %#v", windows)
+	}
+	if windows[0].Label != "5h" || windows[1].Label != "Week" {
+		t.Fatalf("windows must be ordered shortest first: %#v", windows)
+	}
+	if windows[0].RemainingPercent != 50 || windows[0].ReportingAccounts != 2 || windows[0].ExhaustedAccounts != 1 {
+		t.Fatalf("5h roll-up = %#v, want mean 50 over 2 accounts with 1 exhausted", windows[0])
+	}
+	if windows[1].RemainingPercent != 70 || windows[1].ReportingAccounts != 2 || windows[1].ExhaustedAccounts != 0 {
+		t.Fatalf("week roll-up = %#v, want mean 70 over 2 accounts", windows[1])
+	}
+}
+
+// A pool with no quota evidence must report no capacity rather than a fabricated
+// zero, which would read as "everything is exhausted".
+func TestQuotaCapacityIsEmptyWithoutEvidence(t *testing.T) {
+	a := testApp(t, []account{{ID: "a", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"}})
+	a.mu.Lock()
+	windows := a.quotaCapacityLocked(time.Now().UTC())
+	a.mu.Unlock()
+	if len(windows) != 0 {
+		t.Fatalf("capacity reported without any quota snapshot: %#v", windows)
+	}
+}
+
 func TestCodexModelCatalogAdvertisesGPT6(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"

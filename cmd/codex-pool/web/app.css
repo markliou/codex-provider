@@ -336,6 +336,13 @@ input:focus, select:focus { border-color: var(--accent-hot); box-shadow: 0 0 0 3
 .switch-label { white-space: nowrap; }
 .strategy-pill { display: inline-flex; align-items: center; min-height: 28px; padding: 5px 9px; border: 1px solid color-mix(in srgb, var(--accent-hot) 32%, transparent); border-radius: 999px; color: var(--accent-hot); background: color-mix(in srgb, var(--accent-hot) 10%, transparent); font-size: 11px; font-weight: 760; letter-spacing: .03em; }
 .summary-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 10px; margin-bottom: 28px; }
+.quota-capacity { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin: -14px 0 28px; }
+.quota-capacity:empty { display: none; margin: 0; }
+.capacity-item { display: grid; gap: 3px; padding: 11px 14px; border: 1px solid var(--line); border-radius: 13px; background: var(--summary-bg); }
+.capacity-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.capacity-label { color: var(--accent-hot); font-size: 11px; font-weight: 790; letter-spacing: .08em; }
+.capacity-value { font-size: 19px; font-weight: 780; line-height: 1; font-variant-numeric: tabular-nums; }
+.capacity-note { color: var(--muted); font-size: 10px; }
 .summary-item { min-height: 78px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 13px; background: var(--summary-bg); box-shadow: 0 12px 30px color-mix(in srgb, var(--ink) 11%, transparent); }
 .summary-item:first-child { border-color: color-mix(in srgb, var(--accent-hot) 36%, transparent); background: var(--summary-featured-bg); }
 .summary-value { display: block; margin-top: 6px; font-size: 23px; font-weight: 780; line-height: 1; }

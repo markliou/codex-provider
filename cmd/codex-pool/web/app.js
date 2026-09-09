@@ -537,6 +537,32 @@
   // #cache-window row, so it is intentionally not duplicated here. Every
   // account belongs to exactly one non-total card; do not merge Duplicate into
   // Out of pool, because duplicate credential copies may still be in the pool.
+  // Capacity is reported as the mean remaining percentage across the slots that
+  // report a window, never a sum: percentages from different plans describe
+  // different absolute allowances, so adding them would invent a total that does
+  // not exist. The account count travels with the number so the reader can see
+  // how thin the average is.
+  function renderQuotaCapacity(windows) {
+    const container = $("#quota-capacity");
+    if (!container) return;
+    const rows = Array.isArray(windows) ? windows : [];
+    if (!rows.length) {
+      container.innerHTML = "";
+      return;
+    }
+    container.innerHTML = rows.map((window) => {
+      const remaining = quotaPercent(window.remainingPercent);
+      const accounts = Number(window.reportingAccounts) || 0;
+      const exhausted = Number(window.exhaustedAccounts) || 0;
+      const note = `${accounts} ${accounts === 1 ? "account" : "accounts"}${exhausted ? ` · ${exhausted} exhausted` : ""}`;
+      return `<div class="capacity-item">
+        <div class="capacity-head"><span class="capacity-label">${escapeHTML(window.label || "Window")} headroom</span><strong class="capacity-value">${remaining}%</strong></div>
+        ${quotaTrackMarkup(remaining, `${window.label || "Window"} pool headroom`)}
+        <span class="capacity-note">${escapeHTML(note)} · average remaining</span>
+      </div>`;
+    }).join("");
+  }
+
   function renderSummary(summary, publicMode = false) {
     const items = [
       ["Total accounts", summary.total || 0, ""],
@@ -1075,6 +1101,7 @@
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
       renderSettings(serviceState);
       renderSummary(serviceState.summary || {});
+      renderQuotaCapacity(serviceState.quotaCapacity);
       renderThroughput(serviceState.throughput);
       renderCacheWindow(serviceState.promptCacheWindow);
       renderAccounts(state.data.accounts, healthByID);
@@ -1105,6 +1132,7 @@
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
       const accounts = body.dashboard.accounts || [];
       renderSummary(body.dashboard.summary || {}, true);
+      renderQuotaCapacity(body.dashboard.quotaCapacity);
       renderThroughput(body.dashboard.throughput);
       renderCacheWindow(body.dashboard.promptCacheWindow);
       renderPublicAccounts(accounts);

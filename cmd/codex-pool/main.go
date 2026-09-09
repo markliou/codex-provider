@@ -2491,7 +2491,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now), "quotaCapacity": a.quotaCapacityLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -2514,7 +2514,7 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 	// monitor normal traffic without entering management mode. Keep this limited
 	// to aggregate rolling windows: per-account throughput, raw buckets, model
 	// attribution, and request-level routing events remain management-only.
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now)}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "quotaCapacity": a.quotaCapacityLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now)}})
 }
 
 func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) {
@@ -7924,6 +7924,83 @@ func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 	}
 	return result
 }
+
+// quotaCapacityWindow aggregates one reported window duration across the pool.
+type quotaCapacityWindow struct {
+	Label             string  `json:"label"`
+	WindowMinutes     int64   `json:"windowMinutes"`
+	RemainingPercent  float64 `json:"remainingPercent"`
+	ReportingAccounts int     `json:"reportingAccounts"`
+	ExhaustedAccounts int     `json:"exhaustedAccounts"`
+}
+
+// quotaCapacityLocked summarises how much of each reported quota window the pool
+// still holds, so an operator with many credentials can see at a glance whether
+// the short window or the long one is the constraint without reading every row.
+//
+// Only routable slots are counted: an out-of-pool slot is not capacity this pool
+// can spend, and a duplicate slot shares one upstream workspace with its primary,
+// so counting both would report that workspace's quota twice.
+//
+// The reported figure is the mean remaining percentage across the slots that
+// report the window, not a sum. Percentages from different plans describe
+// different absolute allowances, so they can be averaged into "how full the pool
+// is" but must never be added into a single larger total.
+func (a *app) quotaCapacityLocked(now time.Time) []quotaCapacityWindow {
+	type bucket struct {
+		total     float64
+		reporting int
+		exhausted int
+	}
+	buckets := map[int64]*bucket{}
+	for _, item := range a.config.Accounts {
+		if !item.Enabled || !item.InPool {
+			continue
+		}
+		if primary := a.duplicateUpstreamAccountPrimaryLocked(item, now); primary != "" {
+			continue
+		}
+		snapshot := a.state.Quotas[item.ID]
+		if snapshot.Quota == nil {
+			continue
+		}
+		for _, window := range quotaReportedWindows(*snapshot.Quota) {
+			if !window.Present || window.WindowMinutes == nil || *window.WindowMinutes <= 0 {
+				continue
+			}
+			entry := buckets[*window.WindowMinutes]
+			if entry == nil {
+				entry = &bucket{}
+				buckets[*window.WindowMinutes] = entry
+			}
+			remaining := quotaWindowRemaining(window)
+			entry.total += remaining
+			entry.reporting++
+			if remaining <= 0 {
+				entry.exhausted++
+			}
+		}
+	}
+	result := make([]quotaCapacityWindow, 0, len(buckets))
+	for minutes, entry := range buckets {
+		if entry.reporting == 0 {
+			continue
+		}
+		value := minutes
+		result = append(result, quotaCapacityWindow{
+			Label:             quotaWindowLabel(&value),
+			WindowMinutes:     minutes,
+			RemainingPercent:  entry.total / float64(entry.reporting),
+			ReportingAccounts: entry.reporting,
+			ExhaustedAccounts: entry.exhausted,
+		})
+	}
+	// Shortest window first so the burst limit reads before the budget, matching
+	// the order the per-account rows already use.
+	sort.SliceStable(result, func(i, j int) bool { return result[i].WindowMinutes < result[j].WindowMinutes })
+	return result
+}
+
 func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
 	// These raw status counts plus the unavailable roll-up are the source of
 	// truth for the cards above the account table. Keep standby and duplicate
