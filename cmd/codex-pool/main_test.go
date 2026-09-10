@@ -7440,6 +7440,17 @@ func TestCapacityRetryScheduleIsEnvTunable(t *testing.T) {
 	if err := applyCapacityRetryEnv(); err == nil {
 		t.Fatal("a negative retry limit was accepted")
 	}
+
+	// A millisecond count too large to convert would overflow into a negative
+	// duration, firing the timer at once and disabling the wait it configures.
+	t.Setenv("CODEX_POOL_CAPACITY_RETRY_LIMIT", "3")
+	t.Setenv("CODEX_POOL_CAPACITY_RETRY_BACKOFF_MS", "9223372036854775807")
+	if err := applyCapacityRetryEnv(); err == nil {
+		t.Fatal("an unrepresentable millisecond count was accepted")
+	}
+	if streamingCapacityRetryBackoff <= 0 {
+		t.Fatalf("a rejected setting corrupted the schedule: backoff=%s", streamingCapacityRetryBackoff)
+	}
 }
 
 func TestRequestSpecificStreamingFailureDoesNotPenalizeAccount(t *testing.T) {

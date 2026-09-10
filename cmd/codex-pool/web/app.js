@@ -558,6 +558,13 @@
       const reporting = Number(window.reportingAccounts) || 0;
       const exhausted = Number(window.exhaustedAccounts) || 0;
       const uncapped = Number(window.uncappedAccounts) || 0;
+      // Fall back to the two parts only when the field is genuinely absent. A
+      // reported zero is a real denominator, and treating it as missing because
+      // zero is falsy would replace it with a different number.
+      const reportedRoutable = Number(window.routableAccounts);
+      const routable = Number.isFinite(reportedRoutable) && window.routableAccounts !== null && window.routableAccounts !== undefined
+        ? reportedRoutable
+        : reporting + uncapped;
       // The percentage describes only the slots this window constrains, so give
       // both the numerator and the routable denominator, and name the uncapped
       // slots on their own line. A bare "3 accounts" leaves an uneven pair of
