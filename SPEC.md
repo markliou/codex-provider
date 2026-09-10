@@ -1826,10 +1826,16 @@ For streaming responses:
 - Before the first client-visible byte, Pool may buffer only a bounded
   lifecycle-only preamble consisting of `response.created`,
   `response.in_progress`, `response.queued`, a bare `error` event, and SSE
-  keepalive/reconnection metadata. The buffer is limited to 64 KiB and eight
-  complete SSE blocks. Reaching either limit, receiving an unknown event/data
-  block, or receiving any output, reasoning, tool, hosted-tool, or other
-  semantic event commits the buffered prefix immediately.
+  keepalive/reconnection metadata. The buffer is limited to 64 KiB and 64
+  complete lifecycle SSE blocks. Keepalive comments and reconnection metadata
+  count toward the byte limit but never toward the block limit, because they
+  carry no upstream state and must not spend the budget that keeps the retry
+  window open. Reaching either limit, receiving an unknown event/data block, or
+  receiving any output, reasoning, tool, hosted-tool, or other semantic event
+  commits the buffered prefix immediately. The block limit must stay well above
+  the number of lifecycle events upstream sends while a request waits for
+  capacity; when it does not, the window closes on its own bound before the
+  terminal failure arrives and the retry contract below becomes unreachable.
 - A bare `error` event is buffered rather than committed because the Codex
   backend emits it immediately before the `response.failed` that classifies the
   refusal. Committing on the `error` event would close the retry window one
@@ -1876,11 +1882,13 @@ For streaming responses:
 - The routing event records whether the pre-commit window was still open when
   the stream ended (`precommitCommitted`) and, when it had closed, the SSE event
   type that closed it or `bounds` for the size/block limits
-  (`precommitCloseReason`). A committed stream can never be retried, so without
-  these two fields a terminal capacity failure that was never eligible for retry
-  is indistinguishable in diagnostics from one that had no eligible fallback.
-  Both are bounded operational metadata: an event type or `bounds`, never
-  upstream payload text.
+  (`precommitCloseReason`), together with how many lifecycle blocks the window
+  held when it closed (`precommitBlocks`). A committed stream can never be
+  retried, so without these fields a terminal capacity failure that was never
+  eligible for retry is indistinguishable in diagnostics from one that had no
+  eligible fallback, and a `bounds` closure is indistinguishable from a bound set
+  too low. All are bounded operational metadata: an event type, `bounds`, or a
+  count, never upstream payload text.
 - Once any SSE bytes are committed downstream, never retry another account or
   splice a second response stream. In particular, never retry after any output,
   reasoning, tool, hosted-tool, unknown semantic event, or a preamble forced to
