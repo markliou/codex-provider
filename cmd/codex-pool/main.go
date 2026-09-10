@@ -132,8 +132,15 @@ const (
 	// identity is eligible, the same account is retried this many times behind a
 	// linear backoff before the upstream refusal is forwarded, so a pool with no
 	// spare identity does not surface "model is at capacity" on first refusal.
-	streamingCapacityRetryLimit   = 2
-	streamingCapacityRetryBackoff = 250 * time.Millisecond
+	// A capacity refusal is a transient upstream condition that clears on the
+	// order of seconds, not milliseconds. The previous budget of two retries a
+	// quarter second apart gave up after well under a second, so a pool whose
+	// identities all refused surfaced the refusal without ever waiting for the
+	// blip to pass. The schedule below doubles from one second to a fifteen
+	// second cap, roughly thirty seconds across the whole budget, and is only
+	// ever paid when no identity can serve: a pool with a healthy backup fails
+	// over before reaching it and waits for nothing.
+	streamingCapacityRetryLimit = 5
 	// Codex treats remote model metadata as authoritative for ChatGPT-backed
 	// providers. This fallback must remain non-empty or a schema-only fix would
 	// silently remove the coding-agent instructions after a successful refresh.
@@ -1487,6 +1494,10 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	failoverFromAccountID := ""
 	failoverOutcome := ""
 	excluded := map[string]bool{}
+	// capacityExcluded is the subset of excluded that refused for capacity alone.
+	// Only those may be restored for a later round; an auth or transport failure
+	// is not transient and must stay excluded.
+	capacityExcluded := map[string]bool{}
 	capacityRetries := 0
 	attemptLimit := a.proxyAttemptLimit()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
@@ -1604,6 +1615,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			info = result.Info
 			if result.RetryableCapacityFailure {
 				excluded[candidate.ID] = true
+				capacityExcluded[candidate.ID] = true
 				// The buffered prefix has not changed the client-visible
 				// response. Retry only when another real routing candidate and
 				// another configured attempt remain; otherwise preserve the
@@ -1630,17 +1642,33 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 				// pool (attemptLimit 1) could never retry at all.
 				if capacityRetries < streamingCapacityRetryLimit {
 					capacityRetries++
-					delete(excluded, candidate.ID)
 					_ = response.Body.Close()
 					// Deliberately no cooldown: cooling the account down here would
 					// make it unselectable for its own retry and strand the request
 					// on an empty pool.
 					a.markRetryableTerminalResponseFailure(candidate.ID, model, info, false)
-					if !sleepForRetry(r.Context(), time.Duration(capacityRetries)*streamingCapacityRetryBackoff) {
+					// Restore every identity that refused for capacity, not only the
+					// one tried last. After a wait the best identity is often one
+					// that refused earlier, and leaving the others excluded would pin
+					// the whole remaining budget on a single account.
+					restored := 0
+					for id := range capacityExcluded {
+						if excluded[id] {
+							delete(excluded, id)
+							restored++
+						}
+					}
+					a.clearCapacityCooldowns(capacityExcluded, model)
+					capacityExcluded = map[string]bool{}
+					if !sleepForRetry(r.Context(), capacityRetryBackoff(capacityRetries)) {
 						throughput.Cancelled = true
 						return
 					}
-					attempt--
+					// Give back the attempts this capacity round consumed. The retry
+					// budget is bounded on its own, and charging the account-attempt
+					// budget as well would let a pool run out of attempts while it is
+					// still waiting for the blip to clear.
+					attempt -= restored
 					continue
 				}
 				a.addCurrentAccountResponseHeaders(w, candidate.ID)
@@ -2150,6 +2178,32 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 // sleepForRetry waits out an in-request backoff. It reports false when the
 // request context finished first so the caller abandons the retry instead of
 // spending upstream capacity on a caller that already gave up.
+// Retry pacing is a variable, not a constant, so tests can exercise the full
+// retry budget without sleeping through it. Production never reassigns these.
+var (
+	streamingCapacityRetryBackoff = time.Second
+	streamingCapacityRetryMaxWait = 15 * time.Second
+)
+
+// capacityRetryBackoff doubles each round up to a cap, so an early blip costs a
+// second while a sustained refusal is not retried in a tight loop.
+func capacityRetryBackoff(round int) time.Duration {
+	if round < 1 {
+		round = 1
+	}
+	delay := streamingCapacityRetryBackoff
+	for i := 1; i < round; i++ {
+		if delay >= streamingCapacityRetryMaxWait {
+			break
+		}
+		delay *= 2
+	}
+	if delay > streamingCapacityRetryMaxWait {
+		delay = streamingCapacityRetryMaxWait
+	}
+	return delay
+}
+
 func sleepForRetry(ctx context.Context, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -4142,6 +4196,50 @@ func (a *app) markSuccess(route routingDecision, model, accountID string, info p
 // coolDown must be false when the caller intends to retry this same account
 // inside the current request: a cooldown would remove it from selection and the
 // retry could never be routed back to it.
+// clearCapacityCooldowns drops the cooldowns a capacity refusal placed on these
+// accounts for one model. A capacity round only reaches this point once every
+// identity has refused, and it has since waited; the cooldowns were recorded to
+// steer traffic away during the blip, so continuing to honour them would keep
+// the pool pinned to whichever account happened not to be cooled and starve the
+// identities that may already have recovered. Only capacity reasons are
+// cleared, so an auth or quota cooldown still stands.
+func (a *app) clearCapacityCooldowns(accountIDs map[string]bool, model string) {
+	if len(accountIDs) == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	changed := false
+	for accountID := range accountIDs {
+		entries := a.state.Cooldowns[accountID]
+		kept := entries[:0]
+		for _, entry := range entries {
+			if entry.ModelID == model && capacityCooldownReason(entry.Reason) {
+				changed = true
+				continue
+			}
+			kept = append(kept, entry)
+		}
+		if len(kept) == 0 {
+			delete(a.state.Cooldowns, accountID)
+			continue
+		}
+		a.state.Cooldowns[accountID] = kept
+	}
+	if changed {
+		_ = a.saveLocked()
+	}
+}
+
+func capacityCooldownReason(reason string) bool {
+	switch reason {
+	case "server_is_overloaded", "slow_down", "upstream_5xx":
+		return true
+	default:
+		return false
+	}
+}
+
 func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info proxyResponseInfo, coolDown bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

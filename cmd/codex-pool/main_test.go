@@ -23,6 +23,13 @@ import (
 
 func testApp(t *testing.T, accounts []account) *app {
 	t.Helper()
+	// Capacity retries wait seconds in production. Tests exercise the full budget,
+	// so pace it down rather than sleeping through half a minute per case.
+	oldBackoff, oldMax := streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait
+	streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait = time.Millisecond, 4*time.Millisecond
+	t.Cleanup(func() {
+		streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait = oldBackoff, oldMax
+	})
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
 		t.Fatal(err)
@@ -7314,6 +7321,76 @@ func TestNamedKeepaliveEventsKeepTheRetryWindowOpen(t *testing.T) {
 	}
 	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].PrecommitCloseReason == "keepalive" {
 		t.Fatalf("keepalive event still recorded as the close reason: %#v", a.state.RoutingCacheEvents)
+	}
+}
+
+// The backoff must escalate and cap, so an early blip costs about a second while
+// a sustained refusal is not retried in a tight loop.
+func TestCapacityRetryBackoffEscalatesToACap(t *testing.T) {
+	oldBackoff, oldMax := streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait
+	streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait = time.Second, 15*time.Second
+	defer func() { streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait = oldBackoff, oldMax }()
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second}
+	for round, expected := range want {
+		if got := capacityRetryBackoff(round + 1); got != expected {
+			t.Fatalf("round %d backoff = %s, want %s", round+1, got, expected)
+		}
+	}
+	// Past the budget the cap holds, and a nonsense round is treated as the first.
+	if got := capacityRetryBackoff(0); got != time.Second {
+		t.Fatalf("round 0 backoff = %s, want the first delay", got)
+	}
+	if got := capacityRetryBackoff(99); got != 15*time.Second {
+		t.Fatalf("late round backoff = %s, want the cap", got)
+	}
+}
+
+// After a wait, every identity that refused for capacity must be tried again,
+// not just the last one. Otherwise the whole remaining budget is spent on one
+// account while the identity that recovered first sits excluded.
+func TestCapacityRetryRestoresEveryRefusedIdentity(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	capacity := func(id string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			mu.Lock()
+			hits[id]++
+			count := hits[id]
+			mu.Unlock()
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_x\"}}\n\n")
+			// The first account recovers only on its second visit, which it can
+			// never get if a retry round leaves it excluded.
+			if id == "first" && count >= 2 {
+				_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+				_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_x\"}}\n\n")
+				return
+			}
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+		}
+	}
+	first := httptest.NewServer(capacity("first"))
+	defer first.Close()
+	second := httptest.NewServer(capacity("second"))
+	defer second.Close()
+
+	a := testApp(t, []account{
+		{ID: "first", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL},
+		{ID: "second", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: second.URL},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("a recovered identity was never retried: hits=%v body=%s", hits, recorder.Body.String())
+	}
+	if hits["first"] < 2 {
+		t.Fatalf("the first identity was not revisited after the wait: hits=%v", hits)
+	}
+	if strings.Contains(recorder.Body.String(), "server_is_overloaded") {
+		t.Fatalf("an abandoned capacity prefix leaked downstream: %s", recorder.Body.String())
 	}
 }
 

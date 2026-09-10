@@ -1872,14 +1872,22 @@ For streaming responses:
   failure/cooldown counters but does not create a client failure, sticky/thread
   binding, response binding, or request-level throughput result. The eventual
   successful response is classified as `stream_capacity_failover`.
-- If no distinct fallback is available, the same account is retried in place
-  behind a short linear backoff, up to a bounded retry budget, before the
-  refusal is surfaced. Upstream capacity is a transient model-level condition
+- If no distinct fallback is available, the pool waits and sweeps again rather
+  than surfacing the refusal. Each round restores every identity that refused
+  for capacity, clears the capacity cooldowns those refusals recorded for this
+  model, and waits a backoff that doubles from one second to a fifteen second
+  cap across a bounded retry budget. Restoring only the last account tried, or
+  honouring cooldowns recorded moments earlier, would pin the remaining budget
+  on whichever account happened not to be cooled and starve identities that may
+  already have recovered. Cooldowns recorded for any other reason still stand.
+  A capacity refusal is transient on the order of seconds, so a budget measured
+  in milliseconds gives up before the condition can clear. Upstream capacity is a transient model-level condition
   rather than proof that the account is unhealthy, and nothing client-visible
   has been written yet. These in-place retries must not set a cooldown on the
   account being retried, or it would become unselectable for its own retry, and
-  they must not consume the per-account attempt budget, or a single-account pool
-  could never retry. Each failed upstream attempt still counts as an upstream
+  they must not consume the per-account attempt budget: a round returns the
+  attempts it spent, or a pool would exhaust its attempts while still waiting for
+  the blip to clear, and a single-account pool could never retry at all. Each failed upstream attempt still counts as an upstream
   failure. A pool that still has a distinct eligible identity fails over instead
   and must not pay this backoff.
 - Once that retry budget is spent, preserve and forward the original buffered
