@@ -2247,8 +2247,8 @@ the page must roll up how much of each reported quota window the pool still
 holds, so an operator running many credentials can see whether the short window
 or the long one is the constraint without reading every row. One entry per
 reported window duration, ordered shortest first, each showing remaining
-headroom, how many accounts that window constrains, and how many of them are
-exhausted. Headroom is shown to one decimal place, the finest reading the
+headroom, how many accounts that window constrains out of the routable total,
+and how many of them are exhausted. Headroom is shown to one decimal place, the finest reading the
 underlying whole-percent windows support.
 
 A routable slot that reports no entry for a window is not missing data: no limit

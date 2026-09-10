@@ -558,11 +558,13 @@
       const reporting = Number(window.reportingAccounts) || 0;
       const exhausted = Number(window.exhaustedAccounts) || 0;
       const uncapped = Number(window.uncappedAccounts) || 0;
-      // The percentage describes only the slots this window constrains. Say so,
-      // and name the uncapped slots on their own line: a pool whose capped slots
-      // are spent can still have an uncapped slot able to serve immediately, and
-      // a reader who cannot see that reads the low average as the whole story.
-      const note = `avg of ${reporting} ${reporting === 1 ? "account" : "accounts"} with a ${escapeHTML(label)} limit${exhausted ? ` · ${exhausted} exhausted` : ""}`;
+      // The percentage describes only the slots this window constrains, so give
+      // both the numerator and the routable denominator, and name the uncapped
+      // slots on their own line. A bare "3 accounts" leaves an uneven pair of
+      // window counts looking like missing data, and a pool whose capped slots
+      // are spent can still have an uncapped slot able to serve immediately,
+      // which a reader who cannot see it reads as the whole story.
+      const note = `average across ${reporting} of ${routable} ${routable === 1 ? "account" : "accounts"} with a ${escapeHTML(label)} limit${exhausted ? ` · ${exhausted} exhausted` : ""}`;
       const free = uncapped
         ? `<span class="capacity-note capacity-free">${uncapped} ${uncapped === 1 ? "account has" : "accounts have"} no ${escapeHTML(label)} limit</span>`
         : "";
