@@ -112,15 +112,38 @@ const (
 	// an upstream capacity rejection can be retried before anything becomes
 	// client-visible. These hard bounds prevent a changed or malformed upstream
 	// event sequence from turning pre-commit failover into general buffering.
-	streamingPrecommitMaxBytes  = 64 << 10
-	streamingPrecommitMaxBlocks = 8
+	// streamingPrecommitMaxBytes is the fixed part of the pre-commit byte bound.
+	// The effective bound is this plus the inbound request size, see
+	// precommitByteLimit: the first lifecycle event echoes the request back
+	// (instructions, tool definitions, input), so a bound that ignores request
+	// size closes the retry window on the very first block for any large
+	// context. That is exactly what happened in production. The first stream
+	// recorded after depth accounting was added closed on "bounds" holding a
+	// single block, so the byte bound, not the block bound, was shutting the
+	// window, and "bounds" had been closing 44% of all streams.
+	streamingPrecommitMaxBytes = 64 << 10
+	// streamingPrecommitMaxBlocks bounds how many lifecycle blocks may be held
+	// before the stream commits. Only event-bearing lifecycle blocks count, each a
+	// few hundred bytes, so this is a sanity limit on upstream verbosity rather
+	// than the memory guard; the byte bound is that.
+	streamingPrecommitMaxBlocks = 64
 	// An upstream capacity rejection is transient model-level overload, not
 	// proof that the selected account is unhealthy. When no other upstream
 	// identity is eligible, the same account is retried this many times behind a
 	// linear backoff before the upstream refusal is forwarded, so a pool with no
 	// spare identity does not surface "model is at capacity" on first refusal.
-	streamingCapacityRetryLimit   = 2
-	streamingCapacityRetryBackoff = 250 * time.Millisecond
+	// A capacity refusal is a transient upstream condition that clears on the
+	// order of seconds, not milliseconds. The previous budget of two retries a
+	// quarter second apart gave up after well under a second, so a pool whose
+	// identities all refused surfaced the refusal without ever waiting for the
+	// blip to pass. The schedule below doubles from one second to a fifteen
+	// second cap, roughly thirty seconds across the whole budget, and is only
+	// ever paid when no identity can serve: a pool with a healthy backup fails
+	// over before reaching it and waits for nothing.
+	streamingCapacityRetryLimit = 5
+	// precommitRequestEchoFactor is how many times the inbound request the
+	// buffered preamble is allowed to reach before the window commits.
+	precommitRequestEchoFactor = 4
 	// Codex treats remote model metadata as authoritative for ChatGPT-backed
 	// providers. This fallback must remain non-empty or a schema-only fix would
 	// silently remove the coding-agent instructions after a successful refresh.
@@ -415,6 +438,8 @@ type routingCacheEvent struct {
 	// a terminal capacity failure was eligible for retry at all.
 	PrecommitCommitted    bool     `json:"precommitCommitted,omitempty"`
 	PrecommitCloseReason  string   `json:"precommitCloseReason,omitempty"`
+	PrecommitBlocks       int      `json:"precommitBlocks,omitempty"`
+	PrecommitBytes        int      `json:"precommitBytes,omitempty"`
 	ParentAffinity        string   `json:"parentAffinity"`
 	FailoverFromAccountID string   `json:"failoverFromAccountId,omitempty"`
 	UsageObserved         bool     `json:"usageObserved"`
@@ -1472,6 +1497,10 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	failoverFromAccountID := ""
 	failoverOutcome := ""
 	excluded := map[string]bool{}
+	// capacityExcluded is the subset of excluded that refused for capacity alone.
+	// Only those may be restored for a later round; an auth or transport failure
+	// is not transient and must stay excluded.
+	capacityExcluded := map[string]bool{}
 	capacityRetries := 0
 	attemptLimit := a.proxyAttemptLimit()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
@@ -1582,13 +1611,14 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		var info proxyResponseInfo
 		ok := true
 		if !convertResponse && isStreamingProxyResponse(response) {
-			result := copyStreamingProxyResponseWithPrecommit(w, response.Body, func() {
+			result := copyStreamingProxyResponseWithPrecommit(w, response.Body, precommitByteLimit(len(body)), func() {
 				a.addCurrentAccountResponseHeaders(w, candidate.ID)
 				commitProxyResponseHeaders(w, response)
 			})
 			info = result.Info
 			if result.RetryableCapacityFailure {
 				excluded[candidate.ID] = true
+				capacityExcluded[candidate.ID] = true
 				// The buffered prefix has not changed the client-visible
 				// response. Retry only when another real routing candidate and
 				// another configured attempt remain; otherwise preserve the
@@ -1615,17 +1645,33 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 				// pool (attemptLimit 1) could never retry at all.
 				if capacityRetries < streamingCapacityRetryLimit {
 					capacityRetries++
-					delete(excluded, candidate.ID)
 					_ = response.Body.Close()
 					// Deliberately no cooldown: cooling the account down here would
 					// make it unselectable for its own retry and strand the request
 					// on an empty pool.
 					a.markRetryableTerminalResponseFailure(candidate.ID, model, info, false)
-					if !sleepForRetry(r.Context(), time.Duration(capacityRetries)*streamingCapacityRetryBackoff) {
+					// Restore every identity that refused for capacity, not only the
+					// one tried last. After a wait the best identity is often one
+					// that refused earlier, and leaving the others excluded would pin
+					// the whole remaining budget on a single account.
+					restored := 0
+					for id := range capacityExcluded {
+						if excluded[id] {
+							delete(excluded, id)
+							restored++
+						}
+					}
+					a.clearCapacityCooldowns(capacityExcluded, model)
+					capacityExcluded = map[string]bool{}
+					if !sleepForRetry(r.Context(), capacityRetryBackoff(capacityRetries)) {
 						throughput.Cancelled = true
 						return
 					}
-					attempt--
+					// Give back the attempts this capacity round consumed. The retry
+					// budget is bounded on its own, and charging the account-attempt
+					// budget as well would let a pool run out of attempts while it is
+					// still waiting for the blip to clear.
+					attempt -= restored
 					continue
 				}
 				a.addCurrentAccountResponseHeaders(w, candidate.ID)
@@ -1863,6 +1909,12 @@ type proxyResponseInfo struct {
 	// closed it. Streaming responses only; other paths leave them zero.
 	PrecommitCommitted   bool
 	PrecommitCloseReason string
+	// PrecommitBlocks and PrecommitBytes are how much the window held when it
+	// closed. Without them a bounds closure cannot be told apart from a bound
+	// set too low, nor the block bound from the byte bound; misreading exactly
+	// that is what these fields exist to prevent.
+	PrecommitBlocks int
+	PrecommitBytes  int
 }
 
 type streamingProxyResult struct {
@@ -2007,8 +2059,31 @@ func copyProxyResponse(w http.ResponseWriter, response *http.Response) (proxyRes
 	return info, true
 }
 
+// precommitByteLimit sizes the pre-commit buffer for one request. Upstream's
+// first lifecycle event carries the request back (instructions, tools, input),
+// so the buffered prefix legitimately scales with what the client sent, and the
+// client's own payload is already held in memory for the whole attempt. A fixed
+// margin on top covers response scaffolding and the lifecycle events that
+// follow while a request waits for capacity.
+func precommitByteLimit(requestBytes int) int {
+	if requestBytes < 0 {
+		requestBytes = 0
+	}
+	// Upstream does not echo the request verbatim: it expands tool schemas and
+	// injects instructions, so the created event runs several times the size of
+	// what was sent. A one-to-one margin was still too tight and production tripped
+	// it at 783 KB on two blocks, closing the retry window on a subagent request.
+	// Scale by a multiple and keep an absolute ceiling, so the buffer stays the
+	// same order as the request body already held for the attempt.
+	limit := streamingPrecommitMaxBytes + requestBytes*precommitRequestEchoFactor
+	if limit > maxRequestBody || limit < 0 {
+		return maxRequestBody
+	}
+	return limit
+}
+
 func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResponseInfo {
-	result := copyStreamingProxyResponseWithPrecommit(w, body, nil)
+	result := copyStreamingProxyResponseWithPrecommit(w, body, precommitByteLimit(0), nil)
 	if result.RetryableCapacityFailure {
 		// This compatibility wrapper is used only after callers have already
 		// committed headers. It must preserve the upstream failure verbatim;
@@ -2018,7 +2093,7 @@ func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResp
 	return result.Info
 }
 
-func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Reader, beforeCommit func()) streamingProxyResult {
+func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Reader, maxBytes int, beforeCommit func()) streamingProxyResult {
 	var info proxyResponseInfo
 	reader := bufio.NewReader(body)
 	var buffered strings.Builder
@@ -2046,8 +2121,14 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 				writeStreamingBytes(w, []byte(block))
 			} else {
 				buffered.WriteString(block)
-				bufferedBlocks++
-				withinBounds := buffered.Len() <= streamingPrecommitMaxBytes && bufferedBlocks <= streamingPrecommitMaxBlocks
+				// Keepalive comments and reconnection metadata carry no upstream
+				// state, so they must not spend the block budget that exists to
+				// keep the retry window open. They still count toward the byte
+				// bound, which is the guard that actually caps memory.
+				if precommitCountsTowardBlockBound(block) {
+					bufferedBlocks++
+				}
+				withinBounds := buffered.Len() <= maxBytes && bufferedBlocks <= streamingPrecommitMaxBlocks
 				if next.TerminalEvent == "response.failed" && next.TerminalFailureClass == "capacity" && withinBounds {
 					// No headers, lifecycle event, response id, model output, or
 					// tool activity has reached the client. Return the exact
@@ -2066,6 +2147,8 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 					// is the only signal that separates "no eligible fallback" from "the
 					// retry window was already shut".
 					if info.PrecommitCloseReason == "" {
+						info.PrecommitBlocks = bufferedBlocks
+						info.PrecommitBytes = buffered.Len()
 						if !withinBounds {
 							info.PrecommitCloseReason = "bounds"
 						} else if eventType := responseEventTypeFromSSEBlock(block); eventType != "" {
@@ -2108,6 +2191,32 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 // sleepForRetry waits out an in-request backoff. It reports false when the
 // request context finished first so the caller abandons the retry instead of
 // spending upstream capacity on a caller that already gave up.
+// Retry pacing is a variable, not a constant, so tests can exercise the full
+// retry budget without sleeping through it. Production never reassigns these.
+var (
+	streamingCapacityRetryBackoff = time.Second
+	streamingCapacityRetryMaxWait = 15 * time.Second
+)
+
+// capacityRetryBackoff doubles each round up to a cap, so an early blip costs a
+// second while a sustained refusal is not retried in a tight loop.
+func capacityRetryBackoff(round int) time.Duration {
+	if round < 1 {
+		round = 1
+	}
+	delay := streamingCapacityRetryBackoff
+	for i := 1; i < round; i++ {
+		if delay >= streamingCapacityRetryMaxWait {
+			break
+		}
+		delay *= 2
+	}
+	if delay > streamingCapacityRetryMaxWait {
+		delay = streamingCapacityRetryMaxWait
+	}
+	return delay
+}
+
 func sleepForRetry(ctx context.Context, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -2144,9 +2253,29 @@ func readSSEBlock(reader *bufio.Reader) (string, error) {
 	}
 }
 
+// precommitCountsTowardBlockBound reports whether a buffered block spends the
+// block budget. Only blocks that carry response state do; comments and named
+// keepalive events exist to hold a waiting connection open and say nothing
+// about the response, so a long wait for capacity must not exhaust the budget
+// that keeps the retry window open. Bytes are still counted for every block.
+func precommitCountsTowardBlockBound(block string) bool {
+	switch responseEventTypeFromSSEBlock(block) {
+	case "", "keepalive", "ping":
+		return false
+	default:
+		return true
+	}
+}
+
 func precommitLifecycleSSEBlock(block string) bool {
 	switch responseEventTypeFromSSEBlock(block) {
 	case "response.created", "response.in_progress", "response.queued":
+		return true
+	case "keepalive", "ping":
+		// Upstream keeps a waiting stream alive with named events, not only SSE
+		// comments. They carry no response state, and treating one as unknown
+		// committed the stream three blocks in, so the capacity failure behind it
+		// was forwarded verbatim instead of retried.
 		return true
 	case "error":
 		// The Codex backend announces a refusal as a bare `error` event and only
@@ -2491,7 +2620,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now), "quotaCapacity": a.quotaCapacityLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -2514,7 +2643,7 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 	// monitor normal traffic without entering management mode. Keep this limited
 	// to aggregate rolling windows: per-account throughput, raw buckets, model
 	// attribution, and request-level routing events remain management-only.
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now)}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "quotaCapacity": a.quotaCapacityLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now)}})
 }
 
 func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) {
@@ -3696,6 +3825,9 @@ func (a *app) usableLocked(item account, model string, now time.Time) bool {
 	if !a.quotaAvailableLocked(item, model, now) {
 		return false
 	}
+	if !a.modelMeterAllowsLocked(item, model) {
+		return false
+	}
 	if isCodexDeviceAuth(item) {
 		if _, err := a.codexAuth(item); err != nil {
 			return false
@@ -4077,6 +4209,50 @@ func (a *app) markSuccess(route routingDecision, model, accountID string, info p
 // coolDown must be false when the caller intends to retry this same account
 // inside the current request: a cooldown would remove it from selection and the
 // retry could never be routed back to it.
+// clearCapacityCooldowns drops the cooldowns a capacity refusal placed on these
+// accounts for one model. A capacity round only reaches this point once every
+// identity has refused, and it has since waited; the cooldowns were recorded to
+// steer traffic away during the blip, so continuing to honour them would keep
+// the pool pinned to whichever account happened not to be cooled and starve the
+// identities that may already have recovered. Only capacity reasons are
+// cleared, so an auth or quota cooldown still stands.
+func (a *app) clearCapacityCooldowns(accountIDs map[string]bool, model string) {
+	if len(accountIDs) == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	changed := false
+	for accountID := range accountIDs {
+		entries := a.state.Cooldowns[accountID]
+		kept := entries[:0]
+		for _, entry := range entries {
+			if entry.ModelID == model && capacityCooldownReason(entry.Reason) {
+				changed = true
+				continue
+			}
+			kept = append(kept, entry)
+		}
+		if len(kept) == 0 {
+			delete(a.state.Cooldowns, accountID)
+			continue
+		}
+		a.state.Cooldowns[accountID] = kept
+	}
+	if changed {
+		_ = a.saveLocked()
+	}
+}
+
+func capacityCooldownReason(reason string) bool {
+	switch reason {
+	case "server_is_overloaded", "slow_down", "upstream_5xx":
+		return true
+	default:
+		return false
+	}
+}
+
 func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info proxyResponseInfo, coolDown bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -4393,6 +4569,8 @@ func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accoun
 		TerminalErrorCode:     sanitizedErrorCode(info.TerminalErrorCode),
 		PrecommitCommitted:    info.PrecommitCommitted,
 		PrecommitCloseReason:  info.PrecommitCloseReason,
+		PrecommitBlocks:       info.PrecommitBlocks,
+		PrecommitBytes:        info.PrecommitBytes,
 		ParentAffinity:        parentAffinity,
 		FailoverFromAccountID: failoverFromAccountID,
 		UsageObserved:         usage.Present,
@@ -7004,6 +7182,61 @@ func quotaWindowEvidenceActive(window quotaWindow, now time.Time) bool {
 	return now.Unix() < *window.ResetAt
 }
 
+// additionalLimitNamesModel reports whether a per-model meter describes exactly
+// the requested model. Upstream identifies these meters by an internal codename
+// in the id, such as codex_bengalfox, and puts the model in the display name, so
+// matching the id alone silently ignores every meter upstream actually sends.
+// Both sides are compared as sanitized tokens, and a meter that names anything
+// other than this model stays display metadata.
+func additionalLimitNamesModel(limit quotaLimit, model string) bool {
+	model = cleanMetadataToken(model)
+	if model == "" {
+		return false
+	}
+	return cleanMetadataToken(limit.LimitID) == model || cleanMetadataToken(limit.LimitName) == model
+}
+
+// accountMetersModelLocked reports whether upstream currently tells this account
+// it holds a meter for exactly this model.
+func (a *app) accountMetersModelLocked(accountID, model string) bool {
+	quota := a.state.Quotas[accountID].Quota
+	if quota == nil {
+		return false
+	}
+	for _, additional := range quota.AdditionalLimits {
+		if additionalLimitNamesModel(additional, model) {
+			return true
+		}
+	}
+	return false
+}
+
+// modelMeterAllowsLocked keeps a model-scoped entitlement on the accounts that
+// actually hold it. Some models are sold as a separate allowance on top of the
+// subscription, and upstream advertises that allowance as a per-model meter on
+// the accounts entitled to it. Routing such a model to an account without the
+// meter spends an attempt on a request upstream will refuse, while the entitled
+// account's allowance goes unused.
+//
+// The restriction only applies once some account reports the meter. A model no
+// account meters, which is every ordinary subscription model, is unrestricted,
+// and a pool whose quota refresh is failing everywhere reports no meters at all
+// and therefore falls back to plain selection rather than failing closed.
+func (a *app) modelMeterAllowsLocked(item account, model string) bool {
+	if a.accountMetersModelLocked(item.ID, model) {
+		return true
+	}
+	for _, candidate := range a.config.Accounts {
+		if candidate.ID == item.ID || !candidate.Enabled || !candidate.InPool {
+			continue
+		}
+		if a.accountMetersModelLocked(candidate.ID, model) {
+			return false
+		}
+	}
+	return true
+}
+
 func quotaExplicitlyBlocksRouting(quota accountQuota, model string, now time.Time) bool {
 	if quota.Exhausted {
 		return true
@@ -7014,10 +7247,10 @@ func quotaExplicitlyBlocksRouting(quota accountQuota, model string, now time.Tim
 		}
 	}
 	for _, additional := range quota.AdditionalLimits {
-		// Unknown/model-specific buckets are display metadata unless the limit id
-		// exactly names the requested model. Do not turn a new future meter into
-		// an account-wide authorization rule.
-		if additional.LimitID != model {
+		// Unknown/model-specific buckets are display metadata unless the meter
+		// names the requested model. Do not turn a new future meter into an
+		// account-wide authorization rule.
+		if !additionalLimitNamesModel(additional, model) {
 			continue
 		}
 		if additional.Exhausted {
@@ -7866,6 +8099,96 @@ func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 	}
 	return result
 }
+
+// quotaCapacityWindow aggregates one reported window duration across the pool.
+type quotaCapacityWindow struct {
+	Label            string  `json:"label"`
+	WindowMinutes    int64   `json:"windowMinutes"`
+	RemainingPercent float64 `json:"remainingPercent"`
+	// ReportingAccounts counts the slots this window actually constrains. The
+	// remainder is not missing data: a plan without a five-hour cap, such as Pro
+	// or a Business Premium seat, reports only its long window because no
+	// five-hour limit applies to it at all. Those slots are counted separately in
+	// UncappedAccounts rather than dropped, because a pool whose capped slots are
+	// spent can still have an uncapped slot able to serve immediately, and a
+	// roll-up that hides it reports far less short-term capacity than exists.
+	ReportingAccounts int `json:"reportingAccounts"`
+	RoutableAccounts  int `json:"routableAccounts"`
+	UncappedAccounts  int `json:"uncappedAccounts"`
+	ExhaustedAccounts int `json:"exhaustedAccounts"`
+}
+
+// quotaCapacityLocked summarises how much of each reported quota window the pool
+// still holds, so an operator with many credentials can see at a glance whether
+// the short window or the long one is the constraint without reading every row.
+//
+// Only routable slots are counted: an out-of-pool slot is not capacity this pool
+// can spend, and a duplicate slot shares one upstream workspace with its primary,
+// so counting both would report that workspace's quota twice.
+//
+// The reported figure is the mean remaining percentage across the slots that
+// report the window, not a sum. Percentages from different plans describe
+// different absolute allowances, so they can be averaged into "how full the pool
+// is" but must never be added into a single larger total.
+func (a *app) quotaCapacityLocked(now time.Time) []quotaCapacityWindow {
+	type bucket struct {
+		total     float64
+		reporting int
+		exhausted int
+	}
+	buckets := map[int64]*bucket{}
+	routable := 0
+	for _, item := range a.config.Accounts {
+		if !item.Enabled || !item.InPool {
+			continue
+		}
+		if primary := a.duplicateUpstreamAccountPrimaryLocked(item, now); primary != "" {
+			continue
+		}
+		snapshot := a.state.Quotas[item.ID]
+		if snapshot.Quota == nil {
+			continue
+		}
+		routable++
+		for _, window := range quotaReportedWindows(*snapshot.Quota) {
+			if !window.Present || window.WindowMinutes == nil || *window.WindowMinutes <= 0 {
+				continue
+			}
+			entry := buckets[*window.WindowMinutes]
+			if entry == nil {
+				entry = &bucket{}
+				buckets[*window.WindowMinutes] = entry
+			}
+			remaining := quotaWindowRemaining(window)
+			entry.total += remaining
+			entry.reporting++
+			if remaining <= 0 {
+				entry.exhausted++
+			}
+		}
+	}
+	result := make([]quotaCapacityWindow, 0, len(buckets))
+	for minutes, entry := range buckets {
+		if entry.reporting == 0 {
+			continue
+		}
+		value := minutes
+		result = append(result, quotaCapacityWindow{
+			Label:             quotaWindowLabel(&value),
+			WindowMinutes:     minutes,
+			RemainingPercent:  entry.total / float64(entry.reporting),
+			ReportingAccounts: entry.reporting,
+			RoutableAccounts:  routable,
+			UncappedAccounts:  routable - entry.reporting,
+			ExhaustedAccounts: entry.exhausted,
+		})
+	}
+	// Shortest window first so the burst limit reads before the budget, matching
+	// the order the per-account rows already use.
+	sort.SliceStable(result, func(i, j int) bool { return result[i].WindowMinutes < result[j].WindowMinutes })
+	return result
+}
+
 func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
 	// These raw status counts plus the unavailable roll-up are the source of
 	// truth for the cards above the account table. Keep standby and duplicate
@@ -7954,7 +8277,7 @@ func (a *app) routingCacheEventViewsLocked(now time.Time) []map[string]any {
 			"stickyKeyHash": event.StickyKeyHash, "promptCacheKeyHash": event.PromptCacheKeyHash,
 			"routingOutcome": event.RoutingOutcome, "routingSource": event.RoutingSource, "parentAffinity": event.ParentAffinity,
 			"terminalEvent": event.TerminalEvent, "terminalFailureClass": event.TerminalFailureClass, "terminalErrorCode": event.TerminalErrorCode,
-			"precommitCommitted": event.PrecommitCommitted, "precommitCloseReason": event.PrecommitCloseReason,
+			"precommitCommitted": event.PrecommitCommitted, "precommitCloseReason": event.PrecommitCloseReason, "precommitBlocks": event.PrecommitBlocks, "precommitBytes": event.PrecommitBytes,
 			"failoverFromAccountLabel": failoverFromLabel, "failoverFromAccountRef": operationalIdentifierHash("account", event.FailoverFromAccountID),
 			"usageObserved": event.UsageObserved, "inputTokens": event.InputTokens, "cachedTokens": event.CachedTokens,
 			"cacheWriteTokens": event.CacheWriteTokens, "uncachedInputTokens": event.UncachedInputTokens,

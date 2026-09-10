@@ -66,6 +66,11 @@
 
         <section id="summary-grid" class="summary-grid" aria-label="Pool summary"></section>
 
+        <!-- Pool-wide quota headroom per reported window. Kept out of the status
+             card grid above: those cards count accounts, these gauge capacity,
+             and merging them would invite reading a percentage as a count. -->
+        <section id="quota-capacity" class="quota-capacity" aria-label="Pool quota headroom"></section>
+
         <!-- Pool-wide throughput belongs on the default status page for routine
              monitoring. Per-account attribution and request-level diagnostics
              remain management-only and must not be added to this shared panel. -->

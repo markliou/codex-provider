@@ -537,6 +537,46 @@
   // #cache-window row, so it is intentionally not duplicated here. Every
   // account belongs to exactly one non-total card; do not merge Duplicate into
   // Out of pool, because duplicate credential copies may still be in the pool.
+  // Capacity is reported as the mean remaining percentage across the slots that
+  // report a window, never a sum: percentages from different plans describe
+  // different absolute allowances, so adding them would invent a total that does
+  // not exist. The account count travels with the number so the reader can see
+  // how thin the average is.
+  function renderQuotaCapacity(windows) {
+    const container = $("#quota-capacity");
+    if (!container) return;
+    const rows = Array.isArray(windows) ? windows : [];
+    if (!rows.length) {
+      container.innerHTML = "";
+      return;
+    }
+    container.innerHTML = rows.map((window) => {
+      // A mean lands on long fractions that carry no real precision. One decimal
+      // is the finest reading the underlying whole-percent windows can support.
+      const remaining = Math.round(quotaPercent(window.remainingPercent) * 10) / 10;
+      const label = window.label || "Window";
+      const reporting = Number(window.reportingAccounts) || 0;
+      const exhausted = Number(window.exhaustedAccounts) || 0;
+      const uncapped = Number(window.uncappedAccounts) || 0;
+      // The percentage describes only the slots this window constrains, so give
+      // both the numerator and the routable denominator, and name the uncapped
+      // slots on their own line. A bare "3 accounts" leaves an uneven pair of
+      // window counts looking like missing data, and a pool whose capped slots
+      // are spent can still have an uncapped slot able to serve immediately,
+      // which a reader who cannot see it reads as the whole story.
+      const note = `average across ${reporting} of ${routable} ${routable === 1 ? "account" : "accounts"} with a ${escapeHTML(label)} limit${exhausted ? ` · ${exhausted} exhausted` : ""}`;
+      const free = uncapped
+        ? `<span class="capacity-note capacity-free">${uncapped} ${uncapped === 1 ? "account has" : "accounts have"} no ${escapeHTML(label)} limit</span>`
+        : "";
+      return `<div class="capacity-item">
+        <div class="capacity-head"><span class="capacity-label">${escapeHTML(label)} headroom</span><strong class="capacity-value">${remaining.toFixed(1)}%</strong></div>
+        ${quotaTrackMarkup(remaining, `${label} pool headroom`)}
+        <span class="capacity-note">${note}</span>
+        ${free}
+      </div>`;
+    }).join("");
+  }
+
   function renderSummary(summary, publicMode = false) {
     const items = [
       ["Total accounts", summary.total || 0, ""],
@@ -1075,6 +1115,7 @@
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
       renderSettings(serviceState);
       renderSummary(serviceState.summary || {});
+      renderQuotaCapacity(serviceState.quotaCapacity);
       renderThroughput(serviceState.throughput);
       renderCacheWindow(serviceState.promptCacheWindow);
       renderAccounts(state.data.accounts, healthByID);
@@ -1105,6 +1146,7 @@
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
       const accounts = body.dashboard.accounts || [];
       renderSummary(body.dashboard.summary || {}, true);
+      renderQuotaCapacity(body.dashboard.quotaCapacity);
       renderThroughput(body.dashboard.throughput);
       renderCacheWindow(body.dashboard.promptCacheWindow);
       renderPublicAccounts(accounts);

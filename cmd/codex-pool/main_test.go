@@ -23,6 +23,13 @@ import (
 
 func testApp(t *testing.T, accounts []account) *app {
 	t.Helper()
+	// Capacity retries wait seconds in production. Tests exercise the full budget,
+	// so pace it down rather than sleeping through half a minute per case.
+	oldBackoff, oldMax := streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait
+	streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait = time.Millisecond, 4*time.Millisecond
+	t.Cleanup(func() {
+		streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait = oldBackoff, oldMax
+	})
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
 		t.Fatal(err)
@@ -563,6 +570,188 @@ func TestQuotaWindowPrimeSkipsAnchoredAndIneligibleAccounts(t *testing.T) {
 	broken.primeUnanchoredQuotaWindow(context.Background(), "only", errored)
 	if hits != 0 {
 		t.Fatalf("errored refresh was primed: hits=%d", hits)
+	}
+}
+
+// Upstream names a per-model meter by an internal codename in the id and puts
+// the model in the display name, so matching the id alone ignores every meter it
+// actually sends.
+func TestAdditionalLimitNamesModel(t *testing.T) {
+	spark := quotaLimit{LimitID: "codex_bengalfox", LimitName: "GPT-5.3-Codex-Spark"}
+	if !additionalLimitNamesModel(spark, "gpt-5.3-codex-spark") {
+		t.Fatal("meter display name must identify the model it meters")
+	}
+	if additionalLimitNamesModel(spark, "gpt-6-astra") {
+		t.Fatal("meter must not claim an unrelated model")
+	}
+	if additionalLimitNamesModel(quotaLimit{LimitID: "base_model_inference", LimitName: "gpt-reserve"}, "gpt-5.3-codex-spark") {
+		t.Fatal("an unrelated meter must stay display metadata")
+	}
+	// Forward compatibility: an id that already names the model still counts.
+	if !additionalLimitNamesModel(quotaLimit{LimitID: "gpt-5.3-codex-spark"}, "gpt-5.3-codex-spark") {
+		t.Fatal("meter id naming the model must still match")
+	}
+}
+
+// A model sold as a separate allowance must route to the account holding that
+// allowance, not to whichever account selection would otherwise pick.
+func TestModelMeterRestrictsRoutingToEntitledAccounts(t *testing.T) {
+	meter := func(model string) []quotaLimit {
+		return []quotaLimit{{LimitID: "codex_bengalfox", LimitName: model}}
+	}
+	a := testApp(t, []account{
+		{ID: "plain", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://plain.example.test"},
+		{ID: "entitled", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://entitled.example.test"},
+	})
+	a.state.Quotas["entitled"] = quotaSnapshot{AccountID: "entitled", Quota: &accountQuota{AdditionalLimits: meter("GPT-5.3-Codex-Spark")}}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	plain := a.accountLocked("plain")
+	entitled := a.accountLocked("entitled")
+	if a.modelMeterAllowsLocked(*plain, "gpt-5.3-codex-spark") {
+		t.Fatal("an account without the meter must not receive the metered model")
+	}
+	if !a.modelMeterAllowsLocked(*entitled, "gpt-5.3-codex-spark") {
+		t.Fatal("the account holding the meter must receive the metered model")
+	}
+	// An ordinary subscription model is metered by nobody and stays unrestricted.
+	for _, item := range []*account{plain, entitled} {
+		if !a.modelMeterAllowsLocked(*item, "gpt-6-astra") {
+			t.Fatalf("%s was excluded from an unmetered model", item.ID)
+		}
+	}
+}
+
+// If no account reports the meter, which is what a pool with a broken quota
+// refresh looks like, the restriction must not fail every request closed.
+func TestModelMeterWithoutEvidenceDoesNotRestrict(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "one", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://one.example.test"},
+		{ID: "two", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://two.example.test"},
+	})
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, id := range []string{"one", "two"} {
+		if !a.modelMeterAllowsLocked(*a.accountLocked(id), "gpt-5.3-codex-spark") {
+			t.Fatalf("%s was excluded with no meter evidence anywhere", id)
+		}
+	}
+}
+
+// An exhausted per-model meter must stop routing that model, which never
+// happened while only the codename id was compared.
+func TestExhaustedModelMeterBlocksRouting(t *testing.T) {
+	now := time.Now().UTC()
+	zero := 0.0
+	resetAt := now.Add(time.Hour).Unix()
+	quota := accountQuota{AdditionalLimits: []quotaLimit{{
+		LimitID:   "codex_bengalfox",
+		LimitName: "GPT-5.3-Codex-Spark",
+		Windows:   []quotaWindow{{Label: "5h", RemainingPercent: &zero, ResetAt: &resetAt, Present: true, Observed: true}},
+	}}}
+	if !quotaExplicitlyBlocksRouting(quota, "gpt-5.3-codex-spark", now) {
+		t.Fatal("an exhausted per-model meter must block that model")
+	}
+	if quotaExplicitlyBlocksRouting(quota, "gpt-6-astra", now) {
+		t.Fatal("an exhausted per-model meter must not block an unrelated model")
+	}
+}
+
+// The capacity roll-up must average, never sum: percentages from different plans
+// describe different absolute allowances. It must also count each upstream
+// workspace once and ignore slots the pool cannot route.
+func TestQuotaCapacitySummarisesRoutableWindows(t *testing.T) {
+	now := time.Now().UTC()
+	minutes := func(value int64) *int64 { return &value }
+	window := func(windowMinutes int64, remaining float64) quotaWindow {
+		value := remaining
+		return quotaWindow{Label: quotaWindowLabel(minutes(windowMinutes)), WindowMinutes: minutes(windowMinutes), RemainingPercent: &value, Present: true, Observed: true}
+	}
+	a := testApp(t, []account{
+		{ID: "a", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "b", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+		{ID: "out", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: "https://out.example.test"},
+	})
+	a.state.Quotas["a"] = quotaSnapshot{AccountID: "a", Quota: &accountQuota{Windows: []quotaWindow{window(300, 100), window(10080, 80)}}}
+	a.state.Quotas["b"] = quotaSnapshot{AccountID: "b", Quota: &accountQuota{Windows: []quotaWindow{window(300, 0), window(10080, 60)}}}
+	// An out-of-pool slot is not capacity this pool can spend and must not lift
+	// the average.
+	a.state.Quotas["out"] = quotaSnapshot{AccountID: "out", Quota: &accountQuota{Windows: []quotaWindow{window(300, 100), window(10080, 100)}}}
+
+	a.mu.Lock()
+	windows := a.quotaCapacityLocked(now)
+	a.mu.Unlock()
+
+	if len(windows) != 2 {
+		t.Fatalf("expected one entry per reported window duration: %#v", windows)
+	}
+	if windows[0].Label != "5h" || windows[1].Label != "Week" {
+		t.Fatalf("windows must be ordered shortest first: %#v", windows)
+	}
+	if windows[0].RemainingPercent != 50 || windows[0].ReportingAccounts != 2 || windows[0].ExhaustedAccounts != 1 {
+		t.Fatalf("5h roll-up = %#v, want mean 50 over 2 accounts with 1 exhausted", windows[0])
+	}
+	if windows[1].RemainingPercent != 70 || windows[1].ReportingAccounts != 2 || windows[1].ExhaustedAccounts != 0 {
+		t.Fatalf("week roll-up = %#v, want mean 70 over 2 accounts", windows[1])
+	}
+	for _, window := range windows {
+		if window.RoutableAccounts != 2 {
+			t.Fatalf("routable total = %d, want 2: %#v", window.RoutableAccounts, window)
+		}
+	}
+}
+
+// A plan with no five-hour cap reports only its long window, so the two counts
+// legitimately differ. The roll-up must never average a window an account did
+// not report, and must carry the routable total so the gap explains itself.
+func TestQuotaCapacityCountsOnlyWindowsAnAccountReports(t *testing.T) {
+	now := time.Now().UTC()
+	minutes := func(value int64) *int64 { return &value }
+	window := func(windowMinutes int64, remaining float64) quotaWindow {
+		value := remaining
+		return quotaWindow{Label: quotaWindowLabel(minutes(windowMinutes)), WindowMinutes: minutes(windowMinutes), RemainingPercent: &value, Present: true, Observed: true}
+	}
+	a := testApp(t, []account{
+		{ID: "capped", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "uncapped", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+	})
+	a.state.Quotas["capped"] = quotaSnapshot{AccountID: "capped", Quota: &accountQuota{Windows: []quotaWindow{window(300, 40), window(10080, 90)}}}
+	// No five-hour window at all, the shape a Pro or Business Premium seat reports.
+	a.state.Quotas["uncapped"] = quotaSnapshot{AccountID: "uncapped", Quota: &accountQuota{Windows: []quotaWindow{window(10080, 50)}}}
+
+	a.mu.Lock()
+	windows := a.quotaCapacityLocked(now)
+	a.mu.Unlock()
+
+	if len(windows) != 2 {
+		t.Fatalf("expected both window durations: %#v", windows)
+	}
+	if windows[0].ReportingAccounts != 1 || windows[0].RoutableAccounts != 2 || windows[0].RemainingPercent != 40 {
+		t.Fatalf("5h roll-up = %#v, want 1 of 2 accounts at 40", windows[0])
+	}
+	// The uncapped slot must be counted, not dropped: a pool whose capped slots
+	// are spent can still have an uncapped slot able to serve immediately.
+	if windows[0].UncappedAccounts != 1 {
+		t.Fatalf("uncapped count = %d, want 1: %#v", windows[0].UncappedAccounts, windows[0])
+	}
+	if windows[1].ReportingAccounts != 2 || windows[1].RoutableAccounts != 2 || windows[1].RemainingPercent != 70 {
+		t.Fatalf("week roll-up = %#v, want 2 of 2 accounts at mean 70", windows[1])
+	}
+	if windows[1].UncappedAccounts != 0 {
+		t.Fatalf("week window must constrain every routable slot: %#v", windows[1])
+	}
+}
+
+// A pool with no quota evidence must report no capacity rather than a fabricated
+// zero, which would read as "everything is exhausted".
+func TestQuotaCapacityIsEmptyWithoutEvidence(t *testing.T) {
+	a := testApp(t, []account{{ID: "a", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"}})
+	a.mu.Lock()
+	windows := a.quotaCapacityLocked(time.Now().UTC())
+	a.mu.Unlock()
+	if len(windows) != 0 {
+		t.Fatalf("capacity reported without any quota snapshot: %#v", windows)
 	}
 }
 
@@ -4027,7 +4216,7 @@ func TestStreamingPrecommitBlockLimitCommitsBeforeCapacityFailure(t *testing.T) 
 	_, _ = io.WriteString(&stream, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
 	recorder := httptest.NewRecorder()
 	commits := 0
-	result := copyStreamingProxyResponseWithPrecommit(recorder, strings.NewReader(stream.String()), func() {
+	result := copyStreamingProxyResponseWithPrecommit(recorder, strings.NewReader(stream.String()), precommitByteLimit(0), func() {
 		commits++
 		recorder.WriteHeader(http.StatusOK)
 	})
@@ -6927,6 +7116,285 @@ func TestStandaloneCapacityErrorRetriesAtEOF(t *testing.T) {
 	}
 	if a.state.RequestCount != 1 || a.state.SuccessCount != 1 || a.state.FailureCount != 1 {
 		t.Fatalf("standalone capacity retry counters = requests:%d success:%d failure:%d", a.state.RequestCount, a.state.SuccessCount, a.state.FailureCount)
+	}
+}
+
+// Production closed twelve of fourteen capacity refusals on the block bound
+// before the failure arrived, so the retry path never ran. Upstream sends more
+// lifecycle events than the old bound allowed while a request waits for
+// capacity, and a preamble of them must not spend the retry window.
+func TestCapacityFailureAfterLongLifecyclePreambleStillRetries(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_wait\"}}\n\n")
+		for i := 0; i < 20; i++ {
+			_, _ = io.WriteString(w, "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_wait\"}}\n\n")
+		}
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_wait\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_wait\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 2 || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("capacity failure behind a long preamble was not retried: hits=%d body=%s", hits, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "at capacity") {
+		t.Fatalf("abandoned capacity prefix leaked downstream: %s", recorder.Body.String())
+	}
+}
+
+// Keepalive comments carry no upstream state, so they must not spend the block
+// budget that keeps the retry window open.
+func TestKeepaliveCommentsDoNotSpendThePrecommitBudget(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ka\"}}\n\n")
+		for i := 0; i < 200; i++ {
+			_, _ = io.WriteString(w, ": keepalive\n\n")
+		}
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_ka\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ka\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if hits != 2 || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("keepalives closed the retry window: hits=%d body=%s", hits, recorder.Body.String())
+	}
+}
+
+// The bound still exists. A preamble past it commits, and the recorded depth is
+// what separates "upstream really is that verbose" from "the bound is too low".
+func TestPrecommitBoundStillCommitsAndRecordsDepth(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := 0; i < streamingPrecommitMaxBlocks+5; i++ {
+			_, _ = io.WriteString(w, "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_long\"}}\n\n")
+		}
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_long\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 1 {
+		t.Fatalf("a committed stream must never be retried: hits=%d", hits)
+	}
+	if len(a.state.RoutingCacheEvents) != 1 {
+		t.Fatalf("expected one routing event: %#v", a.state.RoutingCacheEvents)
+	}
+	event := a.state.RoutingCacheEvents[0]
+	if event.PrecommitCloseReason != "bounds" {
+		t.Fatalf("close reason = %q, want bounds", event.PrecommitCloseReason)
+	}
+	if event.PrecommitBlocks <= streamingPrecommitMaxBlocks {
+		t.Fatalf("recorded depth = %d, want more than the bound %d", event.PrecommitBlocks, streamingPrecommitMaxBlocks)
+	}
+}
+
+// The first stream recorded after depth accounting was added closed on "bounds"
+// holding one block: the byte bound tripped on response.created alone. That
+// event echoes the request (instructions, tools, input), so any large context
+// shut the retry window before a capacity failure could arrive. The bound must
+// scale with the request, or large-context requests can never be retried.
+func TestLargeContextCapacityFailureStillRetries(t *testing.T) {
+	// Well past the fixed 64 KiB part of the bound on its own.
+	context := strings.Repeat("x", 200<<10)
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		echo, _ := json.Marshal(payload["input"])
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Upstream echoes the request in the created event, as the Responses API does.
+		_, _ = fmt.Fprintf(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_big\",\"input\":%s}}\n\n", echo)
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_big\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_big\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	body, _ := json.Marshal(map[string]any{"model": "gpt-test", "input": context, "stream": true})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 2 || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("large-context capacity failure was not retried: hits=%d", hits)
+	}
+	if strings.Contains(recorder.Body.String(), "at capacity") {
+		t.Fatal("abandoned capacity prefix leaked downstream")
+	}
+	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].PrecommitCloseReason == "bounds" {
+		t.Fatalf("large context still closed the window on bounds: %#v", a.state.RoutingCacheEvents)
+	}
+}
+
+// A bounds closure must record how much was held so the byte bound and the
+// block bound can be told apart, which is the misreading this change corrects.
+func TestPrecommitBoundsClosureRecordsBytes(t *testing.T) {
+	if precommitByteLimit(-1) != streamingPrecommitMaxBytes || precommitByteLimit(1000) != streamingPrecommitMaxBytes+1000*precommitRequestEchoFactor {
+		t.Fatalf("precommitByteLimit does not scale with the request: %d %d", precommitByteLimit(-1), precommitByteLimit(1000))
+	}
+	// The ceiling keeps the buffer the same order as the request body already held.
+	if precommitByteLimit(maxRequestBody) != maxRequestBody {
+		t.Fatalf("precommitByteLimit ignored its ceiling: %d", precommitByteLimit(maxRequestBody))
+	}
+	huge := strings.Repeat("y", streamingPrecommitMaxBytes+1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// One created event larger than the fixed bound with a tiny request behind
+		// it, so the byte bound trips on a single block.
+		_, _ = fmt.Fprintf(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_huge\",\"pad\":\"%s\"}}\n\n", huge)
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_huge\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hi","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if len(a.state.RoutingCacheEvents) != 1 {
+		t.Fatalf("expected one routing event: %#v", a.state.RoutingCacheEvents)
+	}
+	event := a.state.RoutingCacheEvents[0]
+	if event.PrecommitCloseReason != "bounds" || event.PrecommitBlocks != 1 || event.PrecommitBytes <= streamingPrecommitMaxBytes {
+		t.Fatalf("bounds closure did not record a single oversized block: reason=%q blocks=%d bytes=%d", event.PrecommitCloseReason, event.PrecommitBlocks, event.PrecommitBytes)
+	}
+}
+
+// The first capacity failure seen on the scaled-bound build still committed,
+// with close reason "keepalive": upstream keeps a waiting stream alive with a
+// named event, not only a comment, and an unlisted event fails closed. Named
+// keepalives must keep the window open and must not spend the block budget.
+func TestNamedKeepaliveEventsKeepTheRetryWindowOpen(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ka\"}}\n\n")
+		for i := 0; i < streamingPrecommitMaxBlocks+10; i++ {
+			_, _ = io.WriteString(w, "event: keepalive\ndata: {\"type\":\"keepalive\"}\n\n")
+			_, _ = io.WriteString(w, "event: ping\ndata: {}\n\n")
+		}
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_ka\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ka\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if hits != 2 || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("named keepalives closed the retry window: hits=%d", hits)
+	}
+	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].PrecommitCloseReason == "keepalive" {
+		t.Fatalf("keepalive event still recorded as the close reason: %#v", a.state.RoutingCacheEvents)
+	}
+}
+
+// The backoff must escalate and cap, so an early blip costs about a second while
+// a sustained refusal is not retried in a tight loop.
+func TestCapacityRetryBackoffEscalatesToACap(t *testing.T) {
+	oldBackoff, oldMax := streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait
+	streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait = time.Second, 15*time.Second
+	defer func() { streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait = oldBackoff, oldMax }()
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second}
+	for round, expected := range want {
+		if got := capacityRetryBackoff(round + 1); got != expected {
+			t.Fatalf("round %d backoff = %s, want %s", round+1, got, expected)
+		}
+	}
+	// Past the budget the cap holds, and a nonsense round is treated as the first.
+	if got := capacityRetryBackoff(0); got != time.Second {
+		t.Fatalf("round 0 backoff = %s, want the first delay", got)
+	}
+	if got := capacityRetryBackoff(99); got != 15*time.Second {
+		t.Fatalf("late round backoff = %s, want the cap", got)
+	}
+}
+
+// After a wait, every identity that refused for capacity must be tried again,
+// not just the last one. Otherwise the whole remaining budget is spent on one
+// account while the identity that recovered first sits excluded.
+func TestCapacityRetryRestoresEveryRefusedIdentity(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	capacity := func(id string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			mu.Lock()
+			hits[id]++
+			count := hits[id]
+			mu.Unlock()
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_x\"}}\n\n")
+			// The first account recovers only on its second visit, which it can
+			// never get if a retry round leaves it excluded.
+			if id == "first" && count >= 2 {
+				_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+				_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_x\"}}\n\n")
+				return
+			}
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+		}
+	}
+	first := httptest.NewServer(capacity("first"))
+	defer first.Close()
+	second := httptest.NewServer(capacity("second"))
+	defer second.Close()
+
+	a := testApp(t, []account{
+		{ID: "first", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL},
+		{ID: "second", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: second.URL},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("a recovered identity was never retried: hits=%v body=%s", hits, recorder.Body.String())
+	}
+	if hits["first"] < 2 {
+		t.Fatalf("the first identity was not revisited after the wait: hits=%v", hits)
+	}
+	if strings.Contains(recorder.Body.String(), "server_is_overloaded") {
+		t.Fatalf("an abandoned capacity prefix leaked downstream: %s", recorder.Body.String())
 	}
 }
 

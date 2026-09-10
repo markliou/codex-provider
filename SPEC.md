@@ -391,7 +391,27 @@ gpt-5.3-codex-spark
 gpt-5.2-codex
 ```
 
-This keeps a stock Codex client from falling back to bundled model metadata (with its startup warning and conflicting-tool behavior, see 6.4.2) when the user selects a current model this pool was not explicitly configured for. Advertising a model is not an access grant: per-account model filters and upstream plan enforcement still apply (`gpt-5.3-codex-spark` is Pro-only upstream). Catalog `priority` ranks the configured default model first, then the lineup above, then operator-configured extras.
+This keeps a stock Codex client from falling back to bundled model metadata (with its startup warning and conflicting-tool behavior, see 6.4.2) when the user selects a current model this pool was not explicitly configured for. Advertising a model is not an access grant: per-account model filters, the model-meter routing rule below, and upstream plan enforcement still apply (`gpt-5.3-codex-spark` is Pro-only upstream).
+
+##### Model-meter routing
+
+Some models are sold as a separate allowance on top of the subscription, and
+upstream advertises that allowance as a per-model entry in `additionalRateLimits`
+on the accounts entitled to it. A meter identifies its model by sanitized token
+match on either the limit id or the limit display name, because upstream puts an
+internal codename in the id (`codex_bengalfox`) and the model in the name
+(`GPT-5.3-Codex-Spark`); comparing the id alone ignores every meter upstream
+actually sends.
+
+When any enabled in-pool account reports a meter for the requested model, only
+accounts reporting that meter are eligible for it. Routing the model elsewhere
+would spend an attempt on a request upstream refuses while the entitled
+account's allowance goes unused. The restriction is evidence-driven, never a
+hardcoded plan rule: a model that no account meters, which is every ordinary
+subscription model, stays unrestricted, and a pool whose quota refresh is failing
+reports no meters at all and falls back to plain selection rather than failing
+closed. An exhausted meter blocks its own model on that account by the same name
+match, and never blocks any other model. Catalog `priority` ranks the configured default model first, then the lineup above, then operator-configured extras.
 
 Reasoning levels are per model family: the `gpt-6` and `gpt-5.6` families additionally advertise `max` and `ultra`; older families must stay at `low`–`xhigh` so the client cannot submit an effort upstream rejects. The extended tiers are gated by family membership rather than an exact slug list, so a new sibling in a documented family is covered without a code change while any other family stays conservative. Membership requires a family boundary: the family slug itself, or a slug continuing with a hyphen. A bare textual prefix is not membership, or an unrelated slug such as `gpt-60-legacy` would inherit capabilities its upstream never promised.
 
@@ -1805,11 +1825,27 @@ For streaming responses:
   client-visible.
 - Before the first client-visible byte, Pool may buffer only a bounded
   lifecycle-only preamble consisting of `response.created`,
-  `response.in_progress`, `response.queued`, a bare `error` event, and SSE
-  keepalive/reconnection metadata. The buffer is limited to 64 KiB and eight
-  complete SSE blocks. Reaching either limit, receiving an unknown event/data
-  block, or receiving any output, reasoning, tool, hosted-tool, or other
-  semantic event commits the buffered prefix immediately.
+  `response.in_progress`, `response.queued`, a bare `error` event, named
+  `keepalive`/`ping` events, and SSE comment/reconnection metadata. The buffer is limited to 64 KiB plus the size
+  of the inbound request body, and to 64 complete lifecycle SSE blocks. The byte
+  bound scales with the request because upstream's first lifecycle event echoes
+  the request back (instructions, tool definitions, input); a fixed bound closes
+  the retry window on that single block for any large context. The echo is not
+  verbatim, since upstream expands tool schemas and injects instructions, so the
+  margin is a multiple of the request rather than a one-to-one allowance, capped
+  at the maximum request size. The client's payload is already held in memory for
+  the attempt, so the scaled bound stays the same order and adds no new memory
+  class. Keepalive comments, named `keepalive`/`ping` events,
+  and reconnection metadata count toward the byte limit but never toward the
+  block limit, because they carry no upstream state and must not spend the
+  budget that keeps the retry window open; upstream holds a stream waiting for
+  capacity open with them, and an unlisted keepalive committed a real stream
+  three blocks in. Reaching either limit, receiving an unknown event/data block, or
+  receiving any output, reasoning, tool, hosted-tool, or other semantic event
+  commits the buffered prefix immediately. The block limit must stay well above
+  the number of lifecycle events upstream sends while a request waits for
+  capacity; when it does not, the window closes on its own bound before the
+  terminal failure arrives and the retry contract below becomes unreachable.
 - A bare `error` event is buffered rather than committed because the Codex
   backend emits it immediately before the `response.failed` that classifies the
   refusal. Committing on the `error` event would close the retry window one
@@ -1839,14 +1875,22 @@ For streaming responses:
   failure/cooldown counters but does not create a client failure, sticky/thread
   binding, response binding, or request-level throughput result. The eventual
   successful response is classified as `stream_capacity_failover`.
-- If no distinct fallback is available, the same account is retried in place
-  behind a short linear backoff, up to a bounded retry budget, before the
-  refusal is surfaced. Upstream capacity is a transient model-level condition
+- If no distinct fallback is available, the pool waits and sweeps again rather
+  than surfacing the refusal. Each round restores every identity that refused
+  for capacity, clears the capacity cooldowns those refusals recorded for this
+  model, and waits a backoff that doubles from one second to a fifteen second
+  cap across a bounded retry budget. Restoring only the last account tried, or
+  honouring cooldowns recorded moments earlier, would pin the remaining budget
+  on whichever account happened not to be cooled and starve identities that may
+  already have recovered. Cooldowns recorded for any other reason still stand.
+  A capacity refusal is transient on the order of seconds, so a budget measured
+  in milliseconds gives up before the condition can clear. Upstream capacity is a transient model-level condition
   rather than proof that the account is unhealthy, and nothing client-visible
   has been written yet. These in-place retries must not set a cooldown on the
   account being retried, or it would become unselectable for its own retry, and
-  they must not consume the per-account attempt budget, or a single-account pool
-  could never retry. Each failed upstream attempt still counts as an upstream
+  they must not consume the per-account attempt budget: a round returns the
+  attempts it spent, or a pool would exhaust its attempts while still waiting for
+  the blip to clear, and a single-account pool could never retry at all. Each failed upstream attempt still counts as an upstream
   failure. A pool that still has a distinct eligible identity fails over instead
   and must not pay this backoff.
 - Once that retry budget is spent, preserve and forward the original buffered
@@ -1856,11 +1900,14 @@ For streaming responses:
 - The routing event records whether the pre-commit window was still open when
   the stream ended (`precommitCommitted`) and, when it had closed, the SSE event
   type that closed it or `bounds` for the size/block limits
-  (`precommitCloseReason`). A committed stream can never be retried, so without
-  these two fields a terminal capacity failure that was never eligible for retry
-  is indistinguishable in diagnostics from one that had no eligible fallback.
-  Both are bounded operational metadata: an event type or `bounds`, never
-  upstream payload text.
+  (`precommitCloseReason`), together with how many lifecycle blocks and bytes
+  the window held when it closed (`precommitBlocks`, `precommitBytes`). A
+  committed stream can never be retried, so without these fields a terminal
+  capacity failure that was never eligible for retry is indistinguishable in
+  diagnostics from one that had no eligible fallback, a `bounds` closure is
+  indistinguishable from a bound set too low, and the block bound is
+  indistinguishable from the byte bound. All are bounded operational metadata: an
+  event type, `bounds`, or a count, never upstream payload text.
 - Once any SSE bytes are committed downstream, never retry another account or
   splice a second response stream. In particular, never retry after any output,
   reasoning, tool, hosted-tool, unknown semantic event, or a preamble forced to
@@ -2194,6 +2241,34 @@ Quota-protection blocked/unavailable state remains visible in its compact
 control without opening the disclosure.
 Exact reset and refresh timestamps may remain in tooltips so the table stays
 scannable without discarding diagnostic detail.
+
+Above the account table the status cards count accounts. Separately from them,
+the page must roll up how much of each reported quota window the pool still
+holds, so an operator running many credentials can see whether the short window
+or the long one is the constraint without reading every row. One entry per
+reported window duration, ordered shortest first, each showing remaining
+headroom, how many accounts that window constrains out of the routable total,
+and how many of them are exhausted. Headroom is shown to one decimal place, the finest reading the
+underlying whole-percent windows support.
+
+A routable slot that reports no entry for a window is not missing data: no limit
+of that duration applies to it, which is how Pro and Business Premium seats
+report, having no five-hour cap. Such slots must be counted and shown as having
+no limit for that window, never silently dropped. A pool whose capped slots are
+spent can still hold an uncapped slot able to serve immediately, and a roll-up
+that hides it reports far less short-term capacity than the pool actually has.
+The percentage itself covers only the slots the window constrains, and the card
+must say so, because averaging an unconstrained slot in as a full one would
+present the absence of a limit as a limit that happens to be full.
+
+The reported headroom is the mean remaining percentage across the reporting
+slots, never a sum: percentages from different plans describe different absolute
+allowances, so they may be averaged into how full the pool is but must never be
+added into one larger total. Only routable slots count. An out-of-pool slot is
+not capacity this pool can spend, and a duplicate slot shares one upstream
+workspace with its primary, so counting both would report that workspace twice.
+A pool with no quota evidence reports no entries rather than a fabricated zero,
+which would read as total exhaustion.
 
 The pool-wide cache window must show the total request count since reset and
 must group and visibly label Pool-observed counters separately from calculated
