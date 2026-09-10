@@ -558,6 +558,9 @@
       const reporting = Number(window.reportingAccounts) || 0;
       const exhausted = Number(window.exhaustedAccounts) || 0;
       const uncapped = Number(window.uncappedAccounts) || 0;
+      // Fall back to the two parts rather than zero: a missing denominator would
+      // otherwise render "3 of 0 accounts".
+      const routable = Number(window.routableAccounts) || reporting + uncapped;
       // The percentage describes only the slots this window constrains, so give
       // both the numerator and the routable denominator, and name the uncapped
       // slots on their own line. A bare "3 accounts" leaves an uneven pair of
