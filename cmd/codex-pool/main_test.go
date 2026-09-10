@@ -7263,8 +7263,12 @@ func TestLargeContextCapacityFailureStillRetries(t *testing.T) {
 // A bounds closure must record how much was held so the byte bound and the
 // block bound can be told apart, which is the misreading this change corrects.
 func TestPrecommitBoundsClosureRecordsBytes(t *testing.T) {
-	if precommitByteLimit(-1) != streamingPrecommitMaxBytes || precommitByteLimit(1000) != streamingPrecommitMaxBytes+1000 {
+	if precommitByteLimit(-1) != streamingPrecommitMaxBytes || precommitByteLimit(1000) != streamingPrecommitMaxBytes+1000*precommitRequestEchoFactor {
 		t.Fatalf("precommitByteLimit does not scale with the request: %d %d", precommitByteLimit(-1), precommitByteLimit(1000))
+	}
+	// The ceiling keeps the buffer the same order as the request body already held.
+	if precommitByteLimit(maxRequestBody) != maxRequestBody {
+		t.Fatalf("precommitByteLimit ignored its ceiling: %d", precommitByteLimit(maxRequestBody))
 	}
 	huge := strings.Repeat("y", streamingPrecommitMaxBytes+1024)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

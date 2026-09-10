@@ -141,6 +141,9 @@ const (
 	// ever paid when no identity can serve: a pool with a healthy backup fails
 	// over before reaching it and waits for nothing.
 	streamingCapacityRetryLimit = 5
+	// precommitRequestEchoFactor is how many times the inbound request the
+	// buffered preamble is allowed to reach before the window commits.
+	precommitRequestEchoFactor = 4
 	// Codex treats remote model metadata as authoritative for ChatGPT-backed
 	// providers. This fallback must remain non-empty or a schema-only fix would
 	// silently remove the coding-agent instructions after a successful refresh.
@@ -2066,7 +2069,17 @@ func precommitByteLimit(requestBytes int) int {
 	if requestBytes < 0 {
 		requestBytes = 0
 	}
-	return streamingPrecommitMaxBytes + requestBytes
+	// Upstream does not echo the request verbatim: it expands tool schemas and
+	// injects instructions, so the created event runs several times the size of
+	// what was sent. A one-to-one margin was still too tight and production tripped
+	// it at 783 KB on two blocks, closing the retry window on a subagent request.
+	// Scale by a multiple and keep an absolute ceiling, so the buffer stays the
+	// same order as the request body already held for the attempt.
+	limit := streamingPrecommitMaxBytes + requestBytes*precommitRequestEchoFactor
+	if limit > maxRequestBody || limit < 0 {
+		return maxRequestBody
+	}
+	return limit
 }
 
 func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResponseInfo {

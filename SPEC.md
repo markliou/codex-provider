@@ -1830,9 +1830,12 @@ For streaming responses:
   of the inbound request body, and to 64 complete lifecycle SSE blocks. The byte
   bound scales with the request because upstream's first lifecycle event echoes
   the request back (instructions, tool definitions, input); a fixed bound closes
-  the retry window on that single block for any large context, and the client's
-  payload is already held in memory for the attempt, so the scaled bound adds no
-  new memory class. Keepalive comments, named `keepalive`/`ping` events,
+  the retry window on that single block for any large context. The echo is not
+  verbatim, since upstream expands tool schemas and injects instructions, so the
+  margin is a multiple of the request rather than a one-to-one allowance, capped
+  at the maximum request size. The client's payload is already held in memory for
+  the attempt, so the scaled bound stays the same order and adds no new memory
+  class. Keepalive comments, named `keepalive`/`ping` events,
   and reconnection metadata count toward the byte limit but never toward the
   block limit, because they carry no upstream state and must not spend the
   budget that keeps the retry window open; upstream holds a stream waiting for
