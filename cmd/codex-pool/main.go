@@ -140,7 +140,6 @@ const (
 	// second cap, roughly thirty seconds across the whole budget, and is only
 	// ever paid when no identity can serve: a pool with a healthy backup fails
 	// over before reaching it and waits for nothing.
-	streamingCapacityRetryLimit = 5
 	// precommitRequestEchoFactor is how many times the inbound request the
 	// buffered preamble is allowed to reach before the window commits.
 	precommitRequestEchoFactor = 4
@@ -636,6 +635,9 @@ func newAppFromEnv() (*app, error) {
 	}
 	sessionAffinityTTL, err := sessionAffinityTTLFromEnv()
 	if err != nil {
+		return nil, err
+	}
+	if err := applyCapacityRetryEnv(); err != nil {
 		return nil, err
 	}
 	maxRetryAccounts, err := maxRetryAccountsFromEnv()
@@ -2194,8 +2196,15 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 // Retry pacing is a variable, not a constant, so tests can exercise the full
 // retry budget without sleeping through it. Production never reassigns these.
 var (
+	// The schedule doubles from the first delay to the cap and stops after the
+	// limit: 1s, 2s, 4s, 8s, 16s, then the cap, roughly ninety seconds across the
+	// whole budget. Only a pool with no identity able to serve ever pays it, and
+	// an interrupted task costs far more than a wait the caller never sees, so
+	// the default leans toward waiting the blip out. Operators can retune all
+	// three without a rebuild.
+	streamingCapacityRetryLimit   = 8
 	streamingCapacityRetryBackoff = time.Second
-	streamingCapacityRetryMaxWait = 15 * time.Second
+	streamingCapacityRetryMaxWait = 20 * time.Second
 )
 
 // capacityRetryBackoff doubles each round up to a cap, so an early blip costs a
@@ -9744,6 +9753,45 @@ func sessionAffinityTTLFromEnv() (time.Duration, error) {
 	}
 	return time.Duration(millis) * time.Millisecond, nil
 }
+
+// applyCapacityRetryEnv retunes the capacity retry schedule from the
+// environment. Waiting out a refusal trades caller latency against an
+// interrupted task, and only the operator knows which their clients tolerate,
+// so all three knobs are adjustable without a rebuild. An unset variable keeps
+// the default; an invalid one is an error rather than a silent fallback.
+func applyCapacityRetryEnv() error {
+	if raw := strings.TrimSpace(os.Getenv("CODEX_POOL_CAPACITY_RETRY_LIMIT")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 0 {
+			return fmt.Errorf("CODEX_POOL_CAPACITY_RETRY_LIMIT must be zero or a positive integer")
+		}
+		streamingCapacityRetryLimit = value
+	}
+	for _, knob := range []struct {
+		name   string
+		target *time.Duration
+	}{
+		{"CODEX_POOL_CAPACITY_RETRY_BACKOFF_MS", &streamingCapacityRetryBackoff},
+		{"CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS", &streamingCapacityRetryMaxWait},
+	} {
+		raw := strings.TrimSpace(os.Getenv(knob.name))
+		if raw == "" {
+			continue
+		}
+		value, err := strconv.Atoi(raw)
+		if err != nil || value <= 0 {
+			return fmt.Errorf("%s must be a positive integer number of milliseconds", knob.name)
+		}
+		*knob.target = time.Duration(value) * time.Millisecond
+	}
+	// A cap below the first delay would make the schedule shrink instead of
+	// escalate, so hold the cap at or above where the schedule starts.
+	if streamingCapacityRetryMaxWait < streamingCapacityRetryBackoff {
+		streamingCapacityRetryMaxWait = streamingCapacityRetryBackoff
+	}
+	return nil
+}
+
 func maxRetryAccountsFromEnv() (int, error) {
 	raw := strings.TrimSpace(os.Getenv("CODEX_POOL_MAX_RETRY_ACCOUNTS"))
 	if raw == "" {

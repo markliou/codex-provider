@@ -163,6 +163,9 @@ docker run -d \
 | `CODEX_POOL_ROUTING_STRATEGY` | no | `sticky_balanced` | `sticky_balanced` deterministically distributes new sessions across the highest-priority eligible account tier. `sticky_failover` preserves the legacy behavior that sends new sessions to the first preferred account. |
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
+| `CODEX_POOL_CAPACITY_RETRY_LIMIT` | no | `8` | Capacity retry rounds once no identity can serve. `0` disables waiting and surfaces the refusal immediately. |
+| `CODEX_POOL_CAPACITY_RETRY_BACKOFF_MS` | no | `1000` | First capacity retry delay. Each round doubles from here. |
+| `CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS` | no | `20000` | Cap on a single capacity retry delay. Raised to the first delay if set below it. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_MODE` | no | `auto` | `auto` injects a hashed `prompt_cache_key` when the client omitted one. `off`/`passthrough` leave the request unchanged. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_POLICY` | no | `preserve` | Upstream-key policy independent of sticky routing. `preserve` retains a client key and uses the legacy missing-key behavior. `lineage`, `project`, and `user` explicitly replace any client key with a deterministic hashed/bucketed key for that scope. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_SCOPE` | no | `auto` | Coarseness of the injected `prompt_cache_key`. `auto` groups by `X-Codex-Pool-Project` header, else API key, else per-conversation. `project`/`user` force that grouping; `conversation` keeps the historical per-conversation key. Coarser keys let sibling conversations reuse the same static-prefix cache. |
@@ -1878,8 +1881,13 @@ For streaming responses:
 - If no distinct fallback is available, the pool waits and sweeps again rather
   than surfacing the refusal. Each round restores every identity that refused
   for capacity, clears the capacity cooldowns those refusals recorded for this
-  model, and waits a backoff that doubles from one second to a fifteen second
-  cap across a bounded retry budget. Restoring only the last account tried, or
+  model, and waits a backoff that doubles from a first delay to a cap across a
+  bounded retry budget; the default schedule runs eight rounds from one second
+  to a twenty second cap, roughly ninety seconds in total. All three are
+  operator-tunable, because waiting trades caller latency against an interrupted
+  task and only the operator knows which their clients tolerate. An invalid
+  setting is a startup error, never a silent fallback, and a cap below the first
+  delay is raised to it so the schedule cannot shrink instead of escalate. Restoring only the last account tried, or
   honouring cooldowns recorded moments earlier, would pin the remaining budget
   on whichever account happened not to be cooled and starve identities that may
   already have recovered. Cooldowns recorded for any other reason still stand.

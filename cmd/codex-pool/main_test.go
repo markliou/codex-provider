@@ -6931,7 +6931,8 @@ func TestEarlyCapacityStreamingFailureWithoutFallbackPreservesUpstreamSSE(t *tes
 	}
 	// One client request, but every failed upstream attempt is a real upstream
 	// failure and is counted as such.
-	if a.state.RequestCount != 1 || a.state.SuccessCount != 0 || a.state.FailureCount != 1+streamingCapacityRetryLimit || a.state.UpstreamResponseFailedCount != 1+streamingCapacityRetryLimit {
+	upstreamAttempts := uint64(1 + streamingCapacityRetryLimit)
+	if a.state.RequestCount != 1 || a.state.SuccessCount != 0 || a.state.FailureCount != upstreamAttempts || a.state.UpstreamResponseFailedCount != upstreamAttempts {
 		t.Fatalf("single-account capacity counters = requests:%d success:%d failure:%d response_failed:%d", a.state.RequestCount, a.state.SuccessCount, a.state.FailureCount, a.state.UpstreamResponseFailedCount)
 	}
 	// Exactly one cooldown: the final terminal failure owns it. The in-place
@@ -7395,6 +7396,49 @@ func TestCapacityRetryRestoresEveryRefusedIdentity(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "server_is_overloaded") {
 		t.Fatalf("an abandoned capacity prefix leaked downstream: %s", recorder.Body.String())
+	}
+}
+
+// Waiting out a refusal trades caller latency against an interrupted task, and
+// only the operator knows which their clients tolerate, so the schedule has to
+// be tunable without a rebuild.
+func TestCapacityRetryScheduleIsEnvTunable(t *testing.T) {
+	oldLimit, oldBackoff, oldMax := streamingCapacityRetryLimit, streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait
+	defer func() {
+		streamingCapacityRetryLimit, streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait = oldLimit, oldBackoff, oldMax
+	}()
+
+	t.Setenv("CODEX_POOL_CAPACITY_RETRY_LIMIT", "3")
+	t.Setenv("CODEX_POOL_CAPACITY_RETRY_BACKOFF_MS", "500")
+	t.Setenv("CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS", "2000")
+	if err := applyCapacityRetryEnv(); err != nil {
+		t.Fatalf("valid schedule rejected: %s", err)
+	}
+	if streamingCapacityRetryLimit != 3 || streamingCapacityRetryBackoff != 500*time.Millisecond || streamingCapacityRetryMaxWait != 2*time.Second {
+		t.Fatalf("schedule not applied: limit=%d backoff=%s max=%s", streamingCapacityRetryLimit, streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait)
+	}
+	if got := capacityRetryBackoff(3); got != 2*time.Second {
+		t.Fatalf("tuned backoff round 3 = %s, want the tuned cap", got)
+	}
+
+	// A cap below the first delay would make the schedule shrink instead of grow.
+	t.Setenv("CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS", "100")
+	if err := applyCapacityRetryEnv(); err != nil {
+		t.Fatalf("valid schedule rejected: %s", err)
+	}
+	if streamingCapacityRetryMaxWait != streamingCapacityRetryBackoff {
+		t.Fatalf("cap below the first delay was not lifted: backoff=%s max=%s", streamingCapacityRetryBackoff, streamingCapacityRetryMaxWait)
+	}
+
+	// An invalid value is an error, never a silent fallback.
+	t.Setenv("CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS", "0")
+	if err := applyCapacityRetryEnv(); err == nil {
+		t.Fatal("a non-positive wait was accepted")
+	}
+	t.Setenv("CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS", "2000")
+	t.Setenv("CODEX_POOL_CAPACITY_RETRY_LIMIT", "-1")
+	if err := applyCapacityRetryEnv(); err == nil {
+		t.Fatal("a negative retry limit was accepted")
 	}
 }
 
