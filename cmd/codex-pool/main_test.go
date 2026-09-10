@@ -7282,6 +7282,41 @@ func TestPrecommitBoundsClosureRecordsBytes(t *testing.T) {
 	}
 }
 
+// The first capacity failure seen on the scaled-bound build still committed,
+// with close reason "keepalive": upstream keeps a waiting stream alive with a
+// named event, not only a comment, and an unlisted event fails closed. Named
+// keepalives must keep the window open and must not spend the block budget.
+func TestNamedKeepaliveEventsKeepTheRetryWindowOpen(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ka\"}}\n\n")
+		for i := 0; i < streamingPrecommitMaxBlocks+10; i++ {
+			_, _ = io.WriteString(w, "event: keepalive\ndata: {\"type\":\"keepalive\"}\n\n")
+			_, _ = io.WriteString(w, "event: ping\ndata: {}\n\n")
+		}
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_ka\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ka\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if hits != 2 || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("named keepalives closed the retry window: hits=%d", hits)
+	}
+	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].PrecommitCloseReason == "keepalive" {
+		t.Fatalf("keepalive event still recorded as the close reason: %#v", a.state.RoutingCacheEvents)
+	}
+}
+
 func TestRequestSpecificStreamingFailureDoesNotPenalizeAccount(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

@@ -2084,7 +2084,7 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 				// state, so they must not spend the block budget that exists to
 				// keep the retry window open. They still count toward the byte
 				// bound, which is the guard that actually caps memory.
-				if responseEventTypeFromSSEBlock(block) != "" {
+				if precommitCountsTowardBlockBound(block) {
 					bufferedBlocks++
 				}
 				withinBounds := buffered.Len() <= maxBytes && bufferedBlocks <= streamingPrecommitMaxBlocks
@@ -2186,9 +2186,29 @@ func readSSEBlock(reader *bufio.Reader) (string, error) {
 	}
 }
 
+// precommitCountsTowardBlockBound reports whether a buffered block spends the
+// block budget. Only blocks that carry response state do; comments and named
+// keepalive events exist to hold a waiting connection open and say nothing
+// about the response, so a long wait for capacity must not exhaust the budget
+// that keeps the retry window open. Bytes are still counted for every block.
+func precommitCountsTowardBlockBound(block string) bool {
+	switch responseEventTypeFromSSEBlock(block) {
+	case "", "keepalive", "ping":
+		return false
+	default:
+		return true
+	}
+}
+
 func precommitLifecycleSSEBlock(block string) bool {
 	switch responseEventTypeFromSSEBlock(block) {
 	case "response.created", "response.in_progress", "response.queued":
+		return true
+	case "keepalive", "ping":
+		// Upstream keeps a waiting stream alive with named events, not only SSE
+		// comments. They carry no response state, and treating one as unknown
+		// committed the stream three blocks in, so the capacity failure behind it
+		// was forwarded verbatim instead of retried.
 		return true
 	case "error":
 		// The Codex backend announces a refusal as a bare `error` event and only

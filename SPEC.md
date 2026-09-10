@@ -1825,17 +1825,19 @@ For streaming responses:
   client-visible.
 - Before the first client-visible byte, Pool may buffer only a bounded
   lifecycle-only preamble consisting of `response.created`,
-  `response.in_progress`, `response.queued`, a bare `error` event, and SSE
-  keepalive/reconnection metadata. The buffer is limited to 64 KiB plus the size
+  `response.in_progress`, `response.queued`, a bare `error` event, named
+  `keepalive`/`ping` events, and SSE comment/reconnection metadata. The buffer is limited to 64 KiB plus the size
   of the inbound request body, and to 64 complete lifecycle SSE blocks. The byte
   bound scales with the request because upstream's first lifecycle event echoes
   the request back (instructions, tool definitions, input); a fixed bound closes
   the retry window on that single block for any large context, and the client's
   payload is already held in memory for the attempt, so the scaled bound adds no
-  new memory class. Keepalive comments and reconnection metadata
-  count toward the byte limit but never toward the block limit, because they
-  carry no upstream state and must not spend the budget that keeps the retry
-  window open. Reaching either limit, receiving an unknown event/data block, or
+  new memory class. Keepalive comments, named `keepalive`/`ping` events,
+  and reconnection metadata count toward the byte limit but never toward the
+  block limit, because they carry no upstream state and must not spend the
+  budget that keeps the retry window open; upstream holds a stream waiting for
+  capacity open with them, and an unlisted keepalive committed a real stream
+  three blocks in. Reaching either limit, receiving an unknown event/data block, or
   receiving any output, reasoning, tool, hosted-tool, or other semantic event
   commits the buffered prefix immediately. The block limit must stay well above
   the number of lifecycle events upstream sends while a request waits for
