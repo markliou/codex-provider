@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -127,19 +128,14 @@ const (
 	// few hundred bytes, so this is a sanity limit on upstream verbosity rather
 	// than the memory guard; the byte bound is that.
 	streamingPrecommitMaxBlocks = 64
-	// An upstream capacity rejection is transient model-level overload, not
-	// proof that the selected account is unhealthy. When no other upstream
-	// identity is eligible, the same account is retried this many times behind a
-	// linear backoff before the upstream refusal is forwarded, so a pool with no
-	// spare identity does not surface "model is at capacity" on first refusal.
-	// A capacity refusal is a transient upstream condition that clears on the
-	// order of seconds, not milliseconds. The previous budget of two retries a
-	// quarter second apart gave up after well under a second, so a pool whose
-	// identities all refused surfaced the refusal without ever waiting for the
-	// blip to pass. The schedule below doubles from one second to a fifteen
-	// second cap, roughly thirty seconds across the whole budget, and is only
-	// ever paid when no identity can serve: a pool with a healthy backup fails
-	// over before reaching it and waits for nothing.
+	// An upstream capacity rejection is transient model-level overload, not proof
+	// that the selected account is unhealthy. When no other upstream identity is
+	// eligible the pool waits and sweeps again rather than forwarding the
+	// refusal, so a pool with no spare identity does not surface "model is at
+	// capacity" on first refusal. The schedule lives in the retry-pacing vars
+	// below, is operator-configurable, and is only ever paid when no identity can
+	// serve: a pool with a healthy backup fails over before reaching it and waits
+	// for nothing.
 	// precommitRequestEchoFactor is how many times the inbound request the
 	// buffered preamble is allowed to reach before the window commits.
 	precommitRequestEchoFactor = 4
@@ -2196,12 +2192,13 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 // Retry pacing is a variable, not a constant, so tests can exercise the full
 // retry budget without sleeping through it. Production never reassigns these.
 var (
-	// The schedule doubles from the first delay to the cap and stops after the
-	// limit: 1s, 2s, 4s, 8s, 16s, then the cap, roughly ninety seconds across the
-	// whole budget. Only a pool with no identity able to serve ever pays it, and
-	// an interrupted task costs far more than a wait the caller never sees, so
-	// the default leans toward waiting the blip out. Operators can retune all
-	// three without a rebuild.
+	// The schedule doubles from the configured first delay up to the configured
+	// cap and stops after the limit. At the defaults below that is 1s, 2s, 4s,
+	// 8s, 16s, then 20s for the remaining rounds, roughly ninety seconds across
+	// the whole budget. Only a pool with no identity able to serve ever pays it,
+	// and an interrupted task costs far more than a wait the caller never sees,
+	// so the defaults lean toward waiting the blip out. Every number here is a
+	// default: operators retune all three from the environment without a rebuild.
 	streamingCapacityRetryLimit   = 8
 	streamingCapacityRetryBackoff = time.Second
 	streamingCapacityRetryMaxWait = 20 * time.Second
@@ -9778,8 +9775,13 @@ func applyCapacityRetryEnv() error {
 		if raw == "" {
 			continue
 		}
-		value, err := strconv.Atoi(raw)
-		if err != nil || value <= 0 {
+		// Reject anything that cannot survive the conversion. Multiplying an
+		// unchecked millisecond count by time.Millisecond overflows into a
+		// negative duration, which fires the timer immediately and breaks the cap
+		// comparison, so an absurd setting would silently disable the wait
+		// instead of failing startup as promised.
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value <= 0 || value > int64(math.MaxInt64)/int64(time.Millisecond) {
 			return fmt.Errorf("%s must be a positive integer number of milliseconds", knob.name)
 		}
 		*knob.target = time.Duration(value) * time.Millisecond
