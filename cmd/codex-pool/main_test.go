@@ -7112,6 +7112,104 @@ func TestStandaloneCapacityErrorRetriesAtEOF(t *testing.T) {
 	}
 }
 
+// Production closed twelve of fourteen capacity refusals on the block bound
+// before the failure arrived, so the retry path never ran. Upstream sends more
+// lifecycle events than the old bound allowed while a request waits for
+// capacity, and a preamble of them must not spend the retry window.
+func TestCapacityFailureAfterLongLifecyclePreambleStillRetries(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_wait\"}}\n\n")
+		for i := 0; i < 20; i++ {
+			_, _ = io.WriteString(w, "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_wait\"}}\n\n")
+		}
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_wait\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_wait\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 2 || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("capacity failure behind a long preamble was not retried: hits=%d body=%s", hits, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "at capacity") {
+		t.Fatalf("abandoned capacity prefix leaked downstream: %s", recorder.Body.String())
+	}
+}
+
+// Keepalive comments carry no upstream state, so they must not spend the block
+// budget that keeps the retry window open.
+func TestKeepaliveCommentsDoNotSpendThePrecommitBudget(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ka\"}}\n\n")
+		for i := 0; i < 200; i++ {
+			_, _ = io.WriteString(w, ": keepalive\n\n")
+		}
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_ka\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ka\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if hits != 2 || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("keepalives closed the retry window: hits=%d body=%s", hits, recorder.Body.String())
+	}
+}
+
+// The bound still exists. A preamble past it commits, and the recorded depth is
+// what separates "upstream really is that verbose" from "the bound is too low".
+func TestPrecommitBoundStillCommitsAndRecordsDepth(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := 0; i < streamingPrecommitMaxBlocks+5; i++ {
+			_, _ = io.WriteString(w, "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_long\"}}\n\n")
+		}
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_long\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 1 {
+		t.Fatalf("a committed stream must never be retried: hits=%d", hits)
+	}
+	if len(a.state.RoutingCacheEvents) != 1 {
+		t.Fatalf("expected one routing event: %#v", a.state.RoutingCacheEvents)
+	}
+	event := a.state.RoutingCacheEvents[0]
+	if event.PrecommitCloseReason != "bounds" {
+		t.Fatalf("close reason = %q, want bounds", event.PrecommitCloseReason)
+	}
+	if event.PrecommitBlocks <= streamingPrecommitMaxBlocks {
+		t.Fatalf("recorded depth = %d, want more than the bound %d", event.PrecommitBlocks, streamingPrecommitMaxBlocks)
+	}
+}
+
 func TestRequestSpecificStreamingFailureDoesNotPenalizeAccount(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

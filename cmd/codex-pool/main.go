@@ -112,8 +112,15 @@ const (
 	// an upstream capacity rejection can be retried before anything becomes
 	// client-visible. These hard bounds prevent a changed or malformed upstream
 	// event sequence from turning pre-commit failover into general buffering.
-	streamingPrecommitMaxBytes  = 64 << 10
-	streamingPrecommitMaxBlocks = 8
+	streamingPrecommitMaxBytes = 64 << 10
+	// streamingPrecommitMaxBlocks bounds how many lifecycle blocks may be held
+	// before the stream commits. It was eight, and upstream routinely sends more
+	// than that while a request waits for capacity, so the window shut on its own
+	// bound before the failure arrived: twelve of the last fourteen capacity
+	// refusals closed with reason "bounds" and could not be retried at all. Only
+	// lifecycle events count toward it, each a few hundred bytes, so the byte
+	// bound above is what actually caps memory.
+	streamingPrecommitMaxBlocks = 64
 	// An upstream capacity rejection is transient model-level overload, not
 	// proof that the selected account is unhealthy. When no other upstream
 	// identity is eligible, the same account is retried this many times behind a
@@ -415,6 +422,7 @@ type routingCacheEvent struct {
 	// a terminal capacity failure was eligible for retry at all.
 	PrecommitCommitted    bool     `json:"precommitCommitted,omitempty"`
 	PrecommitCloseReason  string   `json:"precommitCloseReason,omitempty"`
+	PrecommitBlocks       int      `json:"precommitBlocks,omitempty"`
 	ParentAffinity        string   `json:"parentAffinity"`
 	FailoverFromAccountID string   `json:"failoverFromAccountId,omitempty"`
 	UsageObserved         bool     `json:"usageObserved"`
@@ -1863,6 +1871,10 @@ type proxyResponseInfo struct {
 	// closed it. Streaming responses only; other paths leave them zero.
 	PrecommitCommitted   bool
 	PrecommitCloseReason string
+	// PrecommitBlocks is how many lifecycle blocks the window held when it
+	// closed. Without it, a bounds closure cannot be told apart from a bound set
+	// too low, which is the mistake this field exists to keep visible.
+	PrecommitBlocks int
 }
 
 type streamingProxyResult struct {
@@ -2046,7 +2058,13 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 				writeStreamingBytes(w, []byte(block))
 			} else {
 				buffered.WriteString(block)
-				bufferedBlocks++
+				// Keepalive comments and reconnection metadata carry no upstream
+				// state, so they must not spend the block budget that exists to
+				// keep the retry window open. They still count toward the byte
+				// bound, which is the guard that actually caps memory.
+				if responseEventTypeFromSSEBlock(block) != "" {
+					bufferedBlocks++
+				}
 				withinBounds := buffered.Len() <= streamingPrecommitMaxBytes && bufferedBlocks <= streamingPrecommitMaxBlocks
 				if next.TerminalEvent == "response.failed" && next.TerminalFailureClass == "capacity" && withinBounds {
 					// No headers, lifecycle event, response id, model output, or
@@ -2066,6 +2084,7 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 					// is the only signal that separates "no eligible fallback" from "the
 					// retry window was already shut".
 					if info.PrecommitCloseReason == "" {
+						info.PrecommitBlocks = bufferedBlocks
 						if !withinBounds {
 							info.PrecommitCloseReason = "bounds"
 						} else if eventType := responseEventTypeFromSSEBlock(block); eventType != "" {
@@ -4396,6 +4415,7 @@ func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accoun
 		TerminalErrorCode:     sanitizedErrorCode(info.TerminalErrorCode),
 		PrecommitCommitted:    info.PrecommitCommitted,
 		PrecommitCloseReason:  info.PrecommitCloseReason,
+		PrecommitBlocks:       info.PrecommitBlocks,
 		ParentAffinity:        parentAffinity,
 		FailoverFromAccountID: failoverFromAccountID,
 		UsageObserved:         usage.Present,
@@ -8102,7 +8122,7 @@ func (a *app) routingCacheEventViewsLocked(now time.Time) []map[string]any {
 			"stickyKeyHash": event.StickyKeyHash, "promptCacheKeyHash": event.PromptCacheKeyHash,
 			"routingOutcome": event.RoutingOutcome, "routingSource": event.RoutingSource, "parentAffinity": event.ParentAffinity,
 			"terminalEvent": event.TerminalEvent, "terminalFailureClass": event.TerminalFailureClass, "terminalErrorCode": event.TerminalErrorCode,
-			"precommitCommitted": event.PrecommitCommitted, "precommitCloseReason": event.PrecommitCloseReason,
+			"precommitCommitted": event.PrecommitCommitted, "precommitCloseReason": event.PrecommitCloseReason, "precommitBlocks": event.PrecommitBlocks,
 			"failoverFromAccountLabel": failoverFromLabel, "failoverFromAccountRef": operationalIdentifierHash("account", event.FailoverFromAccountID),
 			"usageObserved": event.UsageObserved, "inputTokens": event.InputTokens, "cachedTokens": event.CachedTokens,
 			"cacheWriteTokens": event.CacheWriteTokens, "uncachedInputTokens": event.UncachedInputTokens,
