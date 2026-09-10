@@ -112,14 +112,20 @@ const (
 	// an upstream capacity rejection can be retried before anything becomes
 	// client-visible. These hard bounds prevent a changed or malformed upstream
 	// event sequence from turning pre-commit failover into general buffering.
+	// streamingPrecommitMaxBytes is the fixed part of the pre-commit byte bound.
+	// The effective bound is this plus the inbound request size, see
+	// precommitByteLimit: the first lifecycle event echoes the request back
+	// (instructions, tool definitions, input), so a bound that ignores request
+	// size closes the retry window on the very first block for any large
+	// context. That is exactly what happened in production. The first stream
+	// recorded after depth accounting was added closed on "bounds" holding a
+	// single block, so the byte bound, not the block bound, was shutting the
+	// window, and "bounds" had been closing 44% of all streams.
 	streamingPrecommitMaxBytes = 64 << 10
 	// streamingPrecommitMaxBlocks bounds how many lifecycle blocks may be held
-	// before the stream commits. It was eight, and upstream routinely sends more
-	// than that while a request waits for capacity, so the window shut on its own
-	// bound before the failure arrived: twelve of the last fourteen capacity
-	// refusals closed with reason "bounds" and could not be retried at all. Only
-	// lifecycle events count toward it, each a few hundred bytes, so the byte
-	// bound above is what actually caps memory.
+	// before the stream commits. Only event-bearing lifecycle blocks count, each a
+	// few hundred bytes, so this is a sanity limit on upstream verbosity rather
+	// than the memory guard; the byte bound is that.
 	streamingPrecommitMaxBlocks = 64
 	// An upstream capacity rejection is transient model-level overload, not
 	// proof that the selected account is unhealthy. When no other upstream
@@ -423,6 +429,7 @@ type routingCacheEvent struct {
 	PrecommitCommitted    bool     `json:"precommitCommitted,omitempty"`
 	PrecommitCloseReason  string   `json:"precommitCloseReason,omitempty"`
 	PrecommitBlocks       int      `json:"precommitBlocks,omitempty"`
+	PrecommitBytes        int      `json:"precommitBytes,omitempty"`
 	ParentAffinity        string   `json:"parentAffinity"`
 	FailoverFromAccountID string   `json:"failoverFromAccountId,omitempty"`
 	UsageObserved         bool     `json:"usageObserved"`
@@ -1590,7 +1597,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		var info proxyResponseInfo
 		ok := true
 		if !convertResponse && isStreamingProxyResponse(response) {
-			result := copyStreamingProxyResponseWithPrecommit(w, response.Body, func() {
+			result := copyStreamingProxyResponseWithPrecommit(w, response.Body, precommitByteLimit(len(body)), func() {
 				a.addCurrentAccountResponseHeaders(w, candidate.ID)
 				commitProxyResponseHeaders(w, response)
 			})
@@ -1871,10 +1878,12 @@ type proxyResponseInfo struct {
 	// closed it. Streaming responses only; other paths leave them zero.
 	PrecommitCommitted   bool
 	PrecommitCloseReason string
-	// PrecommitBlocks is how many lifecycle blocks the window held when it
-	// closed. Without it, a bounds closure cannot be told apart from a bound set
-	// too low, which is the mistake this field exists to keep visible.
+	// PrecommitBlocks and PrecommitBytes are how much the window held when it
+	// closed. Without them a bounds closure cannot be told apart from a bound
+	// set too low, nor the block bound from the byte bound; misreading exactly
+	// that is what these fields exist to prevent.
 	PrecommitBlocks int
+	PrecommitBytes  int
 }
 
 type streamingProxyResult struct {
@@ -2019,8 +2028,21 @@ func copyProxyResponse(w http.ResponseWriter, response *http.Response) (proxyRes
 	return info, true
 }
 
+// precommitByteLimit sizes the pre-commit buffer for one request. Upstream's
+// first lifecycle event carries the request back (instructions, tools, input),
+// so the buffered prefix legitimately scales with what the client sent, and the
+// client's own payload is already held in memory for the whole attempt. A fixed
+// margin on top covers response scaffolding and the lifecycle events that
+// follow while a request waits for capacity.
+func precommitByteLimit(requestBytes int) int {
+	if requestBytes < 0 {
+		requestBytes = 0
+	}
+	return streamingPrecommitMaxBytes + requestBytes
+}
+
 func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResponseInfo {
-	result := copyStreamingProxyResponseWithPrecommit(w, body, nil)
+	result := copyStreamingProxyResponseWithPrecommit(w, body, precommitByteLimit(0), nil)
 	if result.RetryableCapacityFailure {
 		// This compatibility wrapper is used only after callers have already
 		// committed headers. It must preserve the upstream failure verbatim;
@@ -2030,7 +2052,7 @@ func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResp
 	return result.Info
 }
 
-func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Reader, beforeCommit func()) streamingProxyResult {
+func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Reader, maxBytes int, beforeCommit func()) streamingProxyResult {
 	var info proxyResponseInfo
 	reader := bufio.NewReader(body)
 	var buffered strings.Builder
@@ -2065,7 +2087,7 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 				if responseEventTypeFromSSEBlock(block) != "" {
 					bufferedBlocks++
 				}
-				withinBounds := buffered.Len() <= streamingPrecommitMaxBytes && bufferedBlocks <= streamingPrecommitMaxBlocks
+				withinBounds := buffered.Len() <= maxBytes && bufferedBlocks <= streamingPrecommitMaxBlocks
 				if next.TerminalEvent == "response.failed" && next.TerminalFailureClass == "capacity" && withinBounds {
 					// No headers, lifecycle event, response id, model output, or
 					// tool activity has reached the client. Return the exact
@@ -2085,6 +2107,7 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 					// retry window was already shut".
 					if info.PrecommitCloseReason == "" {
 						info.PrecommitBlocks = bufferedBlocks
+						info.PrecommitBytes = buffered.Len()
 						if !withinBounds {
 							info.PrecommitCloseReason = "bounds"
 						} else if eventType := responseEventTypeFromSSEBlock(block); eventType != "" {
@@ -4416,6 +4439,7 @@ func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accoun
 		PrecommitCommitted:    info.PrecommitCommitted,
 		PrecommitCloseReason:  info.PrecommitCloseReason,
 		PrecommitBlocks:       info.PrecommitBlocks,
+		PrecommitBytes:        info.PrecommitBytes,
 		ParentAffinity:        parentAffinity,
 		FailoverFromAccountID: failoverFromAccountID,
 		UsageObserved:         usage.Present,
@@ -8122,7 +8146,7 @@ func (a *app) routingCacheEventViewsLocked(now time.Time) []map[string]any {
 			"stickyKeyHash": event.StickyKeyHash, "promptCacheKeyHash": event.PromptCacheKeyHash,
 			"routingOutcome": event.RoutingOutcome, "routingSource": event.RoutingSource, "parentAffinity": event.ParentAffinity,
 			"terminalEvent": event.TerminalEvent, "terminalFailureClass": event.TerminalFailureClass, "terminalErrorCode": event.TerminalErrorCode,
-			"precommitCommitted": event.PrecommitCommitted, "precommitCloseReason": event.PrecommitCloseReason, "precommitBlocks": event.PrecommitBlocks,
+			"precommitCommitted": event.PrecommitCommitted, "precommitCloseReason": event.PrecommitCloseReason, "precommitBlocks": event.PrecommitBlocks, "precommitBytes": event.PrecommitBytes,
 			"failoverFromAccountLabel": failoverFromLabel, "failoverFromAccountRef": operationalIdentifierHash("account", event.FailoverFromAccountID),
 			"usageObserved": event.UsageObserved, "inputTokens": event.InputTokens, "cachedTokens": event.CachedTokens,
 			"cacheWriteTokens": event.CacheWriteTokens, "uncachedInputTokens": event.UncachedInputTokens,

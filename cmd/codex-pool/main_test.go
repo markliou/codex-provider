@@ -4209,7 +4209,7 @@ func TestStreamingPrecommitBlockLimitCommitsBeforeCapacityFailure(t *testing.T) 
 	_, _ = io.WriteString(&stream, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
 	recorder := httptest.NewRecorder()
 	commits := 0
-	result := copyStreamingProxyResponseWithPrecommit(recorder, strings.NewReader(stream.String()), func() {
+	result := copyStreamingProxyResponseWithPrecommit(recorder, strings.NewReader(stream.String()), precommitByteLimit(0), func() {
 		commits++
 		recorder.WriteHeader(http.StatusOK)
 	})
@@ -7207,6 +7207,78 @@ func TestPrecommitBoundStillCommitsAndRecordsDepth(t *testing.T) {
 	}
 	if event.PrecommitBlocks <= streamingPrecommitMaxBlocks {
 		t.Fatalf("recorded depth = %d, want more than the bound %d", event.PrecommitBlocks, streamingPrecommitMaxBlocks)
+	}
+}
+
+// The first stream recorded after depth accounting was added closed on "bounds"
+// holding one block: the byte bound tripped on response.created alone. That
+// event echoes the request (instructions, tools, input), so any large context
+// shut the retry window before a capacity failure could arrive. The bound must
+// scale with the request, or large-context requests can never be retried.
+func TestLargeContextCapacityFailureStillRetries(t *testing.T) {
+	// Well past the fixed 64 KiB part of the bound on its own.
+	context := strings.Repeat("x", 200<<10)
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		echo, _ := json.Marshal(payload["input"])
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Upstream echoes the request in the created event, as the Responses API does.
+		_, _ = fmt.Fprintf(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_big\",\"input\":%s}}\n\n", echo)
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_big\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_big\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	body, _ := json.Marshal(map[string]any{"model": "gpt-test", "input": context, "stream": true})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 2 || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("large-context capacity failure was not retried: hits=%d", hits)
+	}
+	if strings.Contains(recorder.Body.String(), "at capacity") {
+		t.Fatal("abandoned capacity prefix leaked downstream")
+	}
+	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].PrecommitCloseReason == "bounds" {
+		t.Fatalf("large context still closed the window on bounds: %#v", a.state.RoutingCacheEvents)
+	}
+}
+
+// A bounds closure must record how much was held so the byte bound and the
+// block bound can be told apart, which is the misreading this change corrects.
+func TestPrecommitBoundsClosureRecordsBytes(t *testing.T) {
+	if precommitByteLimit(-1) != streamingPrecommitMaxBytes || precommitByteLimit(1000) != streamingPrecommitMaxBytes+1000 {
+		t.Fatalf("precommitByteLimit does not scale with the request: %d %d", precommitByteLimit(-1), precommitByteLimit(1000))
+	}
+	huge := strings.Repeat("y", streamingPrecommitMaxBytes+1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// One created event larger than the fixed bound with a tiny request behind
+		// it, so the byte bound trips on a single block.
+		_, _ = fmt.Fprintf(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_huge\",\"pad\":\"%s\"}}\n\n", huge)
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_huge\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hi","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if len(a.state.RoutingCacheEvents) != 1 {
+		t.Fatalf("expected one routing event: %#v", a.state.RoutingCacheEvents)
+	}
+	event := a.state.RoutingCacheEvents[0]
+	if event.PrecommitCloseReason != "bounds" || event.PrecommitBlocks != 1 || event.PrecommitBytes <= streamingPrecommitMaxBytes {
+		t.Fatalf("bounds closure did not record a single oversized block: reason=%q blocks=%d bytes=%d", event.PrecommitCloseReason, event.PrecommitBlocks, event.PrecommitBytes)
 	}
 }
 
