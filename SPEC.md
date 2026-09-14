@@ -2285,52 +2285,50 @@ are read: the five-hour burst limit and the weekly budget. A window no routable
 account reports is omitted entirely rather than drawn against nothing, which
 would read as total exhaustion instead of absent evidence.
 
-The solid fill is what the pool can spend now, as a percentage of the spendable
-denominator, so 100% means every account routing will actually select is
-untouched. Spendable means routing would select it: in the pool and not held back
-by the duplicate guard. The verdict must be read from routing rather than
-reimplemented, so an account routing refuses never inflates the solid reading
-with capacity the pool cannot reach.
+Both readings divide by the same denominator: the pool's whole weighted
+allowance, counting every enabled account whether or not routing can reach it.
+The solid fill is the share routing can spend right now, and the hollow dashed
+run continues from where the fill ends, so the two together are what the pool
+would hold at full reach. The scale is a fixed 0 to 100 and the pair must never
+overrun it. Dividing by only the routable part instead would leave the reading
+unchanged when an account is parked, hiding exactly the loss the bar exists to
+show.
 
-Everything else enabled and reporting the window is recoverable capacity,
-stacked past the 100% mark as a hollow dashed run on the same per-unit scale,
-and may exceed 100% when more is recoverable than the pool itself holds.
+Spendable means routing would select it: in the pool and not held back by the
+duplicate guard. The verdict must be read from routing rather than
+reimplemented, so an account routing refuses never inflates the solid fill with
+capacity the pool cannot reach. Everything else enabled and reporting the window
+is recoverable, and the dashed run must stay hollow: filling it would read as
+capacity already available, when reaching it takes an explicit action.
 Recoverable capacity has two kinds and the reading must name them apart, because
 the action that recovers each differs: an account parked outside the pool needs
 putting back, while an account already in the pool and held back by routing is a
-different problem. Neither kind is dropped: the allowance is real and stays
-counted. It must stay hollow: filling it would read as
-capacity already available, when reaching it requires an operator to put the
-account back. The 100% boundary must be marked, or the dashed run reads as part
-of the same quantity rather than as capacity beyond the pool's own scale.
-
-Each quota allowance counts once, and the allowance is narrower than the
-identity routing deduplicates on. The routing guard keys on the upstream account
-id so a failed request is not retried against the same credential, but for a
-Business or Team workspace that id is the workspace: every member shares it while
-each holds their own allowance, which upstream proves by reporting different
-remaining percentages and even different window shapes for them. Counting
-capacity on the routing key would collapse several real allowances into one and
-hide the rest.
-
-The allowance is therefore keyed on the workspace together with the member's
-email. Two slots created from one login carry the same email and genuinely share
-an allowance; two members of one workspace do not. A slot with no email of its
-own counts alone, because nothing proves it shares with anything. An allowance
-with any slot routing would select belongs to the solid reading, because its
-capacity is spendable now.
+different problem. Neither kind is dropped; the allowance is real and stays
+counted.
 
 ##### Weekly tier weighting
 
-The weekly bar is weighted by plan multiplier; the five-hour bar is not. Plans
-documenting a larger weekly budget do not document a larger burst allowance, and
-the plans that would most distort the burst reading, Pro and Business Premium,
-report no five-hour window at all because no such limit applies to them.
-Weighting the burst reading would invent a difference upstream does not
-describe. Weighting the weekly reading corrects one that is real: a 20x Pro
-account at half capacity holds ten base allowances where a Plus account at half
-holds half of one, and averaging them as equals understates the pool by an order
-of magnitude.
+Both bars are weighted by plan multiplier, which corrects a real difference: a
+20x Pro account at half capacity holds ten base allowances where a Plus account
+at half holds half of one, and averaging them as equals understates the pool by
+an order of magnitude.
+
+A five-hour allowance has no published size to weigh against a weekly one, so
+the five-hour reading borrows the weekly weights and applies two rules of its
+own:
+
+- An account with no five-hour cap can never be held back by one, so on that
+  axis it is fully available and contributes its whole weight. Dropping it would
+  remove the accounts most able to absorb a burst from the very reading meant to
+  measure burst capacity. This applies only to an account that reported
+  something; a refresh that reported nothing is absent evidence and is excluded,
+  never read as an uncapped account sitting full.
+- An account whose weekly budget is spent cannot serve at all, whatever its
+  five-hour window reports. Upstream keeps reporting a five-hour figure for such
+  an account, and taking it at face value would promise burst capacity every
+  request would be refused. A weekly reading of zero therefore forces that
+  account's five-hour share to zero. A weekly reading merely low does not: the
+  account can still serve now, which is what the five-hour reading measures.
 
 Multipliers come from evidence of two different strengths, and the difference
 must remain visible:

@@ -90,8 +90,8 @@ const account = (overrides) => Object.assign({
 }, overrides);
 
 const capacity = [
-  { label: "5h", windowMinutes: 300, poolPercent: 63, outsidePercent: 0, poolAccounts: 4, outsideAccounts: 0, weighted: false, assumed: false },
-  { label: "Week", windowMinutes: 10080, poolPercent: 58.5, outsidePercent: 141.2, poolAccounts: 5, outsideAccounts: 3, blockedAccounts: 2, weighted: true, assumed: true },
+  { label: "5h", windowMinutes: 300, spendablePercent: 47, recoverablePercent: 0, spendableAccounts: 4, recoverableAccounts: 0, blockedAccounts: 0, weighted: true, assumed: false },
+  { label: "Week", windowMinutes: 10080, spendablePercent: 47, recoverablePercent: 18, spendableAccounts: 5, recoverableAccounts: 3, blockedAccounts: 2, weighted: true, assumed: true },
 ];
 
 const cases = [
@@ -109,11 +109,14 @@ const cases = [
     bundle.renderSummary({}, true);
     // A bar with no idle capacity must not draw a zero-width dashed run, and a
     // reading missing its counts must still render.
-    bundle.renderPoolCapacity([{ label: "Week", poolPercent: 12 }]);
+    bundle.renderPoolCapacity([{ label: "Week", spendablePercent: 12 }]);
     bundle.renderThroughput({});
     bundle.renderCacheWindow({});
     bundle.renderPublicAccounts([account({ detail: "", ownerNote: "", quota: null, remainingQuota: null, cacheWindow: null })]);
     bundle.renderRoutingCacheEvents([]);
+  }],
+  ["segments that would overrun the scale", () => {
+    bundle.renderPoolCapacity([{ label: "Week", spendablePercent: 99.9, recoverablePercent: 40, spendableAccounts: 1, recoverableAccounts: 1 }]);
   }],
   ["empty and missing", () => {
     bundle.renderSummary({}, true);

@@ -347,15 +347,12 @@ input:focus, select:focus { border-color: var(--accent-hot); box-shadow: 0 0 0 3
 .capacity-idle { margin-left: 8px; color: var(--muted); }
 .capacity-track { position: relative; height: 11px; border: 1px solid #a8b9b0; border-radius: 5px; background: #e1e6dc; overflow: hidden; }
 .capacity-fill { position: absolute; inset: 0 auto 0 0; border-radius: 4px 0 0 4px; background: linear-gradient(90deg, #0d8f78, #82b84d); }
+/* Hollow on purpose: this capacity exists but is not spendable until an
+   operator puts the account back in the pool or clears what is blocking it. */
 .capacity-fill.watch { background: linear-gradient(90deg, #d49a18, #f2c14e); }
 .capacity-fill.low { background: linear-gradient(90deg, #df5c38, #f08a3e); }
 .capacity-fill.critical { background: linear-gradient(90deg, #c83252, #eb5b65); }
 .capacity-fill.empty { background: linear-gradient(90deg, #a82245, #df314d); }
-/* The full-pool boundary. Without it the dashed run reads as part of the same
-   quantity instead of as capacity stacked beyond the pool's own scale. */
-.capacity-tick { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--muted-strong); opacity: .75; }
-/* Hollow on purpose: this capacity exists but is not spendable until an
-   operator puts the account back in the pool. */
 .capacity-outside { position: absolute; top: 1px; bottom: 1px; border: 1px dashed #0d8f78; border-radius: 3px; background: transparent; }
 .capacity-detail { color: var(--muted); font-size: 10px; }
 .summary-item { min-height: 78px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 13px; background: var(--summary-bg); box-shadow: 0 12px 30px color-mix(in srgb, var(--ink) 11%, transparent); }

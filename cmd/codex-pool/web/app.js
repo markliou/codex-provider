@@ -537,13 +537,13 @@
   // #cache-window row, so it is intentionally not duplicated here. Every
   // account belongs to exactly one non-total card; do not merge Duplicate into
   // Out of pool, because duplicate credential copies may still be in the pool.
-  // Pool capacity reads as a health bar rather than a number because the two
-  // quantities it carries are not comparable as text: what the pool can spend
-  // now, and what more it could spend after an operator puts an idle account
-  // back. The solid fill is the first; the dashed extension past the 100% mark
-  // is the second, drawn on the same per-unit scale so their lengths compare
-  // directly. The dashed part is deliberately hollow: filling it would read as
-  // capacity already available, when reaching it takes an explicit action.
+  // Pool capacity reads as a bar rather than a number because it carries two
+  // quantities that only make sense together: what the pool can spend now, and
+  // how much further that would reach if every account it holds were routable.
+  // Both are shares of the same whole, so the scale is a fixed 0 to 100 and the
+  // dashed run continues from the solid fill rather than restarting. The dashed
+  // part stays hollow: filling it would read as capacity already available, when
+  // reaching it takes an explicit action.
   function renderPoolCapacity(bars) {
     const container = $("#pool-capacity");
     if (!container) return;
@@ -554,41 +554,36 @@
     }
     container.innerHTML = rows.map((bar) => {
       const label = bar.label || "Window";
-      const pool = Math.max(0, finiteMetric(bar.poolPercent) ?? 0);
-      const outside = Math.max(0, finiteMetric(bar.outsidePercent) ?? 0);
-      // The axis runs from zero to the pool's full scale plus whatever sits
-      // outside it, so the 100% mark keeps its meaning as "the pool at full"
-      // however much idle capacity is stacked beyond it.
-      const axis = 100 + outside;
-      const percentOf = (value) => (value / axis * 100).toFixed(3);
-      const tone = quotaTone(pool);
-      const poolAccounts = Number(bar.poolAccounts) || 0;
-      const outsideAccounts = Number(bar.outsideAccounts) || 0;
+      const spendable = Math.min(100, Math.max(0, finiteMetric(bar.spendablePercent) ?? 0));
+      // Never let rounding push the pair past the end of the track.
+      const recoverable = Math.min(100 - spendable, Math.max(0, finiteMetric(bar.recoverablePercent) ?? 0));
+      const reach = spendable + recoverable;
+      const tone = quotaTone(spendable);
+      const spendableAccounts = Number(bar.spendableAccounts) || 0;
+      const recoverableAccounts = Number(bar.recoverableAccounts) || 0;
+      const blocked = Number(bar.blockedAccounts) || 0;
       // An assumed multiplier must never be presented with the authority of a
       // reported one, so the reading carries a marker back to its explanation.
       const assumed = bar.assumed
         ? `<abbr class="capacity-assumed" title="Includes a Business Premium seat multiplier this pool assumes from public pricing rather than one upstream reported. Set CODEX_POOL_PREMIUM_SEAT_MULTIPLIER to correct it.">*</abbr>`
         : "";
-      const idle = outside > 0
-        ? `<span class="capacity-idle">+${outside.toFixed(0)}% recoverable</span>`
+      const extra = recoverable > 0
+        ? `<span class="capacity-idle">→ ${reach.toFixed(0)}% at full reach</span>`
         : "";
-      const dashed = outside > 0
-        ? `<span class="capacity-outside" data-capacity-left="${percentOf(100)}" data-capacity-width="${percentOf(outside)}"></span>`
+      const dashed = recoverable > 0
+        ? `<span class="capacity-outside" data-capacity-left="${spendable.toFixed(3)}" data-capacity-width="${recoverable.toFixed(3)}"></span>`
         : "";
-      const scope = bar.weighted ? "weighted by plan multiplier" : "unweighted";
-      const blocked = Number(bar.blockedAccounts) || 0;
       // Name the two kinds of recoverable capacity apart. One needs the account
       // put back in the pool; the other is already in the pool and held back by
       // routing, which is a different problem with a different fix.
-      const recoverable = outsideAccounts
-        ? `, ${outsideAccounts} recoverable${blocked ? ` (${blocked} blocked by routing)` : ""}`
+      const recoverableText = recoverableAccounts
+        ? `, ${recoverableAccounts} recoverable${blocked ? ` (${blocked} blocked by routing)` : ""}`
         : "";
-      const detail = `${poolAccounts} spendable${recoverable} · ${scope}`;
+      const detail = `${spendableAccounts} spendable${recoverableText} · weighted by plan multiplier`;
       return `<div class="capacity-bar">
-        <div class="capacity-head"><span class="capacity-label">${escapeHTML(label)}${assumed}</span><span class="capacity-readout"><strong>${pool.toFixed(0)}%</strong> pool${idle}</span></div>
-        <div class="capacity-track" role="img" aria-label="${escapeHTML(`${label} capacity: ${pool.toFixed(0)} percent spendable now, ${outside.toFixed(0)} percent more recoverable`)}">
-          <span class="capacity-fill ${escapeHTML(tone)}" data-capacity-width="${percentOf(Math.min(pool, 100))}"></span>
-          <span class="capacity-tick" data-capacity-left="${percentOf(100)}"></span>
+        <div class="capacity-head"><span class="capacity-label">${escapeHTML(label)}${assumed}</span><span class="capacity-readout"><strong>${spendable.toFixed(0)}%</strong>${extra}</span></div>
+        <div class="capacity-track" role="img" aria-label="${escapeHTML(`${label} capacity: ${spendable.toFixed(0)} percent spendable now, ${reach.toFixed(0)} percent at full reach`)}">
+          <span class="capacity-fill ${escapeHTML(tone)}" data-capacity-width="${spendable.toFixed(3)}"></span>
           ${dashed}
         </div>
         <span class="capacity-detail">${escapeHTML(detail)}</span>

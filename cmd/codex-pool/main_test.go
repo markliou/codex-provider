@@ -895,185 +895,214 @@ func TestAccountWeeklyWeight(t *testing.T) {
 	}
 }
 
-// The whole point of weighting: a 20x account at half capacity holds ten base
-// allowances, and averaging it against a Plus account as an equal understates
-// the pool by an order of magnitude.
-func TestPoolCapacityWeightsTheWeeklyWindow(t *testing.T) {
-	minutes := func(v int64) *int64 { return &v }
-	window := func(m int64, remaining float64) quotaWindow {
-		value := remaining
-		return quotaWindow{Label: quotaWindowLabel(minutes(m)), WindowMinutes: minutes(m), RemainingPercent: &value, Present: true, Observed: true}
+// Helpers shared by the capacity readings.
+func capacityWindow(minutes int64, remaining float64) quotaWindow {
+	value := remaining
+	return quotaWindow{Label: quotaWindowLabel(&minutes), WindowMinutes: &minutes, RemainingPercent: &value, Present: true, Observed: true}
+}
+
+func capacityBar(t *testing.T, a *app, minutes int64) poolCapacityBar {
+	t.Helper()
+	a.mu.Lock()
+	bars := a.poolCapacityLocked(time.Now().UTC())
+	a.mu.Unlock()
+	for _, bar := range bars {
+		if bar.WindowMinutes == minutes {
+			return bar
+		}
 	}
+	t.Fatalf("no bar for a %d-minute window: %#v", minutes, bars)
+	return poolCapacityBar{}
+}
+
+// The whole point of weighting: a 20x account at half capacity holds ten base
+// allowances where a Plus account at half holds half of one, so averaging them
+// as equals understates the pool by an order of magnitude.
+func TestPoolCapacityWeightsTheWeeklyWindow(t *testing.T) {
 	a := testApp(t, []account{
 		{ID: "pro", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://pro.example.test"},
 		{ID: "plus", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://plus.example.test"},
 	})
-	// Pro 20x at 50% holds 10 base allowances; Plus at 50% holds 0.5.
-	a.state.Quotas["pro"] = quotaSnapshot{AccountID: "pro", PlanFamily: "pro", PlanLimit: "20x", Quota: &accountQuota{Windows: []quotaWindow{window(weeklyWindowMinutes, 50)}}}
-	a.state.Quotas["plus"] = quotaSnapshot{AccountID: "plus", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{window(weeklyWindowMinutes, 50)}}}
+	a.state.Quotas["pro"] = quotaSnapshot{AccountID: "pro", PlanFamily: "pro", PlanLimit: "20x", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 50)}}}
+	a.state.Quotas["plus"] = quotaSnapshot{AccountID: "plus", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 50)}}}
 
-	a.mu.Lock()
-	bars := a.poolCapacityLocked(time.Now().UTC())
-	a.mu.Unlock()
-
-	if len(bars) != 1 || bars[0].WindowMinutes != weeklyWindowMinutes {
-		t.Fatalf("expected only a weekly bar: %#v", bars)
-	}
-	// (10 + 0.5) / 21 = 50%. Both accounts sit at 50%, so the weighted reading
-	// agrees here, which is what proves the denominator scaled with the numerator.
-	if bars[0].PoolPercent != 50 {
-		t.Fatalf("weighted pool percent = %v, want 50", bars[0].PoolPercent)
-	}
-	if !bars[0].Weighted || bars[0].Assumed {
-		t.Fatalf("weekly bar flags = weighted:%v assumed:%v, want weighted and not assumed", bars[0].Weighted, bars[0].Assumed)
+	// (10 + 0.5) / 21 = 50%. Both sit at 50%, so the weighted reading agrees,
+	// which is what proves the denominator scaled with the numerator.
+	if bar := capacityBar(t, a, weeklyWindowMinutes); bar.SpendablePercent != 50 {
+		t.Fatalf("weighted reading = %v, want 50", bar.SpendablePercent)
 	}
 
-	// Spend the Pro account down and the reading must fall far further than an
-	// unweighted average would, because that one account is 20 of the 21 units.
-	a.state.Quotas["pro"].Quota.Windows[0].RemainingPercent = func() *float64 { v := 0.0; return &v }()
-	a.mu.Lock()
-	bars = a.poolCapacityLocked(time.Now().UTC())
-	a.mu.Unlock()
-	// 0.5 / 21 ≈ 2.4%, where a plain average of 0% and 50% would have said 25%.
-	if bars[0].PoolPercent > 3 {
-		t.Fatalf("exhausting the 20x account barely moved the reading: %v", bars[0].PoolPercent)
+	// Spend the 20x account down and the reading must fall far further than an
+	// unweighted average would, because it is 20 of the 21 units.
+	zero := 0.0
+	a.state.Quotas["pro"].Quota.Windows[0].RemainingPercent = &zero
+	// 0.5 / 21 is about 2.4%, where a plain average of 0 and 50 would say 25%.
+	if bar := capacityBar(t, a, weeklyWindowMinutes); bar.SpendablePercent > 3 {
+		t.Fatalf("exhausting the 20x account barely moved the reading: %v", bar.SpendablePercent)
 	}
 }
 
-// Out-of-pool capacity stacks past the pool's own scale rather than diluting it,
-// so the solid reading keeps meaning "what the pool can spend now".
-func TestPoolCapacityStacksIdleCapacityBeyondThePool(t *testing.T) {
-	minutes := func(v int64) *int64 { return &v }
-	window := func(m int64, remaining float64) quotaWindow {
-		value := remaining
-		return quotaWindow{Label: quotaWindowLabel(minutes(m)), WindowMinutes: minutes(m), RemainingPercent: &value, Present: true, Observed: true}
-	}
+// The two segments are shares of one whole, so they sit inside a fixed scale and
+// their sum is what the pool would hold if every account it has were routable.
+func TestPoolCapacitySplitsOneWholeBetweenSpendableAndRecoverable(t *testing.T) {
 	a := testApp(t, []account{
 		{ID: "inpool", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
-		{ID: "idle", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+		{ID: "parked", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
 		{ID: "off", AuthType: "provider_api_key", Enabled: false, InPool: false, Priority: 100, UpstreamBaseURL: "https://c.example.test"},
 	})
-	a.state.Quotas["inpool"] = quotaSnapshot{AccountID: "inpool", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{window(weeklyWindowMinutes, 40)}}}
-	a.state.Quotas["idle"] = quotaSnapshot{AccountID: "idle", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{window(weeklyWindowMinutes, 90)}}}
+	a.state.Quotas["inpool"] = quotaSnapshot{AccountID: "inpool", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 80)}}}
+	a.state.Quotas["parked"] = quotaSnapshot{AccountID: "parked", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 50)}}}
 	// A disabled slot is not capacity at all and must not appear on either side.
-	a.state.Quotas["off"] = quotaSnapshot{AccountID: "off", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{window(weeklyWindowMinutes, 100)}}}
+	a.state.Quotas["off"] = quotaSnapshot{AccountID: "off", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 100)}}}
 
-	a.mu.Lock()
-	bars := a.poolCapacityLocked(time.Now().UTC())
-	a.mu.Unlock()
-
-	if len(bars) != 1 {
-		t.Fatalf("expected one bar: %#v", bars)
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	// Two equal allowances: 80% of one and 50% of the other, over a denominator
+	// of both, so 40% is spendable now and 25% more is recoverable.
+	if bar.SpendablePercent != 40 || bar.RecoverablePercent != 25 {
+		t.Fatalf("bar = %v spendable, %v recoverable, want 40 and 25", bar.SpendablePercent, bar.RecoverablePercent)
 	}
-	bar := bars[0]
-	if bar.PoolPercent != 40 || bar.OutsidePercent != 90 {
-		t.Fatalf("bar = pool %v, outside %v, want 40 and 90", bar.PoolPercent, bar.OutsidePercent)
+	if bar.SpendablePercent+bar.RecoverablePercent > 100 {
+		t.Fatalf("the two segments overran the scale: %v + %v", bar.SpendablePercent, bar.RecoverablePercent)
 	}
-	if bar.PoolAccounts != 1 || bar.OutsideAccounts != 1 {
-		t.Fatalf("counts = %d in pool, %d outside, want 1 and 1; a disabled slot must not count", bar.PoolAccounts, bar.OutsideAccounts)
+	if bar.SpendableAccounts != 1 || bar.RecoverableAccounts != 1 {
+		t.Fatalf("counts = %d spendable, %d recoverable, want 1 and 1; a disabled slot must not count", bar.SpendableAccounts, bar.RecoverableAccounts)
 	}
 }
 
-// Copies of one credential must count once. If any copy is in the pool the
-// capacity is spendable now, so it belongs to the solid reading rather than
-// being counted on both sides.
-func TestPoolCapacityCountsOneAllowanceOnce(t *testing.T) {
-	minutes := func(v int64) *int64 { return &v }
-	value := 80.0
-	window := quotaWindow{Label: "Week", WindowMinutes: minutes(weeklyWindowMinutes), RemainingPercent: &value, Present: true, Observed: true}
+// Parking an account must lower the spendable reading rather than leave it
+// unchanged, which is what a routable-only denominator would have done.
+func TestPoolCapacityDenominatorSpansTheWholePool(t *testing.T) {
 	a := testApp(t, []account{
-		{ID: "copy-a", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "a@example.test"},
-		{ID: "copy-b", AuthType: "codex_device_auth", Enabled: true, InPool: false, Priority: 100, AccountID: "workspace-1", Email: "a@example.test"},
+		{ID: "a", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "b", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
 	})
-	for _, id := range []string{"copy-a", "copy-b"} {
-		writeTestCodexAuth(t, a, id)
-		a.state.Quotas[id] = quotaSnapshot{AccountID: id, PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{window}}}
+	for _, id := range []string{"a", "b"} {
+		a.state.Quotas[id] = quotaSnapshot{AccountID: id, PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 100)}}}
+	}
+	if bar := capacityBar(t, a, weeklyWindowMinutes); bar.SpendablePercent != 100 {
+		t.Fatalf("a full pool read %v, want 100", bar.SpendablePercent)
 	}
 
-	a.mu.Lock()
-	bars := a.poolCapacityLocked(time.Now().UTC())
-	a.mu.Unlock()
+	a.config.Accounts[1].InPool = false
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	if bar.SpendablePercent != 50 || bar.RecoverablePercent != 50 {
+		t.Fatalf("parking half the pool = %v spendable, %v recoverable, want 50 and 50", bar.SpendablePercent, bar.RecoverablePercent)
+	}
+}
 
-	if len(bars) != 1 {
-		t.Fatalf("expected one bar: %#v", bars)
+// A spent weekly budget blocks the account outright, so its five-hour reading
+// must be zero however much the five-hour window itself still reports. Taking
+// that figure at face value would promise burst capacity every request is
+// refused.
+func TestPoolCapacityZeroesTheFiveHourReadingWhenWeeklyIsSpent(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "spent", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "healthy", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+	})
+	// Upstream still reports a full five-hour window on the exhausted account.
+	a.state.Quotas["spent"] = quotaSnapshot{AccountID: "spent", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(fiveHourWindowMinutes, 100), capacityWindow(weeklyWindowMinutes, 0)}}}
+	a.state.Quotas["healthy"] = quotaSnapshot{AccountID: "healthy", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(fiveHourWindowMinutes, 60), capacityWindow(weeklyWindowMinutes, 90)}}}
+
+	// Only the healthy account contributes: 60% of one allowance in two.
+	if bar := capacityBar(t, a, fiveHourWindowMinutes); bar.SpendablePercent != 30 {
+		t.Fatalf("five-hour reading = %v, want 30; a spent weekly budget must zero its five-hour share", bar.SpendablePercent)
 	}
-	bar := bars[0]
-	if bar.PoolAccounts != 1 || bar.OutsideAccounts != 0 {
-		t.Fatalf("one credential counted %d in pool and %d outside", bar.PoolAccounts, bar.OutsideAccounts)
+	if bar := capacityBar(t, a, weeklyWindowMinutes); bar.SpendablePercent != 45 {
+		t.Fatalf("weekly reading = %v, want 45", bar.SpendablePercent)
 	}
-	if bar.PoolPercent != 80 || bar.OutsidePercent != 0 {
-		t.Fatalf("shared allowance double counted: pool %v outside %v", bar.PoolPercent, bar.OutsidePercent)
+}
+
+// An account with no five-hour cap can never be held back by one, so on that
+// axis it is fully available. Dropping it would remove the accounts most able to
+// absorb a burst from the very reading meant to measure burst capacity.
+func TestPoolCapacityTreatsAnUncappedAccountAsFullOnFiveHours(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "capped", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "uncapped", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+	})
+	a.state.Quotas["capped"] = quotaSnapshot{AccountID: "capped", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(fiveHourWindowMinutes, 0), capacityWindow(weeklyWindowMinutes, 50)}}}
+	// A Business Premium seat: weekly only, no five-hour limit at all.
+	a.state.Quotas["uncapped"] = quotaSnapshot{AccountID: "uncapped", PlanFamily: "business", SeatType: "premium", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 50)}}}
+
+	bar := capacityBar(t, a, fiveHourWindowMinutes)
+	if bar.SpendableAccounts != 2 {
+		t.Fatalf("the uncapped account was dropped from the five-hour reading: %#v", bar)
+	}
+	// The uncapped seat weighs 5 and counts full; the capped one weighs 1 at
+	// zero. So 5 of 6 units are available.
+	want := 5.0 / 6.0 * 100
+	if bar.SpendablePercent < want-0.01 || bar.SpendablePercent > want+0.01 {
+		t.Fatalf("five-hour reading = %v, want about %v", bar.SpendablePercent, want)
+	}
+	if !bar.Assumed {
+		t.Fatal("a reading leaning on the assumed premium multiplier was not flagged")
+	}
+}
+
+// A failed refresh reports nothing, and nothing must never be read as an
+// uncapped account sitting at full capacity.
+func TestPoolCapacityIgnoresAnAccountThatReportedNoWindow(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "reporting", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "silent", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+	})
+	a.state.Quotas["reporting"] = quotaSnapshot{AccountID: "reporting", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(fiveHourWindowMinutes, 40), capacityWindow(weeklyWindowMinutes, 40)}}}
+	a.state.Quotas["silent"] = quotaSnapshot{AccountID: "silent", PlanFamily: "plus", Quota: &accountQuota{}}
+
+	for _, minutes := range []int64{fiveHourWindowMinutes, weeklyWindowMinutes} {
+		bar := capacityBar(t, a, minutes)
+		if bar.SpendableAccounts != 1 || bar.SpendablePercent != 40 {
+			t.Fatalf("%d-minute bar = %#v, want one account at 40", minutes, bar)
+		}
 	}
 }
 
 // A duplicate-blocked slot is in the pool but routing will not select it, so its
-// capacity is real yet unspendable. It must be counted as recoverable rather
-// than inflating the solid reading with capacity the pool cannot reach, and
-// reported apart from capacity an operator parked on purpose.
+// capacity is real yet unspendable. It belongs to the recoverable run, counted
+// apart from capacity an operator parked on purpose.
 func TestPoolCapacityCountsDuplicateBlockedCapacityAsRecoverable(t *testing.T) {
-	minutes := func(v int64) *int64 { return &v }
-	window := func(remaining float64) quotaWindow {
-		value := remaining
-		return quotaWindow{Label: "Week", WindowMinutes: minutes(weeklyWindowMinutes), RemainingPercent: &value, Present: true, Observed: true}
-	}
-	// Two slots, one upstream workspace, one email: genuine copies of one login,
-	// so routing marks the second a duplicate and never selects it.
+	// One workspace, two members with their own allowances, both in the pool.
+	// Routing selects one and holds the other back as a duplicate.
 	a := testApp(t, []account{
-		{ID: "primary", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "same@example.test"},
-		{ID: "copy", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "same@example.test"},
-		{ID: "parked", AuthType: "codex_device_auth", Enabled: true, InPool: false, Priority: 100, AccountID: "workspace-2", Email: "other@example.test"},
-	})
-	for _, seed := range []struct {
-		id        string
-		remaining float64
-	}{{"primary", 60}, {"copy", 60}, {"parked", 100}} {
-		writeTestCodexAuth(t, a, seed.id)
-		a.state.Quotas[seed.id] = quotaSnapshot{AccountID: seed.id, PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{window(seed.remaining)}}}
-	}
-
-	a.mu.Lock()
-	bars := a.poolCapacityLocked(time.Now().UTC())
-	a.mu.Unlock()
-	if len(bars) != 1 {
-		t.Fatalf("expected one bar: %#v", bars)
-	}
-	bar := bars[0]
-	// The two copies share one allowance, so they collapse to a single spendable
-	// reading; the parked account is the only recoverable one here.
-	if bar.PoolAccounts != 1 || bar.OutsideAccounts != 1 {
-		t.Fatalf("counts = %d spendable, %d recoverable, want 1 and 1", bar.PoolAccounts, bar.OutsideAccounts)
-	}
-	if bar.PoolPercent != 60 || bar.OutsidePercent != 100 {
-		t.Fatalf("bar = pool %v, outside %v, want 60 and 100", bar.PoolPercent, bar.OutsidePercent)
-	}
-
-	// Now a separate allowance that routing blocks: a distinct member of the same
-	// workspace, in the pool, which the duplicate guard holds back.
-	blocked := testApp(t, []account{
 		{ID: "member-a", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "a@example.test"},
 		{ID: "member-b", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "b@example.test"},
 	})
 	for _, id := range []string{"member-a", "member-b"} {
-		writeTestCodexAuth(t, blocked, id)
-		blocked.state.Quotas[id] = quotaSnapshot{AccountID: id, PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{window(50)}}}
+		writeTestCodexAuth(t, a, id)
+		a.state.Quotas[id] = quotaSnapshot{AccountID: id, PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 50)}}}
 	}
-	blocked.mu.Lock()
-	bars = blocked.poolCapacityLocked(time.Now().UTC())
-	blocked.mu.Unlock()
-	if len(bars) != 1 {
-		t.Fatalf("expected one bar: %#v", bars)
-	}
-	bar = bars[0]
-	// Routing selects one of the two; the other holds its own allowance but is
-	// unreachable, so it is recoverable and named as blocked rather than parked.
-	if bar.PoolAccounts != 1 || bar.OutsideAccounts != 1 {
-		t.Fatalf("counts = %d spendable, %d recoverable, want 1 and 1", bar.PoolAccounts, bar.OutsideAccounts)
+
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	if bar.SpendableAccounts != 1 || bar.RecoverableAccounts != 1 {
+		t.Fatalf("counts = %d spendable, %d recoverable, want 1 and 1", bar.SpendableAccounts, bar.RecoverableAccounts)
 	}
 	if bar.BlockedAccounts != 1 {
 		t.Fatalf("blocked count = %d, want 1: routing-held capacity must be distinguishable from parked capacity", bar.BlockedAccounts)
 	}
-	if bar.OutsidePercent != 50 {
-		t.Fatalf("blocked capacity was dropped instead of counted: outside %v, want 50", bar.OutsidePercent)
+	// Neither allowance is dropped: each is half of one of two equal units.
+	if bar.SpendablePercent != 25 || bar.RecoverablePercent != 25 {
+		t.Fatalf("bar = %v spendable, %v recoverable, want 25 and 25", bar.SpendablePercent, bar.RecoverablePercent)
+	}
+}
+
+// Copies of one credential share an allowance and must count once, while
+// members of one workspace hold their own and must not be collapsed.
+func TestPoolCapacityCountsOneAllowanceOnce(t *testing.T) {
+	// Same workspace, same email: genuine copies of one login.
+	a := testApp(t, []account{
+		{ID: "copy-a", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "same@example.test"},
+		{ID: "copy-b", AuthType: "codex_device_auth", Enabled: true, InPool: false, Priority: 100, AccountID: "workspace-1", Email: "same@example.test"},
+	})
+	for _, id := range []string{"copy-a", "copy-b"} {
+		writeTestCodexAuth(t, a, id)
+		a.state.Quotas[id] = quotaSnapshot{AccountID: id, PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 80)}}}
+	}
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	if bar.SpendableAccounts != 1 || bar.RecoverableAccounts != 0 {
+		t.Fatalf("one credential counted %d spendable and %d recoverable", bar.SpendableAccounts, bar.RecoverableAccounts)
+	}
+	if bar.SpendablePercent != 80 {
+		t.Fatalf("shared allowance double counted: %v", bar.SpendablePercent)
 	}
 }
 
@@ -1082,12 +1111,6 @@ func TestPoolCapacityCountsDuplicateBlockedCapacityAsRecoverable(t *testing.T) {
 // percentages for them. Counting them on the routing identity would collapse
 // several real allowances into one and hide the rest.
 func TestPoolCapacityCountsEachWorkspaceMemberSeparately(t *testing.T) {
-	minutes := func(v int64) *int64 { return &v }
-	window := func(remaining float64) quotaWindow {
-		value := remaining
-		return quotaWindow{Label: "Week", WindowMinutes: minutes(weeklyWindowMinutes), RemainingPercent: &value, Present: true, Observed: true}
-	}
-	// One workspace, three members, distinct emails and distinct quotas.
 	a := testApp(t, []account{
 		{ID: "member-a", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "a@example.test"},
 		{ID: "member-b", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "b@example.test"},
@@ -1098,58 +1121,18 @@ func TestPoolCapacityCountsEachWorkspaceMemberSeparately(t *testing.T) {
 		remaining float64
 	}{{"member-a", 40}, {"member-b", 60}, {"member-c", 100}} {
 		writeTestCodexAuth(t, a, seed.id)
-		a.state.Quotas[seed.id] = quotaSnapshot{AccountID: seed.id, PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{window(seed.remaining)}}}
+		a.state.Quotas[seed.id] = quotaSnapshot{AccountID: seed.id, PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, seed.remaining)}}}
 	}
 
-	a.mu.Lock()
-	bars := a.poolCapacityLocked(time.Now().UTC())
-	a.mu.Unlock()
-
-	if len(bars) != 1 {
-		t.Fatalf("expected one bar: %#v", bars)
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	if bar.SpendableAccounts+bar.RecoverableAccounts != 3 {
+		t.Fatalf("workspace members collapsed: %d spendable, %d recoverable, want three allowances", bar.SpendableAccounts, bar.RecoverableAccounts)
 	}
-	bar := bars[0]
-	// Routing selects one member of the workspace and blocks the other, so one is
-	// spendable and two are recoverable: one blocked, one parked.
-	if bar.PoolAccounts != 1 || bar.OutsideAccounts != 2 || bar.BlockedAccounts != 1 {
-		t.Fatalf("workspace members = %d spendable, %d recoverable, %d blocked; want 1, 2, 1", bar.PoolAccounts, bar.OutsideAccounts, bar.BlockedAccounts)
-	}
-	// Every member's allowance is still counted somewhere; none is dropped.
-	if bar.PoolPercent+bar.OutsidePercent != 200 {
-		t.Fatalf("a member allowance was lost: pool %v + outside %v", bar.PoolPercent, bar.OutsidePercent)
-	}
-}
-
-// The five-hour bar is unweighted, and the plans that would distort it report no
-// five-hour window at all, so they must be absent from it rather than counted.
-func TestPoolCapacityLeavesTheFiveHourBarUnweighted(t *testing.T) {
-	minutes := func(v int64) *int64 { return &v }
-	window := func(m int64, remaining float64) quotaWindow {
-		value := remaining
-		return quotaWindow{Label: quotaWindowLabel(minutes(m)), WindowMinutes: minutes(m), RemainingPercent: &value, Present: true, Observed: true}
-	}
-	a := testApp(t, []account{
-		{ID: "capped", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
-		{ID: "pro", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
-	})
-	a.state.Quotas["capped"] = quotaSnapshot{AccountID: "capped", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{window(fiveHourWindowMinutes, 30), window(weeklyWindowMinutes, 60)}}}
-	// A 20x Pro slot with no five-hour cap: weekly only.
-	a.state.Quotas["pro"] = quotaSnapshot{AccountID: "pro", PlanFamily: "pro", PlanLimit: "20x", Quota: &accountQuota{Windows: []quotaWindow{window(weeklyWindowMinutes, 60)}}}
-
-	a.mu.Lock()
-	bars := a.poolCapacityLocked(time.Now().UTC())
-	a.mu.Unlock()
-
-	if len(bars) != 2 || bars[0].WindowMinutes != fiveHourWindowMinutes || bars[1].WindowMinutes != weeklyWindowMinutes {
-		t.Fatalf("expected a five-hour bar then a weekly bar: %#v", bars)
-	}
-	// Only one account reports a five-hour window, unweighted, so it reads 30.
-	if bars[0].PoolPercent != 30 || bars[0].PoolAccounts != 1 || bars[0].Weighted {
-		t.Fatalf("five-hour bar = %#v, want an unweighted single-account reading of 30", bars[0])
-	}
-	// Both report weekly, and the 20x slot dominates it.
-	if bars[1].PoolAccounts != 2 || !bars[1].Weighted {
-		t.Fatalf("weekly bar = %#v, want a weighted two-account reading", bars[1])
+	// Every member's allowance is counted somewhere; none is dropped.
+	total := bar.SpendablePercent + bar.RecoverablePercent
+	want := (40.0 + 60 + 100) / 3
+	if total < want-0.01 || total > want+0.01 {
+		t.Fatalf("a member allowance was lost: %v, want about %v", total, want)
 	}
 }
 
@@ -1159,35 +1142,30 @@ func TestPoolCapacityFlagsAndRetunesTheAssumedPremiumWeight(t *testing.T) {
 	oldWeight := premiumSeatWeight
 	defer func() { premiumSeatWeight = oldWeight }()
 
-	minutes := func(v int64) *int64 { return &v }
-	value := 100.0
-	window := quotaWindow{Label: "Week", WindowMinutes: minutes(weeklyWindowMinutes), RemainingPercent: &value, Present: true, Observed: true}
 	a := testApp(t, []account{
 		{ID: "standard", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
-		{ID: "premium", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+		{ID: "premium", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
 	})
-	a.state.Quotas["standard"] = quotaSnapshot{AccountID: "standard", PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{window}}}
-	a.state.Quotas["premium"] = quotaSnapshot{AccountID: "premium", PlanFamily: "business", SeatType: "premium", Quota: &accountQuota{Windows: []quotaWindow{window}}}
+	a.state.Quotas["standard"] = quotaSnapshot{AccountID: "standard", PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 0)}}}
+	a.state.Quotas["premium"] = quotaSnapshot{AccountID: "premium", PlanFamily: "business", SeatType: "premium", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 100)}}}
 
-	a.mu.Lock()
-	bars := a.poolCapacityLocked(time.Now().UTC())
-	a.mu.Unlock()
-	if len(bars) != 1 || !bars[0].Assumed {
-		t.Fatalf("a reading using the assumed ratio was not flagged: %#v", bars)
+	// The premium seat weighs 5 of the 6 units, so a full one reads 83%.
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	if !bar.Assumed {
+		t.Fatalf("a reading using the assumed ratio was not flagged: %#v", bar)
 	}
-	if bars[0].OutsidePercent != defaultPremiumSeatWeight*100 {
-		t.Fatalf("idle premium capacity = %v, want %v", bars[0].OutsidePercent, defaultPremiumSeatWeight*100)
+	want := 5.0 / 6.0 * 100
+	if bar.SpendablePercent < want-0.01 || bar.SpendablePercent > want+0.01 {
+		t.Fatalf("reading = %v, want about %v", bar.SpendablePercent, want)
 	}
 
 	t.Setenv("CODEX_POOL_PREMIUM_SEAT_MULTIPLIER", "3")
 	if err := applyCapacityWeightEnv(); err != nil {
 		t.Fatalf("valid multiplier rejected: %s", err)
 	}
-	a.mu.Lock()
-	bars = a.poolCapacityLocked(time.Now().UTC())
-	a.mu.Unlock()
-	if bars[0].OutsidePercent != 300 {
-		t.Fatalf("retuned multiplier was ignored: %v", bars[0].OutsidePercent)
+	// Now 3 of 4 units.
+	if bar := capacityBar(t, a, weeklyWindowMinutes); bar.SpendablePercent != 75 {
+		t.Fatalf("retuned multiplier was ignored: %v", bar.SpendablePercent)
 	}
 
 	// A wrong multiplier silently distorts every reading it touches, so an
@@ -1200,28 +1178,13 @@ func TestPoolCapacityFlagsAndRetunesTheAssumedPremiumWeight(t *testing.T) {
 	}
 }
 
-// No routable account reporting a window means no denominator. A bar drawn
-// against nothing would read as total exhaustion rather than absent evidence.
-func TestPoolCapacityOmitsAWindowWithNoPoolDenominator(t *testing.T) {
-	minutes := func(v int64) *int64 { return &v }
-	value := 70.0
-	window := quotaWindow{Label: "Week", WindowMinutes: minutes(weeklyWindowMinutes), RemainingPercent: &value, Present: true, Observed: true}
-	a := testApp(t, []account{
-		{ID: "idle", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
-	})
-	a.state.Quotas["idle"] = quotaSnapshot{AccountID: "idle", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{window}}}
+// A pool with no quota evidence reports nothing rather than a zero that would
+// read as total exhaustion.
+func TestPoolCapacityOmitsAWindowWithNoDenominator(t *testing.T) {
+	a := testApp(t, []account{{ID: "a", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"}})
 	a.mu.Lock()
 	bars := a.poolCapacityLocked(time.Now().UTC())
 	a.mu.Unlock()
-	if len(bars) != 0 {
-		t.Fatalf("a bar was drawn with no in-pool denominator: %#v", bars)
-	}
-
-	// And a pool with no quota evidence at all reports nothing rather than zero.
-	empty := testApp(t, []account{{ID: "a", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"}})
-	empty.mu.Lock()
-	bars = empty.poolCapacityLocked(time.Now().UTC())
-	empty.mu.Unlock()
 	if len(bars) != 0 {
 		t.Fatalf("capacity reported without any quota snapshot: %#v", bars)
 	}

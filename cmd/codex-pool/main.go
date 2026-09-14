@@ -8240,29 +8240,29 @@ func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 	return result
 }
 
-// poolCapacityBar is one window's pool-wide reading, shaped for the stacked bar
-// the dashboard draws.
+// poolCapacityBar is one window's pool-wide reading, shaped for the bar the
+// dashboard draws. The two percentages share one denominator, the pool's whole
+// weighted allowance, so they sit on a fixed 0-100 scale and never sum past it.
 type poolCapacityBar struct {
 	Label         string `json:"label"`
 	WindowMinutes int64  `json:"windowMinutes"`
-	// PoolPercent is remaining capacity as a percentage of the pool's own
-	// denominator, so 100 means every in-pool account is untouched. It is what
-	// the solid bar fills to.
-	PoolPercent float64 `json:"poolPercent"`
-	// OutsidePercent is the capacity held by enabled accounts outside the pool,
-	// measured on the same per-unit scale and drawn past the 100% mark. It can
-	// exceed 100 when more capacity sits idle than the pool itself holds, which
-	// is the condition an operator most needs to see.
-	OutsidePercent  float64 `json:"outsidePercent"`
-	PoolAccounts    int     `json:"poolAccounts"`
-	OutsideAccounts int     `json:"outsideAccounts"`
-	// BlockedAccounts is how many of the outside allowances are held back by
-	// routing rather than parked by an operator, so the dashed run can say which
-	// kind of action would recover it.
+	// SpendablePercent is the capacity routing can spend right now. It is the
+	// solid fill, and it is a share of the whole pool rather than of the routable
+	// part, so parking an account lowers it instead of leaving it unchanged.
+	SpendablePercent float64 `json:"spendablePercent"`
+	// RecoverablePercent is how much further the reading would rise if every
+	// enabled account were routable. It is drawn continuing from the solid fill,
+	// so the two together are what the pool would hold at full reach.
+	RecoverablePercent  float64 `json:"recoverablePercent"`
+	SpendableAccounts   int     `json:"spendableAccounts"`
+	RecoverableAccounts int     `json:"recoverableAccounts"`
+	// BlockedAccounts is how many recoverable allowances routing holds back
+	// rather than an operator having parked them, so the reading can say which
+	// action would recover the capacity.
 	BlockedAccounts int `json:"blockedAccounts"`
 	// Weighted marks a reading whose denominator is scaled by tier multipliers.
 	Weighted bool `json:"weighted"`
-	// Assumed marks a reading that any assumed multiplier contributed to, so the
+	// Assumed marks a reading any assumed multiplier contributed to, so the
 	// dashboard can refuse to present it with the authority of reported data.
 	Assumed bool `json:"assumed"`
 }
@@ -8360,77 +8360,101 @@ func (a *app) capacityIdentitiesLocked(now time.Time) map[string]*capacityIdenti
 
 // poolCapacityLocked reads both quota windows across the pool.
 //
-// The five-hour bar is deliberately unweighted. Plans that document a larger
-// weekly budget do not document a larger burst allowance, and the plans that
-// would most distort it, Pro and Business Premium, report no five-hour window at
-// all because no such limit applies to them. Weighting it would invent a
-// difference upstream does not describe.
+// Both bars are weighted, and both divide by the pool's whole weighted
+// allowance rather than only the routable part. A share of the whole is what
+// makes the two segments add up: the solid fill is what routing can spend now,
+// and the dashed run continuing from it is what the same pool would hold if
+// every enabled account were reachable.
 //
-// The weekly bar is weighted, because there the difference is real: a 20x Pro
-// account at half capacity holds ten base allowances while a Plus account at
-// half holds half of one, and averaging those two as equals understates the pool
-// by an order of magnitude.
+// Weighting matters because a 20x Pro account at half capacity holds ten base
+// allowances where a Plus account at half holds half of one, and averaging those
+// as equals understates the pool by an order of magnitude.
 func (a *app) poolCapacityLocked(now time.Time) []poolCapacityBar {
 	identities := a.capacityIdentitiesLocked(now)
 	bars := make([]poolCapacityBar, 0, 2)
-	for _, spec := range []struct {
-		minutes  int64
-		weighted bool
-	}{
-		{fiveHourWindowMinutes, false},
-		{weeklyWindowMinutes, true},
-	} {
-		var poolTotal, poolRemaining, outsideRemaining float64
-		poolAccounts, outsideAccounts, blockedAccounts := 0, 0, 0
+	for _, minutes := range []int64{fiveHourWindowMinutes, weeklyWindowMinutes} {
+		var total, spendable, recoverable float64
+		spendableAccounts, recoverableAccounts, blockedAccounts := 0, 0, 0
 		assumed := false
 		for _, identity := range identities {
-			window, ok := reportedWindowOfDuration(*identity.quota, spec.minutes)
+			share, ok := identity.windowShare(minutes)
 			if !ok {
 				continue
 			}
-			weight := 1.0
-			if spec.weighted {
-				weight = identity.weight
-			}
-			remaining := weight * quotaWindowRemaining(window) / 100
-			switch {
-			case identity.spendable:
-				poolTotal += weight
-				poolRemaining += remaining
-				poolAccounts++
-			default:
-				// Parked and duplicate-blocked capacity both read as recoverable:
-				// it exists, and an operator action would make it spendable.
-				outsideRemaining += remaining
-				outsideAccounts++
+			total += identity.weight
+			if identity.spendable {
+				spendable += identity.weight * share
+				spendableAccounts++
+			} else {
+				recoverable += identity.weight * share
+				recoverableAccounts++
 				if identity.blocked {
 					blockedAccounts++
 				}
 			}
-			if spec.weighted && identity.assumed {
+			if identity.assumed {
 				assumed = true
 			}
 		}
-		// With no routable account reporting this window there is no denominator,
-		// and a bar drawn against nothing would read as total exhaustion rather
-		// than as absent evidence.
-		if poolTotal <= 0 {
+		// Nothing reported this window at all, so there is no denominator. A bar
+		// drawn against nothing would read as total exhaustion rather than as
+		// absent evidence.
+		if total <= 0 {
 			continue
 		}
-		value := spec.minutes
+		value := minutes
 		bars = append(bars, poolCapacityBar{
-			Label:           quotaWindowLabel(&value),
-			WindowMinutes:   spec.minutes,
-			PoolPercent:     poolRemaining / poolTotal * 100,
-			OutsidePercent:  outsideRemaining / poolTotal * 100,
-			PoolAccounts:    poolAccounts,
-			OutsideAccounts: outsideAccounts,
-			BlockedAccounts: blockedAccounts,
-			Weighted:        spec.weighted,
-			Assumed:         assumed,
+			Label:               quotaWindowLabel(&value),
+			WindowMinutes:       minutes,
+			SpendablePercent:    spendable / total * 100,
+			RecoverablePercent:  recoverable / total * 100,
+			SpendableAccounts:   spendableAccounts,
+			RecoverableAccounts: recoverableAccounts,
+			BlockedAccounts:     blockedAccounts,
+			Weighted:            true,
+			Assumed:             assumed,
 		})
 	}
 	return bars
+}
+
+// windowShare is how much of this allowance's capacity the given window leaves,
+// as a fraction, and whether the window can be read for it at all.
+//
+// The weekly window is read directly. The five-hour window needs two rules,
+// because a five-hour allowance has no published size to weigh against a weekly
+// one and some plans carry no five-hour limit whatsoever:
+//
+// An account with no five-hour cap can never be held back by one, so on this
+// axis it is fully available and contributes its whole weight. Counting it as
+// absent instead would drop the very accounts most able to absorb a burst.
+//
+// An account whose weekly budget is spent cannot serve at all, whatever its
+// five-hour window reports. Upstream keeps reporting a five-hour figure for it,
+// and taking that at face value would promise burst capacity that every request
+// would be refused. A weekly reading of zero therefore forces the five-hour
+// reading to zero as well.
+func (identity *capacityIdentity) windowShare(minutes int64) (float64, bool) {
+	weekly, weeklyReported := reportedWindowOfDuration(*identity.quota, weeklyWindowMinutes)
+	if minutes == weeklyWindowMinutes {
+		if !weeklyReported {
+			return 0, false
+		}
+		return quotaWindowRemaining(weekly) / 100, true
+	}
+	if weeklyReported && quotaWindowRemaining(weekly) <= 0 {
+		return 0, true
+	}
+	if window, ok := reportedWindowOfDuration(*identity.quota, minutes); ok {
+		return quotaWindowRemaining(window) / 100, true
+	}
+	// No five-hour window of its own. Only count it as uncapped when something
+	// else about the account was reported, so a failed refresh does not enter the
+	// reading as full capacity.
+	if weeklyReported {
+		return 1, true
+	}
+	return 0, false
 }
 
 // reportedWindowOfDuration finds the window of exactly this duration that
