@@ -3043,7 +3043,7 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusBadGateway, "account_auth_failed", "unable to authenticate this account with upstream")
 			return
 		}
-		outcome, err := a.consumeCodexResetCredit(ctx, auth, randomID())
+		outcome, err := a.consumeCodexResetCredit(ctx, auth, randomUUID())
 		if err != nil {
 			a.logger.Printf("reset credit consume failed for %s: %s", accountCopy.ID, err)
 			writeOpenAIError(w, http.StatusBadGateway, "reset_credit_failed", err.Error())
@@ -6986,7 +6986,10 @@ func resetCreditOutcomeMessage(outcome string) (string, bool) {
 // spend a second credit, so the caller owns the key rather than this function
 // minting a fresh one on every network retry.
 func (a *app) consumeCodexResetCredit(ctx context.Context, auth codexAuthInfo, idempotencyKey string) (string, error) {
-	body, err := json.Marshal(map[string]any{"idempotency_key": idempotencyKey})
+	// The field is camelCase on the wire. Sent as idempotency_key it is simply
+	// absent, and upstream answers 400 with "idempotencyKey must not be empty",
+	// which is exactly how this failed in production.
+	body, err := json.Marshal(map[string]any{"idempotencyKey": idempotencyKey})
 	if err != nil {
 		return "", fmt.Errorf("encode reset-credit consume request: %w", err)
 	}
@@ -10145,6 +10148,20 @@ func chooseTime(value, fallback time.Time) time.Time {
 	}
 	return value
 }
+
+// randomUUID returns a version 4 UUID. Upstream documents a UUID for the
+// reset-credit idempotency key, and a key it rejects would be indistinguishable
+// from a key it never saw, so a retry could spend a second credit.
+func randomUUID() string {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		panic(err)
+	}
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", value[0:4], value[4:6], value[6:8], value[8:10], value[10:16])
+}
+
 func randomID() string {
 	value := make([]byte, 16)
 	if _, err := rand.Read(value); err != nil {

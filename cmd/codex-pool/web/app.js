@@ -8,7 +8,7 @@
     slate: "#263548",
   });
   const themeNames = new Set(Object.keys(themeMetaColors));
-  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public" };
+  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public", resetCreditNotice: null };
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => document.querySelectorAll(selector);
   const loginView = $("#login-view");
@@ -805,7 +805,15 @@
     const action = managementAccountId && available
       ? `<span class="quota-fact-note reset-credit-action"><button class="button secondary reset-credit-button" type="button" data-account-action="quota/reset-credit" data-account-id="${escapeHTML(managementAccountId)}">Use reset credit</button></span>`
       : "";
-    return `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(resetCredits.availableCount))}</strong>${note}${action}</div>`;
+    // Report the outcome where the action was taken. notify() writes into the
+    // header status line, which is easy to miss from an expanded quota cell and
+    // is overwritten by the next poll, so a failed spend looked like the button
+    // had done nothing at all. The notice lives in state so a refresh re-renders
+    // it rather than wiping it.
+    const notice = state.resetCreditNotice && state.resetCreditNotice.accountId === managementAccountId
+      ? `<span class="reset-credit-notice${state.resetCreditNotice.ok ? "" : " failed"}">${escapeHTML(state.resetCreditNotice.message)}</span>`
+      : "";
+    return `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(resetCredits.availableCount))}</strong>${note}${action}${notice}</div>`;
   }
 
   function spendControlMarkup(limit) {
@@ -1209,11 +1217,23 @@
         return;
       } else if (action === "quota/reset-credit") {
         if (!window.confirm("Spend one reset credit on this account? This is irreversible and consumes real entitlement.")) return;
-        const body = await api(`/accounts/${encodeURIComponent(id)}/${action}`, { method: "POST" });
-        // Upstream can decline without spending anything, for instance when no
-        // window is currently eligible. Report its verdict rather than a blanket
-        // success, or a refusal reads as a credit having been used.
-        notify(body?.message || "Reset credit request completed", !body?.consumed);
+        // The upstream call and the quota refresh behind it take a moment, and
+        // an unchanged button through that is what "nothing happened" looks
+        // like. The refresh below re-renders the row and restores it.
+        button.disabled = true;
+        button.textContent = "Spending…";
+        state.resetCreditNotice = null;
+        try {
+          const body = await api(`/accounts/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+          // Upstream can decline without spending anything, for instance when no
+          // window is currently eligible. Report its verdict rather than a
+          // blanket success, or a refusal reads as a credit having been used.
+          state.resetCreditNotice = { accountId: id, message: body?.message || "Reset credit request completed", ok: Boolean(body?.consumed) };
+          notify(state.resetCreditNotice.message, !body?.consumed);
+        } catch (error) {
+          state.resetCreditNotice = { accountId: id, message: error.message, ok: false };
+          notify(error.message, true);
+        }
         refresh(true);
         return;
       } else {

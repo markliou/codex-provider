@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -672,7 +673,10 @@ func TestAdminResetCreditConsumesAndRefreshes(t *testing.T) {
 			consumeCalls++
 			var payload map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&payload)
-			seenKey, _ = payload["idempotency_key"].(string)
+			// Upstream names this field in camelCase and rejects the request
+			// outright when it is absent, which is how a snake_case spelling
+			// turned every real attempt into a 400.
+			seenKey, _ = payload["idempotencyKey"].(string)
 			_, _ = w.Write([]byte(`{"outcome":"reset"}`))
 		case "/backend-api/wham/usage":
 			usageCalls++
@@ -717,12 +721,47 @@ func TestAdminResetCreditConsumesAndRefreshes(t *testing.T) {
 	if consumeCalls != 1 {
 		t.Fatalf("upstream consume calls = %d, want 1", consumeCalls)
 	}
-	if seenKey == "" {
-		t.Fatal("consume request carried no idempotency key")
+	// A key upstream rejects is indistinguishable from one it never saw, so a
+	// retry could spend a second credit. Upstream documents a UUID.
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(seenKey) {
+		t.Fatalf("consume request key %q is not a version 4 UUID", seenKey)
 	}
 	// The reset changes the windows the dashboard shows, so it must re-read them.
 	if usageCalls == 0 {
 		t.Fatal("quota was not refreshed after the reset")
+	}
+}
+
+// A failed spend must reach the operator beside the control that caused it. The
+// header status line alone is easy to miss from an expanded quota cell and the
+// next poll overwrites it, which made a rejected request look like the button
+// had done nothing.
+func TestAdminAssetsReportTheResetOutcomeBesideTheControl(t *testing.T) {
+	a := testApp(t, nil)
+	request := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET app.js returned %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"resetCreditNotice",
+		"reset-credit-notice",
+		// The failure path must record a notice, not only call notify().
+		"state.resetCreditNotice = { accountId: id, message: error.message, ok: false }",
+		// And the control itself must show the request is in flight.
+		`button.textContent = "Spending…"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("app.js did not include %q", want)
+		}
+	}
+	css := httptest.NewRequest(http.MethodGet, "/admin/assets/app.css", nil)
+	cssRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(cssRecorder, css)
+	if !strings.Contains(cssRecorder.Body.String(), ".reset-credit-notice.failed") {
+		t.Fatal("app.css does not distinguish a failed reset notice")
 	}
 }
 

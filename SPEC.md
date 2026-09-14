@@ -2266,8 +2266,10 @@ outright when the account has none rather than letting upstream decline it,
 since a refused call still tells the operator something happened. The browser
 confirms before posting.
 
-Each attempt carries an idempotency key so a retried attempt cannot spend a
-second credit. Upstream answers with an outcome; only `reset` spent a credit,
+Each attempt carries an `idempotencyKey`, spelled in camelCase because upstream
+rejects the request outright when the field is absent, so a retried attempt
+cannot spend a second credit. The key is a UUID: one upstream rejects would be
+indistinguishable from one it never saw, and the retry would spend again. Upstream answers with an outcome; only `reset` spent a credit,
 while `nothingToReset`, `noCreditsAvailable` and `alreadyRedeemed` each explain
 why nothing was spent. Outcomes are matched case-insensitively because this pool
 sanitizes upstream metadata to lowercase, and the response must report the
@@ -2278,6 +2280,14 @@ attempt, including a refused one: a successful reset changes the windows the
 dashboard shows, and `alreadyRedeemed` means the local snapshot is the stale
 half of the disagreement. An upstream failure surfaces only a sanitized status
 and error code, never the raw response body.
+
+The outcome must be reported beside the control that triggered it, and must
+survive the refresh that follows. Reporting it only through the shared status
+line is not enough: that line sits in the page header, far from an expanded
+quota cell, and the next poll overwrites it, so a rejected request is
+indistinguishable from a button that did nothing. The control must also show
+that the request is in flight, because the upstream call and the quota refresh
+behind it take long enough for an unchanged button to read as no response.
 
 Above the account table, separately from the status cards that count accounts,
 the page must show pool capacity per quota window as a stacked bar. Two windows
