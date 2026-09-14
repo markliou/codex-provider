@@ -8,7 +8,7 @@
     slate: "#263548",
   });
   const themeNames = new Set(Object.keys(themeMetaColors));
-  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public", resetCreditNotice: null };
+  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public", resetCreditNotice: null, openQuotaDetails: new Set() };
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => document.querySelectorAll(selector);
   const loginView = $("#login-view");
@@ -770,13 +770,21 @@
     return `<div class="quota-fact quota-fact-telemetry" title="${escapeHTML(title)}"><span class="quota-fact-label">Telemetry:</span><strong class="quota-fact-value">${escapeHTML(label)}</strong>${updated ? `<span class="quota-fact-note">${escapeHTML(updated)}</span>` : ""}</div>`;
   }
 
-  function quotaDetailsMarkup(content) {
+  function quotaDetailsMarkup(content, key = "") {
     if (!content) return "";
     // Progressive disclosure is intentional here: the progress bars are the
     // operator's first-glance signal, while credits and telemetry are useful
     // diagnostic context. Keep every quota window open in the primary view,
     // but do not make secondary facts compete with those bars.
-    return `<details class="quota-details"><summary>More details</summary><div class="quota-facts">${content}</div></details>`;
+    //
+    // The expanded state has to survive a re-render. The table is rebuilt from
+    // markup on every poll, so without this an operator's expanded cell snaps
+    // shut every thirty seconds, and the refresh that follows a reset-credit
+    // spend closes the very panel holding the control and its outcome notice —
+    // which is what made a failed spend look like a button that did nothing.
+    const identity = key ? ` data-details-key="${escapeHTML(key)}"` : "";
+    const open = key && state.openQuotaDetails.has(key) ? " open" : "";
+    return `<details class="quota-details"${identity}${open}><summary>More details</summary><div class="quota-facts">${content}</div></details>`;
   }
   function quotaCreditsMarkup(credits) {
     if (!credits) return '<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">Not reported</strong></div>';
@@ -880,7 +888,7 @@
       // exhaustion and still reaches the operator through the account status
       // reason; repeating the enum here added a row that named a condition
       // without telling anyone what to do about it.
-      const details = quotaDetailsMarkup(`${additionalLimitsMarkup(quota.additionalLimits)}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
+      const details = quotaDetailsMarkup(`${additionalLimitsMarkup(quota.additionalLimits)}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`, managementAccountId);
       // Keep the decisive red Exhausted signal beside its window label. Do not
       // add a second account-level "Blocked" sentence below the bars; that
       // duplicates the signal and makes multi-window rows harder to scan.
@@ -1477,6 +1485,14 @@
     const button = event.target.closest("[data-account-action]");
     if (button) handleAccountAction(button);
   });
+  // A details toggle does not bubble, so this listens in the capture phase.
+  // Losing it would put every expanded quota cell back at the mercy of the poll.
+  $("#accounts-body").addEventListener("toggle", (event) => {
+    const details = event.target.closest?.("[data-details-key]");
+    if (!details) return;
+    if (details.open) state.openQuotaDetails.add(details.dataset.detailsKey);
+    else state.openQuotaDetails.delete(details.dataset.detailsKey);
+  }, true);
   $("#accounts-body").addEventListener("change", (event) => {
     const input = event.target.closest("[data-owner-note-ref], [data-owner-note-account-id]");
     if (input) updateOwnerNote(input);

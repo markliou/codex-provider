@@ -6813,6 +6813,29 @@ func sanitizedErrorCode(value string) string {
 	return value
 }
 
+// upstreamErrorDetail extracts upstream's own explanation for a rejected
+// request. It is for the log only, never for a response: the text is bounded and
+// stripped of control characters, but it is still upstream prose.
+func upstreamErrorDetail(body []byte) string {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	detail, _ := payload["detail"].(string)
+	message, _ := payload["message"].(string)
+	for _, candidate := range []string{
+		detail,
+		nestedString(payload, "detail", "message"),
+		nestedString(payload, "error", "message"),
+		message,
+	} {
+		if text := cleanMetadataText(candidate, 200); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
 func nestedString(payload map[string]any, objectName, key string) string {
 	object, _ := payload[objectName].(map[string]any)
 	if object == nil {
@@ -6958,19 +6981,21 @@ func (a *app) enrichResetCreditExpiration(ctx context.Context, auth codexAuthInf
 // operator-visible wording. Only "reset" spends a credit; the others report why
 // nothing happened, and each needs its own wording because the remedy differs.
 //
-// Outcomes are matched case-insensitively. Upstream sends camelCase and this
-// pool sanitizes metadata to lowercase before it gets here, so comparing the
-// wire spelling directly would silently match nothing but "reset" and report
-// every refusal as unrecognized.
+// Upstream spells these in snake_case: reset, nothing_to_reset, no_credit and
+// already_redeemed. The camelCase spellings are the Codex client's rename of the
+// same enum for its own JSON-RPC surface; they are accepted here so a verdict is
+// never reported as unrecognized if this pool ever reads that surface instead.
+// Matching is case-insensitive because this pool sanitizes metadata to lowercase
+// before it gets here.
 func resetCreditOutcomeMessage(outcome string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(outcome)) {
 	case "reset":
 		return "A reset credit was consumed and the eligible rate-limit windows were reset.", true
-	case "nothingtoreset":
+	case "nothing_to_reset", "nothingtoreset":
 		return "No rate-limit window is currently eligible for a reset, so no credit was spent.", false
-	case "nocreditsavailable", "nocredits":
+	case "no_credit", "nocredit", "nocreditsavailable", "nocredits":
 		return "This account has no earned reset credits available.", false
-	case "alreadyredeemed":
+	case "already_redeemed", "alreadyredeemed":
 		return "This reset attempt already completed, so no further credit was spent.", false
 	default:
 		return "Upstream returned an unrecognized reset outcome.", false
@@ -6981,15 +7006,18 @@ func resetCreditOutcomeMessage(outcome string) (string, bool) {
 // irreversible and costs real entitlement, so it is never automatic: only an
 // explicit operator action reaches here.
 //
-// The idempotency key is generated per attempt and reused for nothing else. A
-// retry of the same logical attempt must carry the same key or upstream would
-// spend a second credit, so the caller owns the key rather than this function
+// The redeem request id is generated per attempt and reused for nothing else. A
+// retry of the same logical attempt must carry the same id or upstream would
+// spend a second credit, so the caller owns it rather than this function
 // minting a fresh one on every network retry.
-func (a *app) consumeCodexResetCredit(ctx context.Context, auth codexAuthInfo, idempotencyKey string) (string, error) {
-	// The field is camelCase on the wire. Sent as idempotency_key it is simply
-	// absent, and upstream answers 400 with "idempotencyKey must not be empty",
-	// which is exactly how this failed in production.
-	body, err := json.Marshal(map[string]any{"idempotencyKey": idempotencyKey})
+func (a *app) consumeCodexResetCredit(ctx context.Context, auth codexAuthInfo, redeemRequestID string) (string, error) {
+	// Upstream reads this key as redeem_request_id and requires it. The Codex
+	// client calls the same value an idempotency key on its own JSON-RPC surface
+	// and renames it here, so both idempotency_key and idempotencyKey leave the
+	// required field absent and earn a 400: that is how every real attempt
+	// failed. The optional credit_id picks one specific credit; omitting it lets
+	// upstream choose, which is what this pool wants.
+	body, err := json.Marshal(map[string]any{"redeem_request_id": redeemRequestID})
 	if err != nil {
 		return "", fmt.Errorf("encode reset-credit consume request: %w", err)
 	}
@@ -7017,19 +7045,28 @@ func (a *app) consumeCodexResetCredit(ctx context.Context, auth codexAuthInfo, i
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		// Report only the sanitized upstream code. The raw body may carry account
-		// or token detail that must not reach the admin surface.
+		// or token detail that must not reach the admin surface. The log keeps
+		// upstream's own explanation, sanitized and bounded: a bare status cannot
+		// say which part of the request upstream refused, and without it a wrong
+		// body field looked the same as a stale token or a wrong endpoint.
+		if detail := upstreamErrorDetail(payload); detail != "" {
+			a.logger.Printf("reset credit consume rejected with status %d: %s", response.StatusCode, detail)
+		}
 		if code := extractUpstreamErrorCode(payload); code != "" {
 			return "", fmt.Errorf("upstream returned status %d [%s]", response.StatusCode, code)
 		}
 		return "", fmt.Errorf("upstream returned status %d", response.StatusCode)
 	}
+	// Upstream names its verdict "code". "outcome" is the Codex client's own
+	// spelling for the same enum on its JSON-RPC surface, and reading that name
+	// here would leave every verdict empty and unrecognized.
 	var decoded struct {
-		Outcome string `json:"outcome"`
+		Code string `json:"code"`
 	}
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		return "", fmt.Errorf("decode reset-credit consume response: %w", err)
 	}
-	return cleanMetadataToken(decoded.Outcome), nil
+	return cleanMetadataToken(decoded.Code), nil
 }
 
 func (a *app) fetchCodexResetCreditExpiration(ctx context.Context, auth codexAuthInfo, now time.Time) (*int64, error) {
@@ -10150,8 +10187,9 @@ func chooseTime(value, fallback time.Time) time.Time {
 }
 
 // randomUUID returns a version 4 UUID. Upstream documents a UUID for the
-// reset-credit idempotency key, and a key it rejects would be indistinguishable
-// from a key it never saw, so a retry could spend a second credit.
+// reset-credit redeem request id, and an id it rejects would be
+// indistinguishable from one it never saw, so a retry could spend a second
+// credit.
 func randomUUID() string {
 	value := make([]byte, 16)
 	if _, err := rand.Read(value); err != nil {

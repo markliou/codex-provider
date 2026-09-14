@@ -2266,20 +2266,34 @@ outright when the account has none rather than letting upstream decline it,
 since a refused call still tells the operator something happened. The browser
 confirms before posting.
 
-Each attempt carries an `idempotencyKey`, spelled in camelCase because upstream
-rejects the request outright when the field is absent, so a retried attempt
-cannot spend a second credit. The key is a UUID: one upstream rejects would be
-indistinguishable from one it never saw, and the retry would spend again. Upstream answers with an outcome; only `reset` spent a credit,
-while `nothingToReset`, `noCreditsAvailable` and `alreadyRedeemed` each explain
-why nothing was spent. Outcomes are matched case-insensitively because this pool
-sanitizes upstream metadata to lowercase, and the response must report the
-outcome upstream actually returned rather than assume success, or a refusal
-reads as a credit having been used. An unrecognized outcome is surfaced as such
-and never counted as a spend. The account's quota is refreshed after every
-attempt, including a refused one: a successful reset changes the windows the
-dashboard shows, and `alreadyRedeemed` means the local snapshot is the stale
-half of the disagreement. An upstream failure surfaces only a sanitized status
-and error code, never the raw response body.
+Each attempt carries a `redeem_request_id`, which upstream requires and which
+makes a retried attempt unable to spend a second credit. The name matters: the
+Codex client calls the same value an idempotency key on its own JSON-RPC
+surface and renames it for the wire, so `idempotency_key` and `idempotencyKey`
+both leave the required field absent and earn a 400. The id is a UUID: one
+upstream rejects would be indistinguishable from one it never saw, and the retry
+would spend again. The optional `credit_id` is omitted, which lets upstream
+choose which credit to spend.
+
+Upstream answers with a `code`; only `reset` spent a credit, while
+`nothing_to_reset`, `no_credit` and `already_redeemed` each explain why nothing
+was spent. That field is `code` and its values are snake_case for the same
+reason: `outcome` and the camelCase spellings belong to the client's JSON-RPC
+rename, and reading those names here leaves every verdict empty. Verdicts are
+matched case-insensitively because this pool sanitizes upstream metadata to
+lowercase, and the response must report what upstream actually returned rather
+than assume success, or a refusal reads as a credit having been used. An
+unrecognized verdict is surfaced as such and never counted as a spend. The
+account's quota is refreshed after every attempt, including a refused one: a
+successful reset changes the windows the dashboard shows, and
+`already_redeemed` means the local snapshot is the stale half of the
+disagreement.
+
+An upstream failure surfaces only a sanitized status and error code to the
+browser, never the raw response body. The service log additionally keeps
+upstream's own explanation, bounded and stripped of control characters, because
+a bare status cannot say which part of a request upstream refused: without it a
+wrong body field is indistinguishable from a stale token or a wrong endpoint.
 
 The outcome must be reported beside the control that triggered it, and must
 survive the refresh that follows. Reporting it only through the shared status
@@ -2288,6 +2302,12 @@ quota cell, and the next poll overwrites it, so a rejected request is
 indistinguishable from a button that did nothing. The control must also show
 that the request is in flight, because the upstream call and the quota refresh
 behind it take long enough for an unchanged button to read as no response.
+
+Because both the control and its notice live behind the quota cell's disclosure,
+an expanded cell must stay expanded across a re-render. The account table is
+rebuilt from markup on every poll, so an expanded state held only in the DOM is
+lost every thirty seconds and, worse, in the refresh that follows a spend: the
+panel closes over the outcome it was supposed to report.
 
 Above the account table, separately from the status cards that count accounts,
 the page must show pool capacity per quota window as a stacked bar. Two windows

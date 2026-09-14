@@ -673,11 +673,17 @@ func TestAdminResetCreditConsumesAndRefreshes(t *testing.T) {
 			consumeCalls++
 			var payload map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&payload)
-			// Upstream names this field in camelCase and rejects the request
-			// outright when it is absent, which is how a snake_case spelling
-			// turned every real attempt into a 400.
-			seenKey, _ = payload["idempotencyKey"].(string)
-			_, _ = w.Write([]byte(`{"outcome":"reset"}`))
+			// Upstream reads redeem_request_id and rejects the request outright
+			// when it is absent, which is how every real attempt became a 400
+			// while a mock that read the same wrong name kept passing. Reject it
+			// here too, so only the name upstream actually reads passes.
+			seenKey, _ = payload["redeem_request_id"].(string)
+			if seenKey == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"detail":"redeem_request_id must not be empty"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":"reset","windows_reset":1}`))
 		case "/backend-api/wham/usage":
 			usageCalls++
 			_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000}},"rate_limit_reset_credits":{"available_count":2}}`))
@@ -721,7 +727,7 @@ func TestAdminResetCreditConsumesAndRefreshes(t *testing.T) {
 	if consumeCalls != 1 {
 		t.Fatalf("upstream consume calls = %d, want 1", consumeCalls)
 	}
-	// A key upstream rejects is indistinguishable from one it never saw, so a
+	// An id upstream rejects is indistinguishable from one it never saw, so a
 	// retry could spend a second credit. Upstream documents a UUID.
 	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(seenKey) {
 		t.Fatalf("consume request key %q is not a version 4 UUID", seenKey)
@@ -752,6 +758,12 @@ func TestAdminAssetsReportTheResetOutcomeBesideTheControl(t *testing.T) {
 		"state.resetCreditNotice = { accountId: id, message: error.message, ok: false }",
 		// And the control itself must show the request is in flight.
 		`button.textContent = "Spending…"`,
+		// The notice lives inside the quota disclosure, which the refresh after
+		// the spend rebuilds from markup. Without a preserved expanded state that
+		// panel closes over the notice and the control, and a failed spend reads
+		// as a button that did nothing.
+		"state.openQuotaDetails",
+		"data-details-key",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("app.js did not include %q", want)
@@ -771,7 +783,7 @@ func TestAdminResetCreditReportsARefusalHonestly(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/backend-api/wham/rate-limit-reset-credits/consume" {
-			_, _ = w.Write([]byte(`{"outcome":"nothingToReset"}`))
+			_, _ = w.Write([]byte(`{"code":"nothing_to_reset"}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000}}}`))
@@ -803,8 +815,8 @@ func TestAdminResetCreditReportsARefusalHonestly(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	// The wire spelling is camelCase; the pool sanitizes metadata to lowercase.
-	if body.Outcome != "nothingtoreset" || body.Consumed {
+	// The pool sanitizes metadata to lowercase; upstream's spelling is snake_case.
+	if body.Outcome != "nothing_to_reset" || body.Consumed {
 		t.Fatalf("a refusal was reported as a spend: %#v", body)
 	}
 }
@@ -816,7 +828,7 @@ func TestAdminResetCreditRefusesWithoutCredits(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"outcome":"reset"}`))
+		_, _ = w.Write([]byte(`{"code":"reset"}`))
 	}))
 	defer upstream.Close()
 
@@ -862,14 +874,15 @@ func TestResetCreditOutcomeMessages(t *testing.T) {
 		}
 	}
 	// A refusal must be distinguishable from a spend by its message too.
-	refusal, _ := resetCreditOutcomeMessage("nothingToReset")
+	refusal, _ := resetCreditOutcomeMessage("nothing_to_reset")
 	spend, _ := resetCreditOutcomeMessage("reset")
 	if refusal == spend {
 		t.Fatal("a refusal and a spend produced the same message")
 	}
-	// Both the wire spelling and the sanitized lowercase form must be recognized,
-	// or every refusal would be reported as unrecognized.
-	for _, outcome := range []string{"nothingToReset", "nothingtoreset", "noCreditsAvailable", "nocreditsavailable", "alreadyRedeemed", "alreadyredeemed", "somethingNew", ""} {
+	// Upstream's own snake_case spellings must be recognized, or every refusal
+	// would be reported as unrecognized. The camelCase spellings belong to the
+	// Codex client's JSON-RPC rename of the same enum and stay accepted.
+	for _, outcome := range []string{"nothing_to_reset", "nothingToReset", "no_credit", "noCreditsAvailable", "already_redeemed", "alreadyRedeemed", "somethingNew", ""} {
 		message, consumed := resetCreditOutcomeMessage(outcome)
 		if consumed {
 			t.Fatalf("%q must not count as consumed", outcome)
