@@ -1006,6 +1006,77 @@ func TestPoolCapacityCountsOneAllowanceOnce(t *testing.T) {
 	}
 }
 
+// A duplicate-blocked slot is in the pool but routing will not select it, so its
+// capacity is real yet unspendable. It must be counted as recoverable rather
+// than inflating the solid reading with capacity the pool cannot reach, and
+// reported apart from capacity an operator parked on purpose.
+func TestPoolCapacityCountsDuplicateBlockedCapacityAsRecoverable(t *testing.T) {
+	minutes := func(v int64) *int64 { return &v }
+	window := func(remaining float64) quotaWindow {
+		value := remaining
+		return quotaWindow{Label: "Week", WindowMinutes: minutes(weeklyWindowMinutes), RemainingPercent: &value, Present: true, Observed: true}
+	}
+	// Two slots, one upstream workspace, one email: genuine copies of one login,
+	// so routing marks the second a duplicate and never selects it.
+	a := testApp(t, []account{
+		{ID: "primary", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "same@example.test"},
+		{ID: "copy", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "same@example.test"},
+		{ID: "parked", AuthType: "codex_device_auth", Enabled: true, InPool: false, Priority: 100, AccountID: "workspace-2", Email: "other@example.test"},
+	})
+	for _, seed := range []struct {
+		id        string
+		remaining float64
+	}{{"primary", 60}, {"copy", 60}, {"parked", 100}} {
+		writeTestCodexAuth(t, a, seed.id)
+		a.state.Quotas[seed.id] = quotaSnapshot{AccountID: seed.id, PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{window(seed.remaining)}}}
+	}
+
+	a.mu.Lock()
+	bars := a.poolCapacityLocked(time.Now().UTC())
+	a.mu.Unlock()
+	if len(bars) != 1 {
+		t.Fatalf("expected one bar: %#v", bars)
+	}
+	bar := bars[0]
+	// The two copies share one allowance, so they collapse to a single spendable
+	// reading; the parked account is the only recoverable one here.
+	if bar.PoolAccounts != 1 || bar.OutsideAccounts != 1 {
+		t.Fatalf("counts = %d spendable, %d recoverable, want 1 and 1", bar.PoolAccounts, bar.OutsideAccounts)
+	}
+	if bar.PoolPercent != 60 || bar.OutsidePercent != 100 {
+		t.Fatalf("bar = pool %v, outside %v, want 60 and 100", bar.PoolPercent, bar.OutsidePercent)
+	}
+
+	// Now a separate allowance that routing blocks: a distinct member of the same
+	// workspace, in the pool, which the duplicate guard holds back.
+	blocked := testApp(t, []account{
+		{ID: "member-a", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "a@example.test"},
+		{ID: "member-b", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "b@example.test"},
+	})
+	for _, id := range []string{"member-a", "member-b"} {
+		writeTestCodexAuth(t, blocked, id)
+		blocked.state.Quotas[id] = quotaSnapshot{AccountID: id, PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{window(50)}}}
+	}
+	blocked.mu.Lock()
+	bars = blocked.poolCapacityLocked(time.Now().UTC())
+	blocked.mu.Unlock()
+	if len(bars) != 1 {
+		t.Fatalf("expected one bar: %#v", bars)
+	}
+	bar = bars[0]
+	// Routing selects one of the two; the other holds its own allowance but is
+	// unreachable, so it is recoverable and named as blocked rather than parked.
+	if bar.PoolAccounts != 1 || bar.OutsideAccounts != 1 {
+		t.Fatalf("counts = %d spendable, %d recoverable, want 1 and 1", bar.PoolAccounts, bar.OutsideAccounts)
+	}
+	if bar.BlockedAccounts != 1 {
+		t.Fatalf("blocked count = %d, want 1: routing-held capacity must be distinguishable from parked capacity", bar.BlockedAccounts)
+	}
+	if bar.OutsidePercent != 50 {
+		t.Fatalf("blocked capacity was dropped instead of counted: outside %v, want 50", bar.OutsidePercent)
+	}
+}
+
 // Members of one Business workspace share its upstream account id but each hold
 // their own allowance, which upstream proves by reporting different remaining
 // percentages for them. Counting them on the routing identity would collapse
@@ -1038,12 +1109,14 @@ func TestPoolCapacityCountsEachWorkspaceMemberSeparately(t *testing.T) {
 		t.Fatalf("expected one bar: %#v", bars)
 	}
 	bar := bars[0]
-	if bar.PoolAccounts != 2 || bar.OutsideAccounts != 1 {
-		t.Fatalf("workspace members collapsed: %d in pool, %d outside, want 2 and 1", bar.PoolAccounts, bar.OutsideAccounts)
+	// Routing selects one member of the workspace and blocks the other, so one is
+	// spendable and two are recoverable: one blocked, one parked.
+	if bar.PoolAccounts != 1 || bar.OutsideAccounts != 2 || bar.BlockedAccounts != 1 {
+		t.Fatalf("workspace members = %d spendable, %d recoverable, %d blocked; want 1, 2, 1", bar.PoolAccounts, bar.OutsideAccounts, bar.BlockedAccounts)
 	}
-	// (40 + 60) / 2 = 50 in pool, and the idle member adds a full allowance.
-	if bar.PoolPercent != 50 || bar.OutsidePercent != 50 {
-		t.Fatalf("bar = pool %v, outside %v, want 50 and 50", bar.PoolPercent, bar.OutsidePercent)
+	// Every member's allowance is still counted somewhere; none is dropped.
+	if bar.PoolPercent+bar.OutsidePercent != 200 {
+		t.Fatalf("a member allowance was lost: pool %v + outside %v", bar.PoolPercent, bar.OutsidePercent)
 	}
 }
 

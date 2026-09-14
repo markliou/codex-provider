@@ -8256,6 +8256,10 @@ type poolCapacityBar struct {
 	OutsidePercent  float64 `json:"outsidePercent"`
 	PoolAccounts    int     `json:"poolAccounts"`
 	OutsideAccounts int     `json:"outsideAccounts"`
+	// BlockedAccounts is how many of the outside allowances are held back by
+	// routing rather than parked by an operator, so the dashed run can say which
+	// kind of action would recover it.
+	BlockedAccounts int `json:"blockedAccounts"`
 	// Weighted marks a reading whose denominator is scaled by tier multipliers.
 	Weighted bool `json:"weighted"`
 	// Assumed marks a reading that any assumed multiplier contributed to, so the
@@ -8272,10 +8276,15 @@ type capacityIdentity struct {
 	// assumed is true when weight came from an assumption rather than a
 	// multiplier the account reported.
 	assumed bool
-	// inPool is true when any slot for this allowance is in the pool. The
-	// capacity is then spendable now, so it belongs to the solid reading even if
-	// other copies of the same credential sit outside.
-	inPool bool
+	// spendable is true when some slot for this allowance is one routing will
+	// actually select: in the pool and not held back by the duplicate guard.
+	// Only then does the capacity belong to the solid reading.
+	spendable bool
+	// blocked is true when the allowance has an in-pool slot that routing
+	// nonetheless refuses, which today means the duplicate guard. Its capacity is
+	// real and it is not idle by choice, so it is counted as recoverable rather
+	// than dropped, and reported apart from capacity the operator parked.
+	blocked bool
 }
 
 // capacityAllowanceKeyLocked names the thing that actually owns one quota
@@ -8308,12 +8317,17 @@ func capacityAllowanceKeyLocked(a *app, item account) string {
 }
 
 // capacityIdentitiesLocked groups enabled accounts by the allowance they spend.
-func (a *app) capacityIdentitiesLocked() map[string]*capacityIdentity {
+func (a *app) capacityIdentitiesLocked(now time.Time) map[string]*capacityIdentity {
 	groups := map[string]*capacityIdentity{}
 	for _, item := range a.config.Accounts {
 		if !item.Enabled {
 			continue
 		}
+		// Read routing's own verdict rather than reimplementing it. An allowance
+		// routing will not select is not capacity the pool can spend now, however
+		// the account is configured.
+		blocked := item.InPool && a.duplicateUpstreamAccountPrimaryLocked(item, now) != ""
+		spendable := item.InPool && !blocked
 		snapshot := a.state.Quotas[item.ID]
 		if snapshot.Quota == nil {
 			continue
@@ -8326,13 +8340,14 @@ func (a *app) capacityIdentitiesLocked() map[string]*capacityIdentity {
 		)
 		entry := groups[key]
 		if entry == nil {
-			groups[key] = &capacityIdentity{quota: snapshot.Quota, weight: weight, assumed: assumed, inPool: item.InPool}
+			groups[key] = &capacityIdentity{quota: snapshot.Quota, weight: weight, assumed: assumed, spendable: spendable, blocked: blocked}
 			continue
 		}
-		// Membership is a property of the allowance, not of one slot: if any copy
-		// can route, the capacity is spendable now.
-		if item.InPool {
-			entry.inPool = true
+		entry.blocked = entry.blocked || blocked
+		// Spendability is a property of the allowance, not of one slot: if any
+		// copy can actually route, the capacity is spendable now.
+		if spendable {
+			entry.spendable = true
 			// Prefer the routable slot's own snapshot and multiplier; that is the
 			// copy whose quota the pool actually spends.
 			entry.quota = snapshot.Quota
@@ -8356,7 +8371,7 @@ func (a *app) capacityIdentitiesLocked() map[string]*capacityIdentity {
 // half holds half of one, and averaging those two as equals understates the pool
 // by an order of magnitude.
 func (a *app) poolCapacityLocked(now time.Time) []poolCapacityBar {
-	identities := a.capacityIdentitiesLocked()
+	identities := a.capacityIdentitiesLocked(now)
 	bars := make([]poolCapacityBar, 0, 2)
 	for _, spec := range []struct {
 		minutes  int64
@@ -8366,7 +8381,7 @@ func (a *app) poolCapacityLocked(now time.Time) []poolCapacityBar {
 		{weeklyWindowMinutes, true},
 	} {
 		var poolTotal, poolRemaining, outsideRemaining float64
-		poolAccounts, outsideAccounts := 0, 0
+		poolAccounts, outsideAccounts, blockedAccounts := 0, 0, 0
 		assumed := false
 		for _, identity := range identities {
 			window, ok := reportedWindowOfDuration(*identity.quota, spec.minutes)
@@ -8378,13 +8393,19 @@ func (a *app) poolCapacityLocked(now time.Time) []poolCapacityBar {
 				weight = identity.weight
 			}
 			remaining := weight * quotaWindowRemaining(window) / 100
-			if identity.inPool {
+			switch {
+			case identity.spendable:
 				poolTotal += weight
 				poolRemaining += remaining
 				poolAccounts++
-			} else {
+			default:
+				// Parked and duplicate-blocked capacity both read as recoverable:
+				// it exists, and an operator action would make it spendable.
 				outsideRemaining += remaining
 				outsideAccounts++
+				if identity.blocked {
+					blockedAccounts++
+				}
 			}
 			if spec.weighted && identity.assumed {
 				assumed = true
@@ -8404,6 +8425,7 @@ func (a *app) poolCapacityLocked(now time.Time) []poolCapacityBar {
 			OutsidePercent:  outsideRemaining / poolTotal * 100,
 			PoolAccounts:    poolAccounts,
 			OutsideAccounts: outsideAccounts,
+			BlockedAccounts: blockedAccounts,
 			Weighted:        spec.weighted,
 			Assumed:         assumed,
 		})

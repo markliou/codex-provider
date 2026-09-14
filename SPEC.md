@@ -2285,11 +2285,21 @@ are read: the five-hour burst limit and the weekly budget. A window no routable
 account reports is omitted entirely rather than drawn against nothing, which
 would read as total exhaustion instead of absent evidence.
 
-The solid fill is what the pool can spend now, as a percentage of the in-pool
-denominator, so 100% means every routable account is untouched. Capacity held by
-enabled accounts outside the pool is stacked past the 100% mark as a hollow
-dashed run on the same per-unit scale, and may exceed 100% when more sits idle
-than the pool itself holds. It must stay hollow: filling it would read as
+The solid fill is what the pool can spend now, as a percentage of the spendable
+denominator, so 100% means every account routing will actually select is
+untouched. Spendable means routing would select it: in the pool and not held back
+by the duplicate guard. The verdict must be read from routing rather than
+reimplemented, so an account routing refuses never inflates the solid reading
+with capacity the pool cannot reach.
+
+Everything else enabled and reporting the window is recoverable capacity,
+stacked past the 100% mark as a hollow dashed run on the same per-unit scale,
+and may exceed 100% when more is recoverable than the pool itself holds.
+Recoverable capacity has two kinds and the reading must name them apart, because
+the action that recovers each differs: an account parked outside the pool needs
+putting back, while an account already in the pool and held back by routing is a
+different problem. Neither kind is dropped: the allowance is real and stays
+counted. It must stay hollow: filling it would read as
 capacity already available, when reaching it requires an operator to put the
 account back. The 100% boundary must be marked, or the dashed run reads as part
 of the same quantity rather than as capacity beyond the pool's own scale.
@@ -2307,8 +2317,8 @@ The allowance is therefore keyed on the workspace together with the member's
 email. Two slots created from one login carry the same email and genuinely share
 an allowance; two members of one workspace do not. A slot with no email of its
 own counts alone, because nothing proves it shares with anything. An allowance
-with any slot in the pool belongs to the solid reading, because its capacity is
-spendable now.
+with any slot routing would select belongs to the solid reading, because its
+capacity is spendable now.
 
 ##### Weekly tier weighting
 

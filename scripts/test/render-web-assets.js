@@ -72,7 +72,7 @@ const account = (overrides) => Object.assign({
 
 const capacity = [
   { label: "5h", windowMinutes: 300, poolPercent: 63, outsidePercent: 0, poolAccounts: 4, outsideAccounts: 0, weighted: false, assumed: false },
-  { label: "Week", windowMinutes: 10080, poolPercent: 58.5, outsidePercent: 141.2, poolAccounts: 5, outsideAccounts: 3, weighted: true, assumed: true },
+  { label: "Week", windowMinutes: 10080, poolPercent: 58.5, outsidePercent: 141.2, poolAccounts: 5, outsideAccounts: 3, blockedAccounts: 2, weighted: true, assumed: true },
 ];
 
 const cases = [

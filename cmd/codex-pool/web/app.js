@@ -570,16 +570,23 @@
         ? `<abbr class="capacity-assumed" title="Includes a Business Premium seat multiplier this pool assumes from public pricing rather than one upstream reported. Set CODEX_POOL_PREMIUM_SEAT_MULTIPLIER to correct it.">*</abbr>`
         : "";
       const idle = outside > 0
-        ? `<span class="capacity-idle">+${outside.toFixed(0)}% idle outside</span>`
+        ? `<span class="capacity-idle">+${outside.toFixed(0)}% recoverable</span>`
         : "";
       const dashed = outside > 0
         ? `<span class="capacity-outside" style="left:${percentOf(100)};width:${percentOf(outside)}"></span>`
         : "";
       const scope = bar.weighted ? "weighted by plan multiplier" : "unweighted";
-      const detail = `${poolAccounts} in pool${outsideAccounts ? `, ${outsideAccounts} outside` : ""} · ${scope}`;
+      const blocked = Number(bar.blockedAccounts) || 0;
+      // Name the two kinds of recoverable capacity apart. One needs the account
+      // put back in the pool; the other is already in the pool and held back by
+      // routing, which is a different problem with a different fix.
+      const recoverable = outsideAccounts
+        ? `, ${outsideAccounts} recoverable${blocked ? ` (${blocked} blocked by routing)` : ""}`
+        : "";
+      const detail = `${poolAccounts} spendable${recoverable} · ${scope}`;
       return `<div class="capacity-bar">
         <div class="capacity-head"><span class="capacity-label">${escapeHTML(label)}${assumed}</span><span class="capacity-readout"><strong>${pool.toFixed(0)}%</strong> pool${idle}</span></div>
-        <div class="capacity-track" role="img" aria-label="${escapeHTML(`${label} capacity: ${pool.toFixed(0)} percent of the pool remaining, ${outside.toFixed(0)} percent more idle outside the pool`)}">
+        <div class="capacity-track" role="img" aria-label="${escapeHTML(`${label} capacity: ${pool.toFixed(0)} percent spendable now, ${outside.toFixed(0)} percent more recoverable`)}">
           <span class="capacity-fill ${escapeHTML(tone)}" style="width:${percentOf(Math.min(pool, 100))}"></span>
           <span class="capacity-tick" style="left:${percentOf(100)}"></span>
           ${dashed}
