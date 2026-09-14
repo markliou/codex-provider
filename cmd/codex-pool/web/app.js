@@ -560,7 +560,7 @@
       // outside it, so the 100% mark keeps its meaning as "the pool at full"
       // however much idle capacity is stacked beyond it.
       const axis = 100 + outside;
-      const percentOf = (value) => `${(value / axis * 100).toFixed(3)}%`;
+      const percentOf = (value) => (value / axis * 100).toFixed(3);
       const tone = quotaTone(pool);
       const poolAccounts = Number(bar.poolAccounts) || 0;
       const outsideAccounts = Number(bar.outsideAccounts) || 0;
@@ -573,7 +573,7 @@
         ? `<span class="capacity-idle">+${outside.toFixed(0)}% recoverable</span>`
         : "";
       const dashed = outside > 0
-        ? `<span class="capacity-outside" style="left:${percentOf(100)};width:${percentOf(outside)}"></span>`
+        ? `<span class="capacity-outside" data-capacity-left="${percentOf(100)}" data-capacity-width="${percentOf(outside)}"></span>`
         : "";
       const scope = bar.weighted ? "weighted by plan multiplier" : "unweighted";
       const blocked = Number(bar.blockedAccounts) || 0;
@@ -587,13 +587,26 @@
       return `<div class="capacity-bar">
         <div class="capacity-head"><span class="capacity-label">${escapeHTML(label)}${assumed}</span><span class="capacity-readout"><strong>${pool.toFixed(0)}%</strong> pool${idle}</span></div>
         <div class="capacity-track" role="img" aria-label="${escapeHTML(`${label} capacity: ${pool.toFixed(0)} percent spendable now, ${outside.toFixed(0)} percent more recoverable`)}">
-          <span class="capacity-fill ${escapeHTML(tone)}" style="width:${percentOf(Math.min(pool, 100))}"></span>
-          <span class="capacity-tick" style="left:${percentOf(100)}"></span>
+          <span class="capacity-fill ${escapeHTML(tone)}" data-capacity-width="${percentOf(Math.min(pool, 100))}"></span>
+          <span class="capacity-tick" data-capacity-left="${percentOf(100)}"></span>
           ${dashed}
         </div>
         <span class="capacity-detail">${escapeHTML(detail)}</span>
       </div>`;
     }).join("");
+    // The admin CSP carries no style-src 'unsafe-inline', so a style attribute
+    // written into markup is dropped by the browser and every bar renders at
+    // zero width against a correct percentage in the text beside it. CSP does
+    // not restrict the CSSOM, so bar geometry is applied here instead. The
+    // throughput chart's series colors document the same trap; nothing else in
+    // this file sizes itself from markup, because the other bars are <progress>
+    // elements carrying a value attribute.
+    container.querySelectorAll("[data-capacity-width]").forEach((element) => {
+      element.style.width = `${element.dataset.capacityWidth}%`;
+    });
+    container.querySelectorAll("[data-capacity-left]").forEach((element) => {
+      element.style.left = `${element.dataset.capacityLeft}%`;
+    });
   }
 
   function renderSummary(summary, publicMode = false) {

@@ -25,16 +25,35 @@ const body = starts
   .map((entry, i) => source.slice(entry.index, i + 1 < starts.length ? starts[i + 1].index : source.lastIndexOf("})();")))
   .join("\n");
 
+// Elements record what was written to them and can hand back stand-ins for the
+// nodes a renderer looks up afterwards, so a renderer that applies geometry
+// through the CSSOM is exercised rather than silently skipped.
 const elements = new Map();
 const element = (key) => {
   if (!elements.has(key)) {
-    elements.set(key, {
+    const node = {
       innerHTML: "", textContent: "", hidden: false, disabled: false, value: "", dataset: {},
       classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
       setAttribute() {}, removeAttribute() {}, getAttribute: () => null,
       addEventListener() {}, removeEventListener() {}, appendChild() {}, querySelector: () => null,
-      querySelectorAll: () => [], closest: () => null, focus() {}, scrollIntoView() {},
-    });
+      closest: () => null, focus() {}, scrollIntoView() {},
+      style: {},
+      // Return one stand-in per matching tag in whatever markup was last written,
+      // carrying that tag's data attributes, which is all a geometry pass needs.
+      querySelectorAll(selector) {
+        const attribute = /^\[([a-zA-Z-]+)\]$/.exec(selector);
+        if (!attribute) return [];
+        const name = attribute[1];
+        const camel = name.replace(/^data-/, "").replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+        const found = [];
+        const tag = new RegExp(`<[^>]*\\b${name}="([^"]*)"[^>]*>`, "g");
+        for (let match = tag.exec(node.innerHTML); match; match = tag.exec(node.innerHTML)) {
+          found.push({ dataset: { [camel]: match[1] }, style: {} });
+        }
+        return found;
+      },
+    };
+    elements.set(key, node);
   }
   return elements.get(key);
 };
@@ -113,6 +132,14 @@ for (const [name, run] of cases) {
   for (const [selector, el] of elements) {
     if (/undefined|NaN/.test(el.innerHTML)) {
       throw new Error(`${name}: ${selector} rendered undefined/NaN: ${el.innerHTML.slice(0, 200)}`);
+    }
+    // The admin CSP has no style-src 'unsafe-inline', so the browser drops a
+    // style attribute written into markup. It fails silently: the element is
+    // still there, just unstyled, which shipped a capacity bar stuck at zero
+    // width beside a correct percentage. Geometry belongs in a class or in the
+    // CSSOM, never in markup.
+    if (/\sstyle="/.test(el.innerHTML)) {
+      throw new Error(`${name}: ${selector} used an inline style attribute, which the admin CSP drops: ${el.innerHTML.slice(0, 200)}`);
     }
   }
   console.log(`ok  ${name}`);
