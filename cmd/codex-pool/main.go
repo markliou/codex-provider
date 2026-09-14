@@ -8263,23 +8263,51 @@ type poolCapacityBar struct {
 	Assumed bool `json:"assumed"`
 }
 
-// capacityIdentity is one upstream workspace and the local slot that represents
-// it. Several slots can hold credentials for one workspace, and they share its
-// quota, so counting each slot would multiply one allowance by however many
-// copies happen to exist.
+// capacityIdentity is one quota allowance and the local slot that represents it.
+// Several slots can hold copies of one credential and share its allowance, so
+// counting each slot would multiply one allowance by however many copies exist.
 type capacityIdentity struct {
 	quota  *accountQuota
 	weight float64
 	// assumed is true when weight came from an assumption rather than a
 	// multiplier the account reported.
 	assumed bool
-	// inPool is true when any slot for this workspace is in the pool. The
-	// workspace's capacity is then spendable now, so it belongs to the solid
-	// reading even if other copies of it sit outside.
+	// inPool is true when any slot for this allowance is in the pool. The
+	// capacity is then spendable now, so it belongs to the solid reading even if
+	// other copies of the same credential sit outside.
 	inPool bool
 }
 
-// capacityIdentitiesLocked groups enabled accounts by upstream workspace.
+// capacityAllowanceKeyLocked names the thing that actually owns one quota
+// allowance, which is narrower than the identity routing deduplicates on.
+//
+// The routing guard keys on the upstream account id so a failed request is not
+// immediately retried against the same credential. For a Business or Team
+// workspace that id is the workspace, and every member shares it while each
+// holds their own allowance: observed live, five slots sharing one workspace id
+// reported five different remaining percentages and two different window
+// shapes. Counting capacity on the routing key would therefore collapse five
+// real allowances into one and hide the rest.
+//
+// The member's email separates them. Two slots created from one login carry the
+// same email and genuinely share an allowance; two members of one workspace do
+// not. A slot with no email of its own counts alone, because nothing proves it
+// shares with anything.
+func capacityAllowanceKeyLocked(a *app, item account) string {
+	workspace := a.upstreamIdentityKeyLocked(item)
+	email := normalizeEmail(item.Email)
+	if email == "" {
+		if auth, err := a.codexAuth(item); err == nil {
+			email = normalizeEmail(auth.Email)
+		}
+	}
+	if workspace == "" && email == "" {
+		return "slot:" + item.ID
+	}
+	return "allowance:" + workspace + "|" + email
+}
+
+// capacityIdentitiesLocked groups enabled accounts by the allowance they spend.
 func (a *app) capacityIdentitiesLocked() map[string]*capacityIdentity {
 	groups := map[string]*capacityIdentity{}
 	for _, item := range a.config.Accounts {
@@ -8290,12 +8318,7 @@ func (a *app) capacityIdentitiesLocked() map[string]*capacityIdentity {
 		if snapshot.Quota == nil {
 			continue
 		}
-		key := a.upstreamIdentityKeyLocked(item)
-		if key == "" {
-			// An identity that cannot be determined is its own group rather than
-			// being dropped, or an account would vanish from the totals entirely.
-			key = "account:" + item.ID
-		}
+		key := capacityAllowanceKeyLocked(a, item)
 		weight, assumed := accountWeeklyWeight(
 			chooseString(snapshot.PlanFamily, item.PlanFamily),
 			chooseString(snapshot.PlanLimit, item.PlanLimit),
@@ -8306,7 +8329,7 @@ func (a *app) capacityIdentitiesLocked() map[string]*capacityIdentity {
 			groups[key] = &capacityIdentity{quota: snapshot.Quota, weight: weight, assumed: assumed, inPool: item.InPool}
 			continue
 		}
-		// Membership is a property of the workspace, not of one slot: if any copy
+		// Membership is a property of the allowance, not of one slot: if any copy
 		// can route, the capacity is spendable now.
 		if item.InPool {
 			entry.inPool = true

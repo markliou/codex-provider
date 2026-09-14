@@ -2294,10 +2294,21 @@ capacity already available, when reaching it requires an operator to put the
 account back. The 100% boundary must be marked, or the dashed run reads as part
 of the same quantity rather than as capacity beyond the pool's own scale.
 
-Each upstream workspace counts once. Several local slots can hold credentials
-for one workspace and share its quota, so counting each slot would multiply one
-allowance by however many copies exist. A workspace with any slot in the pool
-belongs to the solid reading, because its capacity is spendable now.
+Each quota allowance counts once, and the allowance is narrower than the
+identity routing deduplicates on. The routing guard keys on the upstream account
+id so a failed request is not retried against the same credential, but for a
+Business or Team workspace that id is the workspace: every member shares it while
+each holds their own allowance, which upstream proves by reporting different
+remaining percentages and even different window shapes for them. Counting
+capacity on the routing key would collapse several real allowances into one and
+hide the rest.
+
+The allowance is therefore keyed on the workspace together with the member's
+email. Two slots created from one login carry the same email and genuinely share
+an allowance; two members of one workspace do not. A slot with no email of its
+own counts alone, because nothing proves it shares with anything. An allowance
+with any slot in the pool belongs to the solid reading, because its capacity is
+spendable now.
 
 ##### Weekly tier weighting
 

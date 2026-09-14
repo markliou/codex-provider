@@ -974,10 +974,10 @@ func TestPoolCapacityStacksIdleCapacityBeyondThePool(t *testing.T) {
 	}
 }
 
-// One workspace held by several local slots must count once. If any copy is in
-// the pool the capacity is spendable now, so the workspace belongs to the solid
-// reading rather than being counted on both sides.
-func TestPoolCapacityCountsOneWorkspaceOnce(t *testing.T) {
+// Copies of one credential must count once. If any copy is in the pool the
+// capacity is spendable now, so it belongs to the solid reading rather than
+// being counted on both sides.
+func TestPoolCapacityCountsOneAllowanceOnce(t *testing.T) {
 	minutes := func(v int64) *int64 { return &v }
 	value := 80.0
 	window := quotaWindow{Label: "Week", WindowMinutes: minutes(weeklyWindowMinutes), RemainingPercent: &value, Present: true, Observed: true}
@@ -999,10 +999,51 @@ func TestPoolCapacityCountsOneWorkspaceOnce(t *testing.T) {
 	}
 	bar := bars[0]
 	if bar.PoolAccounts != 1 || bar.OutsideAccounts != 0 {
-		t.Fatalf("one workspace counted %d in pool and %d outside", bar.PoolAccounts, bar.OutsideAccounts)
+		t.Fatalf("one credential counted %d in pool and %d outside", bar.PoolAccounts, bar.OutsideAccounts)
 	}
 	if bar.PoolPercent != 80 || bar.OutsidePercent != 0 {
-		t.Fatalf("shared workspace double counted: pool %v outside %v", bar.PoolPercent, bar.OutsidePercent)
+		t.Fatalf("shared allowance double counted: pool %v outside %v", bar.PoolPercent, bar.OutsidePercent)
+	}
+}
+
+// Members of one Business workspace share its upstream account id but each hold
+// their own allowance, which upstream proves by reporting different remaining
+// percentages for them. Counting them on the routing identity would collapse
+// several real allowances into one and hide the rest.
+func TestPoolCapacityCountsEachWorkspaceMemberSeparately(t *testing.T) {
+	minutes := func(v int64) *int64 { return &v }
+	window := func(remaining float64) quotaWindow {
+		value := remaining
+		return quotaWindow{Label: "Week", WindowMinutes: minutes(weeklyWindowMinutes), RemainingPercent: &value, Present: true, Observed: true}
+	}
+	// One workspace, three members, distinct emails and distinct quotas.
+	a := testApp(t, []account{
+		{ID: "member-a", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "a@example.test"},
+		{ID: "member-b", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "b@example.test"},
+		{ID: "member-c", AuthType: "codex_device_auth", Enabled: true, InPool: false, Priority: 100, AccountID: "workspace-1", Email: "c@example.test"},
+	})
+	for _, seed := range []struct {
+		id        string
+		remaining float64
+	}{{"member-a", 40}, {"member-b", 60}, {"member-c", 100}} {
+		writeTestCodexAuth(t, a, seed.id)
+		a.state.Quotas[seed.id] = quotaSnapshot{AccountID: seed.id, PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{window(seed.remaining)}}}
+	}
+
+	a.mu.Lock()
+	bars := a.poolCapacityLocked(time.Now().UTC())
+	a.mu.Unlock()
+
+	if len(bars) != 1 {
+		t.Fatalf("expected one bar: %#v", bars)
+	}
+	bar := bars[0]
+	if bar.PoolAccounts != 2 || bar.OutsideAccounts != 1 {
+		t.Fatalf("workspace members collapsed: %d in pool, %d outside, want 2 and 1", bar.PoolAccounts, bar.OutsideAccounts)
+	}
+	// (40 + 60) / 2 = 50 in pool, and the idle member adds a full allowance.
+	if bar.PoolPercent != 50 || bar.OutsidePercent != 50 {
+		t.Fatalf("bar = pool %v, outside %v, want 50 and 50", bar.PoolPercent, bar.OutsidePercent)
 	}
 }
 
