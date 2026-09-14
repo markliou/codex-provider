@@ -2250,34 +2250,6 @@ control without opening the disclosure.
 Exact reset and refresh timestamps may remain in tooltips so the table stays
 scannable without discarding diagnostic detail.
 
-Above the account table the status cards count accounts. Separately from them,
-the page must roll up how much of each reported quota window the pool still
-holds, so an operator running many credentials can see whether the short window
-or the long one is the constraint without reading every row. One entry per
-reported window duration, ordered shortest first, each showing remaining
-headroom, how many accounts that window constrains out of the routable total,
-and how many of them are exhausted. Headroom is shown to one decimal place, the finest reading the
-underlying whole-percent windows support.
-
-A routable slot that reports no entry for a window is not missing data: no limit
-of that duration applies to it, which is how Pro and Business Premium seats
-report, having no five-hour cap. Such slots must be counted and shown as having
-no limit for that window, never silently dropped. A pool whose capped slots are
-spent can still hold an uncapped slot able to serve immediately, and a roll-up
-that hides it reports far less short-term capacity than the pool actually has.
-The percentage itself covers only the slots the window constrains, and the card
-must say so, because averaging an unconstrained slot in as a full one would
-present the absence of a limit as a limit that happens to be full.
-
-The reported headroom is the mean remaining percentage across the reporting
-slots, never a sum: percentages from different plans describe different absolute
-allowances, so they may be averaged into how full the pool is but must never be
-added into one larger total. Only routable slots count. An out-of-pool slot is
-not capacity this pool can spend, and a duplicate slot shares one upstream
-workspace with its primary, so counting both would report that workspace twice.
-A pool with no quota evidence reports no entries rather than a fabricated zero,
-which would read as total exhaustion.
-
 The pool-wide cache window must show the total request count since reset and
 must group and visibly label Pool-observed counters separately from calculated
 read, request-hit, and cold rates. It must not show an upstream raw-token group
