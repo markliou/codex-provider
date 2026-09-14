@@ -54,7 +54,7 @@ const windowStub = {
 
 const bundle = new Function(
   "document", "window", "sessionStorage", "localStorage", "fetch", "navigator", "console",
-  body + "\nreturn { renderSummary, renderThroughput, renderCacheWindow, renderPublicAccounts, renderRoutingCacheEvents };"
+  body + "\nreturn { renderSummary, renderPoolCapacity, renderThroughput, renderCacheWindow, renderPublicAccounts, renderRoutingCacheEvents };"
 )(documentStub, windowStub, storage, storage, () => Promise.reject(new Error("no network in this guard")), { clipboard: null }, console);
 
 const quotaWindow = (label, minutes, remaining) => ({
@@ -70,9 +70,15 @@ const account = (overrides) => Object.assign({
   quota: { windows: [quotaWindow("5h", 300, 40), quotaWindow("Week", 10080, 80)], additionalLimits: [], credits: null, individualLimit: null, resetCredits: { availableCount: 3, expiresAt: Math.floor(Date.now() / 1000) + 86400 } },
 }, overrides);
 
+const capacity = [
+  { label: "5h", windowMinutes: 300, poolPercent: 63, outsidePercent: 0, poolAccounts: 4, outsideAccounts: 0, weighted: false, assumed: false },
+  { label: "Week", windowMinutes: 10080, poolPercent: 58.5, outsidePercent: 141.2, poolAccounts: 5, outsideAccounts: 3, weighted: true, assumed: true },
+];
+
 const cases = [
   ["full payload", () => {
     bundle.renderSummary({ total: 8, ready: 3, low: 1, cooldown: 1, standby: 2, duplicate: 1, unavailable: 0 }, true);
+    bundle.renderPoolCapacity(capacity);
     bundle.renderThroughput({ current: { requestCount: 10, successRate: 1, averageLatencyMs: 1200, p50LatencyMs: 900, p95LatencyMs: 3000, cacheHitRate: 0.9, outputTokensPerSecond: 40, windowSeconds: 600 }, series: [], bucketIntervalSeconds: 60, seriesIntervalSeconds: 600, retentionHours: 48, activeRequests: 1 });
     bundle.renderCacheWindow({ requestCount: 100, cacheHitRequestCount: 90, coldRequestCount: 10, inputTokens: 1000, cachedTokens: 900, main: {}, subagent: {} });
     bundle.renderPublicAccounts([account({}), account({ quotaUnavailable: true, quota: null, seatType: "standard", seatTypeInferred: false })]);
@@ -82,6 +88,9 @@ const cases = [
   // degrade rather than throw.
   ["sparse payload", () => {
     bundle.renderSummary({}, true);
+    // A bar with no idle capacity must not draw a zero-width dashed run, and a
+    // reading missing its counts must still render.
+    bundle.renderPoolCapacity([{ label: "Week", poolPercent: 12 }]);
     bundle.renderThroughput({});
     bundle.renderCacheWindow({});
     bundle.renderPublicAccounts([account({ detail: "", ownerNote: "", quota: null, remainingQuota: null, cacheWindow: null })]);
@@ -89,6 +98,8 @@ const cases = [
   }],
   ["empty and missing", () => {
     bundle.renderSummary({}, true);
+    bundle.renderPoolCapacity([]);
+    bundle.renderPoolCapacity(undefined);
     bundle.renderThroughput(undefined);
     bundle.renderCacheWindow(undefined);
     bundle.renderPublicAccounts([]);

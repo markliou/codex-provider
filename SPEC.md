@@ -164,6 +164,7 @@ docker run -d \
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
 | `CODEX_POOL_CODEX_RESET_CREDIT_CONSUME_URL` | no | derived | Override for the upstream reset-credit consume endpoint. Testing only. |
+| `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` | no | `5` | Assumed Business Premium weekly allowance, in Standard seats. Not upstream-reported; correct it when a contract differs. |
 | `CODEX_POOL_CAPACITY_RETRY_LIMIT` | no | `8` | Capacity retry rounds once no identity can serve. `0` disables waiting and surfaces the refusal immediately. |
 | `CODEX_POOL_CAPACITY_RETRY_BACKOFF_MS` | no | `1000` | First capacity retry delay. Each round doubles from here. |
 | `CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS` | no | `20000` | Cap on a single capacity retry delay. Raised to the first delay if set below it. |
@@ -2277,6 +2278,56 @@ attempt, including a refused one: a successful reset changes the windows the
 dashboard shows, and `alreadyRedeemed` means the local snapshot is the stale
 half of the disagreement. An upstream failure surfaces only a sanitized status
 and error code, never the raw response body.
+
+Above the account table, separately from the status cards that count accounts,
+the page must show pool capacity per quota window as a stacked bar. Two windows
+are read: the five-hour burst limit and the weekly budget. A window no routable
+account reports is omitted entirely rather than drawn against nothing, which
+would read as total exhaustion instead of absent evidence.
+
+The solid fill is what the pool can spend now, as a percentage of the in-pool
+denominator, so 100% means every routable account is untouched. Capacity held by
+enabled accounts outside the pool is stacked past the 100% mark as a hollow
+dashed run on the same per-unit scale, and may exceed 100% when more sits idle
+than the pool itself holds. It must stay hollow: filling it would read as
+capacity already available, when reaching it requires an operator to put the
+account back. The 100% boundary must be marked, or the dashed run reads as part
+of the same quantity rather than as capacity beyond the pool's own scale.
+
+Each upstream workspace counts once. Several local slots can hold credentials
+for one workspace and share its quota, so counting each slot would multiply one
+allowance by however many copies exist. A workspace with any slot in the pool
+belongs to the solid reading, because its capacity is spendable now.
+
+##### Weekly tier weighting
+
+The weekly bar is weighted by plan multiplier; the five-hour bar is not. Plans
+documenting a larger weekly budget do not document a larger burst allowance, and
+the plans that would most distort the burst reading, Pro and Business Premium,
+report no five-hour window at all because no such limit applies to them.
+Weighting the burst reading would invent a difference upstream does not
+describe. Weighting the weekly reading corrects one that is real: a 20x Pro
+account at half capacity holds ten base allowances where a Plus account at half
+holds half of one, and averaging them as equals understates the pool by an order
+of magnitude.
+
+Multipliers come from evidence of two different strengths, and the difference
+must remain visible:
+
+- A Pro slot reports its own multiplier through `planLimit`, so `5x`, `10x` and
+  `20x` are authoritative. Generic Pro with no reported multiplier weighs one;
+  the plan name is not multiplier evidence.
+- A Business Premium seat reports no multiplier at all. The ratio is an
+  assumption read from public pricing, not telemetry, so it must be
+  operator-tunable through `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` without a
+  rebuild, and an invalid setting is a startup error rather than a silent
+  fallback because a wrong multiplier distorts every reading it touches.
+- Every other plan weighs one base allowance. Absent evidence an account counts
+  once and is never guessed upward.
+
+Any reading an assumed multiplier contributed to must be marked as such and must
+explain where the assumption came from and how to correct it. It must never be
+presented with the authority of a reported multiplier.
 
 The pool-wide cache window must show the total request count since reset and
 must group and visibly label Pool-observed counters separately from calculated

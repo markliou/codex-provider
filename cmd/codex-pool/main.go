@@ -636,6 +636,9 @@ func newAppFromEnv() (*app, error) {
 	if err := applyCapacityRetryEnv(); err != nil {
 		return nil, err
 	}
+	if err := applyCapacityWeightEnv(); err != nil {
+		return nil, err
+	}
 	maxRetryAccounts, err := maxRetryAccountsFromEnv()
 	if err != nil {
 		return nil, err
@@ -2626,7 +2629,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -2649,7 +2652,7 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 	// monitor normal traffic without entering management mode. Keep this limited
 	// to aggregate rolling windows: per-account throughput, raw buckets, model
 	// attribution, and request-level routing events remain management-only.
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now)}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now)}})
 }
 
 func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) {
@@ -7193,6 +7196,10 @@ func quotaWindowByDuration(quota accountQuota, minutes int64) quotaWindow {
 // fiveHourWindowMinutes is the reported duration of the Codex five-hour window.
 const fiveHourWindowMinutes = 300
 
+// weeklyWindowMinutes is the reported duration of the Codex weekly window, the
+// budget the tier multipliers describe.
+const weeklyWindowMinutes = 10080
+
 // businessSeatInferenceFromQuota derives a Business seat tier from the reported
 // quota windows. No endpoint this pool calls carries a Standard/Premium field,
 // and the pinned Codex client model has none either, but OpenAI documents that a
@@ -8231,6 +8238,166 @@ func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 		}
 	}
 	return result
+}
+
+// poolCapacityBar is one window's pool-wide reading, shaped for the stacked bar
+// the dashboard draws.
+type poolCapacityBar struct {
+	Label         string `json:"label"`
+	WindowMinutes int64  `json:"windowMinutes"`
+	// PoolPercent is remaining capacity as a percentage of the pool's own
+	// denominator, so 100 means every in-pool account is untouched. It is what
+	// the solid bar fills to.
+	PoolPercent float64 `json:"poolPercent"`
+	// OutsidePercent is the capacity held by enabled accounts outside the pool,
+	// measured on the same per-unit scale and drawn past the 100% mark. It can
+	// exceed 100 when more capacity sits idle than the pool itself holds, which
+	// is the condition an operator most needs to see.
+	OutsidePercent  float64 `json:"outsidePercent"`
+	PoolAccounts    int     `json:"poolAccounts"`
+	OutsideAccounts int     `json:"outsideAccounts"`
+	// Weighted marks a reading whose denominator is scaled by tier multipliers.
+	Weighted bool `json:"weighted"`
+	// Assumed marks a reading that any assumed multiplier contributed to, so the
+	// dashboard can refuse to present it with the authority of reported data.
+	Assumed bool `json:"assumed"`
+}
+
+// capacityIdentity is one upstream workspace and the local slot that represents
+// it. Several slots can hold credentials for one workspace, and they share its
+// quota, so counting each slot would multiply one allowance by however many
+// copies happen to exist.
+type capacityIdentity struct {
+	quota  *accountQuota
+	weight float64
+	// assumed is true when weight came from an assumption rather than a
+	// multiplier the account reported.
+	assumed bool
+	// inPool is true when any slot for this workspace is in the pool. The
+	// workspace's capacity is then spendable now, so it belongs to the solid
+	// reading even if other copies of it sit outside.
+	inPool bool
+}
+
+// capacityIdentitiesLocked groups enabled accounts by upstream workspace.
+func (a *app) capacityIdentitiesLocked() map[string]*capacityIdentity {
+	groups := map[string]*capacityIdentity{}
+	for _, item := range a.config.Accounts {
+		if !item.Enabled {
+			continue
+		}
+		snapshot := a.state.Quotas[item.ID]
+		if snapshot.Quota == nil {
+			continue
+		}
+		key := a.upstreamIdentityKeyLocked(item)
+		if key == "" {
+			// An identity that cannot be determined is its own group rather than
+			// being dropped, or an account would vanish from the totals entirely.
+			key = "account:" + item.ID
+		}
+		weight, assumed := accountWeeklyWeight(
+			chooseString(snapshot.PlanFamily, item.PlanFamily),
+			chooseString(snapshot.PlanLimit, item.PlanLimit),
+			chooseString(snapshot.SeatType, item.SeatType),
+		)
+		entry := groups[key]
+		if entry == nil {
+			groups[key] = &capacityIdentity{quota: snapshot.Quota, weight: weight, assumed: assumed, inPool: item.InPool}
+			continue
+		}
+		// Membership is a property of the workspace, not of one slot: if any copy
+		// can route, the capacity is spendable now.
+		if item.InPool {
+			entry.inPool = true
+			// Prefer the routable slot's own snapshot and multiplier; that is the
+			// copy whose quota the pool actually spends.
+			entry.quota = snapshot.Quota
+			entry.weight = weight
+			entry.assumed = assumed
+		}
+	}
+	return groups
+}
+
+// poolCapacityLocked reads both quota windows across the pool.
+//
+// The five-hour bar is deliberately unweighted. Plans that document a larger
+// weekly budget do not document a larger burst allowance, and the plans that
+// would most distort it, Pro and Business Premium, report no five-hour window at
+// all because no such limit applies to them. Weighting it would invent a
+// difference upstream does not describe.
+//
+// The weekly bar is weighted, because there the difference is real: a 20x Pro
+// account at half capacity holds ten base allowances while a Plus account at
+// half holds half of one, and averaging those two as equals understates the pool
+// by an order of magnitude.
+func (a *app) poolCapacityLocked(now time.Time) []poolCapacityBar {
+	identities := a.capacityIdentitiesLocked()
+	bars := make([]poolCapacityBar, 0, 2)
+	for _, spec := range []struct {
+		minutes  int64
+		weighted bool
+	}{
+		{fiveHourWindowMinutes, false},
+		{weeklyWindowMinutes, true},
+	} {
+		var poolTotal, poolRemaining, outsideRemaining float64
+		poolAccounts, outsideAccounts := 0, 0
+		assumed := false
+		for _, identity := range identities {
+			window, ok := reportedWindowOfDuration(*identity.quota, spec.minutes)
+			if !ok {
+				continue
+			}
+			weight := 1.0
+			if spec.weighted {
+				weight = identity.weight
+			}
+			remaining := weight * quotaWindowRemaining(window) / 100
+			if identity.inPool {
+				poolTotal += weight
+				poolRemaining += remaining
+				poolAccounts++
+			} else {
+				outsideRemaining += remaining
+				outsideAccounts++
+			}
+			if spec.weighted && identity.assumed {
+				assumed = true
+			}
+		}
+		// With no routable account reporting this window there is no denominator,
+		// and a bar drawn against nothing would read as total exhaustion rather
+		// than as absent evidence.
+		if poolTotal <= 0 {
+			continue
+		}
+		value := spec.minutes
+		bars = append(bars, poolCapacityBar{
+			Label:           quotaWindowLabel(&value),
+			WindowMinutes:   spec.minutes,
+			PoolPercent:     poolRemaining / poolTotal * 100,
+			OutsidePercent:  outsideRemaining / poolTotal * 100,
+			PoolAccounts:    poolAccounts,
+			OutsideAccounts: outsideAccounts,
+			Weighted:        spec.weighted,
+			Assumed:         assumed,
+		})
+	}
+	return bars
+}
+
+// reportedWindowOfDuration finds the window of exactly this duration that
+// upstream actually reported. A window it did not report is absent evidence, not
+// a zero, so the caller must skip the account rather than count it as spent.
+func reportedWindowOfDuration(quota accountQuota, minutes int64) (quotaWindow, bool) {
+	for _, window := range quotaReportedWindows(quota) {
+		if window.Present && window.WindowMinutes != nil && *window.WindowMinutes == minutes {
+			return window, true
+		}
+	}
+	return quotaWindow{}, false
 }
 
 func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
@@ -9305,6 +9472,66 @@ func organizationNameFromNestedMap(values map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// baseWeeklyWeight is the unit every weekly allowance is measured against. An
+// account with no multiplier evidence weighs exactly one, so a pool of ordinary
+// subscriptions normalises to a plain average.
+const baseWeeklyWeight = 1.0
+
+// defaultPremiumSeatWeight is OpenAI's published Premium-to-Standard usage
+// ratio for Business seats.
+//
+// Unlike a Pro multiplier, which the account itself reports through planLimit,
+// no endpoint this pool calls reports a Business seat multiplier at all. This
+// number is therefore an assumption read off a public pricing page, not
+// telemetry, and a deployment whose contract differs must be able to correct it
+// without a rebuild. Every reading it contributes to is flagged as assumed so
+// it can never be presented with the same authority as a reported multiplier.
+const defaultPremiumSeatWeight = 5.0
+
+var premiumSeatWeight = defaultPremiumSeatWeight
+
+// applyCapacityWeightEnv retunes the assumed Business Premium multiplier. An
+// invalid setting is a startup error rather than a silent fallback, because a
+// wrong multiplier silently distorts every weighted reading it touches.
+func applyCapacityWeightEnv() error {
+	raw := strings.TrimSpace(os.Getenv("CODEX_POOL_PREMIUM_SEAT_MULTIPLIER"))
+	if raw == "" {
+		return nil
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || value <= 0 || math.IsInf(value, 0) {
+		return fmt.Errorf("CODEX_POOL_PREMIUM_SEAT_MULTIPLIER must be a positive number")
+	}
+	premiumSeatWeight = value
+	return nil
+}
+
+// accountWeeklyWeight returns how many base allowances one account's weekly
+// budget is worth, and whether that figure is assumed rather than reported.
+//
+// A Pro slot reports its own multiplier, so that value is authoritative. A
+// Business Premium seat reports none, so the assumed ratio applies and the
+// caller must surface it as an assumption. Everything else weighs one: absent
+// evidence, an account counts once rather than being guessed upward.
+func accountWeeklyWeight(planFamily, planLimit, seatType string) (float64, bool) {
+	switch normalizePlanType(planFamily) {
+	case "pro":
+		switch cleanPlanLimit(planLimit) {
+		case "5x":
+			return 5, false
+		case "10x":
+			return 10, false
+		case "20x":
+			return 20, false
+		}
+	case "business":
+		if cleanMetadataToken(seatType) == "premium" {
+			return premiumSeatWeight, true
+		}
+	}
+	return baseWeeklyWeight, false
 }
 
 func cleanPlanLimit(value string) string {

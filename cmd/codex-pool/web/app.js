@@ -537,6 +537,58 @@
   // #cache-window row, so it is intentionally not duplicated here. Every
   // account belongs to exactly one non-total card; do not merge Duplicate into
   // Out of pool, because duplicate credential copies may still be in the pool.
+  // Pool capacity reads as a health bar rather than a number because the two
+  // quantities it carries are not comparable as text: what the pool can spend
+  // now, and what more it could spend after an operator puts an idle account
+  // back. The solid fill is the first; the dashed extension past the 100% mark
+  // is the second, drawn on the same per-unit scale so their lengths compare
+  // directly. The dashed part is deliberately hollow: filling it would read as
+  // capacity already available, when reaching it takes an explicit action.
+  function renderPoolCapacity(bars) {
+    const container = $("#pool-capacity");
+    if (!container) return;
+    const rows = Array.isArray(bars) ? bars : [];
+    if (!rows.length) {
+      container.innerHTML = "";
+      return;
+    }
+    container.innerHTML = rows.map((bar) => {
+      const label = bar.label || "Window";
+      const pool = Math.max(0, finiteMetric(bar.poolPercent) ?? 0);
+      const outside = Math.max(0, finiteMetric(bar.outsidePercent) ?? 0);
+      // The axis runs from zero to the pool's full scale plus whatever sits
+      // outside it, so the 100% mark keeps its meaning as "the pool at full"
+      // however much idle capacity is stacked beyond it.
+      const axis = 100 + outside;
+      const percentOf = (value) => `${(value / axis * 100).toFixed(3)}%`;
+      const tone = quotaTone(pool);
+      const poolAccounts = Number(bar.poolAccounts) || 0;
+      const outsideAccounts = Number(bar.outsideAccounts) || 0;
+      // An assumed multiplier must never be presented with the authority of a
+      // reported one, so the reading carries a marker back to its explanation.
+      const assumed = bar.assumed
+        ? `<abbr class="capacity-assumed" title="Includes a Business Premium seat multiplier this pool assumes from public pricing rather than one upstream reported. Set CODEX_POOL_PREMIUM_SEAT_MULTIPLIER to correct it.">*</abbr>`
+        : "";
+      const idle = outside > 0
+        ? `<span class="capacity-idle">+${outside.toFixed(0)}% idle outside</span>`
+        : "";
+      const dashed = outside > 0
+        ? `<span class="capacity-outside" style="left:${percentOf(100)};width:${percentOf(outside)}"></span>`
+        : "";
+      const scope = bar.weighted ? "weighted by plan multiplier" : "unweighted";
+      const detail = `${poolAccounts} in pool${outsideAccounts ? `, ${outsideAccounts} outside` : ""} · ${scope}`;
+      return `<div class="capacity-bar">
+        <div class="capacity-head"><span class="capacity-label">${escapeHTML(label)}${assumed}</span><span class="capacity-readout"><strong>${pool.toFixed(0)}%</strong> pool${idle}</span></div>
+        <div class="capacity-track" role="img" aria-label="${escapeHTML(`${label} capacity: ${pool.toFixed(0)} percent of the pool remaining, ${outside.toFixed(0)} percent more idle outside the pool`)}">
+          <span class="capacity-fill ${escapeHTML(tone)}" style="width:${percentOf(Math.min(pool, 100))}"></span>
+          <span class="capacity-tick" style="left:${percentOf(100)}"></span>
+          ${dashed}
+        </div>
+        <span class="capacity-detail">${escapeHTML(detail)}</span>
+      </div>`;
+    }).join("");
+  }
+
   function renderSummary(summary, publicMode = false) {
     const items = [
       ["Total accounts", summary.total || 0, ""],
@@ -1082,6 +1134,7 @@
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
       renderSettings(serviceState);
       renderSummary(serviceState.summary || {});
+      renderPoolCapacity(serviceState.poolCapacity);
       renderThroughput(serviceState.throughput);
       renderCacheWindow(serviceState.promptCacheWindow);
       renderAccounts(state.data.accounts, healthByID);
@@ -1112,6 +1165,7 @@
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
       const accounts = body.dashboard.accounts || [];
       renderSummary(body.dashboard.summary || {}, true);
+      renderPoolCapacity(body.dashboard.poolCapacity);
       renderThroughput(body.dashboard.throughput);
       renderCacheWindow(body.dashboard.promptCacheWindow);
       renderPublicAccounts(accounts);
