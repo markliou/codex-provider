@@ -658,6 +658,211 @@ func TestExhaustedModelMeterBlocksRouting(t *testing.T) {
 	}
 }
 
+// Spending a reset credit is irreversible, so the action must reach upstream
+// exactly once, refresh the quota it changed, and report upstream's own verdict
+// rather than assuming success.
+func TestAdminResetCreditConsumesAndRefreshes(t *testing.T) {
+	consumeCalls := 0
+	var seenKey string
+	usageCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/backend-api/wham/rate-limit-reset-credits/consume":
+			consumeCalls++
+			var payload map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			seenKey, _ = payload["idempotency_key"].(string)
+			_, _ = w.Write([]byte(`{"outcome":"reset"}`))
+		case "/backend-api/wham/usage":
+			usageCalls++
+			_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000}},"rate_limit_reset_credits":{"available_count":2}}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	defer upstream.Close()
+
+	a := testApp(t, []account{{ID: "acct", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct")
+	a.codexBaseURL = upstream.URL + "/backend-api"
+	writeTestCodexAuth(t, a, "acct")
+	credits := int64(3)
+	a.state.Quotas["acct"] = quotaSnapshot{AccountID: "acct", Quota: &accountQuota{ResetCredits: &quotaResetCredits{AvailableCount: &credits}}}
+
+	cookies, csrf := adminSession(t, a)
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/acct/quota/reset-credit", nil)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	request.Header.Set("X-CSRF-Token", csrf)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("reset credit returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Outcome  string `json:"outcome"`
+		Consumed bool   `json:"consumed"`
+		Message  string `json:"message"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Outcome != "reset" || !body.Consumed || body.Message == "" {
+		t.Fatalf("outcome not reported: %#v", body)
+	}
+	// One credit spent means exactly one upstream consume, carrying a key.
+	if consumeCalls != 1 {
+		t.Fatalf("upstream consume calls = %d, want 1", consumeCalls)
+	}
+	if seenKey == "" {
+		t.Fatal("consume request carried no idempotency key")
+	}
+	// The reset changes the windows the dashboard shows, so it must re-read them.
+	if usageCalls == 0 {
+		t.Fatal("quota was not refreshed after the reset")
+	}
+}
+
+// Upstream can decline without spending anything. That must not be reported as
+// a credit having been used.
+func TestAdminResetCreditReportsARefusalHonestly(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/backend-api/wham/rate-limit-reset-credits/consume" {
+			_, _ = w.Write([]byte(`{"outcome":"nothingToReset"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000}}}`))
+	}))
+	defer upstream.Close()
+
+	a := testApp(t, []account{{ID: "acct", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct")
+	a.codexBaseURL = upstream.URL + "/backend-api"
+	writeTestCodexAuth(t, a, "acct")
+	credits := int64(1)
+	a.state.Quotas["acct"] = quotaSnapshot{AccountID: "acct", Quota: &accountQuota{ResetCredits: &quotaResetCredits{AvailableCount: &credits}}}
+
+	cookies, csrf := adminSession(t, a)
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/acct/quota/reset-credit", nil)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	request.Header.Set("X-CSRF-Token", csrf)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("declined reset returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Outcome  string `json:"outcome"`
+		Consumed bool   `json:"consumed"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	// The wire spelling is camelCase; the pool sanitizes metadata to lowercase.
+	if body.Outcome != "nothingtoreset" || body.Consumed {
+		t.Fatalf("a refusal was reported as a spend: %#v", body)
+	}
+}
+
+// An account with no credit must never reach upstream: the call would spend
+// nothing but still tell the operator something happened.
+func TestAdminResetCreditRefusesWithoutCredits(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"outcome":"reset"}`))
+	}))
+	defer upstream.Close()
+
+	a := testApp(t, []account{{ID: "acct", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct")
+	a.codexBaseURL = upstream.URL + "/backend-api"
+	writeTestCodexAuth(t, a, "acct")
+	zero := int64(0)
+	a.state.Quotas["acct"] = quotaSnapshot{AccountID: "acct", Quota: &accountQuota{ResetCredits: &quotaResetCredits{AvailableCount: &zero}}}
+
+	cookies, csrf := adminSession(t, a)
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/acct/quota/reset-credit", nil)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	request.Header.Set("X-CSRF-Token", csrf)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("reset without credits returned %d, want 409: %s", recorder.Code, recorder.Body.String())
+	}
+	if calls != 0 {
+		t.Fatalf("upstream was called with no credit available: calls=%d", calls)
+	}
+}
+
+// Spending entitlement is a management action. An unauthenticated caller must
+// not be able to reach it.
+func TestResetCreditRequiresAdminSession(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/acct/quota/reset-credit", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusUnauthorized && recorder.Code != http.StatusForbidden {
+		t.Fatalf("unauthenticated reset returned %d, want 401 or 403", recorder.Code)
+	}
+}
+
+func TestResetCreditOutcomeMessages(t *testing.T) {
+	for _, spelling := range []string{"reset", "Reset", " reset "} {
+		if _, consumed := resetCreditOutcomeMessage(spelling); !consumed {
+			t.Fatalf("%q must count as consumed", spelling)
+		}
+	}
+	// A refusal must be distinguishable from a spend by its message too.
+	refusal, _ := resetCreditOutcomeMessage("nothingToReset")
+	spend, _ := resetCreditOutcomeMessage("reset")
+	if refusal == spend {
+		t.Fatal("a refusal and a spend produced the same message")
+	}
+	// Both the wire spelling and the sanitized lowercase form must be recognized,
+	// or every refusal would be reported as unrecognized.
+	for _, outcome := range []string{"nothingToReset", "nothingtoreset", "noCreditsAvailable", "nocreditsavailable", "alreadyRedeemed", "alreadyredeemed", "somethingNew", ""} {
+		message, consumed := resetCreditOutcomeMessage(outcome)
+		if consumed {
+			t.Fatalf("%q must not count as consumed", outcome)
+		}
+		if message == "" {
+			t.Fatalf("%q produced no operator-visible message", outcome)
+		}
+	}
+}
+
+// The button is a management control: it spends entitlement, so it must never
+// render on the public dashboard, and only while a credit exists.
+func TestAdminAssetsGateTheResetCreditButton(t *testing.T) {
+	a := testApp(t, nil)
+	request := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET app.js returned %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"quota/reset-credit", "Use reset credit", "managementAccountId && available"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("app.js did not include %q", want)
+		}
+	}
+	// The public renderer must pass no account id, so the control cannot appear.
+	if strings.Contains(body, "quotaMarkup(account.remainingQuota, account.quota, null, null, account.quotaFreshness, account.lastSuccessfulRefreshAt, account.quotaMetering, account.id)") {
+		t.Fatal("the public dashboard renders the reset-credit control")
+	}
+}
+
 func TestCodexModelCatalogAdvertisesGPT6(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"
@@ -2604,6 +2809,18 @@ func TestCreateCodexDeviceAuthAccountStagesUntilLogin(t *testing.T) {
 	staged := a.config.Accounts[0]
 	if staged.Enabled || staged.InPool || !staged.PendingPoolActivation || staged.PendingAuthVerification || staged.PendingAuthExpectedAccountID != "" {
 		t.Fatalf("new device-auth account was not staged: %#v", staged)
+	}
+}
+
+func writeTestCodexAuth(t *testing.T, a *app, accountID string) {
+	t.Helper()
+	home := a.accountCodexHome(accountID)
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authJSON := `{"auth_mode":"chatgpt","tokens":{"id_token":"","access_token":"<access-token>","refresh_token":"<refresh-token>"}}`
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

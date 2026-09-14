@@ -718,7 +718,7 @@
     return `<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">${escapeHTML(credits.balance || "Available")}</strong></div>`;
   }
 
-  function resetCreditsMarkup(resetCredits) {
+  function resetCreditsMarkup(resetCredits, managementAccountId = "") {
     if (resetCredits?.availableCount === null || resetCredits?.availableCount === undefined) return "";
     // OpenAI exposes each reset credit's expiry through a separate details
     // endpoint. Show only the nearest available expiry date: a full list or a
@@ -731,7 +731,14 @@
     const note = expires
       ? `<span class="quota-fact-note reset-credit-expiry${expiresSoon ? " expiring-soon" : ""}"${exact ? ` title="${escapeHTML(`Expires ${exact}`)}"` : ""}>Expires ${escapeHTML(expires)}</span>`
       : "";
-    return `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(resetCredits.availableCount))}</strong>${note}</div>`;
+    // Spending a credit is irreversible, so the control appears only where an
+    // operator is authenticated and only while upstream reports a credit to
+    // spend. The public dashboard passes no account id and never renders it.
+    const available = Number(resetCredits.availableCount) > 0;
+    const action = managementAccountId && available
+      ? `<span class="quota-fact-note reset-credit-action"><button class="button secondary reset-credit-button" type="button" data-account-action="quota/reset-credit" data-account-id="${escapeHTML(managementAccountId)}">Use reset credit</button></span>`
+      : "";
+    return `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(resetCredits.availableCount))}</strong>${note}${action}</div>`;
   }
 
   function spendControlMarkup(limit) {
@@ -752,7 +759,7 @@
     }).join("");
     return `<div class="quota-additional-group"><div class="quota-section-label">Additional limits</div>${entries}</div>`;
   }
-  function quotaMarkup(value, quota, quotaError, usageUpdatedAt, freshness, lastSuccessfulRefreshAt, metering) {
+  function quotaMarkup(value, quota, quotaError, usageUpdatedAt, freshness, lastSuccessfulRefreshAt, metering, managementAccountId = "") {
     const refreshError = quotaError ? `<span class="quota-error" title="${escapeHTML(quotaError.message)}">Quota update unavailable</span>` : "";
     if (metering === "api_metered" && !quota) {
       return '<div class="quota quota-detailed"><span class="quota-unknown">API-metered · ChatGPT quota not applicable</span></div>';
@@ -784,7 +791,7 @@
           blockedBy: blocking ? [] : gatingLabels,
         });
       }).filter(Boolean).join("");
-      const resetCredits = resetCreditsMarkup(quota.resetCredits);
+      const resetCredits = resetCreditsMarkup(quota.resetCredits, managementAccountId);
       // Keep every reported quota window visible: Pro/Spark and other windows
       // are distinct upstream limits, not duplicate renderings. Only the
       // supporting text is grouped so operators can scan bars first, then read
@@ -929,7 +936,7 @@
       return `<tr data-account-row="${escapeHTML(account.id)}"${poolMembershipAttribute(account.inPool === false)}>
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${accountEntitlementMarkup(account)}${ownerNoteInput(account)}</div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
-        <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt, health.quotaFreshness, health.lastSuccessfulRefreshAt, health.quotaMetering)}${quotaProtectionMarkup(account, health)}</td>
+        <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt, health.quotaFreshness, health.lastSuccessfulRefreshAt, health.quotaMetering, account.id)}${quotaProtectionMarkup(account, health)}</td>
         <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)} · ${escapeHTML(routeCount)}</div></td>
         <td class="cache-column">${cacheHitMarkup(health, "main", account.id)}</td>
         <td class="cache-column">${cacheHitMarkup(health, "subagent")}</td>
@@ -1130,6 +1137,15 @@
         if (!window.confirm("Repair sign-in for this slot? Sign in with the same upstream account to preserve its cache and affinity history.")) return;
         await startDeviceAuth(id);
         await refresh(true);
+        return;
+      } else if (action === "quota/reset-credit") {
+        if (!window.confirm("Spend one reset credit on this account? This is irreversible and consumes real entitlement.")) return;
+        const body = await api(`/accounts/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+        // Upstream can decline without spending anything, for instance when no
+        // window is currently eligible. Report its verdict rather than a blanket
+        // success, or a refusal reads as a credit having been used.
+        notify(body?.message || "Reset credit request completed", !body?.consumed);
+        refresh(true);
         return;
       } else {
         await api(`/accounts/${encodeURIComponent(id)}/${action}`, { method: "POST" });

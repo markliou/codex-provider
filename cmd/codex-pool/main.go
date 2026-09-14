@@ -3015,6 +3015,49 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, 404, "not_found", "account not found")
 		return
 	}
+	if action == "quota/reset-credit" {
+		// Spending a credit is irreversible and consumes real entitlement, so it
+		// stays an explicit management action: never on the public dashboard,
+		// never automatic, and refused outright when the account has none.
+		accountCopy := *item
+		available := 0
+		if quota := a.state.Quotas[item.ID].Quota; quota != nil && quota.ResetCredits != nil && quota.ResetCredits.AvailableCount != nil {
+			available = int(*quota.ResetCredits.AvailableCount)
+		}
+		a.mu.Unlock()
+		if !isCodexDeviceAuth(accountCopy) {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "reset credits are only available for Codex accounts")
+			return
+		}
+		if available <= 0 {
+			writeOpenAIError(w, http.StatusConflict, "no_reset_credits", "this account has no earned reset credits available")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), quotaRefreshTimeout)
+		defer cancel()
+		auth, err := a.activeCodexAuthContext(ctx, accountCopy)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "account_auth_failed", "unable to authenticate this account with upstream")
+			return
+		}
+		outcome, err := a.consumeCodexResetCredit(ctx, auth, randomID())
+		if err != nil {
+			a.logger.Printf("reset credit consume failed for %s: %s", accountCopy.ID, err)
+			writeOpenAIError(w, http.StatusBadGateway, "reset_credit_failed", err.Error())
+			return
+		}
+		message, consumed := resetCreditOutcomeMessage(outcome)
+		// Refresh regardless of outcome. A successful reset changes the windows
+		// the dashboard shows, and a refusal such as alreadyRedeemed means the
+		// local snapshot is the stale half of the disagreement.
+		snapshot, refreshErr := a.refreshAccountQuota(r.Context(), accountCopy.ID)
+		if refreshErr != nil {
+			a.logger.Printf("quota refresh after reset credit failed for %s: %s", accountCopy.ID, refreshErr)
+		}
+		snapshot = quotaSnapshotForDisplay(snapshot, time.Now().UTC())
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "outcome": outcome, "consumed": consumed, "message": message, "quota": snapshot.Quota})
+		return
+	}
 	if action == "quota/refresh" {
 		accountID := item.ID
 		a.mu.Unlock()
@@ -6045,6 +6088,15 @@ func (a *app) codexUsageURL() string {
 	return strings.TrimRight(a.codexBaseURL, "/") + "/wham/usage"
 }
 
+// codexResetCreditConsumeURL is the upstream endpoint that spends one earned
+// reset credit and clears the account's eligible rate-limit windows.
+func (a *app) codexResetCreditConsumeURL() string {
+	if value := strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_RESET_CREDIT_CONSUME_URL")); value != "" {
+		return value
+	}
+	return strings.TrimRight(a.codexBaseURL, "/") + "/wham/rate-limit-reset-credits/consume"
+}
+
 func (a *app) codexResetCreditsURL() string {
 	if value := strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_RESET_CREDITS_URL")); value != "" {
 		return value
@@ -6897,6 +6949,81 @@ func (a *app) enrichResetCreditExpiration(ctx context.Context, auth codexAuthInf
 		current.ExpiresAt = cloneInt64(prior.ExpiresAt)
 		current.DetailsObservedAt = prior.DetailsObservedAt
 	}
+}
+
+// resetCreditOutcomeMessage turns upstream's verdict on a consume attempt into
+// operator-visible wording. Only "reset" spends a credit; the others report why
+// nothing happened, and each needs its own wording because the remedy differs.
+//
+// Outcomes are matched case-insensitively. Upstream sends camelCase and this
+// pool sanitizes metadata to lowercase before it gets here, so comparing the
+// wire spelling directly would silently match nothing but "reset" and report
+// every refusal as unrecognized.
+func resetCreditOutcomeMessage(outcome string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "reset":
+		return "A reset credit was consumed and the eligible rate-limit windows were reset.", true
+	case "nothingtoreset":
+		return "No rate-limit window is currently eligible for a reset, so no credit was spent.", false
+	case "nocreditsavailable", "nocredits":
+		return "This account has no earned reset credits available.", false
+	case "alreadyredeemed":
+		return "This reset attempt already completed, so no further credit was spent.", false
+	default:
+		return "Upstream returned an unrecognized reset outcome.", false
+	}
+}
+
+// consumeCodexResetCredit spends one earned reset credit on an account. This is
+// irreversible and costs real entitlement, so it is never automatic: only an
+// explicit operator action reaches here.
+//
+// The idempotency key is generated per attempt and reused for nothing else. A
+// retry of the same logical attempt must carry the same key or upstream would
+// spend a second credit, so the caller owns the key rather than this function
+// minting a fresh one on every network retry.
+func (a *app) consumeCodexResetCredit(ctx context.Context, auth codexAuthInfo, idempotencyKey string) (string, error) {
+	body, err := json.Marshal(map[string]any{"idempotency_key": idempotencyKey})
+	if err != nil {
+		return "", fmt.Errorf("encode reset-credit consume request: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, a.codexResetCreditConsumeURL(), bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create reset-credit consume request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+auth.AccessToken)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	if auth.AccountID != "" {
+		request.Header.Set("ChatGPT-Account-Id", auth.AccountID)
+	}
+	if auth.FedRAMP {
+		request.Header.Set("X-OpenAI-Fedramp", "true")
+	}
+	response, err := a.client.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("consume reset credit: %w", err)
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxRequestBody))
+	if err != nil {
+		return "", fmt.Errorf("read reset-credit consume response: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		// Report only the sanitized upstream code. The raw body may carry account
+		// or token detail that must not reach the admin surface.
+		if code := extractUpstreamErrorCode(payload); code != "" {
+			return "", fmt.Errorf("upstream returned status %d [%s]", response.StatusCode, code)
+		}
+		return "", fmt.Errorf("upstream returned status %d", response.StatusCode)
+	}
+	var decoded struct {
+		Outcome string `json:"outcome"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return "", fmt.Errorf("decode reset-credit consume response: %w", err)
+	}
+	return cleanMetadataToken(decoded.Outcome), nil
 }
 
 func (a *app) fetchCodexResetCreditExpiration(ctx context.Context, auth codexAuthInfo, now time.Time) (*int64, error) {

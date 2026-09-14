@@ -163,6 +163,7 @@ docker run -d \
 | `CODEX_POOL_ROUTING_STRATEGY` | no | `sticky_balanced` | `sticky_balanced` deterministically distributes new sessions across the highest-priority eligible account tier. `sticky_failover` preserves the legacy behavior that sends new sessions to the first preferred account. |
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
+| `CODEX_POOL_CODEX_RESET_CREDIT_CONSUME_URL` | no | derived | Override for the upstream reset-credit consume endpoint. Testing only. |
 | `CODEX_POOL_CAPACITY_RETRY_LIMIT` | no | `8` | Capacity retry rounds once no identity can serve. `0` disables waiting and surfaces the refusal immediately. |
 | `CODEX_POOL_CAPACITY_RETRY_BACKOFF_MS` | no | `1000` | First capacity retry delay. Each round doubles from here. |
 | `CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS` | no | `20000` | Cap on a single capacity retry delay. Raised to the first delay if set below it. |
@@ -2249,6 +2250,33 @@ Quota-protection blocked/unavailable state remains visible in its compact
 control without opening the disclosure.
 Exact reset and refresh timestamps may remain in tooltips so the table stays
 scannable without discarding diagnostic detail.
+
+##### Spending a reset credit
+
+An earned reset credit clears an account's eligible rate-limit windows. When
+upstream reports at least one available, the management quota cell offers a
+control to spend one, which posts to the account's `quota/reset-credit` action.
+
+Spending a credit is irreversible and consumes real entitlement, so it is never
+automatic and never appears on the public dashboard: only an authenticated
+management session, past the usual CSRF check, may reach the action, and the
+control is offered only while a credit is reported. The service refuses the call
+outright when the account has none rather than letting upstream decline it,
+since a refused call still tells the operator something happened. The browser
+confirms before posting.
+
+Each attempt carries an idempotency key so a retried attempt cannot spend a
+second credit. Upstream answers with an outcome; only `reset` spent a credit,
+while `nothingToReset`, `noCreditsAvailable` and `alreadyRedeemed` each explain
+why nothing was spent. Outcomes are matched case-insensitively because this pool
+sanitizes upstream metadata to lowercase, and the response must report the
+outcome upstream actually returned rather than assume success, or a refusal
+reads as a credit having been used. An unrecognized outcome is surfaced as such
+and never counted as a spend. The account's quota is refreshed after every
+attempt, including a refused one: a successful reset changes the windows the
+dashboard shows, and `alreadyRedeemed` means the local snapshot is the stale
+half of the disagreement. An upstream failure surfaces only a sanitized status
+and error code, never the raw response body.
 
 The pool-wide cache window must show the total request count since reset and
 must group and visibly label Pool-observed counters separately from calculated
