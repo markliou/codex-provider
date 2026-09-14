@@ -25,16 +25,35 @@ const body = starts
   .map((entry, i) => source.slice(entry.index, i + 1 < starts.length ? starts[i + 1].index : source.lastIndexOf("})();")))
   .join("\n");
 
+// Elements record what was written to them and can hand back stand-ins for the
+// nodes a renderer looks up afterwards, so a renderer that applies geometry
+// through the CSSOM is exercised rather than silently skipped.
 const elements = new Map();
 const element = (key) => {
   if (!elements.has(key)) {
-    elements.set(key, {
+    const node = {
       innerHTML: "", textContent: "", hidden: false, disabled: false, value: "", dataset: {},
       classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
       setAttribute() {}, removeAttribute() {}, getAttribute: () => null,
       addEventListener() {}, removeEventListener() {}, appendChild() {}, querySelector: () => null,
-      querySelectorAll: () => [], closest: () => null, focus() {}, scrollIntoView() {},
-    });
+      closest: () => null, focus() {}, scrollIntoView() {},
+      style: {},
+      // Return one stand-in per matching tag in whatever markup was last written,
+      // carrying that tag's data attributes, which is all a geometry pass needs.
+      querySelectorAll(selector) {
+        const attribute = /^\[([a-zA-Z-]+)\]$/.exec(selector);
+        if (!attribute) return [];
+        const name = attribute[1];
+        const camel = name.replace(/^data-/, "").replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+        const found = [];
+        const tag = new RegExp(`<[^>]*\\b${name}="([^"]*)"[^>]*>`, "g");
+        for (let match = tag.exec(node.innerHTML); match; match = tag.exec(node.innerHTML)) {
+          found.push({ dataset: { [camel]: match[1] }, style: {} });
+        }
+        return found;
+      },
+    };
+    elements.set(key, node);
   }
   return elements.get(key);
 };
@@ -54,7 +73,7 @@ const windowStub = {
 
 const bundle = new Function(
   "document", "window", "sessionStorage", "localStorage", "fetch", "navigator", "console",
-  body + "\nreturn { renderSummary, renderQuotaCapacity, renderThroughput, renderCacheWindow, renderPublicAccounts, renderRoutingCacheEvents };"
+  body + "\nreturn { renderSummary, renderPoolCapacity, renderThroughput, renderCacheWindow, renderPublicAccounts, renderRoutingCacheEvents };"
 )(documentStub, windowStub, storage, storage, () => Promise.reject(new Error("no network in this guard")), { clipboard: null }, console);
 
 const quotaWindow = (label, minutes, remaining) => ({
@@ -71,14 +90,14 @@ const account = (overrides) => Object.assign({
 }, overrides);
 
 const capacity = [
-  { label: "5h", windowMinutes: 300, remainingPercent: 63, reportingAccounts: 3, routableAccounts: 4, uncappedAccounts: 1, exhaustedAccounts: 0 },
-  { label: "Week", windowMinutes: 10080, remainingPercent: 63.25, reportingAccounts: 4, routableAccounts: 4, uncappedAccounts: 0, exhaustedAccounts: 2 },
+  { label: "5h", windowMinutes: 300, spendablePercent: 47, recoverablePercent: 0, spendableAccounts: 4, recoverableAccounts: 0, blockedAccounts: 0, weighted: true, assumed: false },
+  { label: "Week", windowMinutes: 10080, spendablePercent: 47, recoverablePercent: 18, spendableAccounts: 5, recoverableAccounts: 3, blockedAccounts: 2, weighted: true, assumed: true },
 ];
 
 const cases = [
   ["full payload", () => {
     bundle.renderSummary({ total: 8, ready: 3, low: 1, cooldown: 1, standby: 2, duplicate: 1, unavailable: 0 }, true);
-    bundle.renderQuotaCapacity(capacity);
+    bundle.renderPoolCapacity(capacity);
     bundle.renderThroughput({ current: { requestCount: 10, successRate: 1, averageLatencyMs: 1200, p50LatencyMs: 900, p95LatencyMs: 3000, cacheHitRate: 0.9, outputTokensPerSecond: 40, windowSeconds: 600 }, series: [], bucketIntervalSeconds: 60, seriesIntervalSeconds: 600, retentionHours: 48, activeRequests: 1 });
     bundle.renderCacheWindow({ requestCount: 100, cacheHitRequestCount: 90, coldRequestCount: 10, inputTokens: 1000, cachedTokens: 900, main: {}, subagent: {} });
     bundle.renderPublicAccounts([account({}), account({ quotaUnavailable: true, quota: null, seatType: "standard", seatTypeInferred: false })]);
@@ -88,16 +107,21 @@ const cases = [
   // degrade rather than throw.
   ["sparse payload", () => {
     bundle.renderSummary({}, true);
-    bundle.renderQuotaCapacity([{ label: "Week", remainingPercent: 50, reportingAccounts: 2 }]);
+    // A bar with no idle capacity must not draw a zero-width dashed run, and a
+    // reading missing its counts must still render.
+    bundle.renderPoolCapacity([{ label: "Week", spendablePercent: 12 }]);
     bundle.renderThroughput({});
     bundle.renderCacheWindow({});
     bundle.renderPublicAccounts([account({ detail: "", ownerNote: "", quota: null, remainingQuota: null, cacheWindow: null })]);
     bundle.renderRoutingCacheEvents([]);
   }],
+  ["segments that would overrun the scale", () => {
+    bundle.renderPoolCapacity([{ label: "Week", spendablePercent: 99.9, recoverablePercent: 40, spendableAccounts: 1, recoverableAccounts: 1 }]);
+  }],
   ["empty and missing", () => {
     bundle.renderSummary({}, true);
-    bundle.renderQuotaCapacity([]);
-    bundle.renderQuotaCapacity(undefined);
+    bundle.renderPoolCapacity([]);
+    bundle.renderPoolCapacity(undefined);
     bundle.renderThroughput(undefined);
     bundle.renderCacheWindow(undefined);
     bundle.renderPublicAccounts([]);
@@ -111,6 +135,14 @@ for (const [name, run] of cases) {
   for (const [selector, el] of elements) {
     if (/undefined|NaN/.test(el.innerHTML)) {
       throw new Error(`${name}: ${selector} rendered undefined/NaN: ${el.innerHTML.slice(0, 200)}`);
+    }
+    // The admin CSP has no style-src 'unsafe-inline', so the browser drops a
+    // style attribute written into markup. It fails silently: the element is
+    // still there, just unstyled, which shipped a capacity bar stuck at zero
+    // width beside a correct percentage. Geometry belongs in a class or in the
+    // CSSOM, never in markup.
+    if (/\sstyle="/.test(el.innerHTML)) {
+      throw new Error(`${name}: ${selector} used an inline style attribute, which the admin CSP drops: ${el.innerHTML.slice(0, 200)}`);
     }
   }
   console.log(`ok  ${name}`);

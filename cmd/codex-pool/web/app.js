@@ -8,7 +8,7 @@
     slate: "#263548",
   });
   const themeNames = new Set(Object.keys(themeMetaColors));
-  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public" };
+  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public", resetCreditNotice: null, openQuotaDetails: new Set() };
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => document.querySelectorAll(selector);
   const loginView = $("#login-view");
@@ -537,51 +537,71 @@
   // #cache-window row, so it is intentionally not duplicated here. Every
   // account belongs to exactly one non-total card; do not merge Duplicate into
   // Out of pool, because duplicate credential copies may still be in the pool.
-  // Capacity is reported as the mean remaining percentage across the slots that
-  // report a window, never a sum: percentages from different plans describe
-  // different absolute allowances, so adding them would invent a total that does
-  // not exist. The account count travels with the number so the reader can see
-  // how thin the average is.
-  function renderQuotaCapacity(windows) {
-    const container = $("#quota-capacity");
+  // Pool capacity reads as a bar rather than a number because it carries two
+  // quantities that only make sense together: what the pool can spend now, and
+  // how much further that would reach if every account it holds were routable.
+  // Both are shares of the same whole, so the scale is a fixed 0 to 100 and the
+  // dashed run continues from the solid fill rather than restarting. The dashed
+  // part stays hollow: filling it would read as capacity already available, when
+  // reaching it takes an explicit action.
+  function renderPoolCapacity(bars) {
+    const container = $("#pool-capacity");
     if (!container) return;
-    const rows = Array.isArray(windows) ? windows : [];
+    const rows = Array.isArray(bars) ? bars : [];
     if (!rows.length) {
       container.innerHTML = "";
       return;
     }
-    container.innerHTML = rows.map((window) => {
-      // A mean lands on long fractions that carry no real precision. One decimal
-      // is the finest reading the underlying whole-percent windows can support.
-      const remaining = Math.round(quotaPercent(window.remainingPercent) * 10) / 10;
-      const label = window.label || "Window";
-      const reporting = Number(window.reportingAccounts) || 0;
-      const exhausted = Number(window.exhaustedAccounts) || 0;
-      const uncapped = Number(window.uncappedAccounts) || 0;
-      // Fall back to the two parts only when the field is genuinely absent. A
-      // reported zero is a real denominator, and treating it as missing because
-      // zero is falsy would replace it with a different number.
-      const reportedRoutable = Number(window.routableAccounts);
-      const routable = Number.isFinite(reportedRoutable) && window.routableAccounts !== null && window.routableAccounts !== undefined
-        ? reportedRoutable
-        : reporting + uncapped;
-      // The percentage describes only the slots this window constrains, so give
-      // both the numerator and the routable denominator, and name the uncapped
-      // slots on their own line. A bare "3 accounts" leaves an uneven pair of
-      // window counts looking like missing data, and a pool whose capped slots
-      // are spent can still have an uncapped slot able to serve immediately,
-      // which a reader who cannot see it reads as the whole story.
-      const note = `average across ${reporting} of ${routable} ${routable === 1 ? "account" : "accounts"} with a ${escapeHTML(label)} limit${exhausted ? ` · ${exhausted} exhausted` : ""}`;
-      const free = uncapped
-        ? `<span class="capacity-note capacity-free">${uncapped} ${uncapped === 1 ? "account has" : "accounts have"} no ${escapeHTML(label)} limit</span>`
+    container.innerHTML = rows.map((bar) => {
+      const label = bar.label || "Window";
+      const spendable = Math.min(100, Math.max(0, finiteMetric(bar.spendablePercent) ?? 0));
+      // Never let rounding push the pair past the end of the track.
+      const recoverable = Math.min(100 - spendable, Math.max(0, finiteMetric(bar.recoverablePercent) ?? 0));
+      const reach = spendable + recoverable;
+      const tone = quotaTone(spendable);
+      const spendableAccounts = Number(bar.spendableAccounts) || 0;
+      const recoverableAccounts = Number(bar.recoverableAccounts) || 0;
+      const blocked = Number(bar.blockedAccounts) || 0;
+      // An assumed multiplier must never be presented with the authority of a
+      // reported one, so the reading carries a marker back to its explanation.
+      const assumed = bar.assumed
+        ? `<abbr class="capacity-assumed" title="Includes a Business Premium seat multiplier this pool assumes from public pricing rather than one upstream reported. Set CODEX_POOL_PREMIUM_SEAT_MULTIPLIER to correct it.">*</abbr>`
         : "";
-      return `<div class="capacity-item">
-        <div class="capacity-head"><span class="capacity-label">${escapeHTML(label)} headroom</span><strong class="capacity-value">${remaining.toFixed(1)}%</strong></div>
-        ${quotaTrackMarkup(remaining, `${label} pool headroom`)}
-        <span class="capacity-note">${note}</span>
-        ${free}
+      const extra = recoverable > 0
+        ? `<span class="capacity-idle">→ ${reach.toFixed(0)}% at full reach</span>`
+        : "";
+      const dashed = recoverable > 0
+        ? `<span class="capacity-outside" data-capacity-left="${spendable.toFixed(3)}" data-capacity-width="${recoverable.toFixed(3)}"></span>`
+        : "";
+      // Name the two kinds of recoverable capacity apart. One needs the account
+      // put back in the pool; the other is already in the pool and held back by
+      // routing, which is a different problem with a different fix.
+      const recoverableText = recoverableAccounts
+        ? `, ${recoverableAccounts} recoverable${blocked ? ` (${blocked} blocked by routing)` : ""}`
+        : "";
+      const detail = `${spendableAccounts} spendable${recoverableText} · weighted by plan multiplier`;
+      return `<div class="capacity-bar">
+        <div class="capacity-head"><span class="capacity-label">${escapeHTML(label)}${assumed}</span><span class="capacity-readout"><strong>${spendable.toFixed(0)}%</strong>${extra}</span></div>
+        <div class="capacity-track" role="img" aria-label="${escapeHTML(`${label} capacity: ${spendable.toFixed(0)} percent spendable now, ${reach.toFixed(0)} percent at full reach`)}">
+          <span class="capacity-fill ${escapeHTML(tone)}" data-capacity-width="${spendable.toFixed(3)}"></span>
+          ${dashed}
+        </div>
+        <span class="capacity-detail">${escapeHTML(detail)}</span>
       </div>`;
     }).join("");
+    // The admin CSP carries no style-src 'unsafe-inline', so a style attribute
+    // written into markup is dropped by the browser and every bar renders at
+    // zero width against a correct percentage in the text beside it. CSP does
+    // not restrict the CSSOM, so bar geometry is applied here instead. The
+    // throughput chart's series colors document the same trap; nothing else in
+    // this file sizes itself from markup, because the other bars are <progress>
+    // elements carrying a value attribute.
+    container.querySelectorAll("[data-capacity-width]").forEach((element) => {
+      element.style.width = `${element.dataset.capacityWidth}%`;
+    });
+    container.querySelectorAll("[data-capacity-left]").forEach((element) => {
+      element.style.left = `${element.dataset.capacityLeft}%`;
+    });
   }
 
   function renderSummary(summary, publicMode = false) {
@@ -750,13 +770,21 @@
     return `<div class="quota-fact quota-fact-telemetry" title="${escapeHTML(title)}"><span class="quota-fact-label">Telemetry:</span><strong class="quota-fact-value">${escapeHTML(label)}</strong>${updated ? `<span class="quota-fact-note">${escapeHTML(updated)}</span>` : ""}</div>`;
   }
 
-  function quotaDetailsMarkup(content) {
+  function quotaDetailsMarkup(content, key = "") {
     if (!content) return "";
     // Progressive disclosure is intentional here: the progress bars are the
     // operator's first-glance signal, while credits and telemetry are useful
     // diagnostic context. Keep every quota window open in the primary view,
     // but do not make secondary facts compete with those bars.
-    return `<details class="quota-details"><summary>More details</summary><div class="quota-facts">${content}</div></details>`;
+    //
+    // The expanded state has to survive a re-render. The table is rebuilt from
+    // markup on every poll, so without this an operator's expanded cell snaps
+    // shut every thirty seconds, and the refresh that follows a reset-credit
+    // spend closes the very panel holding the control and its outcome notice —
+    // which is what made a failed spend look like a button that did nothing.
+    const identity = key ? ` data-details-key="${escapeHTML(key)}"` : "";
+    const open = key && state.openQuotaDetails.has(key) ? " open" : "";
+    return `<details class="quota-details"${identity}${open}><summary>More details</summary><div class="quota-facts">${content}</div></details>`;
   }
   function quotaCreditsMarkup(credits) {
     if (!credits) return '<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">Not reported</strong></div>';
@@ -765,7 +793,7 @@
     return `<div class="quota-fact"><span class="quota-fact-label">Flexible credits:</span><strong class="quota-fact-value">${escapeHTML(credits.balance || "Available")}</strong></div>`;
   }
 
-  function resetCreditsMarkup(resetCredits) {
+  function resetCreditsMarkup(resetCredits, managementAccountId = "") {
     if (resetCredits?.availableCount === null || resetCredits?.availableCount === undefined) return "";
     // OpenAI exposes each reset credit's expiry through a separate details
     // endpoint. Show only the nearest available expiry date: a full list or a
@@ -778,7 +806,22 @@
     const note = expires
       ? `<span class="quota-fact-note reset-credit-expiry${expiresSoon ? " expiring-soon" : ""}"${exact ? ` title="${escapeHTML(`Expires ${exact}`)}"` : ""}>Expires ${escapeHTML(expires)}</span>`
       : "";
-    return `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(resetCredits.availableCount))}</strong>${note}</div>`;
+    // Spending a credit is irreversible, so the control appears only where an
+    // operator is authenticated and only while upstream reports a credit to
+    // spend. The public dashboard passes no account id and never renders it.
+    const available = Number(resetCredits.availableCount) > 0;
+    const action = managementAccountId && available
+      ? `<span class="quota-fact-note reset-credit-action"><button class="button secondary reset-credit-button" type="button" data-account-action="quota/reset-credit" data-account-id="${escapeHTML(managementAccountId)}">Use reset credit</button></span>`
+      : "";
+    // Report the outcome where the action was taken. notify() writes into the
+    // header status line, which is easy to miss from an expanded quota cell and
+    // is overwritten by the next poll, so a failed spend looked like the button
+    // had done nothing at all. The notice lives in state so a refresh re-renders
+    // it rather than wiping it.
+    const notice = state.resetCreditNotice && state.resetCreditNotice.accountId === managementAccountId
+      ? `<span class="reset-credit-notice${state.resetCreditNotice.ok ? "" : " failed"}">${escapeHTML(state.resetCreditNotice.message)}</span>`
+      : "";
+    return `<div class="quota-fact"><span class="quota-fact-label">Reset credits:</span><strong class="quota-fact-value">${escapeHTML(String(resetCredits.availableCount))}</strong>${note}${action}${notice}</div>`;
   }
 
   function spendControlMarkup(limit) {
@@ -799,7 +842,7 @@
     }).join("");
     return `<div class="quota-additional-group"><div class="quota-section-label">Additional limits</div>${entries}</div>`;
   }
-  function quotaMarkup(value, quota, quotaError, usageUpdatedAt, freshness, lastSuccessfulRefreshAt, metering) {
+  function quotaMarkup(value, quota, quotaError, usageUpdatedAt, freshness, lastSuccessfulRefreshAt, metering, managementAccountId = "") {
     const refreshError = quotaError ? `<span class="quota-error" title="${escapeHTML(quotaError.message)}">Quota update unavailable</span>` : "";
     if (metering === "api_metered" && !quota) {
       return '<div class="quota quota-detailed"><span class="quota-unknown">API-metered · ChatGPT quota not applicable</span></div>';
@@ -831,7 +874,7 @@
           blockedBy: blocking ? [] : gatingLabels,
         });
       }).filter(Boolean).join("");
-      const resetCredits = resetCreditsMarkup(quota.resetCredits);
+      const resetCredits = resetCreditsMarkup(quota.resetCredits, managementAccountId);
       // Keep every reported quota window visible: Pro/Spark and other windows
       // are distinct upstream limits, not duplicate renderings. Only the
       // supporting text is grouped so operators can scan bars first, then read
@@ -845,7 +888,7 @@
       // exhaustion and still reaches the operator through the account status
       // reason; repeating the enum here added a row that named a condition
       // without telling anyone what to do about it.
-      const details = quotaDetailsMarkup(`${additionalLimitsMarkup(quota.additionalLimits)}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`);
+      const details = quotaDetailsMarkup(`${additionalLimitsMarkup(quota.additionalLimits)}${quotaCreditsMarkup(quota.credits)}${spendControlMarkup(quota.individualLimit)}${resetCredits}${quotaFreshnessMarkup(freshness, lastSuccessfulRefreshAt || usageUpdatedAt)}`, managementAccountId);
       // Keep the decisive red Exhausted signal beside its window label. Do not
       // add a second account-level "Blocked" sentence below the bars; that
       // duplicates the signal and makes multi-window rows harder to scan.
@@ -976,7 +1019,7 @@
       return `<tr data-account-row="${escapeHTML(account.id)}"${poolMembershipAttribute(account.inPool === false)}>
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${accountEntitlementMarkup(account)}${ownerNoteInput(account)}</div></td>
         <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
-        <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt, health.quotaFreshness, health.lastSuccessfulRefreshAt, health.quotaMetering)}${quotaProtectionMarkup(account, health)}</td>
+        <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt, health.quotaFreshness, health.lastSuccessfulRefreshAt, health.quotaMetering, account.id)}${quotaProtectionMarkup(account, health)}</td>
         <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)} · ${escapeHTML(routeCount)}</div></td>
         <td class="cache-column">${cacheHitMarkup(health, "main", account.id)}</td>
         <td class="cache-column">${cacheHitMarkup(health, "subagent")}</td>
@@ -1122,7 +1165,7 @@
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
       renderSettings(serviceState);
       renderSummary(serviceState.summary || {});
-      renderQuotaCapacity(serviceState.quotaCapacity);
+      renderPoolCapacity(serviceState.poolCapacity);
       renderThroughput(serviceState.throughput);
       renderCacheWindow(serviceState.promptCacheWindow);
       renderAccounts(state.data.accounts, healthByID);
@@ -1153,7 +1196,7 @@
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
       const accounts = body.dashboard.accounts || [];
       renderSummary(body.dashboard.summary || {}, true);
-      renderQuotaCapacity(body.dashboard.quotaCapacity);
+      renderPoolCapacity(body.dashboard.poolCapacity);
       renderThroughput(body.dashboard.throughput);
       renderCacheWindow(body.dashboard.promptCacheWindow);
       renderPublicAccounts(accounts);
@@ -1179,6 +1222,27 @@
         if (!window.confirm("Repair sign-in for this slot? Sign in with the same upstream account to preserve its cache and affinity history.")) return;
         await startDeviceAuth(id);
         await refresh(true);
+        return;
+      } else if (action === "quota/reset-credit") {
+        if (!window.confirm("Spend one reset credit on this account? This is irreversible and consumes real entitlement.")) return;
+        // The upstream call and the quota refresh behind it take a moment, and
+        // an unchanged button through that is what "nothing happened" looks
+        // like. The refresh below re-renders the row and restores it.
+        button.disabled = true;
+        button.textContent = "Spending…";
+        state.resetCreditNotice = null;
+        try {
+          const body = await api(`/accounts/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+          // Upstream can decline without spending anything, for instance when no
+          // window is currently eligible. Report its verdict rather than a
+          // blanket success, or a refusal reads as a credit having been used.
+          state.resetCreditNotice = { accountId: id, message: body?.message || "Reset credit request completed", ok: Boolean(body?.consumed) };
+          notify(state.resetCreditNotice.message, !body?.consumed);
+        } catch (error) {
+          state.resetCreditNotice = { accountId: id, message: error.message, ok: false };
+          notify(error.message, true);
+        }
+        refresh(true);
         return;
       } else {
         await api(`/accounts/${encodeURIComponent(id)}/${action}`, { method: "POST" });
@@ -1421,6 +1485,14 @@
     const button = event.target.closest("[data-account-action]");
     if (button) handleAccountAction(button);
   });
+  // A details toggle does not bubble, so this listens in the capture phase.
+  // Losing it would put every expanded quota cell back at the mercy of the poll.
+  $("#accounts-body").addEventListener("toggle", (event) => {
+    const details = event.target.closest?.("[data-details-key]");
+    if (!details) return;
+    if (details.open) state.openQuotaDetails.add(details.dataset.detailsKey);
+    else state.openQuotaDetails.delete(details.dataset.detailsKey);
+  }, true);
   $("#accounts-body").addEventListener("change", (event) => {
     const input = event.target.closest("[data-owner-note-ref], [data-owner-note-account-id]");
     if (input) updateOwnerNote(input);

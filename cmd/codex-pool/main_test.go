@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -658,100 +659,586 @@ func TestExhaustedModelMeterBlocksRouting(t *testing.T) {
 	}
 }
 
-// The capacity roll-up must average, never sum: percentages from different plans
-// describe different absolute allowances. It must also count each upstream
-// workspace once and ignore slots the pool cannot route.
-func TestQuotaCapacitySummarisesRoutableWindows(t *testing.T) {
-	now := time.Now().UTC()
-	minutes := func(value int64) *int64 { return &value }
-	window := func(windowMinutes int64, remaining float64) quotaWindow {
-		value := remaining
-		return quotaWindow{Label: quotaWindowLabel(minutes(windowMinutes)), WindowMinutes: minutes(windowMinutes), RemainingPercent: &value, Present: true, Observed: true}
-	}
-	a := testApp(t, []account{
-		{ID: "a", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
-		{ID: "b", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
-		{ID: "out", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: "https://out.example.test"},
-	})
-	a.state.Quotas["a"] = quotaSnapshot{AccountID: "a", Quota: &accountQuota{Windows: []quotaWindow{window(300, 100), window(10080, 80)}}}
-	a.state.Quotas["b"] = quotaSnapshot{AccountID: "b", Quota: &accountQuota{Windows: []quotaWindow{window(300, 0), window(10080, 60)}}}
-	// An out-of-pool slot is not capacity this pool can spend and must not lift
-	// the average.
-	a.state.Quotas["out"] = quotaSnapshot{AccountID: "out", Quota: &accountQuota{Windows: []quotaWindow{window(300, 100), window(10080, 100)}}}
+// Spending a reset credit is irreversible, so the action must reach upstream
+// exactly once, refresh the quota it changed, and report upstream's own verdict
+// rather than assuming success.
+func TestAdminResetCreditConsumesAndRefreshes(t *testing.T) {
+	consumeCalls := 0
+	var seenKey string
+	usageCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/backend-api/wham/rate-limit-reset-credits/consume":
+			consumeCalls++
+			var payload map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			// Upstream reads redeem_request_id and rejects the request outright
+			// when it is absent, which is how every real attempt became a 400
+			// while a mock that read the same wrong name kept passing. Reject it
+			// here too, so only the name upstream actually reads passes.
+			seenKey, _ = payload["redeem_request_id"].(string)
+			if seenKey == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"detail":"redeem_request_id must not be empty"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":"reset","windows_reset":1}`))
+		case "/backend-api/wham/usage":
+			usageCalls++
+			_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000}},"rate_limit_reset_credits":{"available_count":2}}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	defer upstream.Close()
 
-	a.mu.Lock()
-	windows := a.quotaCapacityLocked(now)
-	a.mu.Unlock()
+	a := testApp(t, []account{{ID: "acct", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct")
+	a.codexBaseURL = upstream.URL + "/backend-api"
+	writeTestCodexAuth(t, a, "acct")
+	credits := int64(3)
+	a.state.Quotas["acct"] = quotaSnapshot{AccountID: "acct", Quota: &accountQuota{ResetCredits: &quotaResetCredits{AvailableCount: &credits}}}
 
-	if len(windows) != 2 {
-		t.Fatalf("expected one entry per reported window duration: %#v", windows)
+	cookies, csrf := adminSession(t, a)
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/acct/quota/reset-credit", nil)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
 	}
-	if windows[0].Label != "5h" || windows[1].Label != "Week" {
-		t.Fatalf("windows must be ordered shortest first: %#v", windows)
+	request.Header.Set("X-CSRF-Token", csrf)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("reset credit returned %d: %s", recorder.Code, recorder.Body.String())
 	}
-	if windows[0].RemainingPercent != 50 || windows[0].ReportingAccounts != 2 || windows[0].ExhaustedAccounts != 1 {
-		t.Fatalf("5h roll-up = %#v, want mean 50 over 2 accounts with 1 exhausted", windows[0])
+	var body struct {
+		Outcome  string `json:"outcome"`
+		Consumed bool   `json:"consumed"`
+		Message  string `json:"message"`
 	}
-	if windows[1].RemainingPercent != 70 || windows[1].ReportingAccounts != 2 || windows[1].ExhaustedAccounts != 0 {
-		t.Fatalf("week roll-up = %#v, want mean 70 over 2 accounts", windows[1])
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
 	}
-	for _, window := range windows {
-		if window.RoutableAccounts != 2 {
-			t.Fatalf("routable total = %d, want 2: %#v", window.RoutableAccounts, window)
+	if body.Outcome != "reset" || !body.Consumed || body.Message == "" {
+		t.Fatalf("outcome not reported: %#v", body)
+	}
+	// One credit spent means exactly one upstream consume, carrying a key.
+	if consumeCalls != 1 {
+		t.Fatalf("upstream consume calls = %d, want 1", consumeCalls)
+	}
+	// An id upstream rejects is indistinguishable from one it never saw, so a
+	// retry could spend a second credit. Upstream documents a UUID.
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(seenKey) {
+		t.Fatalf("consume request key %q is not a version 4 UUID", seenKey)
+	}
+	// The reset changes the windows the dashboard shows, so it must re-read them.
+	if usageCalls == 0 {
+		t.Fatal("quota was not refreshed after the reset")
+	}
+}
+
+// A failed spend must reach the operator beside the control that caused it. The
+// header status line alone is easy to miss from an expanded quota cell and the
+// next poll overwrites it, which made a rejected request look like the button
+// had done nothing.
+func TestAdminAssetsReportTheResetOutcomeBesideTheControl(t *testing.T) {
+	a := testApp(t, nil)
+	request := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET app.js returned %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"resetCreditNotice",
+		"reset-credit-notice",
+		// The failure path must record a notice, not only call notify().
+		"state.resetCreditNotice = { accountId: id, message: error.message, ok: false }",
+		// And the control itself must show the request is in flight.
+		`button.textContent = "Spending…"`,
+		// The notice lives inside the quota disclosure, which the refresh after
+		// the spend rebuilds from markup. Without a preserved expanded state that
+		// panel closes over the notice and the control, and a failed spend reads
+		// as a button that did nothing.
+		"state.openQuotaDetails",
+		"data-details-key",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("app.js did not include %q", want)
+		}
+	}
+	css := httptest.NewRequest(http.MethodGet, "/admin/assets/app.css", nil)
+	cssRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(cssRecorder, css)
+	if !strings.Contains(cssRecorder.Body.String(), ".reset-credit-notice.failed") {
+		t.Fatal("app.css does not distinguish a failed reset notice")
+	}
+}
+
+// Upstream can decline without spending anything. That must not be reported as
+// a credit having been used.
+func TestAdminResetCreditReportsARefusalHonestly(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/backend-api/wham/rate-limit-reset-credits/consume" {
+			_, _ = w.Write([]byte(`{"code":"nothing_to_reset"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000}}}`))
+	}))
+	defer upstream.Close()
+
+	a := testApp(t, []account{{ID: "acct", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct")
+	a.codexBaseURL = upstream.URL + "/backend-api"
+	writeTestCodexAuth(t, a, "acct")
+	credits := int64(1)
+	a.state.Quotas["acct"] = quotaSnapshot{AccountID: "acct", Quota: &accountQuota{ResetCredits: &quotaResetCredits{AvailableCount: &credits}}}
+
+	cookies, csrf := adminSession(t, a)
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/acct/quota/reset-credit", nil)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	request.Header.Set("X-CSRF-Token", csrf)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("declined reset returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Outcome  string `json:"outcome"`
+		Consumed bool   `json:"consumed"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	// The pool sanitizes metadata to lowercase; upstream's spelling is snake_case.
+	if body.Outcome != "nothing_to_reset" || body.Consumed {
+		t.Fatalf("a refusal was reported as a spend: %#v", body)
+	}
+}
+
+// An account with no credit must never reach upstream: the call would spend
+// nothing but still tell the operator something happened.
+func TestAdminResetCreditRefusesWithoutCredits(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":"reset"}`))
+	}))
+	defer upstream.Close()
+
+	a := testApp(t, []account{{ID: "acct", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct")
+	a.codexBaseURL = upstream.URL + "/backend-api"
+	writeTestCodexAuth(t, a, "acct")
+	zero := int64(0)
+	a.state.Quotas["acct"] = quotaSnapshot{AccountID: "acct", Quota: &accountQuota{ResetCredits: &quotaResetCredits{AvailableCount: &zero}}}
+
+	cookies, csrf := adminSession(t, a)
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/acct/quota/reset-credit", nil)
+	for _, cookie := range cookies {
+		request.AddCookie(cookie)
+	}
+	request.Header.Set("X-CSRF-Token", csrf)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("reset without credits returned %d, want 409: %s", recorder.Code, recorder.Body.String())
+	}
+	if calls != 0 {
+		t.Fatalf("upstream was called with no credit available: calls=%d", calls)
+	}
+}
+
+// Spending entitlement is a management action. An unauthenticated caller must
+// not be able to reach it.
+func TestResetCreditRequiresAdminSession(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/acct/quota/reset-credit", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusUnauthorized && recorder.Code != http.StatusForbidden {
+		t.Fatalf("unauthenticated reset returned %d, want 401 or 403", recorder.Code)
+	}
+}
+
+func TestResetCreditOutcomeMessages(t *testing.T) {
+	for _, spelling := range []string{"reset", "Reset", " reset "} {
+		if _, consumed := resetCreditOutcomeMessage(spelling); !consumed {
+			t.Fatalf("%q must count as consumed", spelling)
+		}
+	}
+	// A refusal must be distinguishable from a spend by its message too.
+	refusal, _ := resetCreditOutcomeMessage("nothing_to_reset")
+	spend, _ := resetCreditOutcomeMessage("reset")
+	if refusal == spend {
+		t.Fatal("a refusal and a spend produced the same message")
+	}
+	// Upstream's own snake_case spellings must be recognized, or every refusal
+	// would be reported as unrecognized. The camelCase spellings belong to the
+	// Codex client's JSON-RPC rename of the same enum and stay accepted.
+	for _, outcome := range []string{"nothing_to_reset", "nothingToReset", "no_credit", "noCreditsAvailable", "already_redeemed", "alreadyRedeemed", "somethingNew", ""} {
+		message, consumed := resetCreditOutcomeMessage(outcome)
+		if consumed {
+			t.Fatalf("%q must not count as consumed", outcome)
+		}
+		if message == "" {
+			t.Fatalf("%q produced no operator-visible message", outcome)
 		}
 	}
 }
 
-// A plan with no five-hour cap reports only its long window, so the two counts
-// legitimately differ. The roll-up must never average a window an account did
-// not report, and must carry the routable total so the gap explains itself.
-func TestQuotaCapacityCountsOnlyWindowsAnAccountReports(t *testing.T) {
-	now := time.Now().UTC()
-	minutes := func(value int64) *int64 { return &value }
-	window := func(windowMinutes int64, remaining float64) quotaWindow {
-		value := remaining
-		return quotaWindow{Label: quotaWindowLabel(minutes(windowMinutes)), WindowMinutes: minutes(windowMinutes), RemainingPercent: &value, Present: true, Observed: true}
+// The button is a management control: it spends entitlement, so it must never
+// render on the public dashboard, and only while a credit exists.
+func TestAdminAssetsGateTheResetCreditButton(t *testing.T) {
+	a := testApp(t, nil)
+	request := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET app.js returned %d", recorder.Code)
 	}
+	body := recorder.Body.String()
+	for _, want := range []string{"quota/reset-credit", "Use reset credit", "managementAccountId && available"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("app.js did not include %q", want)
+		}
+	}
+	// The public renderer must pass no account id, so the control cannot appear.
+	if strings.Contains(body, "quotaMarkup(account.remainingQuota, account.quota, null, null, account.quotaFreshness, account.lastSuccessfulRefreshAt, account.quotaMetering, account.id)") {
+		t.Fatal("the public dashboard renders the reset-credit control")
+	}
+}
+
+// A Pro slot reports its own multiplier, so that figure is authoritative. A
+// Business Premium seat reports none, so the assumed ratio applies and must be
+// flagged. Absent evidence an account weighs one rather than being guessed up.
+func TestAccountWeeklyWeight(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		family      string
+		limit       string
+		seat        string
+		want        float64
+		wantAssumed bool
+	}{
+		{"pro reports its multiplier", "pro", "20x", "", 20, false},
+		{"pro 5x", "pro", "5x", "", 5, false},
+		{"pro 10x", "pro", "10x", "", 10, false},
+		{"generic pro is not a multiplier", "pro", "", "", 1, false},
+		{"unsupported multiplier text is ignored", "pro", "50x", "", 1, false},
+		{"premium seat uses the assumed ratio", "business", "", "premium", defaultPremiumSeatWeight, true},
+		{"standard seat is the base unit", "business", "", "standard", 1, false},
+		{"business with no seat evidence", "business", "", "", 1, false},
+		{"plus", "plus", "", "", 1, false},
+		{"a seat type on a non-business plan is not a multiplier", "plus", "", "premium", 1, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			weight, assumed := accountWeeklyWeight(testCase.family, testCase.limit, testCase.seat)
+			if weight != testCase.want || assumed != testCase.wantAssumed {
+				t.Fatalf("weight = (%v, %v), want (%v, %v)", weight, assumed, testCase.want, testCase.wantAssumed)
+			}
+		})
+	}
+}
+
+// Helpers shared by the capacity readings.
+func capacityWindow(minutes int64, remaining float64) quotaWindow {
+	value := remaining
+	return quotaWindow{Label: quotaWindowLabel(&minutes), WindowMinutes: &minutes, RemainingPercent: &value, Present: true, Observed: true}
+}
+
+func capacityBar(t *testing.T, a *app, minutes int64) poolCapacityBar {
+	t.Helper()
+	a.mu.Lock()
+	bars := a.poolCapacityLocked(time.Now().UTC())
+	a.mu.Unlock()
+	for _, bar := range bars {
+		if bar.WindowMinutes == minutes {
+			return bar
+		}
+	}
+	t.Fatalf("no bar for a %d-minute window: %#v", minutes, bars)
+	return poolCapacityBar{}
+}
+
+// The whole point of weighting: a 20x account at half capacity holds ten base
+// allowances where a Plus account at half holds half of one, so averaging them
+// as equals understates the pool by an order of magnitude.
+func TestPoolCapacityWeightsTheWeeklyWindow(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "pro", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://pro.example.test"},
+		{ID: "plus", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://plus.example.test"},
+	})
+	a.state.Quotas["pro"] = quotaSnapshot{AccountID: "pro", PlanFamily: "pro", PlanLimit: "20x", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 50)}}}
+	a.state.Quotas["plus"] = quotaSnapshot{AccountID: "plus", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 50)}}}
+
+	// (10 + 0.5) / 21 = 50%. Both sit at 50%, so the weighted reading agrees,
+	// which is what proves the denominator scaled with the numerator.
+	if bar := capacityBar(t, a, weeklyWindowMinutes); bar.SpendablePercent != 50 {
+		t.Fatalf("weighted reading = %v, want 50", bar.SpendablePercent)
+	}
+
+	// Spend the 20x account down and the reading must fall far further than an
+	// unweighted average would, because it is 20 of the 21 units.
+	zero := 0.0
+	a.state.Quotas["pro"].Quota.Windows[0].RemainingPercent = &zero
+	// 0.5 / 21 is about 2.4%, where a plain average of 0 and 50 would say 25%.
+	if bar := capacityBar(t, a, weeklyWindowMinutes); bar.SpendablePercent > 3 {
+		t.Fatalf("exhausting the 20x account barely moved the reading: %v", bar.SpendablePercent)
+	}
+}
+
+// The two segments are shares of one whole, so they sit inside a fixed scale and
+// their sum is what the pool would hold if every account it has were routable.
+func TestPoolCapacitySplitsOneWholeBetweenSpendableAndRecoverable(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "inpool", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "parked", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+		{ID: "off", AuthType: "provider_api_key", Enabled: false, InPool: false, Priority: 100, UpstreamBaseURL: "https://c.example.test"},
+	})
+	a.state.Quotas["inpool"] = quotaSnapshot{AccountID: "inpool", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 80)}}}
+	a.state.Quotas["parked"] = quotaSnapshot{AccountID: "parked", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 50)}}}
+	// A disabled slot is not capacity at all and must not appear on either side.
+	a.state.Quotas["off"] = quotaSnapshot{AccountID: "off", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 100)}}}
+
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	// Two equal allowances: 80% of one and 50% of the other, over a denominator
+	// of both, so 40% is spendable now and 25% more is recoverable.
+	if bar.SpendablePercent != 40 || bar.RecoverablePercent != 25 {
+		t.Fatalf("bar = %v spendable, %v recoverable, want 40 and 25", bar.SpendablePercent, bar.RecoverablePercent)
+	}
+	if bar.SpendablePercent+bar.RecoverablePercent > 100 {
+		t.Fatalf("the two segments overran the scale: %v + %v", bar.SpendablePercent, bar.RecoverablePercent)
+	}
+	if bar.SpendableAccounts != 1 || bar.RecoverableAccounts != 1 {
+		t.Fatalf("counts = %d spendable, %d recoverable, want 1 and 1; a disabled slot must not count", bar.SpendableAccounts, bar.RecoverableAccounts)
+	}
+}
+
+// Parking an account must lower the spendable reading rather than leave it
+// unchanged, which is what a routable-only denominator would have done.
+func TestPoolCapacityDenominatorSpansTheWholePool(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "a", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "b", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+	})
+	for _, id := range []string{"a", "b"} {
+		a.state.Quotas[id] = quotaSnapshot{AccountID: id, PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 100)}}}
+	}
+	if bar := capacityBar(t, a, weeklyWindowMinutes); bar.SpendablePercent != 100 {
+		t.Fatalf("a full pool read %v, want 100", bar.SpendablePercent)
+	}
+
+	a.config.Accounts[1].InPool = false
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	if bar.SpendablePercent != 50 || bar.RecoverablePercent != 50 {
+		t.Fatalf("parking half the pool = %v spendable, %v recoverable, want 50 and 50", bar.SpendablePercent, bar.RecoverablePercent)
+	}
+}
+
+// A spent weekly budget blocks the account outright, so its five-hour reading
+// must be zero however much the five-hour window itself still reports. Taking
+// that figure at face value would promise burst capacity every request is
+// refused.
+func TestPoolCapacityZeroesTheFiveHourReadingWhenWeeklyIsSpent(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "spent", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "healthy", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+	})
+	// Upstream still reports a full five-hour window on the exhausted account.
+	a.state.Quotas["spent"] = quotaSnapshot{AccountID: "spent", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(fiveHourWindowMinutes, 100), capacityWindow(weeklyWindowMinutes, 0)}}}
+	a.state.Quotas["healthy"] = quotaSnapshot{AccountID: "healthy", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(fiveHourWindowMinutes, 60), capacityWindow(weeklyWindowMinutes, 90)}}}
+
+	// Only the healthy account contributes: 60% of one allowance in two.
+	if bar := capacityBar(t, a, fiveHourWindowMinutes); bar.SpendablePercent != 30 {
+		t.Fatalf("five-hour reading = %v, want 30; a spent weekly budget must zero its five-hour share", bar.SpendablePercent)
+	}
+	if bar := capacityBar(t, a, weeklyWindowMinutes); bar.SpendablePercent != 45 {
+		t.Fatalf("weekly reading = %v, want 45", bar.SpendablePercent)
+	}
+}
+
+// An account with no five-hour cap can never be held back by one, so on that
+// axis it is fully available. Dropping it would remove the accounts most able to
+// absorb a burst from the very reading meant to measure burst capacity.
+func TestPoolCapacityTreatsAnUncappedAccountAsFullOnFiveHours(t *testing.T) {
 	a := testApp(t, []account{
 		{ID: "capped", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
 		{ID: "uncapped", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
 	})
-	a.state.Quotas["capped"] = quotaSnapshot{AccountID: "capped", Quota: &accountQuota{Windows: []quotaWindow{window(300, 40), window(10080, 90)}}}
-	// No five-hour window at all, the shape a Pro or Business Premium seat reports.
-	a.state.Quotas["uncapped"] = quotaSnapshot{AccountID: "uncapped", Quota: &accountQuota{Windows: []quotaWindow{window(10080, 50)}}}
+	a.state.Quotas["capped"] = quotaSnapshot{AccountID: "capped", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(fiveHourWindowMinutes, 0), capacityWindow(weeklyWindowMinutes, 50)}}}
+	// A Business Premium seat: weekly only, no five-hour limit at all.
+	a.state.Quotas["uncapped"] = quotaSnapshot{AccountID: "uncapped", PlanFamily: "business", SeatType: "premium", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 50)}}}
 
-	a.mu.Lock()
-	windows := a.quotaCapacityLocked(now)
-	a.mu.Unlock()
-
-	if len(windows) != 2 {
-		t.Fatalf("expected both window durations: %#v", windows)
+	bar := capacityBar(t, a, fiveHourWindowMinutes)
+	if bar.SpendableAccounts != 2 {
+		t.Fatalf("the uncapped account was dropped from the five-hour reading: %#v", bar)
 	}
-	if windows[0].ReportingAccounts != 1 || windows[0].RoutableAccounts != 2 || windows[0].RemainingPercent != 40 {
-		t.Fatalf("5h roll-up = %#v, want 1 of 2 accounts at 40", windows[0])
+	// The uncapped seat weighs 5 and counts full; the capped one weighs 1 at
+	// zero. So 5 of 6 units are available.
+	want := 5.0 / 6.0 * 100
+	if bar.SpendablePercent < want-0.01 || bar.SpendablePercent > want+0.01 {
+		t.Fatalf("five-hour reading = %v, want about %v", bar.SpendablePercent, want)
 	}
-	// The uncapped slot must be counted, not dropped: a pool whose capped slots
-	// are spent can still have an uncapped slot able to serve immediately.
-	if windows[0].UncappedAccounts != 1 {
-		t.Fatalf("uncapped count = %d, want 1: %#v", windows[0].UncappedAccounts, windows[0])
-	}
-	if windows[1].ReportingAccounts != 2 || windows[1].RoutableAccounts != 2 || windows[1].RemainingPercent != 70 {
-		t.Fatalf("week roll-up = %#v, want 2 of 2 accounts at mean 70", windows[1])
-	}
-	if windows[1].UncappedAccounts != 0 {
-		t.Fatalf("week window must constrain every routable slot: %#v", windows[1])
+	if !bar.Assumed {
+		t.Fatal("a reading leaning on the assumed premium multiplier was not flagged")
 	}
 }
 
-// A pool with no quota evidence must report no capacity rather than a fabricated
-// zero, which would read as "everything is exhausted".
-func TestQuotaCapacityIsEmptyWithoutEvidence(t *testing.T) {
+// A failed refresh reports nothing, and nothing must never be read as an
+// uncapped account sitting at full capacity.
+func TestPoolCapacityIgnoresAnAccountThatReportedNoWindow(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "reporting", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "silent", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+	})
+	a.state.Quotas["reporting"] = quotaSnapshot{AccountID: "reporting", PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(fiveHourWindowMinutes, 40), capacityWindow(weeklyWindowMinutes, 40)}}}
+	a.state.Quotas["silent"] = quotaSnapshot{AccountID: "silent", PlanFamily: "plus", Quota: &accountQuota{}}
+
+	for _, minutes := range []int64{fiveHourWindowMinutes, weeklyWindowMinutes} {
+		bar := capacityBar(t, a, minutes)
+		if bar.SpendableAccounts != 1 || bar.SpendablePercent != 40 {
+			t.Fatalf("%d-minute bar = %#v, want one account at 40", minutes, bar)
+		}
+	}
+}
+
+// A duplicate-blocked slot is in the pool but routing will not select it, so its
+// capacity is real yet unspendable. It belongs to the recoverable run, counted
+// apart from capacity an operator parked on purpose.
+func TestPoolCapacityCountsDuplicateBlockedCapacityAsRecoverable(t *testing.T) {
+	// One workspace, two members with their own allowances, both in the pool.
+	// Routing selects one and holds the other back as a duplicate.
+	a := testApp(t, []account{
+		{ID: "member-a", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "a@example.test"},
+		{ID: "member-b", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "b@example.test"},
+	})
+	for _, id := range []string{"member-a", "member-b"} {
+		writeTestCodexAuth(t, a, id)
+		a.state.Quotas[id] = quotaSnapshot{AccountID: id, PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 50)}}}
+	}
+
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	if bar.SpendableAccounts != 1 || bar.RecoverableAccounts != 1 {
+		t.Fatalf("counts = %d spendable, %d recoverable, want 1 and 1", bar.SpendableAccounts, bar.RecoverableAccounts)
+	}
+	if bar.BlockedAccounts != 1 {
+		t.Fatalf("blocked count = %d, want 1: routing-held capacity must be distinguishable from parked capacity", bar.BlockedAccounts)
+	}
+	// Neither allowance is dropped: each is half of one of two equal units.
+	if bar.SpendablePercent != 25 || bar.RecoverablePercent != 25 {
+		t.Fatalf("bar = %v spendable, %v recoverable, want 25 and 25", bar.SpendablePercent, bar.RecoverablePercent)
+	}
+}
+
+// Copies of one credential share an allowance and must count once, while
+// members of one workspace hold their own and must not be collapsed.
+func TestPoolCapacityCountsOneAllowanceOnce(t *testing.T) {
+	// Same workspace, same email: genuine copies of one login.
+	a := testApp(t, []account{
+		{ID: "copy-a", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "same@example.test"},
+		{ID: "copy-b", AuthType: "codex_device_auth", Enabled: true, InPool: false, Priority: 100, AccountID: "workspace-1", Email: "same@example.test"},
+	})
+	for _, id := range []string{"copy-a", "copy-b"} {
+		writeTestCodexAuth(t, a, id)
+		a.state.Quotas[id] = quotaSnapshot{AccountID: id, PlanFamily: "plus", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 80)}}}
+	}
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	if bar.SpendableAccounts != 1 || bar.RecoverableAccounts != 0 {
+		t.Fatalf("one credential counted %d spendable and %d recoverable", bar.SpendableAccounts, bar.RecoverableAccounts)
+	}
+	if bar.SpendablePercent != 80 {
+		t.Fatalf("shared allowance double counted: %v", bar.SpendablePercent)
+	}
+}
+
+// Members of one Business workspace share its upstream account id but each hold
+// their own allowance, which upstream proves by reporting different remaining
+// percentages for them. Counting them on the routing identity would collapse
+// several real allowances into one and hide the rest.
+func TestPoolCapacityCountsEachWorkspaceMemberSeparately(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "member-a", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "a@example.test"},
+		{ID: "member-b", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "b@example.test"},
+		{ID: "member-c", AuthType: "codex_device_auth", Enabled: true, InPool: false, Priority: 100, AccountID: "workspace-1", Email: "c@example.test"},
+	})
+	for _, seed := range []struct {
+		id        string
+		remaining float64
+	}{{"member-a", 40}, {"member-b", 60}, {"member-c", 100}} {
+		writeTestCodexAuth(t, a, seed.id)
+		a.state.Quotas[seed.id] = quotaSnapshot{AccountID: seed.id, PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, seed.remaining)}}}
+	}
+
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	if bar.SpendableAccounts+bar.RecoverableAccounts != 3 {
+		t.Fatalf("workspace members collapsed: %d spendable, %d recoverable, want three allowances", bar.SpendableAccounts, bar.RecoverableAccounts)
+	}
+	// Every member's allowance is counted somewhere; none is dropped.
+	total := bar.SpendablePercent + bar.RecoverablePercent
+	want := (40.0 + 60 + 100) / 3
+	if total < want-0.01 || total > want+0.01 {
+		t.Fatalf("a member allowance was lost: %v, want about %v", total, want)
+	}
+}
+
+// A reading that leaned on the assumed Premium ratio must say so, and the ratio
+// must be correctable without a rebuild.
+func TestPoolCapacityFlagsAndRetunesTheAssumedPremiumWeight(t *testing.T) {
+	oldWeight := premiumSeatWeight
+	defer func() { premiumSeatWeight = oldWeight }()
+
+	a := testApp(t, []account{
+		{ID: "standard", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"},
+		{ID: "premium", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test"},
+	})
+	a.state.Quotas["standard"] = quotaSnapshot{AccountID: "standard", PlanFamily: "business", SeatType: "standard", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 0)}}}
+	a.state.Quotas["premium"] = quotaSnapshot{AccountID: "premium", PlanFamily: "business", SeatType: "premium", Quota: &accountQuota{Windows: []quotaWindow{capacityWindow(weeklyWindowMinutes, 100)}}}
+
+	// The premium seat weighs 5 of the 6 units, so a full one reads 83%.
+	bar := capacityBar(t, a, weeklyWindowMinutes)
+	if !bar.Assumed {
+		t.Fatalf("a reading using the assumed ratio was not flagged: %#v", bar)
+	}
+	want := 5.0 / 6.0 * 100
+	if bar.SpendablePercent < want-0.01 || bar.SpendablePercent > want+0.01 {
+		t.Fatalf("reading = %v, want about %v", bar.SpendablePercent, want)
+	}
+
+	t.Setenv("CODEX_POOL_PREMIUM_SEAT_MULTIPLIER", "3")
+	if err := applyCapacityWeightEnv(); err != nil {
+		t.Fatalf("valid multiplier rejected: %s", err)
+	}
+	// Now 3 of 4 units.
+	if bar := capacityBar(t, a, weeklyWindowMinutes); bar.SpendablePercent != 75 {
+		t.Fatalf("retuned multiplier was ignored: %v", bar.SpendablePercent)
+	}
+
+	// A wrong multiplier silently distorts every reading it touches, so an
+	// invalid setting must fail rather than fall back.
+	for _, raw := range []string{"0", "-2", "abc"} {
+		t.Setenv("CODEX_POOL_PREMIUM_SEAT_MULTIPLIER", raw)
+		if err := applyCapacityWeightEnv(); err == nil {
+			t.Fatalf("%q was accepted as a multiplier", raw)
+		}
+	}
+}
+
+// A pool with no quota evidence reports nothing rather than a zero that would
+// read as total exhaustion.
+func TestPoolCapacityOmitsAWindowWithNoDenominator(t *testing.T) {
 	a := testApp(t, []account{{ID: "a", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test"}})
 	a.mu.Lock()
-	windows := a.quotaCapacityLocked(time.Now().UTC())
+	bars := a.poolCapacityLocked(time.Now().UTC())
 	a.mu.Unlock()
-	if len(windows) != 0 {
-		t.Fatalf("capacity reported without any quota snapshot: %#v", windows)
+	if len(bars) != 0 {
+		t.Fatalf("capacity reported without any quota snapshot: %#v", bars)
 	}
 }
 
@@ -2701,6 +3188,18 @@ func TestCreateCodexDeviceAuthAccountStagesUntilLogin(t *testing.T) {
 	staged := a.config.Accounts[0]
 	if staged.Enabled || staged.InPool || !staged.PendingPoolActivation || staged.PendingAuthVerification || staged.PendingAuthExpectedAccountID != "" {
 		t.Fatalf("new device-auth account was not staged: %#v", staged)
+	}
+}
+
+func writeTestCodexAuth(t *testing.T, a *app, accountID string) {
+	t.Helper()
+	home := a.accountCodexHome(accountID)
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authJSON := `{"auth_mode":"chatgpt","tokens":{"id_token":"","access_token":"<access-token>","refresh_token":"<refresh-token>"}}`
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

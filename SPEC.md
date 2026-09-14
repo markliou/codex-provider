@@ -163,6 +163,8 @@ docker run -d \
 | `CODEX_POOL_ROUTING_STRATEGY` | no | `sticky_balanced` | `sticky_balanced` deterministically distributes new sessions across the highest-priority eligible account tier. `sticky_failover` preserves the legacy behavior that sends new sessions to the first preferred account. |
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
+| `CODEX_POOL_CODEX_RESET_CREDIT_CONSUME_URL` | no | derived | Override for the upstream reset-credit consume endpoint. Testing only. |
+| `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` | no | `5` | Assumed Business Premium weekly allowance, in Standard seats. Not upstream-reported; correct it when a contract differs. |
 | `CODEX_POOL_CAPACITY_RETRY_LIMIT` | no | `8` | Capacity retry rounds once no identity can serve. `0` disables waiting and surfaces the refusal immediately. |
 | `CODEX_POOL_CAPACITY_RETRY_BACKOFF_MS` | no | `1000` | First capacity retry delay. Each round doubles from here. |
 | `CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS` | no | `20000` | Cap on a single capacity retry delay. Raised to the first delay if set below it. |
@@ -2250,33 +2252,131 @@ control without opening the disclosure.
 Exact reset and refresh timestamps may remain in tooltips so the table stays
 scannable without discarding diagnostic detail.
 
-Above the account table the status cards count accounts. Separately from them,
-the page must roll up how much of each reported quota window the pool still
-holds, so an operator running many credentials can see whether the short window
-or the long one is the constraint without reading every row. One entry per
-reported window duration, ordered shortest first, each showing remaining
-headroom, how many accounts that window constrains out of the routable total,
-and how many of them are exhausted. Headroom is shown to one decimal place, the finest reading the
-underlying whole-percent windows support.
+##### Spending a reset credit
 
-A routable slot that reports no entry for a window is not missing data: no limit
-of that duration applies to it, which is how Pro and Business Premium seats
-report, having no five-hour cap. Such slots must be counted and shown as having
-no limit for that window, never silently dropped. A pool whose capped slots are
-spent can still hold an uncapped slot able to serve immediately, and a roll-up
-that hides it reports far less short-term capacity than the pool actually has.
-The percentage itself covers only the slots the window constrains, and the card
-must say so, because averaging an unconstrained slot in as a full one would
-present the absence of a limit as a limit that happens to be full.
+An earned reset credit clears an account's eligible rate-limit windows. When
+upstream reports at least one available, the management quota cell offers a
+control to spend one, which posts to the account's `quota/reset-credit` action.
 
-The reported headroom is the mean remaining percentage across the reporting
-slots, never a sum: percentages from different plans describe different absolute
-allowances, so they may be averaged into how full the pool is but must never be
-added into one larger total. Only routable slots count. An out-of-pool slot is
-not capacity this pool can spend, and a duplicate slot shares one upstream
-workspace with its primary, so counting both would report that workspace twice.
-A pool with no quota evidence reports no entries rather than a fabricated zero,
-which would read as total exhaustion.
+Spending a credit is irreversible and consumes real entitlement, so it is never
+automatic and never appears on the public dashboard: only an authenticated
+management session, past the usual CSRF check, may reach the action, and the
+control is offered only while a credit is reported. The service refuses the call
+outright when the account has none rather than letting upstream decline it,
+since a refused call still tells the operator something happened. The browser
+confirms before posting.
+
+Each attempt carries a `redeem_request_id`, which upstream requires and which
+makes a retried attempt unable to spend a second credit. The name matters: the
+Codex client calls the same value an idempotency key on its own JSON-RPC
+surface and renames it for the wire, so `idempotency_key` and `idempotencyKey`
+both leave the required field absent and earn a 400. The id is a UUID: one
+upstream rejects would be indistinguishable from one it never saw, and the retry
+would spend again. The optional `credit_id` is omitted, which lets upstream
+choose which credit to spend.
+
+Upstream answers with a `code`; only `reset` spent a credit, while
+`nothing_to_reset`, `no_credit` and `already_redeemed` each explain why nothing
+was spent. That field is `code` and its values are snake_case for the same
+reason: `outcome` and the camelCase spellings belong to the client's JSON-RPC
+rename, and reading those names here leaves every verdict empty. Verdicts are
+matched case-insensitively because this pool sanitizes upstream metadata to
+lowercase, and the response must report what upstream actually returned rather
+than assume success, or a refusal reads as a credit having been used. An
+unrecognized verdict is surfaced as such and never counted as a spend. The
+account's quota is refreshed after every attempt, including a refused one: a
+successful reset changes the windows the dashboard shows, and
+`already_redeemed` means the local snapshot is the stale half of the
+disagreement.
+
+An upstream failure surfaces only a sanitized status and error code to the
+browser, never the raw response body. The service log additionally keeps
+upstream's own explanation, bounded and stripped of control characters, because
+a bare status cannot say which part of a request upstream refused: without it a
+wrong body field is indistinguishable from a stale token or a wrong endpoint.
+
+The outcome must be reported beside the control that triggered it, and must
+survive the refresh that follows. Reporting it only through the shared status
+line is not enough: that line sits in the page header, far from an expanded
+quota cell, and the next poll overwrites it, so a rejected request is
+indistinguishable from a button that did nothing. The control must also show
+that the request is in flight, because the upstream call and the quota refresh
+behind it take long enough for an unchanged button to read as no response.
+
+Because both the control and its notice live behind the quota cell's disclosure,
+an expanded cell must stay expanded across a re-render. The account table is
+rebuilt from markup on every poll, so an expanded state held only in the DOM is
+lost every thirty seconds and, worse, in the refresh that follows a spend: the
+panel closes over the outcome it was supposed to report.
+
+Above the account table, separately from the status cards that count accounts,
+the page must show pool capacity per quota window as a stacked bar. Two windows
+are read: the five-hour burst limit and the weekly budget. A window no routable
+account reports is omitted entirely rather than drawn against nothing, which
+would read as total exhaustion instead of absent evidence.
+
+Both readings divide by the same denominator: the pool's whole weighted
+allowance, counting every enabled account whether or not routing can reach it.
+The solid fill is the share routing can spend right now, and the hollow dashed
+run continues from where the fill ends, so the two together are what the pool
+would hold at full reach. The scale is a fixed 0 to 100 and the pair must never
+overrun it. Dividing by only the routable part instead would leave the reading
+unchanged when an account is parked, hiding exactly the loss the bar exists to
+show.
+
+Spendable means routing would select it: in the pool and not held back by the
+duplicate guard. The verdict must be read from routing rather than
+reimplemented, so an account routing refuses never inflates the solid fill with
+capacity the pool cannot reach. Everything else enabled and reporting the window
+is recoverable, and the dashed run must stay hollow: filling it would read as
+capacity already available, when reaching it takes an explicit action.
+Recoverable capacity has two kinds and the reading must name them apart, because
+the action that recovers each differs: an account parked outside the pool needs
+putting back, while an account already in the pool and held back by routing is a
+different problem. Neither kind is dropped; the allowance is real and stays
+counted.
+
+##### Weekly tier weighting
+
+Both bars are weighted by plan multiplier, which corrects a real difference: a
+20x Pro account at half capacity holds ten base allowances where a Plus account
+at half holds half of one, and averaging them as equals understates the pool by
+an order of magnitude.
+
+A five-hour allowance has no published size to weigh against a weekly one, so
+the five-hour reading borrows the weekly weights and applies two rules of its
+own:
+
+- An account with no five-hour cap can never be held back by one, so on that
+  axis it is fully available and contributes its whole weight. Dropping it would
+  remove the accounts most able to absorb a burst from the very reading meant to
+  measure burst capacity. This applies only to an account that reported
+  something; a refresh that reported nothing is absent evidence and is excluded,
+  never read as an uncapped account sitting full.
+- An account whose weekly budget is spent cannot serve at all, whatever its
+  five-hour window reports. Upstream keeps reporting a five-hour figure for such
+  an account, and taking it at face value would promise burst capacity every
+  request would be refused. A weekly reading of zero therefore forces that
+  account's five-hour share to zero. A weekly reading merely low does not: the
+  account can still serve now, which is what the five-hour reading measures.
+
+Multipliers come from evidence of two different strengths, and the difference
+must remain visible:
+
+- A Pro slot reports its own multiplier through `planLimit`, so `5x`, `10x` and
+  `20x` are authoritative. Generic Pro with no reported multiplier weighs one;
+  the plan name is not multiplier evidence.
+- A Business Premium seat reports no multiplier at all. The ratio is an
+  assumption read from public pricing, not telemetry, so it must be
+  operator-tunable through `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` without a
+  rebuild, and an invalid setting is a startup error rather than a silent
+  fallback because a wrong multiplier distorts every reading it touches.
+- Every other plan weighs one base allowance. Absent evidence an account counts
+  once and is never guessed upward.
+
+Any reading an assumed multiplier contributed to must be marked as such and must
+explain where the assumption came from and how to correct it. It must never be
+presented with the authority of a reported multiplier.
 
 The pool-wide cache window must show the total request count since reset and
 must group and visibly label Pool-observed counters separately from calculated

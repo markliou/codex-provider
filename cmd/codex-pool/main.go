@@ -636,6 +636,9 @@ func newAppFromEnv() (*app, error) {
 	if err := applyCapacityRetryEnv(); err != nil {
 		return nil, err
 	}
+	if err := applyCapacityWeightEnv(); err != nil {
+		return nil, err
+	}
 	maxRetryAccounts, err := maxRetryAccountsFromEnv()
 	if err != nil {
 		return nil, err
@@ -2626,7 +2629,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now), "quotaCapacity": a.quotaCapacityLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now)}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -2649,7 +2652,7 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 	// monitor normal traffic without entering management mode. Keep this limited
 	// to aggregate rolling windows: per-account throughput, raw buckets, model
 	// attribution, and request-level routing events remain management-only.
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "quotaCapacity": a.quotaCapacityLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now)}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now)}})
 }
 
 func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) {
@@ -3013,6 +3016,49 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 	if item == nil {
 		a.mu.Unlock()
 		writeOpenAIError(w, 404, "not_found", "account not found")
+		return
+	}
+	if action == "quota/reset-credit" {
+		// Spending a credit is irreversible and consumes real entitlement, so it
+		// stays an explicit management action: never on the public dashboard,
+		// never automatic, and refused outright when the account has none.
+		accountCopy := *item
+		available := 0
+		if quota := a.state.Quotas[item.ID].Quota; quota != nil && quota.ResetCredits != nil && quota.ResetCredits.AvailableCount != nil {
+			available = int(*quota.ResetCredits.AvailableCount)
+		}
+		a.mu.Unlock()
+		if !isCodexDeviceAuth(accountCopy) {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "reset credits are only available for Codex accounts")
+			return
+		}
+		if available <= 0 {
+			writeOpenAIError(w, http.StatusConflict, "no_reset_credits", "this account has no earned reset credits available")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), quotaRefreshTimeout)
+		defer cancel()
+		auth, err := a.activeCodexAuthContext(ctx, accountCopy)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "account_auth_failed", "unable to authenticate this account with upstream")
+			return
+		}
+		outcome, err := a.consumeCodexResetCredit(ctx, auth, randomUUID())
+		if err != nil {
+			a.logger.Printf("reset credit consume failed for %s: %s", accountCopy.ID, err)
+			writeOpenAIError(w, http.StatusBadGateway, "reset_credit_failed", err.Error())
+			return
+		}
+		message, consumed := resetCreditOutcomeMessage(outcome)
+		// Refresh regardless of outcome. A successful reset changes the windows
+		// the dashboard shows, and a refusal such as alreadyRedeemed means the
+		// local snapshot is the stale half of the disagreement.
+		snapshot, refreshErr := a.refreshAccountQuota(r.Context(), accountCopy.ID)
+		if refreshErr != nil {
+			a.logger.Printf("quota refresh after reset credit failed for %s: %s", accountCopy.ID, refreshErr)
+		}
+		snapshot = quotaSnapshotForDisplay(snapshot, time.Now().UTC())
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accountId": id, "outcome": outcome, "consumed": consumed, "message": message, "quota": snapshot.Quota})
 		return
 	}
 	if action == "quota/refresh" {
@@ -6045,6 +6091,15 @@ func (a *app) codexUsageURL() string {
 	return strings.TrimRight(a.codexBaseURL, "/") + "/wham/usage"
 }
 
+// codexResetCreditConsumeURL is the upstream endpoint that spends one earned
+// reset credit and clears the account's eligible rate-limit windows.
+func (a *app) codexResetCreditConsumeURL() string {
+	if value := strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_RESET_CREDIT_CONSUME_URL")); value != "" {
+		return value
+	}
+	return strings.TrimRight(a.codexBaseURL, "/") + "/wham/rate-limit-reset-credits/consume"
+}
+
 func (a *app) codexResetCreditsURL() string {
 	if value := strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_RESET_CREDITS_URL")); value != "" {
 		return value
@@ -6758,6 +6813,29 @@ func sanitizedErrorCode(value string) string {
 	return value
 }
 
+// upstreamErrorDetail extracts upstream's own explanation for a rejected
+// request. It is for the log only, never for a response: the text is bounded and
+// stripped of control characters, but it is still upstream prose.
+func upstreamErrorDetail(body []byte) string {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	detail, _ := payload["detail"].(string)
+	message, _ := payload["message"].(string)
+	for _, candidate := range []string{
+		detail,
+		nestedString(payload, "detail", "message"),
+		nestedString(payload, "error", "message"),
+		message,
+	} {
+		if text := cleanMetadataText(candidate, 200); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
 func nestedString(payload map[string]any, objectName, key string) string {
 	object, _ := payload[objectName].(map[string]any)
 	if object == nil {
@@ -6897,6 +6975,98 @@ func (a *app) enrichResetCreditExpiration(ctx context.Context, auth codexAuthInf
 		current.ExpiresAt = cloneInt64(prior.ExpiresAt)
 		current.DetailsObservedAt = prior.DetailsObservedAt
 	}
+}
+
+// resetCreditOutcomeMessage turns upstream's verdict on a consume attempt into
+// operator-visible wording. Only "reset" spends a credit; the others report why
+// nothing happened, and each needs its own wording because the remedy differs.
+//
+// Upstream spells these in snake_case: reset, nothing_to_reset, no_credit and
+// already_redeemed. The camelCase spellings are the Codex client's rename of the
+// same enum for its own JSON-RPC surface; they are accepted here so a verdict is
+// never reported as unrecognized if this pool ever reads that surface instead.
+// Matching is case-insensitive because this pool sanitizes metadata to lowercase
+// before it gets here.
+func resetCreditOutcomeMessage(outcome string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "reset":
+		return "A reset credit was consumed and the eligible rate-limit windows were reset.", true
+	case "nothing_to_reset", "nothingtoreset":
+		return "No rate-limit window is currently eligible for a reset, so no credit was spent.", false
+	case "no_credit", "nocredit", "nocreditsavailable", "nocredits":
+		return "This account has no earned reset credits available.", false
+	case "already_redeemed", "alreadyredeemed":
+		return "This reset attempt already completed, so no further credit was spent.", false
+	default:
+		return "Upstream returned an unrecognized reset outcome.", false
+	}
+}
+
+// consumeCodexResetCredit spends one earned reset credit on an account. This is
+// irreversible and costs real entitlement, so it is never automatic: only an
+// explicit operator action reaches here.
+//
+// The redeem request id is generated per attempt and reused for nothing else. A
+// retry of the same logical attempt must carry the same id or upstream would
+// spend a second credit, so the caller owns it rather than this function
+// minting a fresh one on every network retry.
+func (a *app) consumeCodexResetCredit(ctx context.Context, auth codexAuthInfo, redeemRequestID string) (string, error) {
+	// Upstream reads this key as redeem_request_id and requires it. The Codex
+	// client calls the same value an idempotency key on its own JSON-RPC surface
+	// and renames it here, so both idempotency_key and idempotencyKey leave the
+	// required field absent and earn a 400: that is how every real attempt
+	// failed. The optional credit_id picks one specific credit; omitting it lets
+	// upstream choose, which is what this pool wants.
+	body, err := json.Marshal(map[string]any{"redeem_request_id": redeemRequestID})
+	if err != nil {
+		return "", fmt.Errorf("encode reset-credit consume request: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, a.codexResetCreditConsumeURL(), bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create reset-credit consume request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+auth.AccessToken)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	if auth.AccountID != "" {
+		request.Header.Set("ChatGPT-Account-Id", auth.AccountID)
+	}
+	if auth.FedRAMP {
+		request.Header.Set("X-OpenAI-Fedramp", "true")
+	}
+	response, err := a.client.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("consume reset credit: %w", err)
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxRequestBody))
+	if err != nil {
+		return "", fmt.Errorf("read reset-credit consume response: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		// Report only the sanitized upstream code. The raw body may carry account
+		// or token detail that must not reach the admin surface. The log keeps
+		// upstream's own explanation, sanitized and bounded: a bare status cannot
+		// say which part of the request upstream refused, and without it a wrong
+		// body field looked the same as a stale token or a wrong endpoint.
+		if detail := upstreamErrorDetail(payload); detail != "" {
+			a.logger.Printf("reset credit consume rejected with status %d: %s", response.StatusCode, detail)
+		}
+		if code := extractUpstreamErrorCode(payload); code != "" {
+			return "", fmt.Errorf("upstream returned status %d [%s]", response.StatusCode, code)
+		}
+		return "", fmt.Errorf("upstream returned status %d", response.StatusCode)
+	}
+	// Upstream names its verdict "code". "outcome" is the Codex client's own
+	// spelling for the same enum on its JSON-RPC surface, and reading that name
+	// here would leave every verdict empty and unrecognized.
+	var decoded struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return "", fmt.Errorf("decode reset-credit consume response: %w", err)
+	}
+	return cleanMetadataToken(decoded.Code), nil
 }
 
 func (a *app) fetchCodexResetCreditExpiration(ctx context.Context, auth codexAuthInfo, now time.Time) (*int64, error) {
@@ -7065,6 +7235,10 @@ func quotaWindowByDuration(quota accountQuota, minutes int64) quotaWindow {
 
 // fiveHourWindowMinutes is the reported duration of the Codex five-hour window.
 const fiveHourWindowMinutes = 300
+
+// weeklyWindowMinutes is the reported duration of the Codex weekly window, the
+// budget the tier multipliers describe.
+const weeklyWindowMinutes = 10080
 
 // businessSeatInferenceFromQuota derives a Business seat tier from the reported
 // quota windows. No endpoint this pool calls carries a Standard/Premium field,
@@ -8106,93 +8280,233 @@ func activeCooldowns(values []cooldown, now time.Time) []cooldown {
 	return result
 }
 
-// quotaCapacityWindow aggregates one reported window duration across the pool.
-type quotaCapacityWindow struct {
-	Label            string  `json:"label"`
-	WindowMinutes    int64   `json:"windowMinutes"`
-	RemainingPercent float64 `json:"remainingPercent"`
-	// ReportingAccounts counts the slots this window actually constrains. The
-	// remainder is not missing data: a plan without a five-hour cap, such as Pro
-	// or a Business Premium seat, reports only its long window because no
-	// five-hour limit applies to it at all. Those slots are counted separately in
-	// UncappedAccounts rather than dropped, because a pool whose capped slots are
-	// spent can still have an uncapped slot able to serve immediately, and a
-	// roll-up that hides it reports far less short-term capacity than exists.
-	ReportingAccounts int `json:"reportingAccounts"`
-	RoutableAccounts  int `json:"routableAccounts"`
-	UncappedAccounts  int `json:"uncappedAccounts"`
-	ExhaustedAccounts int `json:"exhaustedAccounts"`
+// poolCapacityBar is one window's pool-wide reading, shaped for the bar the
+// dashboard draws. The two percentages share one denominator, the pool's whole
+// weighted allowance, so they sit on a fixed 0-100 scale and never sum past it.
+type poolCapacityBar struct {
+	Label         string `json:"label"`
+	WindowMinutes int64  `json:"windowMinutes"`
+	// SpendablePercent is the capacity routing can spend right now. It is the
+	// solid fill, and it is a share of the whole pool rather than of the routable
+	// part, so parking an account lowers it instead of leaving it unchanged.
+	SpendablePercent float64 `json:"spendablePercent"`
+	// RecoverablePercent is how much further the reading would rise if every
+	// enabled account were routable. It is drawn continuing from the solid fill,
+	// so the two together are what the pool would hold at full reach.
+	RecoverablePercent  float64 `json:"recoverablePercent"`
+	SpendableAccounts   int     `json:"spendableAccounts"`
+	RecoverableAccounts int     `json:"recoverableAccounts"`
+	// BlockedAccounts is how many recoverable allowances routing holds back
+	// rather than an operator having parked them, so the reading can say which
+	// action would recover the capacity.
+	BlockedAccounts int `json:"blockedAccounts"`
+	// Weighted marks a reading whose denominator is scaled by tier multipliers.
+	Weighted bool `json:"weighted"`
+	// Assumed marks a reading any assumed multiplier contributed to, so the
+	// dashboard can refuse to present it with the authority of reported data.
+	Assumed bool `json:"assumed"`
 }
 
-// quotaCapacityLocked summarises how much of each reported quota window the pool
-// still holds, so an operator with many credentials can see at a glance whether
-// the short window or the long one is the constraint without reading every row.
+// capacityIdentity is one quota allowance and the local slot that represents it.
+// Several slots can hold copies of one credential and share its allowance, so
+// counting each slot would multiply one allowance by however many copies exist.
+type capacityIdentity struct {
+	quota  *accountQuota
+	weight float64
+	// assumed is true when weight came from an assumption rather than a
+	// multiplier the account reported.
+	assumed bool
+	// spendable is true when some slot for this allowance is one routing will
+	// actually select: in the pool and not held back by the duplicate guard.
+	// Only then does the capacity belong to the solid reading.
+	spendable bool
+	// blocked is true when the allowance has an in-pool slot that routing
+	// nonetheless refuses, which today means the duplicate guard. Its capacity is
+	// real and it is not idle by choice, so it is counted as recoverable rather
+	// than dropped, and reported apart from capacity the operator parked.
+	blocked bool
+}
+
+// capacityAllowanceKeyLocked names the thing that actually owns one quota
+// allowance, which is narrower than the identity routing deduplicates on.
 //
-// Only routable slots are counted: an out-of-pool slot is not capacity this pool
-// can spend, and a duplicate slot shares one upstream workspace with its primary,
-// so counting both would report that workspace's quota twice.
+// The routing guard keys on the upstream account id so a failed request is not
+// immediately retried against the same credential. For a Business or Team
+// workspace that id is the workspace, and every member shares it while each
+// holds their own allowance: observed live, five slots sharing one workspace id
+// reported five different remaining percentages and two different window
+// shapes. Counting capacity on the routing key would therefore collapse five
+// real allowances into one and hide the rest.
 //
-// The reported figure is the mean remaining percentage across the slots that
-// report the window, not a sum. Percentages from different plans describe
-// different absolute allowances, so they can be averaged into "how full the pool
-// is" but must never be added into a single larger total.
-func (a *app) quotaCapacityLocked(now time.Time) []quotaCapacityWindow {
-	type bucket struct {
-		total     float64
-		reporting int
-		exhausted int
+// The member's email separates them. Two slots created from one login carry the
+// same email and genuinely share an allowance; two members of one workspace do
+// not. A slot with no email of its own counts alone, because nothing proves it
+// shares with anything.
+func capacityAllowanceKeyLocked(a *app, item account) string {
+	workspace := a.upstreamIdentityKeyLocked(item)
+	email := normalizeEmail(item.Email)
+	if email == "" {
+		if auth, err := a.codexAuth(item); err == nil {
+			email = normalizeEmail(auth.Email)
+		}
 	}
-	buckets := map[int64]*bucket{}
-	routable := 0
+	if workspace == "" && email == "" {
+		return "slot:" + item.ID
+	}
+	return "allowance:" + workspace + "|" + email
+}
+
+// capacityIdentitiesLocked groups enabled accounts by the allowance they spend.
+func (a *app) capacityIdentitiesLocked(now time.Time) map[string]*capacityIdentity {
+	groups := map[string]*capacityIdentity{}
 	for _, item := range a.config.Accounts {
-		if !item.Enabled || !item.InPool {
+		if !item.Enabled {
 			continue
 		}
-		if primary := a.duplicateUpstreamAccountPrimaryLocked(item, now); primary != "" {
-			continue
-		}
+		// Read routing's own verdict rather than reimplementing it. An allowance
+		// routing will not select is not capacity the pool can spend now, however
+		// the account is configured.
+		blocked := item.InPool && a.duplicateUpstreamAccountPrimaryLocked(item, now) != ""
+		spendable := item.InPool && !blocked
 		snapshot := a.state.Quotas[item.ID]
 		if snapshot.Quota == nil {
 			continue
 		}
-		routable++
-		for _, window := range quotaReportedWindows(*snapshot.Quota) {
-			if !window.Present || window.WindowMinutes == nil || *window.WindowMinutes <= 0 {
-				continue
-			}
-			entry := buckets[*window.WindowMinutes]
-			if entry == nil {
-				entry = &bucket{}
-				buckets[*window.WindowMinutes] = entry
-			}
-			remaining := quotaWindowRemaining(window)
-			entry.total += remaining
-			entry.reporting++
-			if remaining <= 0 {
-				entry.exhausted++
-			}
+		key := capacityAllowanceKeyLocked(a, item)
+		weight, assumed := accountWeeklyWeight(
+			chooseString(snapshot.PlanFamily, item.PlanFamily),
+			chooseString(snapshot.PlanLimit, item.PlanLimit),
+			chooseString(snapshot.SeatType, item.SeatType),
+		)
+		entry := groups[key]
+		if entry == nil {
+			groups[key] = &capacityIdentity{quota: snapshot.Quota, weight: weight, assumed: assumed, spendable: spendable, blocked: blocked}
+			continue
+		}
+		entry.blocked = entry.blocked || blocked
+		// Spendability is a property of the allowance, not of one slot: if any
+		// copy can actually route, the capacity is spendable now.
+		if spendable {
+			entry.spendable = true
+			// Prefer the routable slot's own snapshot and multiplier; that is the
+			// copy whose quota the pool actually spends.
+			entry.quota = snapshot.Quota
+			entry.weight = weight
+			entry.assumed = assumed
 		}
 	}
-	result := make([]quotaCapacityWindow, 0, len(buckets))
-	for minutes, entry := range buckets {
-		if entry.reporting == 0 {
+	return groups
+}
+
+// poolCapacityLocked reads both quota windows across the pool.
+//
+// Both bars are weighted, and both divide by the pool's whole weighted
+// allowance rather than only the routable part. A share of the whole is what
+// makes the two segments add up: the solid fill is what routing can spend now,
+// and the dashed run continuing from it is what the same pool would hold if
+// every enabled account were reachable.
+//
+// Weighting matters because a 20x Pro account at half capacity holds ten base
+// allowances where a Plus account at half holds half of one, and averaging those
+// as equals understates the pool by an order of magnitude.
+func (a *app) poolCapacityLocked(now time.Time) []poolCapacityBar {
+	identities := a.capacityIdentitiesLocked(now)
+	bars := make([]poolCapacityBar, 0, 2)
+	for _, minutes := range []int64{fiveHourWindowMinutes, weeklyWindowMinutes} {
+		var total, spendable, recoverable float64
+		spendableAccounts, recoverableAccounts, blockedAccounts := 0, 0, 0
+		assumed := false
+		for _, identity := range identities {
+			share, ok := identity.windowShare(minutes)
+			if !ok {
+				continue
+			}
+			total += identity.weight
+			if identity.spendable {
+				spendable += identity.weight * share
+				spendableAccounts++
+			} else {
+				recoverable += identity.weight * share
+				recoverableAccounts++
+				if identity.blocked {
+					blockedAccounts++
+				}
+			}
+			if identity.assumed {
+				assumed = true
+			}
+		}
+		// Nothing reported this window at all, so there is no denominator. A bar
+		// drawn against nothing would read as total exhaustion rather than as
+		// absent evidence.
+		if total <= 0 {
 			continue
 		}
 		value := minutes
-		result = append(result, quotaCapacityWindow{
-			Label:             quotaWindowLabel(&value),
-			WindowMinutes:     minutes,
-			RemainingPercent:  entry.total / float64(entry.reporting),
-			ReportingAccounts: entry.reporting,
-			RoutableAccounts:  routable,
-			UncappedAccounts:  routable - entry.reporting,
-			ExhaustedAccounts: entry.exhausted,
+		bars = append(bars, poolCapacityBar{
+			Label:               quotaWindowLabel(&value),
+			WindowMinutes:       minutes,
+			SpendablePercent:    spendable / total * 100,
+			RecoverablePercent:  recoverable / total * 100,
+			SpendableAccounts:   spendableAccounts,
+			RecoverableAccounts: recoverableAccounts,
+			BlockedAccounts:     blockedAccounts,
+			Weighted:            true,
+			Assumed:             assumed,
 		})
 	}
-	// Shortest window first so the burst limit reads before the budget, matching
-	// the order the per-account rows already use.
-	sort.SliceStable(result, func(i, j int) bool { return result[i].WindowMinutes < result[j].WindowMinutes })
-	return result
+	return bars
+}
+
+// windowShare is how much of this allowance's capacity the given window leaves,
+// as a fraction, and whether the window can be read for it at all.
+//
+// The weekly window is read directly. The five-hour window needs two rules,
+// because a five-hour allowance has no published size to weigh against a weekly
+// one and some plans carry no five-hour limit whatsoever:
+//
+// An account with no five-hour cap can never be held back by one, so on this
+// axis it is fully available and contributes its whole weight. Counting it as
+// absent instead would drop the very accounts most able to absorb a burst.
+//
+// An account whose weekly budget is spent cannot serve at all, whatever its
+// five-hour window reports. Upstream keeps reporting a five-hour figure for it,
+// and taking that at face value would promise burst capacity that every request
+// would be refused. A weekly reading of zero therefore forces the five-hour
+// reading to zero as well.
+func (identity *capacityIdentity) windowShare(minutes int64) (float64, bool) {
+	weekly, weeklyReported := reportedWindowOfDuration(*identity.quota, weeklyWindowMinutes)
+	if minutes == weeklyWindowMinutes {
+		if !weeklyReported {
+			return 0, false
+		}
+		return quotaWindowRemaining(weekly) / 100, true
+	}
+	if weeklyReported && quotaWindowRemaining(weekly) <= 0 {
+		return 0, true
+	}
+	if window, ok := reportedWindowOfDuration(*identity.quota, minutes); ok {
+		return quotaWindowRemaining(window) / 100, true
+	}
+	// No five-hour window of its own. Only count it as uncapped when something
+	// else about the account was reported, so a failed refresh does not enter the
+	// reading as full capacity.
+	if weeklyReported {
+		return 1, true
+	}
+	return 0, false
+}
+
+// reportedWindowOfDuration finds the window of exactly this duration that
+// upstream actually reported. A window it did not report is absent evidence, not
+// a zero, so the caller must skip the account rather than count it as spent.
+func reportedWindowOfDuration(quota accountQuota, minutes int64) (quotaWindow, bool) {
+	for _, window := range quotaReportedWindows(quota) {
+		if window.Present && window.WindowMinutes != nil && *window.WindowMinutes == minutes {
+			return window, true
+		}
+	}
+	return quotaWindow{}, false
 }
 
 func (a *app) dashboardSummaryLocked(now time.Time) map[string]int {
@@ -9269,6 +9583,66 @@ func organizationNameFromNestedMap(values map[string]any) string {
 	return ""
 }
 
+// baseWeeklyWeight is the unit every weekly allowance is measured against. An
+// account with no multiplier evidence weighs exactly one, so a pool of ordinary
+// subscriptions normalises to a plain average.
+const baseWeeklyWeight = 1.0
+
+// defaultPremiumSeatWeight is OpenAI's published Premium-to-Standard usage
+// ratio for Business seats.
+//
+// Unlike a Pro multiplier, which the account itself reports through planLimit,
+// no endpoint this pool calls reports a Business seat multiplier at all. This
+// number is therefore an assumption read off a public pricing page, not
+// telemetry, and a deployment whose contract differs must be able to correct it
+// without a rebuild. Every reading it contributes to is flagged as assumed so
+// it can never be presented with the same authority as a reported multiplier.
+const defaultPremiumSeatWeight = 5.0
+
+var premiumSeatWeight = defaultPremiumSeatWeight
+
+// applyCapacityWeightEnv retunes the assumed Business Premium multiplier. An
+// invalid setting is a startup error rather than a silent fallback, because a
+// wrong multiplier silently distorts every weighted reading it touches.
+func applyCapacityWeightEnv() error {
+	raw := strings.TrimSpace(os.Getenv("CODEX_POOL_PREMIUM_SEAT_MULTIPLIER"))
+	if raw == "" {
+		return nil
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || value <= 0 || math.IsInf(value, 0) {
+		return fmt.Errorf("CODEX_POOL_PREMIUM_SEAT_MULTIPLIER must be a positive number")
+	}
+	premiumSeatWeight = value
+	return nil
+}
+
+// accountWeeklyWeight returns how many base allowances one account's weekly
+// budget is worth, and whether that figure is assumed rather than reported.
+//
+// A Pro slot reports its own multiplier, so that value is authoritative. A
+// Business Premium seat reports none, so the assumed ratio applies and the
+// caller must surface it as an assumption. Everything else weighs one: absent
+// evidence, an account counts once rather than being guessed upward.
+func accountWeeklyWeight(planFamily, planLimit, seatType string) (float64, bool) {
+	switch normalizePlanType(planFamily) {
+	case "pro":
+		switch cleanPlanLimit(planLimit) {
+		case "5x":
+			return 5, false
+		case "10x":
+			return 10, false
+		case "20x":
+			return 20, false
+		}
+	case "business":
+		if cleanMetadataToken(seatType) == "premium" {
+			return premiumSeatWeight, true
+		}
+	}
+	return baseWeeklyWeight, false
+}
+
 func cleanPlanLimit(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	switch value {
@@ -9811,6 +10185,21 @@ func chooseTime(value, fallback time.Time) time.Time {
 	}
 	return value
 }
+
+// randomUUID returns a version 4 UUID. Upstream documents a UUID for the
+// reset-credit redeem request id, and an id it rejects would be
+// indistinguishable from one it never saw, so a retry could spend a second
+// credit.
+func randomUUID() string {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		panic(err)
+	}
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", value[0:4], value[4:6], value[6:8], value[8:10], value[10:16])
+}
+
 func randomID() string {
 	value := make([]byte, 16)
 	if _, err := rand.Read(value); err != nil {
