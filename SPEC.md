@@ -1909,6 +1909,18 @@ For streaming responses:
   `5xx` earned a cooldown and a fallback — one condition with two opposite
   outcomes, decided only by where upstream reported it. An unrecognized code is
   still not retried and still does not touch account health.
+- Every upstream terminal failure is logged with the account, model, terminal
+  event, sanitized class and code, the request's operational id, whether the
+  attempt was retried or final, and upstream's own message bounded and stripped
+  of control characters. The message is the only place the upstream request id
+  that support asks for appears, and the caller is shown that message and
+  nothing else, so without this line an operator holding a request id cannot
+  tell which identity produced it, nor one account faulting from a whole pool
+  faulting. Retried attempts log too: a request that failed after ten attempts
+  on one account is a different diagnosis from one that failed once. The message
+  stays in the service log — it must never enter runtime state, a routing event,
+  or any admin or client response, which keeps the sanitized-code contract for
+  every surface intact.
 - A retryable terminal failure that describes a server needing a moment
   (`server_is_overloaded`, `slow_down`, `server_error`,
   `internal_server_error`) takes the longer upstream-`5xx` cooldown; a drained

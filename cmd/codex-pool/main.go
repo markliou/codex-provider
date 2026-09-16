@@ -1923,12 +1923,17 @@ type promptCacheUsage struct {
 }
 
 type proxyResponseInfo struct {
-	ResponseID            string
-	Usage                 promptCacheUsage
-	CompletedAt           time.Time
-	TerminalEvent         string
-	TerminalFailureClass  string
-	TerminalErrorCode     string
+	ResponseID           string
+	Usage                promptCacheUsage
+	CompletedAt          time.Time
+	TerminalEvent        string
+	TerminalFailureClass string
+	TerminalErrorCode    string
+	// TerminalErrorMessage is upstream's own explanation, bounded and stripped of
+	// control characters. It exists for the service log and nothing else: it must
+	// never enter runtime state, a routing event, or an admin response, which is
+	// why it carries no json tag and is copied nowhere but the log line.
+	TerminalErrorMessage  string
 	RequestID             string
 	FailoverFromAccountID string
 	FailoverOutcome       string
@@ -2397,6 +2402,7 @@ func (info *proxyResponseInfo) merge(next proxyResponseInfo) {
 		info.TerminalEvent = next.TerminalEvent
 		info.TerminalFailureClass = next.TerminalFailureClass
 		info.TerminalErrorCode = next.TerminalErrorCode
+		info.TerminalErrorMessage = next.TerminalErrorMessage
 	}
 }
 
@@ -2427,20 +2433,23 @@ func responseInfoFromSSEBlock(block string) proxyResponseInfo {
 		info = responseInfoFromPayload(response)
 		if errorPayload, _ := response["error"].(map[string]any); errorPayload != nil {
 			info.TerminalErrorCode = sanitizedErrorCode(claimString(errorPayload, "code"))
+			info.TerminalErrorMessage = terminalErrorMessage(errorPayload)
 		}
 	} else {
 		info = responseInfoFromPayload(payload)
 		if errorPayload, _ := payload["error"].(map[string]any); errorPayload != nil {
 			info.TerminalErrorCode = sanitizedErrorCode(claimString(errorPayload, "code"))
+			info.TerminalErrorMessage = terminalErrorMessage(errorPayload)
 		}
 	}
 	if eventType == "error" {
 		// The standalone Responses streaming error shape carries code/message at
-		// the event root rather than inside response.error. Retain only the same
-		// bounded code token used for response.failed; the message remains solely
-		// in the client-bound SSE bytes and is never persisted.
+		// the event root rather than inside response.error.
 		if code := sanitizedErrorCode(claimString(payload, "code")); code != "" {
 			info.TerminalErrorCode = code
+		}
+		if message := terminalErrorMessage(payload); message != "" {
+			info.TerminalErrorMessage = message
 		}
 	}
 	if isTerminalResponseEvent(eventType) {
@@ -2494,6 +2503,41 @@ func retryableTerminalCooldown(reason string) time.Duration {
 		return upstream5xxCooldown
 	}
 	return 30 * time.Second
+}
+
+// terminalErrorMessage pulls upstream's explanation out of a terminal error
+// payload for the log. Upstream's message is where the request id its support
+// asks for lives, so it is kept bounded and stripped of control characters
+// rather than dropped, but it stays out of state and out of every response.
+func terminalErrorMessage(errorPayload map[string]any) string {
+	return cleanMetadataText(claimString(errorPayload, "message"), 300)
+}
+
+// logTerminalResponseFailure records which identity produced an upstream
+// terminal failure. The caller is shown upstream's message and nothing else, so
+// an operator holding the request id from that message has no way to tell which
+// account or model produced it, nor one account faulting from a whole pool
+// faulting, unless this line exists. Every retried attempt logs too: a request
+// that failed after ten attempts on one account is a different diagnosis from
+// one that failed once.
+func (a *app) logTerminalResponseFailure(accountID, model string, info proxyResponseInfo, retried bool) {
+	if a.logger == nil {
+		return
+	}
+	disposition := "final"
+	if retried {
+		disposition = "retried"
+	}
+	line := fmt.Sprintf("upstream terminal failure: account=%s model=%s event=%s class=%s code=%s disposition=%s",
+		accountID, model, codeOr(info.TerminalEvent, "-"), codeOr(info.TerminalFailureClass, "-"),
+		codeOr(info.TerminalErrorCode, "-"), disposition)
+	if info.RequestID != "" {
+		line += " request=" + info.RequestID
+	}
+	if info.TerminalErrorMessage != "" {
+		line += fmt.Sprintf(" message=%q", info.TerminalErrorMessage)
+	}
+	a.logger.Print(line)
 }
 
 func terminalFailureClass(eventType, code string) string {
@@ -4411,6 +4455,7 @@ func (a *app) spendCapacityRetryRound(ctx context.Context, model string, delay t
 }
 
 func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info proxyResponseInfo, coolDown bool) {
+	a.logTerminalResponseFailure(accountID, model, info, true)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
@@ -4433,6 +4478,7 @@ func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info
 }
 
 func (a *app) markTerminalResponseFailureWithMeasurement(route routingDecision, model, accountID string, info proxyResponseInfo, measurement *throughputMeasurement) {
+	a.logTerminalResponseFailure(accountID, model, info, false)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()

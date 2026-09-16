@@ -7383,6 +7383,100 @@ func TestTerminalFailureClassesAndCooldownPricing(t *testing.T) {
 	}
 }
 
+// The caller is shown upstream's message and nothing else, and that message is
+// where the request id support asks for lives. Without a log line naming the
+// account and model, an operator holding a request id cannot tell which
+// identity produced it. The message must still stay out of persisted state.
+func TestTerminalFailureIsLoggedWithoutPersistingTheMessage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bad\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"visible\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_bad\",\"error\":{\"code\":\"server_error\",\"message\":\"An error occurred.\\nPlease include the request ID 52cb6f95-f64b-48dc-a68e-aeb7e6e9b870 in your message.\"}}}\n\n")
+	}))
+	defer upstream.Close()
+
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	var logged bytes.Buffer
+	a.logger = log.New(&logged, "", 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Request-Id", "req-abc")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	line := logged.String()
+	for _, want := range []string{
+		"upstream terminal failure:",
+		"account=only",
+		"model=gpt-test",
+		"code=server_error",
+		"class=transient",
+		"request=req-abc",
+		// The upstream request id is the whole point: it is what support asks for.
+		"52cb6f95-f64b-48dc-a68e-aeb7e6e9b870",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("log line missing %q: %s", want, line)
+		}
+	}
+	// Bounded and stripped: a newline in upstream prose must not break the line
+	// into something that reads as a separate log entry.
+	if strings.Count(strings.TrimSuffix(line, "\n"), "\n") != 0 {
+		t.Fatalf("upstream prose split the log line: %q", line)
+	}
+	// State is the boundary the message must not cross.
+	persisted, err := json.Marshal(a.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"52cb6f95", "An error occurred"} {
+		if strings.Contains(string(persisted), forbidden) {
+			t.Fatalf("upstream message reached persisted state: %s", persisted)
+		}
+	}
+	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].TerminalErrorCode != "server_error" {
+		t.Fatalf("routing event did not record the sanitized code: %#v", a.state.RoutingCacheEvents)
+	}
+}
+
+// A retried attempt must log too: failing after ten attempts on one account is a
+// different diagnosis from failing once.
+func TestRetriedTerminalFailureIsLoggedAsRetried(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_only\"}}\n\n")
+		if hits >= 2 {
+			_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_only\"}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_only\",\"error\":{\"code\":\"server_error\",\"message\":\"transient fault\"}}}\n\n")
+	}))
+	defer upstream.Close()
+
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	var logged bytes.Buffer
+	a.logger = log.New(&logged, "", 0)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK || hits != 2 {
+		t.Fatalf("the retry did not recover: code=%d hits=%d", recorder.Code, hits)
+	}
+	if !strings.Contains(logged.String(), "disposition=retried") {
+		t.Fatalf("a recovered attempt was not logged as retried: %s", logged.String())
+	}
+	if strings.Contains(logged.String(), "disposition=final") {
+		t.Fatalf("a recovered request logged a final failure: %s", logged.String())
+	}
+}
+
 func TestCommittedStreamingResponseFailedDoesNotRetry(t *testing.T) {
 	firstHits := 0
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
