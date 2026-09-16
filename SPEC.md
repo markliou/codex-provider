@@ -687,6 +687,26 @@ Optional exception: when `preserveProQuota` is enabled from the admin Console, i
 
 On upstream quota exhaustion or rate limiting (`429`), mark the account/model in cooldown and retry the next eligible account in the same request. By default, the retry budget scales with the configured account count; `CODEX_POOL_MAX_RETRY_ACCOUNTS` can cap it.
 
+When no distinct eligible identity remains, a `429` that arrives before any byte
+reaches the caller is a transient refusal like any other capacity class, and it
+must spend a round of the same capacity retry budget on the same account rather
+than ending the request. Excluding the only identity and reporting "all eligible
+upstream accounts failed" without ever waiting gives a single-account pool no
+retry at all. As on the streaming path, the retried round records the failure but
+sets no cooldown — one would make the account unselectable for its own retry —
+and does not consume the per-account attempt budget. A pool that still has a
+distinct eligible identity fails over on the first refusal instead and pays no
+wait, because another identity is always cheaper than a delay.
+
+Upstream's `Retry-After` decides whether waiting is honest. A header longer than
+the configured per-round cap describes a drained window rather than congestion,
+so that refusal is surfaced immediately with the advertised cooldown recorded
+instead of being waited out inside the caller's request. An absent header is not
+evidence of a long wait and does not block the retry; the backoff paces those
+rounds. When a header within the cap is present, the round waits at least that
+long, since retrying before a wait upstream just named would spend an attempt on
+a refusal it already promised.
+
 Quota polling is advisory and must not become an inference availability gate for transient usage-endpoint failures. A quota refresh timeout, transport error, decode error, or upstream `5xx` may be retained for diagnostics, but it must not make an otherwise authenticated account ineligible. Only an explicit credential failure such as `401`, `403`, `invalid_token`, or a failed OAuth refresh that is classified as an auth failure may block routing. This distinction is required so exhaustion of a non-Pro account can still fail over to a healthy Pro account instead of returning a false initial `503`.
 
 Per-slot quota protection is a separate opt-in exception based on positive quota
@@ -1902,7 +1922,10 @@ For streaming responses:
   attempts it spent, or a pool would exhaust its attempts while still waiting for
   the blip to clear, and a single-account pool could never retry at all. Each failed upstream attempt still counts as an upstream
   failure. A pool that still has a distinct eligible identity fails over instead
-  and must not pay this backoff.
+  and must not pay this backoff. The same budget, schedule, and restore rules
+  cover an HTTP `429` with no distinct fallback (section 6.4): the two paths share
+  one bounded budget per client request, so a request cannot spend the schedule
+  twice by meeting a refusal in both forms.
 - Once that retry budget is spent, preserve and forward the original buffered
   upstream failure instead of replacing it with a synthetic pool error. The
   final terminal failure owns the client failure record and the account
