@@ -4719,7 +4719,7 @@ func TestStreamingPrecommitBlockLimitCommitsBeforeCapacityFailure(t *testing.T) 
 		commits++
 		recorder.WriteHeader(http.StatusOK)
 	})
-	if result.RetryableCapacityFailure {
+	if result.RetryableTerminalFailure {
 		t.Fatal("capacity failure remained retryable after precommit block limit")
 	}
 	if commits != 1 || !recorder.Flushed || !strings.Contains(recorder.Body.String(), "response.failed") {
@@ -7212,6 +7212,174 @@ func TestEarlyCapacityStreamingFailureRetriesBeforeCommit(t *testing.T) {
 	}
 	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].RoutingOutcome != "stream_capacity_failover" || a.state.RoutingCacheEvents[0].FailoverFromAccountID != "first" || a.state.RoutingCacheEvents[0].TerminalEvent != "response.completed" {
 		t.Fatalf("recovered stream routing event = %#v", a.state.RoutingCacheEvents)
+	}
+}
+
+// An upstream server fault delivered inside the stream is a server-side
+// condition like any other, and it must move to another identity instead of
+// being handed to the caller. Unclassified, this failed the caller outright
+// while the identical fault reported as an HTTP 5xx got a fallback.
+func TestServerErrorStreamFailsOverToAnotherIdentity(t *testing.T) {
+	firstHits, secondHits := 0, 0
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"error\":{\"code\":\"server_error\",\"message\":\"secret upstream detail\"}}}\n\n")
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_second\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_second\"}}\n\n")
+	}))
+	defer second.Close()
+
+	a := testApp(t, []account{
+		{ID: "first", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL},
+		{ID: "second", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: second.URL},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("a server-error stream was not retried elsewhere: first=%d second=%d body=%s", firstHits, secondHits, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "server_error") || strings.Contains(recorder.Body.String(), "secret upstream detail") {
+		t.Fatalf("the abandoned failure leaked downstream: %s", recorder.Body.String())
+	}
+	if firstHits != 1 || secondHits != 1 {
+		t.Fatalf("failover did not happen exactly once: first=%d second=%d", firstHits, secondHits)
+	}
+	// The outcome must name the cause. Reporting this as a capacity failover
+	// would send an operator looking at quota for a server fault.
+	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].RoutingOutcome != "stream_transient_failover" {
+		t.Fatalf("routing outcome did not name the server fault: %#v", a.state.RoutingCacheEvents)
+	}
+	// A server fault needs a moment, not a spent allowance: it earns the longer
+	// 5xx cooldown rather than the short default.
+	cooldowns := a.state.Cooldowns["first"]
+	if len(cooldowns) != 1 || cooldowns[0].Reason != "server_error" {
+		t.Fatalf("server-error terminal failure cooldown = %#v", cooldowns)
+	}
+}
+
+// With nowhere to fail over, the same account must be retried behind the shared
+// capacity backoff rather than the caller being handed the fault.
+func TestSingleAccountServerErrorStreamRetriesTheSameAccount(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_only\"}}\n\n")
+		if hits >= 3 {
+			_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+			_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_only\"}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_only\",\"error\":{\"code\":\"internal_server_error\"}}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if !strings.Contains(recorder.Body.String(), "recovered") || hits != 3 {
+		t.Fatalf("a single account was not retried through a server fault: hits=%d body=%s", hits, recorder.Body.String())
+	}
+	// The in-place retries must leave no cooldown: one would make the only
+	// account unselectable for its own retry.
+	if len(a.state.Cooldowns["only"]) != 0 {
+		t.Fatalf("an in-request retry left a cooldown: %#v", a.state.Cooldowns["only"])
+	}
+}
+
+// Recognizing two documented codes must not soften the rule they sit beside: an
+// unrecognized code is still no evidence that another attempt would fare better.
+func TestUnrecognizedTerminalCodeIsStillNotRetried(t *testing.T) {
+	firstHits, secondHits := 0, 0
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_odd\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_odd\",\"error\":{\"code\":\"some_new_condition\"}}}\n\n")
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_second\"}}\n\n")
+	}))
+	defer second.Close()
+
+	a := testApp(t, []account{
+		{ID: "first", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL},
+		{ID: "second", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: second.URL},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if secondHits != 0 || firstHits != 1 {
+		t.Fatalf("an unrecognized code was retried: first=%d second=%d", firstHits, secondHits)
+	}
+	if !strings.Contains(recorder.Body.String(), "some_new_condition") {
+		t.Fatalf("the unrecognized failure was not forwarded verbatim: %s", recorder.Body.String())
+	}
+	// An unknown terminal failure still must not touch account health.
+	if len(a.state.Cooldowns["first"]) != 0 || a.state.Health["first"].ConsecutiveFailure != 0 {
+		t.Fatalf("an unknown failure penalized the account: cooldowns=%#v health=%#v", a.state.Cooldowns["first"], a.state.Health["first"])
+	}
+}
+
+func TestTerminalFailureClassesAndCooldownPricing(t *testing.T) {
+	for code, want := range map[string]string{
+		"server_error":          "transient",
+		"internal_server_error": "transient",
+		"server_is_overloaded":  "capacity",
+		"rate_limit_exceeded":   "capacity",
+		"invalid_prompt":        "request",
+		"unauthorized":          "authentication",
+		"some_new_condition":    "unknown",
+	} {
+		if got := terminalFailureClass("response.failed", code); got != want {
+			t.Fatalf("terminalFailureClass(%q) = %q, want %q", code, got, want)
+		}
+	}
+	for _, class := range []string{"capacity", "transient"} {
+		if !retryableTerminalFailureClass(class) {
+			t.Fatalf("%q must be retryable", class)
+		}
+	}
+	for _, class := range []string{"unknown", "request", "authentication", "incomplete", ""} {
+		if retryableTerminalFailureClass(class) {
+			t.Fatalf("%q must not be retryable", class)
+		}
+	}
+	// A server fault needs a moment, not a spent allowance, so it is priced like
+	// overload rather than getting the short default.
+	for _, reason := range []string{"server_error", "internal_server_error", "server_is_overloaded", "slow_down"} {
+		if got := retryableTerminalCooldown(reason); got != upstream5xxCooldown {
+			t.Fatalf("retryableTerminalCooldown(%q) = %s, want %s", reason, got, upstream5xxCooldown)
+		}
+	}
+	if got := retryableTerminalCooldown("rate_limit_exceeded"); got != 30*time.Second {
+		t.Fatalf("retryableTerminalCooldown(rate_limit_exceeded) = %s, want 30s", got)
+	}
+	// The outcome must name the cause an operator has to act on.
+	if got := streamRetryFailoverOutcome("transient"); got != "stream_transient_failover" {
+		t.Fatalf("transient failover outcome = %q", got)
+	}
+	if got := streamRetryFailoverOutcome("capacity"); got != "stream_capacity_failover" {
+		t.Fatalf("capacity failover outcome = %q", got)
 	}
 }
 
