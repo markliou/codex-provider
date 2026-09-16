@@ -657,6 +657,7 @@ parent_affinity_fallback
 quota_failover
 rate_limit_failover
 stream_capacity_failover
+stream_transient_failover
 auth_failover
 transport_failover
 repeated_5xx_failover
@@ -669,7 +670,10 @@ values so operators can distinguish healthy distribution from cache-breaking
 failover. `stream_capacity_failover` specifically means an upstream
 `response.failed` capacity event was detected and discarded before any SSE
 bytes became client-visible, then a different upstream identity completed the
-same client request.
+same client request. `stream_transient_failover` is the same mechanism for an
+upstream server fault (`server_error`, `internal_server_error`) and must be
+reported under its own name: an operator scanning outcomes must not be sent
+looking at quota for a request that moved because upstream faulted.
 
 ### 6.4 Failback behavior
 
@@ -1893,13 +1897,32 @@ For streaming responses:
   failures may quarantine the credential. Context length, invalid prompt, and
   policy failures do not penalize account health. Unknown codes remain a
   sanitized generic failure instead of being guessed as quota/auth.
+- Two classes of terminal failure are retryable: `capacity`
+  (`rate_limit_exceeded`, `insufficient_quota`, `usage_not_included`,
+  `server_is_overloaded`, `slow_down`) and `transient` (`server_error`,
+  `internal_server_error`). Both describe a server-side condition another
+  attempt or another identity can serve, and both take the same pre-commit
+  retry path and the same bounded retry budget. Recognizing the two transient
+  codes is not the guessing that `unknown` exists to prevent: they are
+  documented and unambiguous, and while they were unclassified the pool handed
+  the caller a hard failure even though the identical fault reported as an HTTP
+  `5xx` earned a cooldown and a fallback — one condition with two opposite
+  outcomes, decided only by where upstream reported it. An unrecognized code is
+  still not retried and still does not touch account health.
+- A retryable terminal failure that describes a server needing a moment
+  (`server_is_overloaded`, `slow_down`, `server_error`,
+  `internal_server_error`) takes the longer upstream-`5xx` cooldown; a drained
+  allowance takes the shorter default. A retry round may clear the former,
+  because that is the condition it is waiting out, but never a `rate_limited`
+  cooldown, which records evidence that an allowance is spent.
 - A capacity-class `response.failed` received entirely inside the bounded
   lifecycle-only preamble may be discarded and retried only when another
   eligible account with a different upstream identity and another configured
   proxy attempt are available. The failed attempt updates upstream
   failure/cooldown counters but does not create a client failure, sticky/thread
   binding, response binding, or request-level throughput result. The eventual
-  successful response is classified as `stream_capacity_failover`.
+  successful response is classified as `stream_capacity_failover`, or
+  `stream_transient_failover` when the discarded failure was a server fault.
 - If no distinct fallback is available, the pool waits and sweeps again rather
   than surfacing the refusal. Each round restores every identity that refused
   for capacity, clears the capacity cooldowns those refusals recorded for this

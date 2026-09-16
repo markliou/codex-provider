@@ -1657,7 +1657,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 				commitProxyResponseHeaders(w, response)
 			})
 			info = result.Info
-			if result.RetryableCapacityFailure {
+			if result.RetryableTerminalFailure {
 				excluded[candidate.ID] = true
 				capacityExcluded[candidate.ID] = true
 				// The buffered prefix has not changed the client-visible
@@ -1668,7 +1668,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 				if attempt+1 < attemptLimit && a.hasPreferredAccount(model, excluded) {
 					_ = response.Body.Close()
 					failoverFromAccountID = candidate.ID
-					failoverOutcome = "stream_capacity_failover"
+					failoverOutcome = streamRetryFailoverOutcome(info.TerminalFailureClass)
 					a.markRetryableTerminalResponseFailure(candidate.ID, model, info, true)
 					continue
 				}
@@ -1949,7 +1949,7 @@ type proxyResponseInfo struct {
 type streamingProxyResult struct {
 	Info                     proxyResponseInfo
 	Buffered                 []byte
-	RetryableCapacityFailure bool
+	RetryableTerminalFailure bool
 }
 
 func (a *app) writeChatFromResponse(w http.ResponseWriter, response *http.Response, model string) (proxyResponseInfo, bool) {
@@ -2113,7 +2113,7 @@ func precommitByteLimit(requestBytes int) int {
 
 func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResponseInfo {
 	result := copyStreamingProxyResponseWithPrecommit(w, body, precommitByteLimit(0), nil)
-	if result.RetryableCapacityFailure {
+	if result.RetryableTerminalFailure {
 		// This compatibility wrapper is used only after callers have already
 		// committed headers. It must preserve the upstream failure verbatim;
 		// only the main proxy loop can discard an uncommitted prefix and retry.
@@ -2158,7 +2158,7 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 					bufferedBlocks++
 				}
 				withinBounds := buffered.Len() <= maxBytes && bufferedBlocks <= streamingPrecommitMaxBlocks
-				if next.TerminalEvent == "response.failed" && next.TerminalFailureClass == "capacity" && withinBounds {
+				if next.TerminalEvent == "response.failed" && retryableTerminalFailureClass(next.TerminalFailureClass) && withinBounds {
 					// No headers, lifecycle event, response id, model output, or
 					// tool activity has reached the client. Return the exact
 					// buffered failure so the caller can either discard it for a
@@ -2167,7 +2167,7 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 					return streamingProxyResult{
 						Info:                     info,
 						Buffered:                 []byte(buffered.String()),
-						RetryableCapacityFailure: true,
+						RetryableTerminalFailure: true,
 					}
 				}
 				if !withinBounds || !precommitLifecycleSSEBlock(block) {
@@ -2191,7 +2191,7 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 			}
 		}
 		if errors.Is(err, io.EOF) {
-			if !committed && info.TerminalEvent == "error" && info.TerminalFailureClass == "capacity" {
+			if !committed && info.TerminalEvent == "error" && retryableTerminalFailureClass(info.TerminalFailureClass) {
 				// If a Responses stream ends with the error event itself instead
 				// of a following response.failed, EOF is the point at which that
 				// sequence is known. Wait until then before treating it as
@@ -2201,7 +2201,7 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 				return streamingProxyResult{
 					Info:                     info,
 					Buffered:                 []byte(buffered.String()),
-					RetryableCapacityFailure: true,
+					RetryableTerminalFailure: true,
 				}
 			}
 			commit()
@@ -2459,6 +2459,43 @@ func isTerminalResponseEvent(value string) bool {
 	}
 }
 
+// retryableTerminalFailureClass reports whether a terminal failure may be
+// discarded and retried within one client request. Both classes describe a
+// server-side condition that another attempt or another identity can serve;
+// request, authentication, incomplete and unknown failures may not be retried,
+// because none of them is evidence that a second attempt would go any better.
+// streamRetryFailoverOutcome names the cause of a pre-commit failover. Both
+// classes take the same path, but an operator scanning the outcome column must
+// not be sent looking at quota for a request that moved because of a server
+// fault.
+func streamRetryFailoverOutcome(class string) string {
+	if class == "transient" {
+		return "stream_transient_failover"
+	}
+	return "stream_capacity_failover"
+}
+
+func retryableTerminalFailureClass(class string) bool {
+	switch class {
+	case "capacity", "transient":
+		return true
+	default:
+		return false
+	}
+}
+
+// retryableTerminalCooldown prices the cooldown for a retryable terminal
+// failure. Overload, throttling and a server fault all describe a server that
+// needs a moment rather than an allowance that is spent, so they share the
+// longer 5xx cooldown; anything else gets the shorter default.
+func retryableTerminalCooldown(reason string) time.Duration {
+	switch reason {
+	case "server_is_overloaded", "slow_down", "server_error", "internal_server_error":
+		return upstream5xxCooldown
+	}
+	return 30 * time.Second
+}
+
 func terminalFailureClass(eventType, code string) string {
 	if eventType == "response.incomplete" {
 		return "incomplete"
@@ -2469,6 +2506,14 @@ func terminalFailureClass(eventType, code string) string {
 	switch sanitizedErrorCode(code) {
 	case "rate_limit_exceeded", "insufficient_quota", "usage_not_included", "server_is_overloaded", "slow_down":
 		return "capacity"
+	// A server-side fault upstream chose to deliver inside the stream. These two
+	// codes are documented and unambiguous, so recognizing them is not the
+	// guessing that "unknown" exists to prevent. Left unclassified they were
+	// handed to the caller untouched while the same fault reported as an HTTP
+	// 5xx got a cooldown and a fallback: one condition, two opposite outcomes,
+	// decided only by where upstream put it.
+	case "server_error", "internal_server_error":
+		return "transient"
 	case "account_auth_failed", "authentication_error", "invalid_api_key", "invalid_token", "token_invalidated", "token_revoked", "unauthorized", "forbidden":
 		return "authentication"
 	case "context_length_exceeded", "invalid_prompt", "cyber_policy", "content_policy_violation", "policy_violation":
@@ -4307,7 +4352,7 @@ func (a *app) clearCapacityCooldowns(accountIDs map[string]bool, model string) {
 		entries := a.state.Cooldowns[accountID]
 		kept := entries[:0]
 		for _, entry := range entries {
-			if entry.ModelID == model && capacityCooldownReason(entry.Reason) {
+			if entry.ModelID == model && retryableCooldownReason(entry.Reason) {
 				changed = true
 				continue
 			}
@@ -4324,9 +4369,13 @@ func (a *app) clearCapacityCooldowns(accountIDs map[string]bool, model string) {
 	}
 }
 
-func capacityCooldownReason(reason string) bool {
+// retryableCooldownReason marks the cooldowns a retry round may clear: a
+// server-side condition recorded moments earlier, which is exactly what the
+// round is waiting out. A drained allowance (rate_limited) is not one of them,
+// so its cooldown stands.
+func retryableCooldownReason(reason string) bool {
 	switch reason {
-	case "server_is_overloaded", "slow_down", "upstream_5xx":
+	case "server_is_overloaded", "slow_down", "upstream_5xx", "server_error", "internal_server_error":
 		return true
 	default:
 		return false
@@ -4372,11 +4421,7 @@ func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info
 	health.ConsecutiveFailure++
 	a.state.Health[accountID] = health
 	if coolDown {
-		duration := 30 * time.Second
-		if reason == "server_is_overloaded" || reason == "slow_down" {
-			duration = upstream5xxCooldown
-		}
-		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
+		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(retryableTerminalCooldown(reason)), Reason: reason})
 	}
 	// This is an upstream failed attempt recovered inside one client request.
 	// Count the upstream failure and protect the account, but do not finish the
@@ -4401,17 +4446,13 @@ func (a *app) markTerminalResponseFailureWithMeasurement(route routingDecision, 
 		reason = "stream_incomplete"
 	}
 	switch class {
-	case "capacity":
+	case "capacity", "transient":
 		health := a.state.Health[accountID]
 		health.LastFailureAt = now
 		health.LastFailureReason = reason
 		health.ConsecutiveFailure++
 		a.state.Health[accountID] = health
-		duration := 30 * time.Second
-		if reason == "server_is_overloaded" || reason == "slow_down" {
-			duration = upstream5xxCooldown
-		}
-		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
+		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(retryableTerminalCooldown(reason)), Reason: reason})
 	case "authentication":
 		health := a.state.Health[accountID]
 		health.LastFailureAt = now
@@ -4589,7 +4630,7 @@ func (a *app) routingOutcomeLocked(route routingDecision, model, accountID strin
 
 func normalizedRoutingOutcome(value string) string {
 	switch value {
-	case "sticky_reuse", "new_route_assignment", "parent_affinity", "parent_affinity_fallback", "quota_failover", "rate_limit_failover", "stream_capacity_failover", "auth_failover", "transport_failover", "repeated_5xx_failover":
+	case "sticky_reuse", "new_route_assignment", "parent_affinity", "parent_affinity_fallback", "quota_failover", "rate_limit_failover", "stream_capacity_failover", "stream_transient_failover", "auth_failover", "transport_failover", "repeated_5xx_failover":
 		return value
 	default:
 		return ""

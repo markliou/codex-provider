@@ -1084,6 +1084,7 @@
     quota_failover: "Quota failover",
     rate_limit_failover: "Rate-limit failover",
     stream_capacity_failover: "Stream capacity failover",
+    stream_transient_failover: "Stream server-error failover",
     auth_failover: "Auth failover",
     transport_failover: "Transport failover",
     repeated_5xx_failover: "Repeated 5xx failover",
