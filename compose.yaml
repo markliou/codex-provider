@@ -1,0 +1,24 @@
+services:
+  codex-pool:
+    image: codex-pool:local
+    container_name: codex-pool
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8317:8317"
+    volumes:
+      - codex-pool-data:/data
+    # The pool and its sidecar log only to stdout, and Docker's json-file driver
+    # has no default size limit, so the container log grows until the disk fills.
+    # It looks bounded only because every deploy recreates the container and
+    # starts a new file; a long uptime is what would fill the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  codex-pool-data:
+    external: true

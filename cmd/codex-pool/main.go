@@ -4308,6 +4308,23 @@ func addHistogramObservation(histogram []uint64, value uint64) []uint64 {
 	return histogram
 }
 
+// appendCooldownLocked records a cooldown and drops the account's expired ones
+// in the same pass. Selection already ignores an expired entry, so keeping it
+// changed no behavior, but nothing ever removed it either: the list only grew,
+// for the life of the volume. Pruning on write keeps it proportional to what is
+// actually in force without adding a sweeper. Only entries whose retry time has
+// passed are dropped; an active cooldown is evidence still in force.
+func (a *app) appendCooldownLocked(accountID, model, reason string, retryAt, now time.Time) {
+	entries := a.state.Cooldowns[accountID]
+	kept := make([]cooldown, 0, len(entries)+1)
+	for _, entry := range entries {
+		if entry.NextRetryAt.After(now) {
+			kept = append(kept, entry)
+		}
+	}
+	a.state.Cooldowns[accountID] = append(kept, cooldown{ModelID: model, NextRetryAt: retryAt, Reason: reason})
+}
+
 func (a *app) markFailure(accountID, model, reason string, duration time.Duration) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -4329,7 +4346,7 @@ func (a *app) markFailure(accountID, model, reason string, duration time.Duratio
 	a.state.Health[accountID] = health
 	a.state.FailureCount++
 	if duration > 0 {
-		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
+		a.appendCooldownLocked(accountID, model, reason, now.Add(duration), now)
 	}
 	_ = a.saveLocked()
 	return health.ConsecutiveFailure
@@ -4342,7 +4359,7 @@ func (a *app) markCooldown(accountID, model, reason string, duration time.Durati
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
-	a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(duration), Reason: reason})
+	a.appendCooldownLocked(accountID, model, reason, now.Add(duration), now)
 	_ = a.saveLocked()
 }
 
@@ -4366,7 +4383,7 @@ func (a *app) markAccountAuthFailure(accountID, model, reason string) {
 		prior.QuotaError = &quotaErrorInfo{Code: reason, Message: "account credential is unavailable; sign in again", Timestamp: now}
 		a.state.Quotas[accountID] = prior
 	} else {
-		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(15 * time.Minute), Reason: reason})
+		a.appendCooldownLocked(accountID, model, reason, now.Add(15*time.Minute), now)
 	}
 	_ = a.saveLocked()
 }
@@ -4466,7 +4483,7 @@ func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info
 	health.ConsecutiveFailure++
 	a.state.Health[accountID] = health
 	if coolDown {
-		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(retryableTerminalCooldown(reason)), Reason: reason})
+		a.appendCooldownLocked(accountID, model, reason, now.Add(retryableTerminalCooldown(reason)), now)
 	}
 	// This is an upstream failed attempt recovered inside one client request.
 	// Count the upstream failure and protect the account, but do not finish the
@@ -4498,7 +4515,7 @@ func (a *app) markTerminalResponseFailureWithMeasurement(route routingDecision, 
 		health.LastFailureReason = reason
 		health.ConsecutiveFailure++
 		a.state.Health[accountID] = health
-		a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(retryableTerminalCooldown(reason)), Reason: reason})
+		a.appendCooldownLocked(accountID, model, reason, now.Add(retryableTerminalCooldown(reason)), now)
 	case "authentication":
 		health := a.state.Health[accountID]
 		health.LastFailureAt = now
@@ -4511,7 +4528,7 @@ func (a *app) markTerminalResponseFailureWithMeasurement(route routingDecision, 
 			prior.QuotaError = &quotaErrorInfo{Code: reason, Message: "account credential is unavailable; sign in again", Timestamp: now}
 			a.state.Quotas[accountID] = prior
 		} else {
-			a.state.Cooldowns[accountID] = append(a.state.Cooldowns[accountID], cooldown{ModelID: model, NextRetryAt: now.Add(15 * time.Minute), Reason: reason})
+			a.appendCooldownLocked(accountID, model, reason, now.Add(15*time.Minute), now)
 		}
 	}
 	// Request-specific and unknown terminal failures intentionally do not touch
