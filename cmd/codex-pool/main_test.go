@@ -7477,6 +7477,37 @@ func TestRetriedTerminalFailureIsLoggedAsRetried(t *testing.T) {
 	}
 }
 
+// Cooldowns were append-only: selection ignores an expired entry, so nothing
+// misbehaved, but nothing removed one either and the list grew for the life of
+// the volume. A write prunes what has expired and keeps what is still in force.
+func TestRecordingACooldownPrunesExpiredOnes(t *testing.T) {
+	a := testApp(t, []account{{ID: "acct", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100}})
+	now := time.Now().UTC()
+	a.state.Cooldowns["acct"] = []cooldown{
+		{ModelID: "gpt-old", NextRetryAt: now.Add(-48 * time.Hour), Reason: "rate_limited"},
+		{ModelID: "gpt-old", NextRetryAt: now.Add(-time.Minute), Reason: "server_is_overloaded"},
+		{ModelID: "gpt-live", NextRetryAt: now.Add(10 * time.Minute), Reason: "rate_limited"},
+	}
+
+	a.markFailure("acct", "gpt-test", "rate_limited", time.Minute)
+
+	entries := a.state.Cooldowns["acct"]
+	if len(entries) != 2 {
+		t.Fatalf("expired cooldowns were not pruned: %#v", entries)
+	}
+	// The active one must survive: it is evidence still in force, and dropping it
+	// would hand traffic back to an account upstream has refused.
+	if entries[0].ModelID != "gpt-live" || entries[1].ModelID != "gpt-test" {
+		t.Fatalf("pruning kept the wrong entries: %#v", entries)
+	}
+	// An account whose every entry has expired keeps only the new one.
+	a.state.Cooldowns["acct"] = []cooldown{{ModelID: "gpt-old", NextRetryAt: now.Add(-time.Hour), Reason: "rate_limited"}}
+	a.markCooldown("acct", "gpt-test", "server_is_overloaded", time.Minute)
+	if entries := a.state.Cooldowns["acct"]; len(entries) != 1 || entries[0].ModelID != "gpt-test" {
+		t.Fatalf("a fully expired list was not replaced: %#v", entries)
+	}
+}
+
 func TestCommittedStreamingResponseFailedDoesNotRetry(t *testing.T) {
 	firstHits := 0
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

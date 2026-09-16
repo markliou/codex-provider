@@ -728,6 +728,13 @@ reservation.
 
 If at least one upstream account has already been selected and then failed in a request, exhausting the remaining failover candidates is an upstream failure (`502 bad_gateway`), not initial pool exhaustion (`503 no eligible account`). Initial `503 no eligible account` is reserved for the strict case where no account can be selected before any upstream attempt.
 
+Recording a cooldown also drops that account's expired entries. Selection
+already ignores an expired cooldown, so retaining one changes no routing
+decision, but nothing removed it either and the list grew for the life of the
+data volume. Pruning happens on write rather than through a sweeper, and only
+entries whose retry time has passed are dropped: an active cooldown is evidence
+still in force and must survive.
+
 A transient upstream `5xx` without `Retry-After` must preserve sticky account locality for KV cache hit rate. Do not cool down or fail over the selected account on the first isolated `5xx`; return `502` for that request and let the next request retry the same sticky account. Only recent repeated `5xx` failures may cool down that account and move the sticky route to another upstream identity.
 
 ### 6.4.1 Codex model catalog compatibility
