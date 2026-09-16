@@ -1574,6 +1574,46 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			if response.StatusCode == http.StatusTooManyRequests {
 				reason = "rate_limited"
 				excluded[candidate.ID] = true
+				capacityExcluded[candidate.ID] = true
+				// Another identity is cheaper than any wait, so fail over whenever
+				// one can still serve this model.
+				if attempt+1 < attemptLimit && a.hasPreferredAccount(model, excluded) {
+					failoverFromAccountID = candidate.ID
+					failoverOutcome = "rate_limit_failover"
+					a.markFailure(candidate.ID, model, reason, wait)
+					continue
+				}
+				// Nothing else can serve it. A 429 before any byte reaches the
+				// caller is the same transient refusal the streaming path already
+				// waits out, but this branch had nowhere to go: it excluded the only
+				// identity and the next round reported "all eligible upstream
+				// accounts failed" without ever waiting, so a single-account pool
+				// got no retry at all. Spend a capacity round on the same account.
+				//
+				// Upstream's own Retry-After decides whether waiting is honest. A
+				// header longer than the configured cap describes a drained window
+				// rather than congestion, and holding the caller's request for it
+				// would be worse than telling them now. An absent header is not
+				// evidence of a long wait, so it does not block the retry: the
+				// backoff paces those rounds instead.
+				advertised := retryAfterOrDefault(retryAfterHeader, 0)
+				if capacityRetries < streamingCapacityRetryLimit && advertised <= streamingCapacityRetryMaxWait {
+					capacityRetries++
+					// Deliberately no cooldown: cooling the account down here would
+					// make it unselectable for its own retry and strand the request
+					// on an empty pool. The failure is still recorded.
+					a.markFailure(candidate.ID, model, reason, 0)
+					// Wait out whichever is longer. Retrying before a Retry-After
+					// upstream just named would spend an attempt on a refusal it
+					// already promised.
+					restored, waited := a.spendCapacityRetryRound(r.Context(), model, max(capacityRetryBackoff(capacityRetries), advertised), excluded, capacityExcluded)
+					if !waited {
+						throughput.Cancelled = true
+						return
+					}
+					attempt -= restored
+					continue
+				}
 				failoverFromAccountID = candidate.ID
 				failoverOutcome = "rate_limit_failover"
 				a.markFailure(candidate.ID, model, reason, wait)
@@ -1651,20 +1691,8 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 					// make it unselectable for its own retry and strand the request
 					// on an empty pool.
 					a.markRetryableTerminalResponseFailure(candidate.ID, model, info, false)
-					// Restore every identity that refused for capacity, not only the
-					// one tried last. After a wait the best identity is often one
-					// that refused earlier, and leaving the others excluded would pin
-					// the whole remaining budget on a single account.
-					restored := 0
-					for id := range capacityExcluded {
-						if excluded[id] {
-							delete(excluded, id)
-							restored++
-						}
-					}
-					a.clearCapacityCooldowns(capacityExcluded, model)
-					capacityExcluded = map[string]bool{}
-					if !sleepForRetry(r.Context(), capacityRetryBackoff(capacityRetries)) {
+					restored, waited := a.spendCapacityRetryRound(r.Context(), model, capacityRetryBackoff(capacityRetries), excluded, capacityExcluded)
+					if !waited {
 						throughput.Cancelled = true
 						return
 					}
@@ -4303,6 +4331,34 @@ func capacityCooldownReason(reason string) bool {
 	default:
 		return false
 	}
+}
+
+// spendCapacityRetryRound spends one round of the shared capacity retry budget.
+// It restores every identity that refused for capacity, not only the one tried
+// last: after a wait the best identity is often one that refused earlier, and
+// leaving the others excluded would pin the whole remaining budget on a single
+// account. It reports how many it restored, so the caller can give back the
+// attempts that round consumed, and whether the wait finished rather than the
+// caller's context ending first.
+//
+// Retrying the same account is not another account attempt, so no caller may
+// charge this to the attempt budget: a single-account pool has an attempt limit
+// of one and could never retry at all.
+func (a *app) spendCapacityRetryRound(ctx context.Context, model string, delay time.Duration, excluded, capacityExcluded map[string]bool) (int, bool) {
+	restored := 0
+	for id := range capacityExcluded {
+		if excluded[id] {
+			delete(excluded, id)
+			restored++
+		}
+	}
+	a.clearCapacityCooldowns(capacityExcluded, model)
+	// Cleared in place rather than replaced: both callers keep using the same map
+	// for the rounds that follow.
+	for id := range capacityExcluded {
+		delete(capacityExcluded, id)
+	}
+	return restored, sleepForRetry(ctx, delay)
 }
 
 func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info proxyResponseInfo, coolDown bool) {

@@ -7898,6 +7898,153 @@ func TestCapacityRetryRestoresEveryRefusedIdentity(t *testing.T) {
 	}
 }
 
+// A 429 arriving before any byte reaches the caller is the same transient
+// refusal the streaming path waits out. On a pool with no other identity the old
+// branch excluded the only account and reported "all eligible upstream accounts
+// failed" without ever waiting, so a single-account pool got no retry at all.
+func TestSingleAccountRateLimitRetriesTheSameAccount(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		// Recovers only on the third visit, which it can never get without an
+		// in-request retry of the same account.
+		if hits < 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"code":"rate_limit_exceeded","message":"slow down"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"resp_recovered","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "resp_recovered") {
+		t.Fatalf("a single account was not retried through its rate limit: code=%d hits=%d body=%s", recorder.Code, hits, recorder.Body.String())
+	}
+	if hits != 3 {
+		t.Fatalf("upstream attempts = %d, want 3", hits)
+	}
+	// The retried rounds must leave no cooldown behind: one would make the only
+	// account unselectable for its own retry and strand the request.
+	if len(a.state.Cooldowns["only"]) != 0 {
+		t.Fatalf("an in-request retry left a cooldown: %#v", a.state.Cooldowns["only"])
+	}
+}
+
+// The retry budget is bounded, and the caller must still get upstream's refusal
+// with a cooldown recorded once it is spent.
+func TestSingleAccountRateLimitStopsAtTheRetryBudget(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":"rate_limit_exceeded"}}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 1+streamingCapacityRetryLimit {
+		t.Fatalf("upstream attempts = %d, want %d", hits, 1+streamingCapacityRetryLimit)
+	}
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("a spent budget was reported as success: %s", recorder.Body.String())
+	}
+	// The last attempt owns the cooldown, so the account stops taking traffic
+	// once the request itself gives up.
+	if len(a.state.Cooldowns["only"]) != 1 {
+		t.Fatalf("cooldowns after the budget = %#v", a.state.Cooldowns["only"])
+	}
+}
+
+// Retry-After separates congestion from a drained window. A wait longer than the
+// configured cap is not a blip, and holding the caller's request for it would be
+// worse than telling them now.
+func TestSingleAccountRateLimitHonorsALongRetryAfter(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":"rate_limit_exceeded"}}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if hits != 1 {
+		t.Fatalf("an hour-long Retry-After was waited out in-request: hits=%d", hits)
+	}
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("a refused request was reported as success: %s", recorder.Body.String())
+	}
+	cooldowns := a.state.Cooldowns["only"]
+	if len(cooldowns) != 1 || cooldowns[0].Reason != "rate_limited" {
+		t.Fatalf("the advertised wait was not recorded as a cooldown: %#v", cooldowns)
+	}
+}
+
+// A pool with a healthy backup must not pay any wait: failing over is cheaper,
+// so the retry path exists only for a pool that has nowhere else to go.
+func TestRateLimitPrefersAFallbackOverWaiting(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	limited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		hits["limited"]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":"rate_limit_exceeded"}}`))
+	}))
+	defer limited.Close()
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		hits["healthy"]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_backup","output":[]}`))
+	}))
+	defer healthy.Close()
+
+	a := testApp(t, []account{
+		{ID: "limited", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: limited.URL},
+		{ID: "healthy", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: healthy.URL},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "resp_backup") {
+		t.Fatalf("the fallback did not serve the request: code=%d hits=%v body=%s", recorder.Code, hits, recorder.Body.String())
+	}
+	// The rate-limited identity is visited once and then left alone: its
+	// advertised cooldown stands rather than being waited out in-request.
+	if hits["limited"] != 1 || hits["healthy"] != 1 {
+		t.Fatalf("failover did not happen on the first refusal: hits=%v", hits)
+	}
+	if len(a.state.Cooldowns["limited"]) != 1 {
+		t.Fatalf("the rate-limited account kept no cooldown: %#v", a.state.Cooldowns["limited"])
+	}
+}
+
 // Waiting out a refusal trades caller latency against an interrupted task, and
 // only the operator knows which their clients tolerate, so the schedule has to
 // be tunable without a rebuild.
