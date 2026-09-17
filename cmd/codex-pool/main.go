@@ -1660,6 +1660,16 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			if result.RetryableTerminalFailure {
 				excluded[candidate.ID] = true
 				capacityExcluded[candidate.ID] = true
+				// The rule this block implements, in order, and the order is the
+				// point: sweep every other available identity first with no wait,
+				// because another account is always cheaper than any delay; only
+				// when every one of them has refused, wait out one backoff round,
+				// restore all of them, and sweep again from the top; each round
+				// waits longer than the last. It ends when both the identities and
+				// the schedule are spent, and only then does the caller see the
+				// refusal. Do not reorder this into a wait-per-account loop: that
+				// pays the schedule once per identity instead of once per sweep.
+				//
 				// The buffered prefix has not changed the client-visible
 				// response. Retry only when another real routing candidate and
 				// another configured attempt remain; otherwise preserve the
@@ -2312,6 +2322,18 @@ func precommitCountsTowardBlockBound(block string) bool {
 func precommitLifecycleSSEBlock(block string) bool {
 	switch responseEventTypeFromSSEBlock(block) {
 	case "response.created", "response.in_progress", "response.queued":
+		return true
+	case "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
+		// These announce an empty shell — an output item, a content part, a
+		// reasoning summary part — and carry no text, arguments or reasoning of
+		// their own. The rule this path enforces is that nothing client-visible
+		// has been written yet, not that no semantic event has arrived, so a
+		// shell must not close the window. Upstream regularly starts a stream and
+		// only then falls over: in production every one of these announcements
+		// committed the stream one block before the capacity failure behind it
+		// could be retried, which is three quarters of all client-visible
+		// failures. The first delta still commits, because that is the first
+		// event carrying content a retry would have to duplicate.
 		return true
 	case "keepalive", "ping":
 		// Upstream keeps a waiting stream alive with named events, not only SSE
