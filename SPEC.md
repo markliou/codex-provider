@@ -1861,7 +1861,9 @@ For streaming responses:
   client-visible.
 - Before the first client-visible byte, Pool may buffer only a bounded
   lifecycle-only preamble consisting of `response.created`,
-  `response.in_progress`, `response.queued`, a bare `error` event, named
+  `response.in_progress`, `response.queued`, the empty shell announcements
+  `response.output_item.added`, `response.content_part.added` and
+  `response.reasoning_summary_part.added`, a bare `error` event, named
   `keepalive`/`ping` events, and SSE comment/reconnection metadata. The buffer is limited to 64 KiB plus the size
   of the inbound request body, and to 64 complete lifecycle SSE blocks. The byte
   bound scales with the request because upstream's first lifecycle event echoes
@@ -1882,6 +1884,16 @@ For streaming responses:
   the number of lifecycle events upstream sends while a request waits for
   capacity; when it does not, the window closes on its own bound before the
   terminal failure arrives and the retry contract below becomes unreachable.
+- The shell announcements are buffered rather than committed because they
+  announce an output item, a content part or a reasoning summary part without
+  carrying any of its text, arguments or reasoning. The bar this path enforces is
+  that nothing client-visible has been written, not that no semantic event has
+  arrived, and a shell clears that bar. Upstream regularly begins a stream and
+  only then falls over, so committing on a shell closes the window one block
+  before the failure behind it can be retried; in production that accounted for
+  three quarters of every client-visible terminal failure. The first event
+  carrying content still commits, because a retry after it would have to
+  duplicate what the caller has already seen.
 - A bare `error` event is buffered rather than committed because the Codex
   backend emits it immediately before the `response.failed` that classifies the
   refusal. Committing on the `error` event would close the retry window one
@@ -1942,6 +1954,16 @@ For streaming responses:
   binding, response binding, or request-level throughput result. The eventual
   successful response is classified as `stream_capacity_failover`, or
   `stream_transient_failover` when the discarded failure was a server fault.
+- The order of recovery is itself the contract, and it is: sweep every other
+  available identity first with no wait at all, because another identity is
+  always cheaper than any delay; only once every one of them has refused, wait
+  out a single backoff round, restore all of them, and sweep the whole set again
+  from the top; each round waits longer than the last, up to the cap. The
+  sequence ends when both the identities and the schedule are spent, and only
+  then does the caller see the refusal. It must not be reorganized into a
+  wait-per-account loop: that spends the schedule once per identity instead of
+  once per sweep, and it makes a pool with a healthy backup sit through a delay
+  for a refusal it could have routed around immediately.
 - If no distinct fallback is available, the pool waits and sweeps again rather
   than surfacing the refusal. Each round restores every identity that refused
   for capacity, clears the capacity cooldowns those refusals recorded for this

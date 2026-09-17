@@ -7508,6 +7508,100 @@ func TestRecordingACooldownPrunesExpiredOnes(t *testing.T) {
 	}
 }
 
+// The retry order is the contract: every available identity is swept before any
+// wait, then the whole set is swept again behind a longer wait. A wait-per-
+// account loop would pay the schedule once per identity instead of once per
+// sweep, and a pool with a healthy backup would sit waiting on a refusal it
+// could have routed around immediately.
+func TestCapacityRefusalSweepsEveryAccountBeforeWaiting(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	handler := func(id string, succeedFromVisit int) http.HandlerFunc {
+		visits := 0
+		return func(w http.ResponseWriter, _ *http.Request) {
+			mu.Lock()
+			visits++
+			visit := visits
+			order = append(order, id)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_x\"}}\n\n")
+			// The refusal arrives after upstream has announced an output item,
+			// which is where production actually falls over.
+			_, _ = io.WriteString(w, "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item_1\",\"type\":\"reasoning\",\"summary\":[]}}\n\n")
+			if succeedFromVisit > 0 && visit >= succeedFromVisit {
+				_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+				_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_x\"}}\n\n")
+				return
+			}
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+		}
+	}
+	first := httptest.NewServer(handler("first", 0))
+	defer first.Close()
+	second := httptest.NewServer(handler("second", 0))
+	defer second.Close()
+	// The third identity recovers only on its second visit, which it can reach
+	// only after a full sweep and one wait.
+	third := httptest.NewServer(handler("third", 2))
+	defer third.Close()
+
+	a := testApp(t, []account{
+		{ID: "first", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL},
+		{ID: "second", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: second.URL},
+		{ID: "third", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 80, UpstreamBaseURL: third.URL},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("the sweep never reached a recovered identity: order=%v body=%s", order, recorder.Body.String())
+	}
+	// Every identity once, in priority order, before the second visit to any of
+	// them: that is a sweep, not a per-account wait loop.
+	want := []string{"first", "second", "third", "first", "second", "third"}
+	if len(order) != len(want) {
+		t.Fatalf("attempt order = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("attempt order = %v, want %v", order, want)
+		}
+	}
+	if strings.Contains(recorder.Body.String(), "server_is_overloaded") {
+		t.Fatalf("an abandoned refusal leaked downstream: %s", recorder.Body.String())
+	}
+}
+
+// An announcement that carries no content must not close the retry window; the
+// first event carrying content must.
+func TestShellEventsKeepTheRetryWindowOpen(t *testing.T) {
+	shell := func(eventType string) string {
+		return "event: " + eventType + "\ndata: {\"type\":\"" + eventType + "\"}\n\n"
+	}
+	for _, eventType := range []string{
+		"response.created", "response.in_progress", "response.queued",
+		"response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added",
+	} {
+		if !precommitLifecycleSSEBlock(shell(eventType)) {
+			t.Fatalf("%s must keep the retry window open", eventType)
+		}
+	}
+	// Content, and the completion of an item that carries content, still commit:
+	// a retry after either would have to duplicate what the caller already saw.
+	for _, eventType := range []string{
+		"response.output_text.delta", "response.reasoning_summary_text.delta",
+		"response.function_call_arguments.delta", "response.output_item.done",
+		"response.content_part.done", "response.custom_tool_call_input.delta",
+	} {
+		if precommitLifecycleSSEBlock(shell(eventType)) {
+			t.Fatalf("%s must close the retry window", eventType)
+		}
+	}
+}
+
 func TestCommittedStreamingResponseFailedDoesNotRetry(t *testing.T) {
 	firstHits := 0
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
