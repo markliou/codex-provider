@@ -743,6 +743,32 @@ When Codex requests `/v1/models` with `client_version`, return the current Codex
 
 The generic `/v1/models` response without `client_version` remains OpenAI-compatible and may continue exposing configured request aliases for non-Codex clients.
 
+The advertised catalog must carry only models that can actually be routed.
+Two rules enforce that. The built-in lineup lists only models upstream still
+serves: upstream's own catalog at `GET /backend-api/codex/models` is
+authoritative, and a model absent from it at every client version is retired and
+must be removed rather than left listed. The lineup is then filtered against the
+models the local gateway reports, because the two lists drift — this pool's is
+compiled in, the gateway's comes from its own catalog — and a model in one but
+not the other is exactly how a client picks one whose every request dies at the
+gateway. Filtering covers the built-in lineup alone: the configured default
+model, per-account `allowedModels` and aliases are operator statements about the
+deployment, and silently dropping one would hide a misconfiguration instead of
+reporting it. A gateway that cannot be reached never empties the catalog; the
+unfiltered lineup stands, because a client with no models at all is worse off
+than one that can still pick something routable.
+
+A gateway that has no provider for a requested model answers with a `5xx` whose
+body names the model. That is a fact about the request, not about the account
+that happened to be selected: no other identity can serve a model the gateway
+does not know. It must be reported to the caller as `model_not_found`, must not
+mark account health, must not set a cooldown, and must not sweep the pool.
+Treating it as an upstream failure marked healthy accounts unhealthy, spent the
+failover budget, and told the caller its account had failed, for a request that
+could never succeed. The match is on the gateway's own wording and nothing
+broader: a loose test on `5xx` bodies would swallow genuine upstream failures and
+suppress the failover they require.
+
 ### 6.4.2 Hosted tool namespace conflicts
 
 The ChatGPT Codex backend reserves the `image_gen` tool namespace implicitly: for current models it attaches its hosted image generation twin server-side even when the request declares no hosted tool. A Codex client running experimental features (multi-agent, image generation) or bundled fallback metadata can declare a client-side twin — verified against the live backend (2026-07), a `namespace` tool named `image_gen` inside an `additional_tools` input item is flattened upstream to `image_gen.imagegen` and the whole request is rejected with `Invalid Value: 'tools'. Function 'image_gen.imagegen' conflicts with a hosted tool in the same request.`
