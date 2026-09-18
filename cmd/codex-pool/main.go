@@ -574,6 +574,7 @@ type app struct {
 	codexGatewayMode     string
 	cliproxyBaseURL      string
 	cliproxyAPIKey       string
+	gatewayModels        gatewayModelCache
 	jobs                 map[string]*loginJob
 	loginCancels         map[string]context.CancelFunc
 	loginFailures        map[string]loginFailure
@@ -1278,18 +1279,22 @@ type codexModelInfo struct {
 // on bundled fallback metadata, which prints a startup warning and can attach
 // conflicting tools (see dropHostedToolConflicts). Advertising a model is not
 // an access grant: per-account allowedModels/excludedModels still gate
-// routing, and upstream still enforces plan access (for example
-// gpt-5.3-codex-spark is Pro-only).
+// routing, and upstream still enforces plan access.
+//
+// Only models upstream still serves belong here. gpt-5.4, gpt-5.4-mini,
+// gpt-5.3-codex-spark and gpt-5.2-codex were retired: upstream's own catalog
+// at GET /backend-api/codex/models returns gpt-6-astra, gpt-5.6-sol,
+// gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, codex-auto-review and gpt-reserve at
+// every client_version, and none of the four appears at any version. Listing a
+// retired model is worse than omitting it: a client picks it out of this
+// catalog and every request dies at the gateway, which answers a model it
+// cannot route with a 5xx that reads as an account failure.
 var defaultCodexModelSlugs = []string{
 	"gpt-6-astra",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
 	"gpt-5.5",
-	"gpt-5.4",
-	"gpt-5.4-mini",
-	"gpt-5.3-codex-spark",
-	"gpt-5.2-codex",
 }
 
 func codexReasoningLevels() []codexReasoningLevel {
@@ -1427,9 +1432,12 @@ func (a *app) codexModelCatalogLocked(models []string) []codexModelInfo {
 }
 
 func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
+	// Resolved before the state lock: this can reach the gateway over the network,
+	// and no network call belongs under that lock.
+	routable := a.gatewayRoutableModels(r.Context())
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	models := a.modelsLocked()
+	models := a.modelsLocked(routable)
 	if r.URL.Query().Get("client_version") != "" {
 		// Codex decodes this endpoint with its remote-model schema, not the loose
 		// OpenAI model-list shape below. Keep reasoning effort as structured model
@@ -1567,7 +1575,19 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			continue
 		}
 		if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {
+			gatewayBody, _ := io.ReadAll(io.LimitReader(response.Body, maxRequestBody))
 			_ = response.Body.Close()
+			// The gateway answers a model it cannot route with a 5xx, but nothing
+			// about the account failed and no other identity can serve a model the
+			// gateway does not know. Treated as an upstream failure it marked
+			// healthy accounts unhealthy, swept the whole pool, and told the caller
+			// its account had failed, for a request that can never succeed. Answer
+			// the caller with the truth instead, and leave account health alone.
+			if gatewayUnknownModel(gatewayBody) {
+				a.logger.Printf("gateway cannot route model %s requested by a client", model)
+				writeOpenAIError(w, http.StatusNotFound, "model_not_found", "requested model is not available through this pool")
+				return
+			}
 			retryAfterHeader := response.Header.Get("Retry-After")
 			wait := retryAfter(retryAfterHeader)
 			reason := "upstream_5xx"
@@ -1900,6 +1920,86 @@ func markAccountAuthError(err error) error {
 		return err
 	}
 	return fmt.Errorf("%w: %w", errAccountAuthFailed, err)
+}
+
+// gatewayModelCache holds the model names the local gateway can route. It has
+// its own lock because the catalog is read while the state lock is held, and a
+// network call must never happen under that lock.
+type gatewayModelCache struct {
+	mu        sync.Mutex
+	models    map[string]bool
+	refreshed time.Time
+}
+
+const gatewayModelCacheTTL = 5 * time.Minute
+
+// gatewayRoutableModels reports the models the sidecar has a provider for, so
+// the advertised catalog can exclude what it cannot route. The two lists drift:
+// this pool's lineup is compiled in, while the gateway's comes from its own
+// model catalog, and a model in one but not the other is how a client came to
+// pick a model whose every request died at the gateway.
+//
+// A nil result means "do not filter". Losing the gateway must never empty this
+// pool's catalog: a client with no models at all is worse off than one that can
+// still pick something routable.
+func (a *app) gatewayRoutableModels(ctx context.Context) map[string]bool {
+	if a.codexGatewayMode == "direct" || a.cliproxyBaseURL == "" {
+		return nil
+	}
+	a.gatewayModels.mu.Lock()
+	defer a.gatewayModels.mu.Unlock()
+	if a.gatewayModels.models != nil && time.Since(a.gatewayModels.refreshed) < gatewayModelCacheTTL {
+		return a.gatewayModels.models
+	}
+	models := a.fetchGatewayModels(ctx)
+	if len(models) == 0 {
+		return a.gatewayModels.models
+	}
+	a.gatewayModels.models = models
+	a.gatewayModels.refreshed = time.Now()
+	return models
+}
+
+func (a *app) fetchGatewayModels(ctx context.Context) map[string]bool {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cliproxyBaseURL+"/models", nil)
+	if err != nil {
+		return nil
+	}
+	request.Header.Set("Accept", "application/json")
+	if a.cliproxyAPIKey != "" {
+		request.Header.Set("Authorization", "Bearer "+a.cliproxyAPIKey)
+	}
+	response, err := a.client.Do(request)
+	if err != nil {
+		return nil
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil
+	}
+	var decoded struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, maxRequestBody)).Decode(&decoded); err != nil {
+		return nil
+	}
+	models := map[string]bool{}
+	for _, item := range decoded.Data {
+		// The gateway registers one entry per account as "<account prefix>/<model>".
+		// Only the model half is comparable with this pool's catalog.
+		id := item.ID
+		if index := strings.LastIndex(id, "/"); index >= 0 {
+			id = id[index+1:]
+		}
+		if id != "" {
+			models[id] = true
+		}
+	}
+	return models
 }
 
 func (a *app) usesCliproxySidecar(item account) bool {
@@ -3496,7 +3596,13 @@ func (a *app) validSession(token string) bool {
 	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
 }
 
-func (a *app) modelsLocked() []string {
+// modelsLocked builds the advertised catalog. routable, when non-empty, is what
+// the gateway can actually serve: the compiled-in lineup is filtered against it
+// so a client cannot pick a model whose every request would die at the gateway.
+// Only that lineup is filtered. The configured default model, per-account
+// allowedModels and aliases are operator statements about this deployment, and
+// silently dropping one would hide a misconfiguration instead of reporting it.
+func (a *app) modelsLocked(routable map[string]bool) []string {
 	set := map[string]bool{a.config.DefaultModel: true}
 	if base, _ := parseModel(a.config.DefaultModel); base != "" {
 		set[base] = true
@@ -3505,6 +3611,9 @@ func (a *app) modelsLocked() []string {
 		}
 	}
 	for _, slug := range defaultCodexModelSlugs {
+		if len(routable) > 0 && !routable[slug] {
+			continue
+		}
 		set[slug] = true
 	}
 	for _, account := range a.config.Accounts {
@@ -6960,6 +7069,22 @@ func (a *app) saveQuotaError(accountID, code, message string) {
 	prior.QuotaError = &quotaErrorInfo{Code: code, Message: message, Timestamp: time.Now().UTC()}
 	a.state.Quotas[accountID] = prior
 	_ = a.saveLocked()
+}
+
+// gatewayUnknownModel reports whether an upstream 5xx is the local gateway
+// refusing a model it has no provider for. The phrase is matched narrowly and
+// deliberately: a broader test on a 5xx body would swallow genuine upstream
+// failures and stop the pool from failing over when it should.
+func gatewayUnknownModel(body []byte) bool {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	message := nestedString(payload, "error", "message")
+	if message == "" {
+		message, _ = payload["message"].(string)
+	}
+	return strings.Contains(strings.ToLower(message), "unknown provider for model")
 }
 
 func extractUpstreamErrorCode(body []byte) string {

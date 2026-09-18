@@ -86,7 +86,7 @@ func TestParseModel(t *testing.T) {
 func TestDefaultModelCatalogIncludesThinkingTiers(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"
-	models := strings.Join(a.modelsLocked(), "\n")
+	models := strings.Join(a.modelsLocked(nil), "\n")
 	for _, expected := range []string{"gpt-5.5", "gpt-5.5(low)", "gpt-5.5(medium)", "gpt-5.5(high)", "gpt-5.5(xhigh)"} {
 		if !strings.Contains(models, expected) {
 			t.Fatalf("modelsLocked missing %q in:\n%s", expected, models)
@@ -200,7 +200,7 @@ func TestCodexModelCatalogAdvertisesReasoningCapabilities(t *testing.T) {
 func TestCodexModelCatalogNormalizesUnsupportedDefaultReasoningTier(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(max)"
-	models := a.codexModelCatalogLocked(a.modelsLocked())
+	models := a.codexModelCatalogLocked(a.modelsLocked(nil))
 	for _, model := range models {
 		if model.Slug == "gpt-5.5" {
 			if model.DefaultReasoningLevel != "medium" {
@@ -215,7 +215,7 @@ func TestCodexModelCatalogNormalizesUnsupportedDefaultReasoningTier(t *testing.T
 func TestCodexModelCatalogIncludesCurrentCodexLineup(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"
-	models := a.codexModelCatalogLocked(a.modelsLocked())
+	models := a.codexModelCatalogLocked(a.modelsLocked(nil))
 	bySlug := map[string]codexModelInfo{}
 	for _, model := range models {
 		bySlug[model.Slug] = model
@@ -228,9 +228,11 @@ func TestCodexModelCatalogIncludesCurrentCodexLineup(t *testing.T) {
 	if models[0].Slug != "gpt-5.5" || models[0].Priority != 0 {
 		t.Fatalf("default model must rank first: %#v", models[0])
 	}
-	if bySlug["gpt-5.6-sol"].Priority >= bySlug["gpt-5.2-codex"].Priority {
-		t.Fatalf("built-in lineup order was not reflected in priority: sol=%d legacy=%d",
-			bySlug["gpt-5.6-sol"].Priority, bySlug["gpt-5.2-codex"].Priority)
+	// The lineup's own order must reach the picker. The comparison uses two
+	// non-default models because the configured default always ranks first.
+	if bySlug["gpt-6-astra"].Priority >= bySlug["gpt-5.6-luna"].Priority {
+		t.Fatalf("built-in lineup order was not reflected in priority: astra=%d luna=%d",
+			bySlug["gpt-6-astra"].Priority, bySlug["gpt-5.6-luna"].Priority)
 	}
 	sol := bySlug["gpt-5.6-sol"]
 	efforts := make([]string, 0, len(sol.SupportedReasoningLevels))
@@ -1245,7 +1247,7 @@ func TestPoolCapacityOmitsAWindowWithNoDenominator(t *testing.T) {
 func TestCodexModelCatalogAdvertisesGPT6(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"
-	models := a.codexModelCatalogLocked(a.modelsLocked())
+	models := a.codexModelCatalogLocked(a.modelsLocked(nil))
 	bySlug := map[string]codexModelInfo{}
 	for _, model := range models {
 		bySlug[model.Slug] = model
@@ -1269,11 +1271,11 @@ func TestCodexModelCatalogAdvertisesGPT6(t *testing.T) {
 func TestCodexModelCatalogKeepsExtendedDefaultReasoningTierOn56(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.6-sol(ultra)"
-	models := a.codexModelCatalogLocked(a.modelsLocked())
+	models := a.codexModelCatalogLocked(a.modelsLocked(nil))
 	if models[0].Slug != "gpt-5.6-sol" || models[0].DefaultReasoningLevel != "ultra" {
 		t.Fatalf("gpt-5.6 default reasoning tier was not preserved: %#v", models[0])
 	}
-	aliases := strings.Join(a.modelsLocked(), "\n")
+	aliases := strings.Join(a.modelsLocked(nil), "\n")
 	for _, expected := range []string{"gpt-5.6-sol(max)", "gpt-5.6-sol(ultra)"} {
 		if !strings.Contains(aliases, expected) {
 			t.Fatalf("generic model list missing %q in:\n%s", expected, aliases)
@@ -7598,6 +7600,105 @@ func TestShellEventsKeepTheRetryWindowOpen(t *testing.T) {
 	} {
 		if precommitLifecycleSSEBlock(shell(eventType)) {
 			t.Fatalf("%s must close the retry window", eventType)
+		}
+	}
+}
+
+// A model the gateway cannot route is a fact about the request, not about the
+// account that happened to be selected. Treated as an upstream failure it marked
+// healthy accounts unhealthy, swept the pool, and told the caller its account had
+// failed, for a request that can never succeed.
+func TestUnroutableModelIsAClientErrorNotAnAccountFailure(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":{"message":"unknown provider for model codex-pool-acct/gpt-retired","type":"server_error","code":"internal_server_error"}}`))
+	}))
+	defer upstream.Close()
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_ok","output":[]}`))
+	}))
+	defer other.Close()
+
+	a := testApp(t, []account{
+		{ID: "first", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL},
+		{ID: "second", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: other.URL},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusNotFound || !strings.Contains(recorder.Body.String(), "model_not_found") {
+		t.Fatalf("an unroutable model was not reported as such: code=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// No sweep: no other identity can serve a model the gateway does not know.
+	if hits != 1 {
+		t.Fatalf("upstream attempts = %d, want 1", hits)
+	}
+	if a.state.Health["first"].ConsecutiveFailure != 0 || len(a.state.Cooldowns["first"]) != 0 {
+		t.Fatalf("a client's bad model penalized the account: health=%#v cooldowns=%#v", a.state.Health["first"], a.state.Cooldowns["first"])
+	}
+	// A genuine 5xx must still be treated as an upstream failure.
+	if !gatewayUnknownModel([]byte(`{"error":{"message":"unknown provider for model x"}}`)) {
+		t.Fatal("the gateway's own wording was not recognized")
+	}
+	for _, body := range []string{
+		`{"error":{"message":"Our servers are currently overloaded."}}`,
+		`{"error":{"code":"internal_server_error"}}`,
+		`not json`,
+	} {
+		if gatewayUnknownModel([]byte(body)) {
+			t.Fatalf("a genuine upstream failure was misread as an unroutable model: %s", body)
+		}
+	}
+}
+
+// Advertising a model the gateway cannot route is how a client comes to pick one
+// whose every request dies at the gateway. The two lists drift, so the catalog
+// is filtered against what the gateway actually serves.
+func TestAdvertisedCatalogExcludesWhatTheGatewayCannotRoute(t *testing.T) {
+	a := testApp(t, nil)
+	a.config.DefaultModel = "gpt-5.5"
+	a.config.ModelAliases = map[string]string{"house-alias": "gpt-5.5"}
+	a.config.Accounts = []account{{ID: "acct", AllowedModels: []string{"operator-declared"}}}
+
+	full := strings.Join(a.modelsLocked(nil), "\n")
+	for _, want := range defaultCodexModelSlugs {
+		if !strings.Contains(full, want) {
+			t.Fatalf("unfiltered catalog dropped %s: %s", want, full)
+		}
+	}
+
+	filtered := a.modelsLocked(map[string]bool{"gpt-5.5": true})
+	joined := strings.Join(filtered, "\n")
+	for _, gone := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+		if strings.Contains(joined, gone) {
+			t.Fatalf("catalog advertised %s, which the gateway cannot route: %s", gone, joined)
+		}
+	}
+	// What the operator declared for this deployment is never filtered away:
+	// dropping it silently would hide a misconfiguration instead of reporting it.
+	for _, want := range []string{"gpt-5.5", "house-alias", "operator-declared"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("filtering dropped %s: %s", want, joined)
+		}
+	}
+}
+
+// The retired models are gone from the lineup, and the ones upstream still
+// serves are all present.
+func TestDefaultLineupMatchesWhatUpstreamStillServes(t *testing.T) {
+	want := map[string]bool{"gpt-6-astra": true, "gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true, "gpt-5.5": true}
+	if len(defaultCodexModelSlugs) != len(want) {
+		t.Fatalf("lineup = %v, want exactly %v", defaultCodexModelSlugs, want)
+	}
+	for _, slug := range defaultCodexModelSlugs {
+		if !want[slug] {
+			t.Fatalf("%s is not in upstream's catalog and must not be advertised", slug)
 		}
 	}
 }
