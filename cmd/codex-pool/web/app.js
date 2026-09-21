@@ -8,7 +8,7 @@
     slate: "#263548",
   });
   const themeNames = new Set(Object.keys(themeMetaColors));
-  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public", resetCreditNotice: null, openQuotaDetails: new Set() };
+  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public", resetCreditNotice: null, openQuotaDetails: new Set(), quotaFloorPercent: 0 };
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => document.querySelectorAll(selector);
   const loginView = $("#login-view");
@@ -877,12 +877,18 @@
       // window carries no evidence and must never be treated as a gate, or an
       // unreported bucket would mute every healthy window on the account.
       const windowRemaining = (entry) => entry && entry.present ? finiteMetric(entry.remainingPercent ?? entry.percentage) : null;
-      // Match quotaExplicitlyBlocksRouting: zero-percent evidence stops gating
-      // once its reported reset time has passed. Otherwise stale display data
-      // would claim a sibling is unavailable after routing has already failed
-      // open pending the next authoritative refresh.
+      // Match quotaExplicitlyBlocksRouting: a window at or below the server's
+      // reserved floor stops gating once its reported reset time has passed.
+      // Otherwise stale display data would claim a sibling is unavailable after
+      // routing has already failed open pending the next authoritative refresh.
+      //
+      // The floor comes from the server rather than being restated here: the
+      // server decides what it refuses to spend, and a second copy of the number
+      // would eventually disagree and mark a different set of windows than
+      // routing actually blocks.
       const windowBlocksRouting = (entry) => {
-        if (windowRemaining(entry) !== 0) return false;
+        const remaining = windowRemaining(entry);
+        if (remaining === null || remaining > state.quotaFloorPercent) return false;
         const resetAt = finiteMetric(entry && entry.resetAt);
         return resetAt === null || Date.now() / 1000 < resetAt;
       };
@@ -1181,6 +1187,7 @@
     try {
       const [stateResponse, accountsResponse, healthResponse, sessionsResponse] = await Promise.all([api("/state"), api("/accounts"), api("/accounts/health"), api("/sticky-sessions")]);
       const serviceState = stateResponse.state;
+      state.quotaFloorPercent = finiteMetric(serviceState.quotaFloorPercent) ?? 0;
       const healthByID = new Map(healthResponse.accounts.map((item) => [item.accountId, item]));
       const activeLoginJob = healthResponse.accounts.find((item) => item.loginJob)?.loginJob || null;
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
@@ -1216,6 +1223,7 @@
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
       const accounts = body.dashboard.accounts || [];
+      state.quotaFloorPercent = finiteMetric(body.dashboard.quotaFloorPercent) ?? 0;
       renderSummary(body.dashboard.summary || {}, true);
       renderPoolCapacity(body.dashboard.poolCapacity);
       renderThroughput(body.dashboard.throughput);

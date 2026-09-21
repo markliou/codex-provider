@@ -7763,6 +7763,106 @@ func TestExpiringResetCreditOutlinesTheStatusBadge(t *testing.T) {
 	}
 }
 
+// Upstream bills the overage against flexible credits by itself once an
+// included allowance runs out, so spending a window to zero spends money the
+// operator never chose to spend. A reserved floor is what declines that, and it
+// has to hold everywhere at once: routing, account status, and the capacity bars.
+func TestQuotaFloorStopsRoutingBeforeCreditsAreCharged(t *testing.T) {
+	now := time.Now().UTC()
+	window := func(remaining float64) quotaWindow {
+		percent := remaining
+		minutes := int64(weeklyWindowMinutes)
+		resetAt := now.Add(48 * time.Hour).Unix()
+		return quotaWindow{Role: "primary", Label: "Week", Present: true, RemainingPercent: &percent, WindowMinutes: &minutes, ResetAt: &resetAt}
+	}
+	for _, testCase := range []struct {
+		remaining float64
+		blocked   bool
+	}{
+		{remaining: 0, blocked: true},
+		{remaining: 0.5, blocked: true},
+		{remaining: 1, blocked: true},
+		{remaining: 1.5, blocked: false},
+		{remaining: 40, blocked: false},
+	} {
+		quota := accountQuota{Windows: []quotaWindow{window(testCase.remaining)}}
+		if got := quotaExplicitlyBlocksRouting(quota, "", now); got != testCase.blocked {
+			t.Fatalf("remaining %.1f%%: blocked = %v, want %v", testCase.remaining, got, testCase.blocked)
+		}
+	}
+
+	// The account must also read as exhausted rather than merely low, or an
+	// operator would go looking for why a "low" account takes no traffic.
+	a := testApp(t, []account{{ID: "acct", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct")
+	writeTestCodexAuth(t, a, "acct")
+	a.state.Quotas["acct"] = quotaSnapshot{AccountID: "acct", Quota: &accountQuota{Windows: []quotaWindow{window(1)}}}
+	status, reason := a.accountStatusLocked(a.config.Accounts[0], now)
+	if status != "exhausted" {
+		t.Fatalf("status at the floor = %q (%s), want exhausted", status, reason)
+	}
+
+	// And the capacity bar must not promise what routing refuses to spend.
+	a.state.Quotas["acct"] = quotaSnapshot{AccountID: "acct", PlanFamily: "business", Quota: &accountQuota{Windows: []quotaWindow{window(1)}}}
+	for _, bar := range a.poolCapacityLocked(now) {
+		if bar.SpendablePercent > 0 {
+			t.Fatalf("a window held back by the floor was reported as spendable: %#v", bar)
+		}
+	}
+}
+
+// The floor is a billing decision, so it is tunable; an invalid setting must
+// fail startup rather than silently fall back.
+func TestQuotaFloorIsEnvTunable(t *testing.T) {
+	original := quotaExhaustionFloorPercent
+	defer func() { quotaExhaustionFloorPercent = original }()
+
+	t.Setenv("CODEX_POOL_QUOTA_FLOOR_PERCENT", "5")
+	if err := applyQuotaFloorEnv(); err != nil {
+		t.Fatal(err)
+	}
+	if quotaExhaustionFloorPercent != 5 {
+		t.Fatalf("floor = %v, want 5", quotaExhaustionFloorPercent)
+	}
+	// Zero is a legitimate choice: it restores spending a window to the last token.
+	t.Setenv("CODEX_POOL_QUOTA_FLOOR_PERCENT", "0")
+	if err := applyQuotaFloorEnv(); err != nil {
+		t.Fatal(err)
+	}
+	if quotaExhaustionFloorPercent != 0 {
+		t.Fatalf("floor = %v, want 0", quotaExhaustionFloorPercent)
+	}
+	for _, invalid := range []string{"-1", "21", "abc", "100"} {
+		t.Setenv("CODEX_POOL_QUOTA_FLOOR_PERCENT", invalid)
+		if err := applyQuotaFloorEnv(); err == nil {
+			t.Fatalf("%q was accepted as a floor", invalid)
+		}
+	}
+}
+
+// The dashboard must mark exactly the windows routing blocks. It reads the
+// server's floor instead of restating the number, or the two would drift and the
+// page would call a window healthy while routing refused to use it.
+func TestDashboardReadsTheQuotaFloorFromTheServer(t *testing.T) {
+	a := testApp(t, nil)
+	request := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"state.quotaFloorPercent = finiteMetric(serviceState.quotaFloorPercent)",
+		"state.quotaFloorPercent = finiteMetric(body.dashboard.quotaFloorPercent)",
+		"remaining > state.quotaFloorPercent",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("app.js did not include %q", want)
+		}
+	}
+	if strings.Contains(body, "windowRemaining(entry) !== 0") {
+		t.Fatal("app.js still gates on a hardcoded zero instead of the server's floor")
+	}
+}
+
 func TestCommittedStreamingResponseFailedDoesNotRetry(t *testing.T) {
 	firstHits := 0
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
