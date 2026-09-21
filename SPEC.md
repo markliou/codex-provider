@@ -2356,6 +2356,16 @@ that fact; the exact timestamp may remain in its tooltip. When the exact expiry
 is still future but strictly less than seven 24-hour days away, render the
 `Expires` date in bold alert red. An expiry exactly seven days away retains the
 normal secondary-text treatment.
+
+The same seven-day window also outlines the account's status badge in alert
+red, on both the management and public tables. The `Expires` warning alone is
+not enough: it lives behind the quota cell's disclosure, and a collapsed row —
+which is every row after a refresh — hides it completely, so an operator learns
+that a credit lapsed only after it has. The badge is the one part of the row
+that is always visible. The outline takes the border only and never the badge's
+colour or background, because the account's status is still the status: a Ready
+account holding a credit about to expire is still Ready. A row with no available
+credit is never outlined; there is then nothing to lose and nothing to act on.
 Quota exhaustion is represented by the zero/critical bar, percentage, account
 status, and compact inline red markers on the exhausted window and any siblings
 it makes unavailable; do not repeat it as a separate red `Blocked: ...`

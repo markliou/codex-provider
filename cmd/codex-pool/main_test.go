@@ -7703,6 +7703,66 @@ func TestDefaultLineupMatchesWhatUpstreamStillServes(t *testing.T) {
 	}
 }
 
+// A reset credit that expires unused is entitlement thrown away, and the Expires
+// warning sits behind the quota cell's disclosure, which a collapsed row hides
+// completely. The status badge is always visible, so the same seven-day window
+// must outline it.
+func TestExpiringResetCreditOutlinesTheStatusBadge(t *testing.T) {
+	a := testApp(t, nil)
+	request := httptest.NewRequest(http.MethodGet, "/admin/assets/app.js", nil)
+	recorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"function resetCreditExpiryFlag(quota)",
+		"function statusBadgeMarkup(tone, label, quota)",
+		"expiring-reset",
+		// It reuses the one seven-day rule rather than restating the window.
+		"resetCreditExpiresSoon(credits.expiresAt)",
+		// Nothing to lose when no credit is available, so nothing is marked.
+		"Number(credits.availableCount) > 0",
+		// Both tables carry it: the same fact is public.
+		"statusBadgeMarkup(health.status, statusLabel(health.status), health.quota)",
+		"statusBadgeMarkup(tone, label, account.quota)",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("app.js did not include %q", want)
+		}
+	}
+	// The outline must not replace the tone: a Ready account holding an expiring
+	// credit is still Ready, so the rule may only take the border.
+	css := httptest.NewRequest(http.MethodGet, "/admin/assets/app.css", nil)
+	cssRecorder := httptest.NewRecorder()
+	a.adminMux().ServeHTTP(cssRecorder, css)
+	style := cssRecorder.Body.String()
+	index := strings.Index(style, ".badge.expiring-reset")
+	if index < 0 {
+		t.Fatal("app.css does not outline a badge with an expiring reset credit")
+	}
+	rule := style[index:]
+	if end := strings.Index(rule, "}"); end >= 0 {
+		rule = rule[:end]
+	}
+	if !strings.Contains(rule, "var(--red)") {
+		t.Fatalf("the outline is not alert red: %s", rule)
+	}
+	if open := strings.Index(rule, "{"); open >= 0 {
+		for _, declaration := range strings.Split(rule[open+1:], ";") {
+			property := strings.TrimSpace(strings.SplitN(declaration, ":", 2)[0])
+			if property == "" {
+				continue
+			}
+			if property != "border-color" && property != "box-shadow" {
+				t.Fatalf("the outline set %q, which is not part of an outline: %s", property, rule)
+			}
+		}
+	}
+	// Declared after the tones, or the tone borders would win at equal specificity.
+	if index < strings.Index(style, ".badge.ready") {
+		t.Fatal("the outline is declared before the tone borders it must override")
+	}
+}
+
 func TestCommittedStreamingResponseFailedDoesNotRetry(t *testing.T) {
 	firstHits := 0
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

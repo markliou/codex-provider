@@ -688,6 +688,26 @@
     return Number.isFinite(expiresAt) && expiresAt > now && expiresAt - now < resetCreditExpiryWarningWindowMs;
   }
 
+  // An earned reset credit that expires unused is entitlement thrown away, and
+  // the Expires warning lives behind the quota cell's disclosure where a
+  // collapsed row hides it completely. The status badge is the one thing on the
+  // row that is always visible, so the same seven-day window outlines it in red.
+  // It marks nothing when no credit is available: there is then nothing to lose
+  // and nothing for the operator to act on.
+  function resetCreditExpiryFlag(quota) {
+    const credits = quota && quota.resetCredits;
+    if (!credits || !(Number(credits.availableCount) > 0)) return { cls: "", title: "" };
+    if (!resetCreditExpiresSoon(credits.expiresAt)) return { cls: "", title: "" };
+    const when = displayUnixDate(credits.expiresAt);
+    return { cls: " expiring-reset", title: when ? `Reset credit expires ${when} — spend it or lose it` : "Reset credit expires within seven days" };
+  }
+
+  function statusBadgeMarkup(tone, label, quota) {
+    const flag = resetCreditExpiryFlag(quota);
+    const title = flag.title ? ` title="${escapeHTML(flag.title)}"` : "";
+    return `<span class="badge ${escapeHTML(tone)}${flag.cls}"${title}>${escapeHTML(label)}</span>`;
+  }
+
   function displayResetCountdown(value) {
     const seconds = Math.max(0, Math.ceil(Number(value) - Date.now() / 1000));
     if (!Number.isFinite(seconds)) return "";
@@ -1018,7 +1038,7 @@
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
       return `<tr data-account-row="${escapeHTML(account.id)}"${poolMembershipAttribute(account.inPool === false)}>
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${accountEntitlementMarkup(account)}${ownerNoteInput(account)}</div></td>
-        <td><div class="status-stack"><span class="badge ${escapeHTML(health.status)}">${statusLabel(health.status)}</span>${activeBadge(health.active)}</div></td>
+        <td><div class="status-stack">${statusBadgeMarkup(health.status, statusLabel(health.status), health.quota)}${activeBadge(health.active)}</div></td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt, health.quotaFreshness, health.lastSuccessfulRefreshAt, health.quotaMetering, account.id)}${quotaProtectionMarkup(account, health)}</td>
         <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)} · ${escapeHTML(routeCount)}</div></td>
         <td class="cache-column">${cacheHitMarkup(health, "main", account.id)}</td>
@@ -1065,7 +1085,7 @@
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
       return `<tr${poolMembershipAttribute(account.outOfPool === true)}>
       <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${publicSeatMarkup(account)}${ownerNoteInput(account, true)}</div></td>
-      <td><div class="status-stack"><span class="badge ${escapeHTML(tone)}">${escapeHTML(label)}</span>${activeBadge(account.active)}</div></td>
+      <td><div class="status-stack">${statusBadgeMarkup(tone, label, account.quota)}${activeBadge(account.active)}</div></td>
       <td>${quota}</td>
       <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong></div></td>
       <td class="cache-column">${cacheHitMarkup(account, "main")}</td>
