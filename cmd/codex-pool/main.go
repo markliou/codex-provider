@@ -640,6 +640,9 @@ func newAppFromEnv() (*app, error) {
 	if err := applyCapacityWeightEnv(); err != nil {
 		return nil, err
 	}
+	if err := applyQuotaFloorEnv(); err != nil {
+		return nil, err
+	}
 	maxRetryAccounts, err := maxRetryAccountsFromEnv()
 	if err != nil {
 		return nil, err
@@ -2868,7 +2871,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now)}
+	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now), "quotaFloorPercent": quotaExhaustionFloorPercent}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -2891,7 +2894,7 @@ func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
 	// monitor normal traffic without entering management mode. Keep this limited
 	// to aggregate rolling windows: per-account throughput, raw buckets, model
 	// attribution, and request-level routing events remain management-only.
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now), "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now)}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dashboard": map[string]any{"updatedAt": a.state.UpdatedAt, "summary": a.publicDashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now), "quotaFloorPercent": quotaExhaustionFloorPercent, "accounts": accounts, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now)}})
 }
 
 func (a *app) handlePublicAccountAction(w http.ResponseWriter, r *http.Request) {
@@ -7524,6 +7527,27 @@ func quotaWindowLabel(minutes *int64) string {
 	return fmt.Sprintf("%dh %dm", *minutes/60, *minutes%60)
 }
 
+// quotaExhaustionFloorPercent is the remaining share at or below which a quota
+// window counts as consumed. It is not zero because upstream no longer stops at
+// zero: once an included allowance runs out it bills the overage against the
+// account's flexible credits automatically, so the last sliver of a window buys
+// nothing and the request after it spends money the operator did not choose to
+// spend. Reserving a floor is the only way to decline that from this side.
+//
+// Tunable through the environment because how much headroom is worth holding
+// back is a billing decision for the operator, not a protocol fact. Zero
+// restores the old behavior of spending a window to the last token.
+var quotaExhaustionFloorPercent = 1.0
+
+// quotaWindowSpent reports whether a reported window must be treated as
+// consumed. Every routing and display decision that used to compare against
+// zero goes through here, so the floor cannot apply in one place and not
+// another: a window that blocks routing must also read as exhausted on the
+// dashboard and count as spent in the capacity bars.
+func quotaWindowSpent(window quotaWindow) bool {
+	return quotaWindowRemaining(window) <= quotaExhaustionFloorPercent
+}
+
 func quotaWindowRemaining(window quotaWindow) float64 {
 	if window.RemainingPercent != nil {
 		return clampFloat(*window.RemainingPercent, 0, 100)
@@ -7729,7 +7753,7 @@ func quotaExplicitlyBlocksRouting(quota accountQuota, model string, now time.Tim
 		return true
 	}
 	for _, window := range quotaReportedWindows(quota) {
-		if window.Present && quotaWindowRemaining(window) <= 0 && quotaWindowEvidenceActive(window, now) {
+		if window.Present && quotaWindowSpent(window) && quotaWindowEvidenceActive(window, now) {
 			return true
 		}
 	}
@@ -7744,7 +7768,10 @@ func quotaExplicitlyBlocksRouting(quota accountQuota, model string, now time.Tim
 			return true
 		}
 		for _, window := range additional.Windows {
-			if window.Present && quotaWindowRemaining(window) <= 0 && quotaWindowEvidenceActive(window, now) {
+			// A model-specific meter bills the same way, so the floor holds here
+			// too: an almost-spent meter would otherwise route one request that
+			// charges credits before the meter finally reads zero.
+			if window.Present && quotaWindowSpent(window) && quotaWindowEvidenceActive(window, now) {
 				return true
 			}
 		}
@@ -8787,12 +8814,20 @@ func (identity *capacityIdentity) windowShare(minutes int64) (float64, bool) {
 		if !weeklyReported {
 			return 0, false
 		}
+		if quotaWindowSpent(weekly) {
+			// Held back by the floor is not spendable. Reporting the sliver would
+			// promise capacity routing refuses to spend.
+			return 0, true
+		}
 		return quotaWindowRemaining(weekly) / 100, true
 	}
-	if weeklyReported && quotaWindowRemaining(weekly) <= 0 {
+	if weeklyReported && quotaWindowSpent(weekly) {
 		return 0, true
 	}
 	if window, ok := reportedWindowOfDuration(*identity.quota, minutes); ok {
+		if quotaWindowSpent(window) {
+			return 0, true
+		}
 		return quotaWindowRemaining(window) / 100, true
 	}
 	// No five-hour window of its own. Only count it as uncapped when something
@@ -10430,6 +10465,27 @@ func sessionAffinityTTLFromEnv() (time.Duration, error) {
 		return 0, fmt.Errorf("CODEX_POOL_SESSION_AFFINITY_TTL_MS must be a positive integer number of milliseconds")
 	}
 	return time.Duration(millis) * time.Millisecond, nil
+}
+
+// applyQuotaFloorEnv retunes the share of a quota window held back from
+// routing. Upstream bills the overage against flexible credits by itself, so
+// the floor is what declines that, and how much headroom is worth reserving is
+// the operator's billing decision. An unset variable keeps the default; zero
+// spends a window to the last token as before. The ceiling is deliberate: a
+// floor at or above the "low quota" band would mark an account exhausted while
+// the dashboard still called it merely low, and one at 100 would hold every
+// account out of the pool the moment upstream reported anything at all.
+func applyQuotaFloorEnv() error {
+	raw := strings.TrimSpace(os.Getenv("CODEX_POOL_QUOTA_FLOOR_PERCENT"))
+	if raw == "" {
+		return nil
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || value < 0 || value > 20 {
+		return fmt.Errorf("CODEX_POOL_QUOTA_FLOOR_PERCENT must be a number between 0 and 20")
+	}
+	quotaExhaustionFloorPercent = value
+	return nil
 }
 
 // applyCapacityRetryEnv retunes the capacity retry schedule from the

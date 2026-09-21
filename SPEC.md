@@ -165,6 +165,7 @@ docker run -d \
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
 | `CODEX_POOL_CODEX_RESET_CREDIT_CONSUME_URL` | no | derived | Override for the upstream reset-credit consume endpoint. Testing only. |
 | `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` | no | `5` | Assumed Business Premium weekly allowance, in Standard seats. Not upstream-reported; correct it when a contract differs. |
+| `CODEX_POOL_QUOTA_FLOOR_PERCENT` | no | `1` | Share of a quota window held back from routing. A window at or below it counts as consumed. `0` spends a window to the last token. Must be 0-20. |
 | `CODEX_POOL_CAPACITY_RETRY_LIMIT` | no | `8` | Capacity retry rounds once no identity can serve. `0` disables waiting and surfaces the refusal immediately. |
 | `CODEX_POOL_CAPACITY_RETRY_BACKOFF_MS` | no | `1000` | First capacity retry delay. Each round doubles from here. |
 | `CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS` | no | `20000` | Cap on a single capacity retry delay. Raised to the first delay if set below it. |
@@ -2366,6 +2367,26 @@ that is always visible. The outline takes the border only and never the badge's
 colour or background, because the account's status is still the status: a Ready
 account holding a credit about to expire is still Ready. A row with no available
 credit is never outlined; there is then nothing to lose and nothing to act on.
+A reported quota window counts as consumed at or below a reserved floor, one
+percent remaining by default, not at zero. Upstream no longer stops when an
+included allowance runs out: it bills the overage against the account's
+flexible credits automatically, so the last sliver of a window buys nothing and
+the request after it spends money the operator never chose to spend. Declining
+that is only possible from this side, by holding the floor back.
+
+The floor must apply everywhere at once — routing eligibility, account status,
+and the pool capacity bars — because a window that blocks routing while the
+page still calls it healthy sends an operator looking for why a "low" account
+takes no traffic. It covers model-specific meters on the same reasoning. The
+capacity bars report held-back share as zero rather than as a sliver, since
+promising capacity routing refuses to spend is worse than reporting none. The
+dashboard reads the floor from the server instead of restating it, so the two
+can never mark a different set of windows. The floor is operator-tunable
+because how much headroom is worth reserving is a billing decision, and zero
+restores spending a window to the last token. It is distinct from per-slot
+quota protection, which stays an opt-in reserve with its own threshold on top
+of this pool-wide floor.
+
 Quota exhaustion is represented by the zero/critical bar, percentage, account
 status, and compact inline red markers on the exhausted window and any siblings
 it makes unavailable; do not repeat it as a separate red `Blocked: ...`
