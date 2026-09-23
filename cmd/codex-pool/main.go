@@ -1288,12 +1288,18 @@ type codexModelInfo struct {
 // gpt-5.3-codex-spark and gpt-5.2-codex were retired: upstream's own catalog
 // at GET /backend-api/codex/models returns gpt-6-astra, gpt-5.6-sol,
 // gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, codex-auto-review and gpt-reserve at
-// every client_version, and none of the four appears at any version. Listing a
+// every client_version, and none of the four appears at any version.
+// gpt-6-sol and gpt-6-luna shipped on 2026-09-22 and the gateway routes both;
+// they rank above their gpt-5.6 predecessors, which OpenAI keeps available
+// during the rollout and which therefore stay listed until upstream drops
+// them. There is no gpt-6-terra: OpenAI dropped the medium tier. Listing a
 // retired model is worse than omitting it: a client picks it out of this
 // catalog and every request dies at the gateway, which answers a model it
 // cannot route with a 5xx that reads as an account failure.
 var defaultCodexModelSlugs = []string{
 	"gpt-6-astra",
+	"gpt-6-sol",
+	"gpt-6-luna",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
@@ -1326,6 +1332,15 @@ func codexExtendedReasoningModel(model string) bool {
 	return codexModelInFamily(model, "gpt-6") || codexModelInFamily(model, "gpt-5.6")
 }
 
+// codexUltraReasoningModel reports whether an extended-tier model also documents
+// `ultra`. gpt-6-luna is the one documented exception: it goes up to `max` but
+// not `ultra`, so advertising ultra there would let the client submit an effort
+// upstream rejects. The exception is an exact slug on purpose; the rest of the
+// gpt-6 family, and gpt-5.6-luna, keep the full extended range.
+func codexUltraReasoningModel(model string) bool {
+	return codexExtendedReasoningModel(model) && model != "gpt-6-luna"
+}
+
 // codexReasoningLevelsForModel returns the reasoning levels a model may
 // advertise. Advertising the extended tiers on a family that does not document
 // them would let the client submit an effort upstream rejects, so they stay
@@ -1333,10 +1348,10 @@ func codexExtendedReasoningModel(model string) bool {
 func codexReasoningLevelsForModel(model string) []codexReasoningLevel {
 	levels := codexReasoningLevels()
 	if codexExtendedReasoningModel(model) {
-		levels = append(levels,
-			codexReasoningLevel{Effort: "max", Description: "Maximum reasoning depth for the hardest problems"},
-			codexReasoningLevel{Effort: "ultra", Description: "Deepest reasoning for ambiguous, high-value work"},
-		)
+		levels = append(levels, codexReasoningLevel{Effort: "max", Description: "Maximum reasoning depth for the hardest problems"})
+	}
+	if codexUltraReasoningModel(model) {
+		levels = append(levels, codexReasoningLevel{Effort: "ultra", Description: "Deepest reasoning for ambiguous, high-value work"})
 	}
 	return levels
 }
