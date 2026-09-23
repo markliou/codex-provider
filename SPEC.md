@@ -155,7 +155,7 @@ docker run -d \
 | `CODEX_POOL_PUBLIC_DASHBOARD` | no | `true` | Enable unauthenticated public pool status and join/leave controls on the control page. Set to `false` to hide the public mode. |
 | `CODEX_POOL_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error`. |
 | `CODEX_POOL_REDACT_LOGS` | no | `true` | Redact tokens, auth headers, API keys, refresh tokens. |
-| `CODEX_POOL_DEFAULT_MODEL` | no | `gpt-5.5(xhigh)` | Default model when request omits model. |
+| `CODEX_POOL_DEFAULT_MODEL` | no | `gpt-6-sol(xhigh)` | Default model when request omits model. |
 | `CODEX_POOL_CODEX_BASE_URL` | no | `https://chatgpt.com/backend-api` | Codex/ChatGPT backend base URL used for quota reads and the legacy direct gateway. |
 | `CODEX_POOL_CODEX_USAGE_URL` | no | `CODEX_POOL_CODEX_BASE_URL + /wham/usage` | Optional quota endpoint override for tests or compatible backends. |
 | `CODEX_POOL_CODEX_RESET_CREDITS_URL` | no | `CODEX_POOL_CODEX_BASE_URL + /wham/rate-limit-reset-credits` | Optional reset-credit details endpoint override for tests or compatible backends. |

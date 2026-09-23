@@ -758,7 +758,7 @@ func (a *app) load() error {
 	if err := os.MkdirAll(filepath.Join(a.dataDir, "state"), 0o700); err != nil {
 		return fmt.Errorf("create data directory: %w", err)
 	}
-	a.config = config{DefaultModel: envOr("CODEX_POOL_DEFAULT_MODEL", "gpt-5.5(xhigh)"), ModelAliases: map[string]string{}}
+	a.config = config{DefaultModel: envOr("CODEX_POOL_DEFAULT_MODEL", "gpt-6-sol(xhigh)"), ModelAliases: map[string]string{}}
 	a.state = state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, ThreadBindings: map[string]threadBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}}
 	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &a.config); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read config: %w", err)
@@ -770,7 +770,7 @@ func (a *app) load() error {
 		a.config.DefaultModel = configuredDefault
 	}
 	if strings.TrimSpace(a.config.DefaultModel) == "" {
-		a.config.DefaultModel = "gpt-5.5(xhigh)"
+		a.config.DefaultModel = "gpt-6-sol(xhigh)"
 	}
 	if err := readJSON(filepath.Join(a.dataDir, "state", "runtime.json"), &a.state); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read runtime state: %w", err)
@@ -5711,6 +5711,8 @@ var hostedToolNamespaces = map[string]string{
 // the same request". Verified against the live backend (2026-07): declaring a
 // `namespace` tool named `image_gen` under an `additional_tools` input item
 // reproduces that exact 400 with no hosted tool anywhere in the request.
+// Re-verified 2026-09-22 on gpt-6-sol with Codex 0.156.1 current: the issue
+// is still open and the Codex client still registers image_gen.imagegen.
 var alwaysReservedToolNamespaces = []string{
 	// TODO(upstream): DELETE the "image_gen" entry (and this comment) once
 	// OpenAI fixes the Codex client/hosted collision tracked in
