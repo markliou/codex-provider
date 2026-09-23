@@ -387,17 +387,17 @@ The advertised catalog must always include the current Codex model lineup in add
 
 ```text
 gpt-6-astra
+gpt-6-sol
+gpt-6-luna
 gpt-5.6-sol
 gpt-5.6-terra
 gpt-5.6-luna
 gpt-5.5
-gpt-5.4
-gpt-5.4-mini
-gpt-5.3-codex-spark
-gpt-5.2-codex
 ```
 
-This keeps a stock Codex client from falling back to bundled model metadata (with its startup warning and conflicting-tool behavior, see 6.4.2) when the user selects a current model this pool was not explicitly configured for. Advertising a model is not an access grant: per-account model filters, the model-meter routing rule below, and upstream plan enforcement still apply (`gpt-5.3-codex-spark` is Pro-only upstream).
+`gpt-6-sol` and `gpt-6-luna` (released 2026-09-22) succeed their `gpt-5.6` counterparts and rank above them; the `gpt-5.6` models remain listed while upstream still serves them. There is no `gpt-6-terra`. Only models upstream still serves are listed: `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark` and `gpt-5.2-codex` are retired and must not be advertised.
+
+This keeps a stock Codex client from falling back to bundled model metadata (with its startup warning and conflicting-tool behavior, see 6.4.2) when the user selects a current model this pool was not explicitly configured for. Advertising a model is not an access grant: per-account model filters, the model-meter routing rule below, and upstream plan enforcement still apply.
 
 ##### Model-meter routing
 
@@ -419,7 +419,7 @@ reports no meters at all and falls back to plain selection rather than failing
 closed. An exhausted meter blocks its own model on that account by the same name
 match, and never blocks any other model. Catalog `priority` ranks the configured default model first, then the lineup above, then operator-configured extras.
 
-Reasoning levels are per model family: the `gpt-6` and `gpt-5.6` families additionally advertise `max` and `ultra`; older families must stay at `low`–`xhigh` so the client cannot submit an effort upstream rejects. The extended tiers are gated by family membership rather than an exact slug list, so a new sibling in a documented family is covered without a code change while any other family stays conservative. Membership requires a family boundary: the family slug itself, or a slug continuing with a hyphen. A bare textual prefix is not membership, or an unrelated slug such as `gpt-60-legacy` would inherit capabilities its upstream never promised.
+Reasoning levels are per model family: the `gpt-6` and `gpt-5.6` families additionally advertise `max` and `ultra`, except `gpt-6-luna`, which upstream documents up to `max` but not `ultra` and so advertises `max` only; older families must stay at `low`–`xhigh` so the client cannot submit an effort upstream rejects. The extended tiers are gated by family membership rather than an exact slug list, so a new sibling in a documented family is covered without a code change while any other family stays conservative. Membership requires a family boundary: the family slug itself, or a slug continuing with a hyphen. A bare textual prefix is not membership, or an unrelated slug such as `gpt-60-legacy` would inherit capabilities its upstream never promised.
 
 ### 5.3 Thinking tier model suffix
 
