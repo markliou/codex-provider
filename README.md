@@ -30,7 +30,7 @@ docker run -d \
   -v codex-pool-data:/data \
   -e CODEX_POOL_API_KEY='replace-with-a-long-random-client-key' \
   -e CODEX_POOL_ADMIN_PASSWORD_HASH='pbkdf2-sha256:...' \
-  -e CODEX_POOL_DEFAULT_MODEL='gpt-5.5(xhigh)' \
+  -e CODEX_POOL_DEFAULT_MODEL='gpt-6-sol(xhigh)' \
   -e CODEX_POOL_ROUTING_STRATEGY='sticky_balanced' \
   -e CODEX_POOL_SESSION_AFFINITY_TTL_MS=86400000 \
   -e CODEX_POOL_ADDR='0.0.0.0:8317' \
@@ -261,7 +261,7 @@ auto-refreshes every five minutes; use `Refresh` for an immediate status read.
 Create `~/.codex/config.toml` on the machine running Codex:
 
 ```toml
-model = "gpt-5.5(xhigh)"
+model = "gpt-6-sol(xhigh)"
 model_provider = "codex-pool"
 
 [model_providers.codex-pool]
