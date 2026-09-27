@@ -2761,7 +2761,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin JS still uses crowded cache-cell markup %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"displayResetCountdown", "displayUnixDate", "resetCreditExpiresSoon", "resetCreditExpiryWarningWindowMs = 7 * 24 * 60 * 60 * 1000", "expiresAt - now < resetCreditExpiryWarningWindowMs", "resetCreditsMarkup", `reset-credit-expiry${expiresSoon ? " expiring-soon" : ""}`, "Expires ${escapeHTML(expires)}", "quotaTone", "quotaTrackMarkup", `"critical"`, `"watch"`, "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
+	for _, expected := range []string{"displayResetCountdown", "displayUnixDateTime", `hour: "2-digit", minute: "2-digit"`, "resetCreditExpiresSoon", "resetCreditExpiryWarningWindowMs = 7 * 24 * 60 * 60 * 1000", "expiresAt - now < resetCreditExpiryWarningWindowMs", "resetCreditsMarkup", `reset-credit-expiry${expiresSoon ? " expiring-soon" : ""}`, "Expires ${escapeHTML(expires)}", "quotaTone", "quotaTrackMarkup", `"critical"`, `"watch"`, "Resets in", "% left", "<progress", "value=\"${remaining}\""} {
 		if !strings.Contains(jsRecorder.Body.String(), expected) {
 			t.Fatalf("admin JS does not render clear quota state %q", expected)
 		}
