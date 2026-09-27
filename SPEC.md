@@ -2351,9 +2351,12 @@ use flat, aligned rows rather than a nested card for every fact; additional
 limits, credits, spend control, reset credits, telemetry freshness, and
 protection controls are secondary context and stay behind a compact disclosure
 control by default. The `Reset credits` fact shows its count and, when reported,
-one visible local-calendar `Expires` date for the earliest currently available
-credit. Do not render every credit, a countdown, or quota-window reset times in
-that fact; the exact timestamp may remain in its tooltip. When the exact expiry
+one visible local `Expires` date and time (hour and minute) for the earliest
+currently available credit. A credit lapses at an exact moment, so a date
+without a time would suggest it stays usable until local midnight. Do not
+render every credit, a countdown, or quota-window reset times in that fact; the
+full timestamp may remain in its tooltip. The status badge's expiring-credit
+tooltip shows the same date and time. When the exact expiry
 is still future but strictly less than seven 24-hour days away, render the
 `Expires` date in bold alert red. An expiry exactly seven days away retains the
 normal secondary-text treatment.

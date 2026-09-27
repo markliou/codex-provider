@@ -675,10 +675,16 @@
     return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
   }
 
-  function displayUnixDate(value) {
+  // A reset credit lapses at an exact moment, not at local midnight. A date
+  // alone read as "usable until the end of that day" and hid why two credits
+  // labelled with the same day could fall on opposite sides of the seven-day
+  // warning, so the visible label carries the local hour and minute too. The
+  // year is omitted because an earned credit expires within weeks; the tooltip
+  // keeps the full timestamp.
+  function displayUnixDateTime(value) {
     if (!value) return "";
     const date = new Date(Number(value) * 1000);
-    return Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+    return Number.isNaN(date.getTime()) ? "" : date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
   }
 
   const resetCreditExpiryWarningWindowMs = 7 * 24 * 60 * 60 * 1000;
@@ -698,7 +704,7 @@
     const credits = quota && quota.resetCredits;
     if (!credits || !(Number(credits.availableCount) > 0)) return { cls: "", title: "" };
     if (!resetCreditExpiresSoon(credits.expiresAt)) return { cls: "", title: "" };
-    const when = displayUnixDate(credits.expiresAt);
+    const when = displayUnixDateTime(credits.expiresAt);
     return { cls: " expiring-reset", title: when ? `Reset credit expires ${when} — spend it or lose it` : "Reset credit expires within seven days" };
   }
 
@@ -816,11 +822,12 @@
   function resetCreditsMarkup(resetCredits, managementAccountId = "") {
     if (resetCredits?.availableCount === null || resetCredits?.availableCount === undefined) return "";
     // OpenAI exposes each reset credit's expiry through a separate details
-    // endpoint. Show only the nearest available expiry date: a full list or a
-    // live countdown would add noise without changing the operator's decision.
+    // endpoint. Show only the nearest available expiry, to the minute: a full
+    // list or a live countdown would add noise without changing the operator's
+    // decision.
     // The strict seven-day warning uses the exact timestamp, not the rounded
     // calendar label, so only genuinely urgent credits become bold red.
-    const expires = displayUnixDate(resetCredits.expiresAt);
+    const expires = displayUnixDateTime(resetCredits.expiresAt);
     const exact = displayUnixTime(resetCredits.expiresAt);
     const expiresSoon = resetCreditExpiresSoon(resetCredits.expiresAt);
     const note = expires
