@@ -368,12 +368,12 @@ func TestAdminAssetsLabelInferredSeat(t *testing.T) {
 // starts with the same letters must not inherit them: the client would offer an
 // effort the upstream for that model rejects.
 func TestExtendedReasoningRequiresFamilyBoundary(t *testing.T) {
-	for _, model := range []string{"gpt-6", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra"} {
+	for _, model := range []string{"gpt-6", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1", "gpt-6.1-sol", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra"} {
 		if !codexExtendedReasoningModel(model) {
 			t.Fatalf("%q is a documented extended-tier family member", model)
 		}
 	}
-	for _, model := range []string{"gpt-60-legacy", "gpt-6preview", "gpt-5.61", "gpt-5.6x", "gpt-5.5", "gpt-5.2-codex", "gpt-61"} {
+	for _, model := range []string{"gpt-60-legacy", "gpt-6preview", "gpt-5.61", "gpt-5.6x", "gpt-5.5", "gpt-5.2-codex", "gpt-61", "gpt-6.10-sol", "gpt-6.1x"} {
 		if codexExtendedReasoningModel(model) {
 			t.Fatalf("%q must not inherit the extended tiers", model)
 		}
@@ -392,8 +392,12 @@ func TestGPT6LunaStopsAtMax(t *testing.T) {
 		}
 		return strings.Join(out, ",")
 	}
-	if got := efforts("gpt-6-luna"); got != "low,medium,high,xhigh,max" {
-		t.Fatalf("gpt-6-luna reasoning levels = %s", got)
+	// gpt-6.1-sol documents ultra only as "coming later", so it stops at max
+	// too, while still getting max even though it is not a gpt-6- slug.
+	for _, model := range []string{"gpt-6-luna", "gpt-6.1-sol"} {
+		if got := efforts(model); got != "low,medium,high,xhigh,max" {
+			t.Fatalf("%s reasoning levels = %s", model, got)
+		}
 	}
 	for _, model := range []string{"gpt-6-sol", "gpt-6-astra", "gpt-5.6-luna"} {
 		if got := efforts(model); got != "low,medium,high,xhigh,max,ultra" {
@@ -7697,7 +7701,7 @@ func TestAdvertisedCatalogExcludesWhatTheGatewayCannotRoute(t *testing.T) {
 
 	filtered := a.modelsLocked(map[string]bool{"gpt-5.5": true})
 	joined := strings.Join(filtered, "\n")
-	for _, gone := range []string{"gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+	for _, gone := range []string{"gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
 		if strings.Contains(joined, gone) {
 			t.Fatalf("catalog advertised %s, which the gateway cannot route: %s", gone, joined)
 		}
@@ -7714,7 +7718,7 @@ func TestAdvertisedCatalogExcludesWhatTheGatewayCannotRoute(t *testing.T) {
 // The retired models are gone from the lineup, and the ones upstream still
 // serves are all present.
 func TestDefaultLineupMatchesWhatUpstreamStillServes(t *testing.T) {
-	want := map[string]bool{"gpt-6-astra": true, "gpt-6-sol": true, "gpt-6-luna": true, "gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true, "gpt-5.5": true}
+	want := map[string]bool{"gpt-6-astra": true, "gpt-6.1-sol": true, "gpt-6-sol": true, "gpt-6-luna": true, "gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true, "gpt-5.5": true}
 	if len(defaultCodexModelSlugs) != len(want) {
 		t.Fatalf("lineup = %v, want exactly %v", defaultCodexModelSlugs, want)
 	}

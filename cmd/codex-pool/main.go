@@ -758,7 +758,7 @@ func (a *app) load() error {
 	if err := os.MkdirAll(filepath.Join(a.dataDir, "state"), 0o700); err != nil {
 		return fmt.Errorf("create data directory: %w", err)
 	}
-	a.config = config{DefaultModel: envOr("CODEX_POOL_DEFAULT_MODEL", "gpt-6-sol(xhigh)"), ModelAliases: map[string]string{}}
+	a.config = config{DefaultModel: envOr("CODEX_POOL_DEFAULT_MODEL", "gpt-6.1-sol(xhigh)"), ModelAliases: map[string]string{}}
 	a.state = state{StickySessions: map[string]stickySession{}, ResponseBindings: map[string]responseBinding{}, ThreadBindings: map[string]threadBinding{}, Cooldowns: map[string][]cooldown{}, Health: map[string]accountHealth{}, Quotas: map[string]quotaSnapshot{}, PromptCache: map[string]promptCacheStat{}}
 	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &a.config); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read config: %w", err)
@@ -770,7 +770,7 @@ func (a *app) load() error {
 		a.config.DefaultModel = configuredDefault
 	}
 	if strings.TrimSpace(a.config.DefaultModel) == "" {
-		a.config.DefaultModel = "gpt-6-sol(xhigh)"
+		a.config.DefaultModel = "gpt-6.1-sol(xhigh)"
 	}
 	if err := readJSON(filepath.Join(a.dataDir, "state", "runtime.json"), &a.state); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read runtime state: %w", err)
@@ -1292,12 +1292,16 @@ type codexModelInfo struct {
 // gpt-6-sol and gpt-6-luna shipped on 2026-09-22 and the gateway routes both;
 // they rank above their gpt-5.6 predecessors, which OpenAI keeps available
 // during the rollout and which therefore stay listed until upstream drops
-// them. There is no gpt-6-terra: OpenAI dropped the medium tier. Listing a
+// them. There is no gpt-6-terra: OpenAI dropped the medium tier.
+// gpt-6.1-sol shipped on 2026-09-29 as the upgrade to gpt-6-sol and ranks just
+// under gpt-6-astra; gpt-6-sol stays listed because the gateway still routes
+// it. There is no gpt-6.1-astra: OpenAI withdrew it before release. Listing a
 // retired model is worse than omitting it: a client picks it out of this
 // catalog and every request dies at the gateway, which answers a model it
 // cannot route with a 5xx that reads as an account failure.
 var defaultCodexModelSlugs = []string{
 	"gpt-6-astra",
+	"gpt-6.1-sol",
 	"gpt-6-sol",
 	"gpt-6-luna",
 	"gpt-5.6-sol",
@@ -1324,21 +1328,29 @@ func codexModelInFamily(model, family string) bool {
 }
 
 // codexExtendedReasoningModel reports whether a model family documents the
-// extended `max` and `ultra` tiers. Codex documents both for gpt-6 and for the
-// gpt-5.6 family; older families stop at xhigh. This is a family test rather
-// than a slug list so a new sibling in a documented family is covered without a
-// code change, while any other family stays conservative.
+// extended `max` tier. Codex documents it for the gpt-6, gpt-6.1 and gpt-5.6
+// families; older families stop at xhigh. This is a family test rather than a
+// slug list so a new sibling in a documented family is covered without a code
+// change, while any other family stays conservative. gpt-6.1 is its own family
+// on purpose: a point release is not a hyphenated member of gpt-6, so
+// gpt-6.1-sol would otherwise silently fall back to the low-xhigh range.
 func codexExtendedReasoningModel(model string) bool {
-	return codexModelInFamily(model, "gpt-6") || codexModelInFamily(model, "gpt-5.6")
+	return codexModelInFamily(model, "gpt-6") || codexModelInFamily(model, "gpt-6.1") || codexModelInFamily(model, "gpt-5.6")
 }
 
 // codexUltraReasoningModel reports whether an extended-tier model also documents
-// `ultra`. gpt-6-luna is the one documented exception: it goes up to `max` but
-// not `ultra`, so advertising ultra there would let the client submit an effort
-// upstream rejects. The exception is an exact slug on purpose; the rest of the
-// gpt-6 family, and gpt-5.6-luna, keep the full extended range.
+// `ultra`. Advertising ultra where it is not documented would let the client
+// submit an effort upstream rejects, so two cases stop at `max`:
+//   - gpt-6-luna, documented up to max but not ultra. This is an exact slug on
+//     purpose; the rest of the gpt-6 family, and gpt-5.6-luna, keep ultra.
+//   - the gpt-6.1 family, whose ultra support OpenAI lists as "coming later"
+//     (2026-09-29). TODO(upstream): drop this exclusion once the Codex models
+//     page documents ultra for gpt-6.1-sol.
 func codexUltraReasoningModel(model string) bool {
-	return codexExtendedReasoningModel(model) && model != "gpt-6-luna"
+	if model == "gpt-6-luna" || codexModelInFamily(model, "gpt-6.1") {
+		return false
+	}
+	return codexExtendedReasoningModel(model)
 }
 
 // codexReasoningLevelsForModel returns the reasoning levels a model may
