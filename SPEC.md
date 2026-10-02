@@ -1203,11 +1203,21 @@ Account metadata keeps these concepts separate:
 - `seatType`: authoritative Business `standard`/`premium`, if supported;
 - `seatTypeRaw`: sanitized unknown authoritative seat value, display-only;
 - `seatTypeInferred`: marks a `seatType` this pool derived rather than read;
-- `planLimit`: exact reported `5x`, `10x`, or `20x` multiplier only;
+- `planLimit`: exact reported `5x`, `10x`, `20x`, or `25x` multiplier only;
 - `quotaPolicy`: explicit policy such as `no_five_hour_cap`.
 
-For the pinned Codex client, raw `team` and
-`self_serve_business_usage_based` map to the Business family, while raw
+Plan names follow OpenAI's September 2026 naming: raw `prolite` displays as
+`Pro 100`, and a Pro account with a reported multiplier displays its tier with
+the multiplier beside it (`5x` → `Pro 100`, `10x`/`20x` → `Pro 200`, `25x` →
+`Pro 500`). The multiplier stays visible because the mapping is not one-to-one:
+existing Pro 200 subscribers keep `20x` until 2026-10-29, new ones get `10x`.
+Labels generated under the earlier names (`Pro Lite`, `Pro 20x`) still count as
+metadata-derived.
+
+For the pinned Codex client, raw `team`,
+`self_serve_business_usage_based` and `self_serve_business_prolite` map to the
+Business family (the last appeared in ID-token claims in September 2026 on seats
+inferred as Premium; it is a family mapping only, not seat evidence), while raw
 `business` and `enterprise_cbp_usage_based` map to Enterprise. These mappings
 do not prove a Business seat. No endpoint this pool calls carries a
 Standard/Premium field, and the pinned `AccountsCheckResponse` has none either,
@@ -2511,9 +2521,13 @@ own:
 Multipliers come from evidence of two different strengths, and the difference
 must remain visible:
 
-- A Pro slot reports its own multiplier through `planLimit`, so `5x`, `10x` and
-  `20x` are authoritative. Generic Pro with no reported multiplier weighs one;
-  the plan name is not multiplier evidence.
+- A Pro slot reports its own multiplier through `planLimit`, so `5x`, `10x`,
+  `20x` and `25x` are authoritative. Generic Pro with no reported multiplier
+  weighs one; the plan name is not multiplier evidence.
+- Raw plan `prolite` is the Pro 100 tier, which OpenAI prices at 5x Plus. It
+  reports no multiplier, so like a Premium seat it weighs the published ratio
+  and every reading it contributes to is marked as assumed. This is not a
+  generic-Pro guess: the raw plan names the tier exactly.
 - A Business Premium seat reports no multiplier at all. The ratio is an
   assumption read from public pricing, not telemetry, so it must be
   operator-tunable through `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` without a
