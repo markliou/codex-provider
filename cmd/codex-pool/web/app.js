@@ -908,7 +908,7 @@
         });
       }).filter(Boolean).join("");
       const resetCredits = resetCreditsMarkup(quota.resetCredits, managementAccountId);
-      // Keep every reported quota window visible: Pro/Spark and other windows
+      // Keep every reported quota window visible: Pro and other windows
       // are distinct upstream limits, not duplicate renderings. Only the
       // supporting text is grouped so operators can scan bars first, then read
       // reset/credit/telemetry facts without losing any quota semantics.
