@@ -1299,6 +1299,18 @@ type codexModelInfo struct {
 // retired model is worse than omitting it: a client picks it out of this
 // catalog and every request dies at the gateway, which answers a model it
 // cannot route with a 5xx that reads as an account failure.
+// retiredCodexModelSlugs are models upstream no longer serves. They must never
+// be advertised, and a per-model meter that names one is dropped on ingestion
+// (see dropRetiredModelMeters): upstream kept reporting a GPT-5.3-Codex-Spark
+// allowance on Pro accounts weeks after the model left its catalog, which put
+// a meter for an unusable model on the dashboard.
+var retiredCodexModelSlugs = []string{
+	"gpt-5.4",
+	"gpt-5.4-mini",
+	"gpt-5.3-codex-spark",
+	"gpt-5.2-codex",
+}
+
 var defaultCodexModelSlugs = []string{
 	"gpt-6-astra",
 	"gpt-6.1-sol",
@@ -7260,6 +7272,7 @@ func quotaFromUsage(usage codexUsageResponse, now time.Time) accountQuota {
 			now,
 		))
 	}
+	quota.AdditionalLimits = dropRetiredModelMeters(quota.AdditionalLimits)
 	if usage.ResetCredits != nil {
 		quota.ResetCredits = &quotaResetCredits{AvailableCount: usage.ResetCredits.AvailableCount}
 	}
@@ -7471,7 +7484,9 @@ func mergeSparseQuota(prior *accountQuota, current accountQuota, usage codexUsag
 		current.ResetCredits = prior.ResetCredits
 	}
 	if usage.AdditionalRateLimits == nil && usage.CodeReviewRateLimit == nil {
-		current.AdditionalLimits = append([]quotaLimit(nil), prior.AdditionalLimits...)
+		// The prior snapshot may predate a retirement, so it is filtered too;
+		// otherwise a sparse refresh would carry a retired meter forward forever.
+		current.AdditionalLimits = dropRetiredModelMeters(append([]quotaLimit(nil), prior.AdditionalLimits...))
 	}
 	return current
 }
@@ -7734,6 +7749,32 @@ func additionalLimitNamesModel(limit quotaLimit, model string) bool {
 		return false
 	}
 	return cleanMetadataToken(limit.LimitID) == model || cleanMetadataToken(limit.LimitName) == model
+}
+
+// dropRetiredModelMeters removes per-model meters that name a retired model.
+// This is the one exception to keeping every upstream-reported meter visible:
+// the model behind it can no longer be requested, so the meter is neither an
+// entitlement to route on nor anything an operator can act on. Matching uses
+// additionalLimitNamesModel, so only a meter naming exactly a retired slug is
+// dropped; feature meters such as code review and meters for live models stay.
+func dropRetiredModelMeters(limits []quotaLimit) []quotaLimit {
+	if len(limits) == 0 {
+		return limits
+	}
+	kept := limits[:0:0]
+	for _, limit := range limits {
+		retired := false
+		for _, model := range retiredCodexModelSlugs {
+			if additionalLimitNamesModel(limit, model) {
+				retired = true
+				break
+			}
+		}
+		if !retired {
+			kept = append(kept, limit)
+		}
+	}
+	return kept
 }
 
 // accountMetersModelLocked reports whether upstream currently tells this account

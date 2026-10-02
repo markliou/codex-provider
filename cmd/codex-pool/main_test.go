@@ -9401,3 +9401,29 @@ func TestSeptember2026PlanNames(t *testing.T) {
 		t.Fatal("a legacy Pro 20x label must count as metadata-derived")
 	}
 }
+
+// Upstream kept reporting a GPT-5.3-Codex-Spark meter on Pro accounts after the
+// model was retired. A meter naming a retired model is dropped, while feature
+// meters and meters for live models are kept unmerged.
+func TestRetiredModelMetersAreDropped(t *testing.T) {
+	limits := []quotaLimit{
+		{LimitID: "codex_bengalfox", LimitName: "GPT-5.3-Codex-Spark"},
+		{LimitID: "code_review", LimitName: "Code review"},
+		{LimitID: "codex_live", LimitName: "gpt-6-astra"},
+		{LimitID: "gpt-5.2-codex"},
+	}
+	kept := dropRetiredModelMeters(limits)
+	if len(kept) != 2 || kept[0].LimitID != "code_review" || kept[1].LimitID != "codex_live" {
+		t.Fatalf("kept = %#v", kept)
+	}
+	if len(limits) != 4 || limits[0].LimitID != "codex_bengalfox" {
+		t.Fatalf("the input slice must not be modified: %#v", limits)
+	}
+	for _, slug := range retiredCodexModelSlugs {
+		for _, live := range defaultCodexModelSlugs {
+			if slug == live {
+				t.Fatalf("%s is both retired and advertised", slug)
+			}
+		}
+	}
+}

@@ -2321,8 +2321,13 @@ column.
 
 The quota cell must keep every upstream-reported subscription quota window
 visible as its own labeled progress bar in the primary view. Distinct
-subscription, Pro/Spark, and additional limit windows must not be merged or
-treated as duplicate renderings. Additional limits are model- or feature-scoped
+subscription, Pro, and additional limit windows must not be merged or
+treated as duplicate renderings. The one exception is a per-model meter that
+names a retired model (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`,
+`gpt-5.2-codex`): it is dropped when quota is ingested, including from a prior
+snapshot carried over by a sparse refresh, because the model can no longer be
+requested. Upstream kept reporting a `GPT-5.3-Codex-Spark` meter on Pro
+accounts after the model was retired. Additional limits are model- or feature-scoped
 meters rather than the account-wide subscription allowance, so their group stays
 behind the same disclosure control as the other secondary facts; each one is
 still rendered individually with its own windows and reached state, never
