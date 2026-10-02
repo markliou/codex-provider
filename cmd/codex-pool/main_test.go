@@ -958,6 +958,8 @@ func TestAccountWeeklyWeight(t *testing.T) {
 		{"pro reports its multiplier", "pro", "20x", "", 20, false},
 		{"pro 5x", "pro", "5x", "", 5, false},
 		{"pro 10x", "pro", "10x", "", 10, false},
+		{"pro 500 reports 25x", "pro", "25x", "", 25, false},
+		{"pro lite is the assumed pro 100 ratio", "pro_lite", "", "", proLiteWeight, true},
 		{"generic pro is not a multiplier", "pro", "", "", 1, false},
 		{"unsupported multiplier text is ignored", "pro", "50x", "", 1, false},
 		{"premium seat uses the assumed ratio", "business", "", "premium", defaultPremiumSeatWeight, true},
@@ -7007,12 +7009,13 @@ func TestPlanMetadataKeepsRawFamilySeatAndMultiplierSeparate(t *testing.T) {
 			t.Fatalf("planFamilyFromRaw(%q) = %q, want %q", raw, got, family)
 		}
 	}
-	for _, value := range []string{"25x", "15x", "premium", "plan-5x-extra", "pro20x"} {
+	// 25x is Pro 500 (September 2026); 15x and 50x are still no tier.
+	for _, value := range []string{"15x", "50x", "premium", "plan-5x-extra", "pro20x"} {
 		if got := cleanPlanLimit(value); got != "" {
 			t.Fatalf("cleanPlanLimit(%q) guessed %q", value, got)
 		}
 	}
-	for _, value := range []string{"5x", "10x", "20x"} {
+	for _, value := range []string{"5x", "10x", "20x", "25x"} {
 		if got := cleanPlanLimit(value); got != value {
 			t.Fatalf("cleanPlanLimit(%q) = %q", value, got)
 		}
@@ -9367,5 +9370,34 @@ func TestAdminLoginAndCSRFMiddleware(t *testing.T) {
 	}
 	if strings.Contains(providerBody, "provider@example.test") || strings.Contains(providerBody, "provider-secret") || strings.Contains(providerBody, "provider-team") {
 		t.Fatalf("provider account create response used sensitive metadata as identity: %s", providerBody)
+	}
+}
+
+// OpenAI renamed Pro to Pro 100/200/500 in September 2026 and started issuing
+// self_serve_business_prolite for Premium Business seats. The new raw plan must
+// stay in the Business family, and the tier names must follow the multiplier.
+func TestSeptember2026PlanNames(t *testing.T) {
+	if got := planFamilyFromRaw("self_serve_business_prolite"); got != "business" {
+		t.Fatalf("self_serve_business_prolite family = %q, want business", got)
+	}
+	if got := planDisplayName("pro_lite"); got != "Pro 100" {
+		t.Fatalf("pro_lite display = %q", got)
+	}
+	for limit, want := range map[string]string{"5x": "Pro 100", "10x": "Pro 200", "20x": "Pro 200", "25x": "Pro 500", "": "Pro"} {
+		if got := proTierDisplayName(limit); got != want {
+			t.Fatalf("proTierDisplayName(%q) = %q, want %q", limit, got, want)
+		}
+	}
+	if got := planLimitFromNumber(25); got != "25x" {
+		t.Fatalf("a 25x multiplier must be accepted, got %q", got)
+	}
+	// Labels generated under the old names still refresh.
+	lite := account{PlanFamily: "pro_lite", PlanType: "pro_lite"}
+	if !metadataDerivedAccountLabel(lite, "Pro Lite account") {
+		t.Fatal("a legacy Pro Lite label must count as metadata-derived")
+	}
+	pro := account{PlanFamily: "pro", PlanType: "pro", PlanLimit: "20x"}
+	if !metadataDerivedAccountLabel(pro, "Pro 20x") {
+		t.Fatal("a legacy Pro 20x label must count as metadata-derived")
 	}
 }

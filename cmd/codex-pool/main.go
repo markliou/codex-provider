@@ -9832,6 +9832,15 @@ func metadataDerivedAccountLabel(item account, label string) bool {
 		planDisplayName(item.PlanType),
 		planDisplayName(item.PlanType) + " account",
 	}
+	// Labels generated before the Pro 100/200/500 rename still count as
+	// metadata-derived, so they keep refreshing instead of freezing as if an
+	// operator had typed them.
+	if effectivePlanFamily(item) == "pro_lite" {
+		generated = append(generated, "Pro Lite", "Pro Lite account")
+	}
+	if limit := cleanPlanLimit(item.PlanLimit); limit != "" && effectivePlanFamily(item) == "pro" {
+		generated = append(generated, "Pro "+limit, "Pro "+limit+" account")
+	}
 	for _, value := range generated {
 		if value != "" && strings.EqualFold(label, value) {
 			return true
@@ -9970,6 +9979,11 @@ const baseWeeklyWeight = 1.0
 // it can never be presented with the same authority as a reported multiplier.
 const defaultPremiumSeatWeight = 5.0
 
+// proLiteWeight is OpenAI's published Pro 100 (raw plan prolite) allowance
+// relative to Plus. It is an assumption from public pricing, flagged as such
+// wherever it contributes, for the same reason as defaultPremiumSeatWeight.
+const proLiteWeight = 5.0
+
 var premiumSeatWeight = defaultPremiumSeatWeight
 
 // applyCapacityWeightEnv retunes the assumed Business Premium multiplier. An
@@ -10005,7 +10019,16 @@ func accountWeeklyWeight(planFamily, planLimit, seatType string) (float64, bool)
 			return 10, false
 		case "20x":
 			return 20, false
+		case "25x":
+			return 25, false
 		}
+	case "pro_lite":
+		// Pro Lite is the Pro 100 tier, which OpenAI prices at 5x Plus. Like the
+		// Premium seat ratio this is read off a pricing page rather than reported
+		// by the account, so it is flagged as assumed. It is not a "generic Pro"
+		// guess: the raw plan names the tier exactly, and weighing it as one
+		// understated a 5x account as a single base allowance.
+		return proLiteWeight, true
 	case "business":
 		if cleanMetadataToken(seatType) == "premium" {
 			return premiumSeatWeight, true
@@ -10017,7 +10040,7 @@ func accountWeeklyWeight(planFamily, planLimit, seatType string) (float64, bool)
 func cleanPlanLimit(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	switch value {
-	case "5x", "10x", "20x":
+	case "5x", "10x", "20x", "25x":
 		return value
 	default:
 		return ""
@@ -10094,7 +10117,7 @@ func planLimitFromValue(value any) string {
 
 func planLimitFromNumber(value int64) string {
 	switch value {
-	case 5, 10, 20:
+	case 5, 10, 20, 25:
 		return strconv.FormatInt(value, 10) + "x"
 	default:
 		return ""
@@ -10181,7 +10204,15 @@ func planFamilyFromRaw(value string) string {
 		return "pro"
 	case "prolite":
 		return "pro_lite"
-	case "team", "chatgptteam", "chatgpt_team", "chatgptteamplan", "self_serve_business_usage_based":
+	// self_serve_business_prolite appeared in ID-token claims in September 2026
+	// on the Business seats inferred as Premium (Premium is priced like Pro
+	// 100, hence "prolite"). It is mapped to the Business family only; it is
+	// deliberately not treated as authoritative seat evidence, because no
+	// upstream documentation defines it and the quota-shape inference already
+	// covers these seats. Without this entry a re-login, which takes the plan
+	// from the token, showed the account as "Unknown tier" and dropped it out
+	// of Business seat inference until the next quota refresh.
+	case "team", "chatgptteam", "chatgpt_team", "chatgptteamplan", "self_serve_business_usage_based", "self_serve_business_prolite":
 		return "business"
 	case "business", "enterprise_cbp_usage_based", "enterprise", "hc":
 		return "enterprise"
@@ -10250,6 +10281,24 @@ func planRank(plan string) int {
 	}
 }
 
+// proTierDisplayName names a Pro account's tier from its reported multiplier,
+// using OpenAI's September 2026 names. The multiplier is kept next to the name
+// because the two do not map one-to-one: Pro 200 is 10x for new subscribers
+// but 20x for existing ones until 2026-10-29, and 5x is also what the
+// separate prolite plan (Pro 100) provides.
+func proTierDisplayName(limit string) string {
+	switch limit {
+	case "5x":
+		return "Pro 100"
+	case "10x", "20x":
+		return "Pro 200"
+	case "25x":
+		return "Pro 500"
+	default:
+		return "Pro"
+	}
+}
+
 func planDisplayName(plan string) string {
 	normalized := normalizePlanType(plan)
 	switch normalized {
@@ -10260,7 +10309,9 @@ func planDisplayName(plan string) string {
 	case "pro":
 		return "Pro"
 	case "pro_lite":
-		return "Pro Lite"
+		// OpenAI now sells Pro as Pro 100 / 200 / 500; the prolite plan is the
+		// $100 tier.
+		return "Pro 100"
 	case "go":
 		return "Go"
 	case "team":
@@ -10291,7 +10342,7 @@ func accountPlanDisplayName(item account, withAccountSuffix bool) string {
 	name := planDisplayName(plan)
 	if plan == "pro" {
 		if limit := cleanPlanLimit(item.PlanLimit); limit != "" {
-			name += " " + limit
+			name = proTierDisplayName(limit) + " " + limit
 		}
 	}
 	if withAccountSuffix {
