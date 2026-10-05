@@ -6944,9 +6944,14 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 	planRaw := cleanRawPlanType(chooseString(usage.PlanType, usage.SubscriptionPlan))
 	plan := planFamilyFromRaw(planRaw)
 	planLimit := planLimitFromMap(usageFields)
-	if planLimit == "" {
-		planLimit = cleanPlanLimit(auth.PlanLimit)
-	}
+	// auth.PlanLimit is mostly this pool's own earlier output: the multiplier is
+	// written into the sidecar auth record and read back from it on the next
+	// refresh. Using it before the account metadata made a recorded multiplier
+	// self-perpetuating, so a Pro 200 account kept showing 20x after upstream
+	// cut the tier to 10x. It is therefore only a last resort, used when the
+	// metadata lookup could not run; a metadata answer, including "no
+	// multiplier", always wins over it.
+	storedPlanLimit := cleanPlanLimit(auth.PlanLimit)
 	organizationName := cleanOrganizationName(organizationNameFromMap(usageFields))
 	if organizationName == "" && auth.OrganizationName != "" {
 		organizationName = cleanOrganizationName(auth.OrganizationName)
@@ -6974,6 +6979,9 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 				organizationName = metadata.OrganizationName
 			}
 		}
+	}
+	if planLimit == "" && !metadataResolved {
+		planLimit = storedPlanLimit
 	}
 	if plan != "" && plan != "unknown" && !organizationScopedPlan(plan) {
 		organizationName = ""

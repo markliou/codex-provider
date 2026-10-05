@@ -9427,3 +9427,64 @@ func TestRetiredModelMetersAreDropped(t *testing.T) {
 		}
 	}
 }
+
+// The multiplier the pool writes into the sidecar auth record is read back as
+// auth.PlanLimit on the next refresh. It used to win over the account metadata,
+// so a Pro 200 account kept 20x after upstream cut the tier to 10x. Fresh
+// metadata must now win, and a metadata answer with no multiplier must clear
+// the stale value rather than fall back to it.
+func TestQuotaRefreshDoesNotPerpetuateStoredPlanLimit(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		subscription string
+		want         string
+	}{
+		{"metadata reports the new multiplier", `{"subscription_plan":"chatgptpro","plan_limit":"10x"}`, "10x"},
+		{"metadata reports no multiplier", `{"subscription_plan":"chatgptpro"}`, ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/backend-api/wham/usage":
+					_, _ = w.Write([]byte(`{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":10,"limit_window_seconds":604800}}}`))
+				case "/backend-api/accounts/check/v4-2023-04-27":
+					_, _ = w.Write([]byte(`{"accounts":{"primary":{"account":{"account_id":"acct-pro","account_name":"Personal Pro","plan_type":"pro"}}}}`))
+				case "/backend-api/subscriptions":
+					_, _ = w.Write([]byte(testCase.subscription))
+				default:
+					t.Fatalf("unexpected path %s", r.URL.Path)
+				}
+			}))
+			defer upstream.Close()
+
+			a := testApp(t, []account{{ID: "codex-pro", AccountID: "acct-pro", AuthType: "codex_device_auth", PlanType: "pro", PlanFamily: "pro", RawPlanType: "chatgptpro", PlanLimit: "20x", Enabled: true, InPool: true, Priority: 100}})
+			a.codexBaseURL = upstream.URL + "/backend-api"
+			a.codexGatewayMode = "sidecar"
+			home := a.accountCodexHome("codex-pro")
+			if err := os.MkdirAll(home, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			token := fakeJWT(time.Now().Add(time.Hour))
+			authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"refresh_token":"<refresh-token>"}}`, token)
+			if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			path := a.cliproxyAuthPath("codex-pro")
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeJSONAtomic(path, cliproxyCodexAuthFile{Type: "codex", AccessToken: token, RefreshToken: "<refresh-token>", AccountID: "acct-pro", Prefix: cliproxyAccountPrefix("codex-pro"), PlanType: "chatgptpro", PlanLimit: "20x"}); err != nil {
+				t.Fatal(err)
+			}
+
+			snapshot, err := a.refreshAccountQuota(context.Background(), "codex-pro")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if snapshot.PlanLimit != testCase.want || a.config.Accounts[0].PlanLimit != testCase.want {
+				t.Fatalf("plan limit = snapshot %q, account %q; want %q", snapshot.PlanLimit, a.config.Accounts[0].PlanLimit, testCase.want)
+			}
+		})
+	}
+}
