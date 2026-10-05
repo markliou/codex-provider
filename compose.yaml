@@ -9,6 +9,10 @@ services:
       - "8317:8317"
     volumes:
       - codex-pool-data:/data
+    # Docker's default 10s stop timeout would SIGKILL the pool in the middle of
+    # its shutdown drain, which waits up to CODEX_POOL_SHUTDOWN_GRACE (120s by
+    # default) for in-flight streams. Keep this above that grace.
+    stop_grace_period: 150s
     # The pool and its sidecar log only to stdout, and Docker's json-file driver
     # has no default size limit, so the container log grows until the disk fills.
     # It looks bounded only because every deploy recreates the container and

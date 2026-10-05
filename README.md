@@ -345,6 +345,16 @@ sh scripts/build-local-image.sh
 
 The script injects `CODEX_POOL_VERSION` and `CODEX_POOL_COMMIT` as Docker build args. The footer displays a git-derived version such as `v2026.06.25-222b57e`; dirty staged or unstaged changes append `-dirty`.
 
+## Deploy
+
+Deploy with the deploy script rather than a bare `docker compose up -d`:
+
+```bash
+sh scripts/deploy.sh
+```
+
+It builds the image, waits until no provider request is in flight, and only then recreates the container, so a deploy does not cut agents' open streams. If requests never pause it restarts after `CODEX_POOL_DEPLOY_IDLE_WAIT` seconds (default 600) and relies on the pool's shutdown drain, which lets in-flight requests finish for up to `CODEX_POOL_SHUTDOWN_GRACE` (default `120s`). `--force` restarts a running pool that predates in-flight tracking.
+
 ## Commit Security
 
 Install the repository hook once:

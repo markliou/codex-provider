@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9486,5 +9487,165 @@ func TestQuotaRefreshDoesNotPerpetuateStoredPlanLimit(t *testing.T) {
 				t.Fatalf("plan limit = snapshot %q, account %q; want %q", snapshot.PlanLimit, a.config.Accounts[0].PlanLimit, testCase.want)
 			}
 		})
+	}
+}
+
+// Every deploy used to kill the pool mid-stream. A stop signal must now let an
+// in-flight request run to completion, refuse new connections meanwhile, and
+// only then return.
+func TestStopSignalDrainsInFlightRequests(t *testing.T) {
+	a := testApp(t, nil)
+	a.shutdownGrace = 10 * time.Second
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := a.trackInFlight(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		_, _ = w.Write([]byte("finished"))
+	})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	ctx, stop := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- a.serveUntilStopped(ctx, listener, handler) }()
+
+	type result struct {
+		body string
+		err  error
+	}
+	response := make(chan result, 1)
+	go func() {
+		resp, err := http.Get("http://" + address + "/")
+		if err != nil {
+			response <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		response <- result{body: string(body), err: err}
+	}()
+	<-started
+	if got := a.inFlight.Load(); got != 1 {
+		t.Fatalf("in-flight = %d, want 1", got)
+	}
+	stop()
+	// The listener closes when the drain starts, so a new request is refused.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		conn, err := net.DialTimeout("tcp", address, 200*time.Millisecond)
+		if err != nil {
+			break
+		}
+		conn.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("the listener still accepted connections during the drain")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	select {
+	case err := <-served:
+		t.Fatalf("serve returned before the in-flight request finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	got := <-response
+	if got.err != nil || got.body != "finished" {
+		t.Fatalf("in-flight request was cut: body %q, err %v", got.body, got.err)
+	}
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after the drain")
+	}
+	if got := a.inFlight.Load(); got != 0 {
+		t.Fatalf("in-flight = %d after the drain, want 0", got)
+	}
+}
+
+// The drain is bounded: a request that never finishes must not hold the
+// process past the grace.
+func TestStopSignalDrainIsBoundedByGrace(t *testing.T) {
+	a := testApp(t, nil)
+	a.shutdownGrace = 150 * time.Millisecond
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	handler := a.trackInFlight(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- a.serveUntilStopped(ctx, listener, handler) }()
+	go func() {
+		if resp, err := http.Get("http://" + listener.Addr().String() + "/"); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	<-started
+	begin := time.Now()
+	stop()
+	select {
+	case <-served:
+		if elapsed := time.Since(begin); elapsed > 3*time.Second {
+			t.Fatalf("drain took %s with a 150ms grace", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drain ignored its grace")
+	}
+}
+
+// The in-flight count reveals current usage, so it is served to loopback
+// callers (the deploy script, from inside the container) and to nobody else.
+func TestInFlightEndpointIsLoopbackOnly(t *testing.T) {
+	a := testApp(t, nil)
+	a.inFlight.Store(3)
+	for _, testCase := range []struct {
+		remote string
+		want   int
+	}{
+		{"127.0.0.1:41000", http.StatusOK},
+		{"[::1]:41000", http.StatusOK},
+		{"192.168.3.1:41000", http.StatusNotFound},
+		{"172.21.0.1:41000", http.StatusNotFound},
+		{"garbage", http.StatusNotFound},
+	} {
+		request := httptest.NewRequest(http.MethodGet, "/internal/inflight", nil)
+		request.RemoteAddr = testCase.remote
+		recorder := httptest.NewRecorder()
+		a.mux().ServeHTTP(recorder, request)
+		if recorder.Code != testCase.want {
+			t.Fatalf("%s: status %d, want %d", testCase.remote, recorder.Code, testCase.want)
+		}
+		if testCase.want == http.StatusOK && !strings.Contains(recorder.Body.String(), `"inFlight":3`) {
+			t.Fatalf("%s: body %s", testCase.remote, recorder.Body.String())
+		}
+	}
+}
+
+func TestShutdownGraceFromEnv(t *testing.T) {
+	t.Setenv("CODEX_POOL_SHUTDOWN_GRACE", "")
+	if grace, err := shutdownGraceFromEnv(); err != nil || grace != defaultShutdownGrace {
+		t.Fatalf("default grace = %s, %v", grace, err)
+	}
+	t.Setenv("CODEX_POOL_SHUTDOWN_GRACE", "5m")
+	if grace, err := shutdownGraceFromEnv(); err != nil || grace != 5*time.Minute {
+		t.Fatalf("5m grace = %s, %v", grace, err)
+	}
+	for _, bad := range []string{"soon", "-1s", "120"} {
+		t.Setenv("CODEX_POOL_SHUTDOWN_GRACE", bad)
+		if _, err := shutdownGraceFromEnv(); err == nil {
+			t.Fatalf("%q must be rejected", bad)
+		}
 	}
 }

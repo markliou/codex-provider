@@ -57,11 +57,26 @@ SIDECAR_URL=http://127.0.0.1:8319/v1
 /usr/local/bin/cliproxy-sidecar -config "$CONFIG_FILE" &
 SIDECAR_PID=$!
 
+POOL_PID=""
+
 cleanup() {
   kill "$SIDECAR_PID" 2>/dev/null || true
   wait "$SIDECAR_PID" 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+
+# A stop signal goes to the pool first, and the sidecar is stopped only after
+# the pool exits. The pool drains in-flight requests on SIGTERM, and those
+# streams still flow through the sidecar; stopping the sidecar first, as this
+# script used to on every signal, cut every open stream on every deploy.
+on_stop() {
+  if [ -n "$POOL_PID" ] && kill -0 "$POOL_PID" 2>/dev/null; then
+    kill -TERM "$POOL_PID" 2>/dev/null || true
+    wait "$POOL_PID" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap cleanup EXIT
+trap on_stop INT TERM
 
 for _ in $(seq 1 40); do
   if ! kill -0 "$SIDECAR_PID" 2>/dev/null; then
