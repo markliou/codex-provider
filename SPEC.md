@@ -164,6 +164,7 @@ docker run -d \
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
 | `CODEX_POOL_CODEX_RESET_CREDIT_CONSUME_URL` | no | derived | Override for the upstream reset-credit consume endpoint. Testing only. |
+| `CODEX_POOL_SHUTDOWN_GRACE` | no | `120s` | How long a stop signal waits for in-flight provider requests (Go duration). `compose.yaml`'s `stop_grace_period` must stay above it. An invalid value is a startup error. |
 | `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` | no | `5` | Assumed Business Premium weekly allowance, in Standard seats. Not upstream-reported; correct it when a contract differs. |
 | `CODEX_POOL_QUOTA_FLOOR_PERCENT` | no | `1` | Share of a quota window held back from routing. A window at or below it counts as consumed. `0` spends a window to the last token. Must be 0-20. |
 | `CODEX_POOL_CAPACITY_RETRY_LIMIT` | no | `8` | Capacity retry rounds once no identity can serve. `0` disables waiting and surfaces the refusal immediately. |
@@ -195,6 +196,30 @@ For a device-auth account, Pool writes a separate CLIProxy auth record under `/d
 The sidecar owns refreshes of its copied OAuth credential. Pool must read the sidecar copy for quota polling and must not concurrently refresh the original Codex CLI auth file. Sidecar auth records, its internal API key, and generated config are runtime `/data` content and must never be committed.
 
 The original Codex `auth.json` is still read for account metadata, routing eligibility, and sidecar sync. Codex CLI or the sidecar may rewrite that file while requests are selecting accounts, so Pool must use bounded retry when a read sees invalid or incomplete auth content. A missing auth file for a staged or unauthenticated slot must classify quickly as unavailable instead of retrying under the global state lock; a transient partial write must not make all device-auth slots look missing and produce a false `503 no eligible account` response.
+
+#### 2.3.1 Shutdown and deploys
+
+A stop signal must not cut in-flight work. Requests routinely stream for one to
+two minutes, and killing the process outright, as every deploy used to, made
+remote Codex clients report error responses for each open stream.
+
+- On `SIGTERM` or `SIGINT` the pool closes its listener, lets in-flight provider
+  requests (responses, compact, chat completions; streams included) finish for
+  up to `CODEX_POOL_SHUTDOWN_GRACE`, saves state, and exits. A request still
+  running when the grace expires is cut.
+- The supervisor forwards the signal to the pool and stops the sidecar only
+  after the pool exits, because draining streams still flow through it.
+- `compose.yaml` sets `stop_grace_period` above the grace so Docker does not
+  kill the drain.
+- Docker stops the old container before starting the new one, so a drain
+  cannot accept new requests and the port is closed until it ends. Deploys
+  therefore go through `scripts/deploy.sh`, which builds first, waits until the
+  in-flight count is zero (up to `CODEX_POOL_DEPLOY_IDLE_WAIT`, default 600s),
+  and only then recreates the container. The drain is the backstop for a
+  request that starts in between.
+- The in-flight count is served at `GET /internal/inflight` to loopback callers
+  only; the deploy script reads it from inside the container. It reveals current
+  usage and must never be served to the network.
 
 The service should warn when:
 
