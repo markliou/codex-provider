@@ -10129,6 +10129,10 @@ const defaultPremiumSeatWeight = 5.0
 // wherever it contributes, for the same reason as defaultPremiumSeatWeight.
 const proLiteWeight = 5.0
 
+// proDefaultWeight is the published Pro 200 allowance (10x Plus since
+// 2026-09-29), assumed for a Pro account that reports no multiplier.
+const proDefaultWeight = 10.0
+
 var premiumSeatWeight = defaultPremiumSeatWeight
 
 // applyCapacityWeightEnv retunes the assumed Business Premium multiplier. An
@@ -10167,6 +10171,12 @@ func accountWeeklyWeight(planFamily, planLimit, seatType string) (float64, bool)
 		case "25x":
 			return 25, false
 		}
+		// Upstream reports no multiplier for this Pro account. Pro 100 has its
+		// own raw plan (prolite), so a plain Pro without one is weighed as Pro
+		// 200, OpenAI's published 10x, and flagged as assumed like Pro 100 and
+		// Premium seats. Weighing it as one understated a 10x account as a
+		// single base allowance. If it is really Pro 500 this still errs low.
+		return proDefaultWeight, true
 	case "pro_lite":
 		// Pro Lite is the Pro 100 tier, which OpenAI prices at 5x Plus. Like the
 		// Premium seat ratio this is read off a pricing page rather than reported
@@ -10488,6 +10498,10 @@ func accountPlanDisplayName(item account, withAccountSuffix bool) string {
 	if plan == "pro" {
 		if limit := cleanPlanLimit(item.PlanLimit); limit != "" {
 			name = proTierDisplayName(limit) + " " + limit
+		} else {
+			// No reported multiplier: shown as the assumed Pro 200 tier, with no
+			// multiplier beside it, so it never reads as a reported value.
+			name = "Pro 200"
 		}
 	}
 	if withAccountSuffix {

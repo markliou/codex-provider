@@ -2552,8 +2552,11 @@ Multipliers come from evidence of two different strengths, and the difference
 must remain visible:
 
 - A Pro slot reports its own multiplier through `planLimit`, so `5x`, `10x`,
-  `20x` and `25x` are authoritative. Generic Pro with no reported multiplier
-  weighs one; the plan name is not multiplier evidence.
+  `20x` and `25x` are authoritative. A Pro account with no reported multiplier
+  weighs the published Pro 200 ratio (`10x`), marked as assumed, and displays
+  as `Pro 200` without a multiplier: Pro 100 has its own raw plan (`prolite`),
+  so a plain Pro is taken as Pro 200, and if it is really Pro 500 the reading
+  errs low. The assumption never becomes a `planLimit`.
   On each quota refresh the multiplier comes from the usage response, then the
   freshly fetched account metadata. The multiplier this pool previously stored
   (and mirrored into the sidecar auth record) is never evidence while metadata
