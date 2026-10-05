@@ -2529,6 +2529,12 @@ must remain visible:
 - A Pro slot reports its own multiplier through `planLimit`, so `5x`, `10x`,
   `20x` and `25x` are authoritative. Generic Pro with no reported multiplier
   weighs one; the plan name is not multiplier evidence.
+  On each quota refresh the multiplier comes from the usage response, then the
+  freshly fetched account metadata. The multiplier this pool previously stored
+  (and mirrored into the sidecar auth record) is never evidence while metadata
+  answered: it is used only when the metadata lookup could not run, so a tier
+  change upstream (Pro 200 going from `20x` to `10x`) replaces it, and a
+  metadata answer with no multiplier clears it.
 - Raw plan `prolite` is the Pro 100 tier, which OpenAI prices at 5x Plus. It
   reports no multiplier, so like a Premium seat it weighs the published ratio
   and every reading it contributes to is marked as assumed. This is not a
