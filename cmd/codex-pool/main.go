@@ -433,10 +433,13 @@ type routingCacheEvent struct {
 	// to the client when the stream ended, and PrecommitCloseReason names the
 	// event type (or "bounds") that released them. Together they show whether
 	// a terminal capacity failure was eligible for retry at all.
-	PrecommitCommitted    bool     `json:"precommitCommitted,omitempty"`
-	PrecommitCloseReason  string   `json:"precommitCloseReason,omitempty"`
-	PrecommitBlocks       int      `json:"precommitBlocks,omitempty"`
-	PrecommitBytes        int      `json:"precommitBytes,omitempty"`
+	PrecommitCommitted   bool   `json:"precommitCommitted,omitempty"`
+	PrecommitCloseReason string `json:"precommitCloseReason,omitempty"`
+	PrecommitBlocks      int    `json:"precommitBlocks,omitempty"`
+	PrecommitBytes       int    `json:"precommitBytes,omitempty"`
+	// PrecommitHoldMs is how long the client got no byte at all, headers
+	// included, while the pre-commit window was open.
+	PrecommitHoldMs       int64    `json:"precommitHoldMs,omitempty"`
 	ParentAffinity        string   `json:"parentAffinity"`
 	FailoverFromAccountID string   `json:"failoverFromAccountId,omitempty"`
 	UsageObserved         bool     `json:"usageObserved"`
@@ -2197,6 +2200,9 @@ type proxyResponseInfo struct {
 	// that is what these fields exist to prevent.
 	PrecommitBlocks int
 	PrecommitBytes  int
+	// PrecommitHoldMs is how long the client waited for the first byte
+	// (headers included) because of the pre-commit window.
+	PrecommitHoldMs int64
 }
 
 type streamingProxyResult struct {
@@ -2375,17 +2381,25 @@ func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResp
 	return result.Info
 }
 
+// sseRead is one readSSEBlock result handed from the reader goroutine.
+type sseRead struct {
+	block string
+	err   error
+}
+
 func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Reader, maxBytes int, beforeCommit func()) streamingProxyResult {
 	var info proxyResponseInfo
 	reader := bufio.NewReader(body)
 	var buffered strings.Builder
 	bufferedBlocks := 0
 	committed := false
+	started := time.Now()
 	commit := func() {
 		if committed {
 			return
 		}
 		committed = true
+		info.PrecommitHoldMs = time.Since(started).Milliseconds()
 		if beforeCommit != nil {
 			beforeCommit()
 		}
@@ -2394,8 +2408,50 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 			buffered.Reset()
 		}
 	}
+	// Blocks are read on their own goroutine so the hold bound can fire while
+	// upstream is silent, which is exactly when it matters. The goroutine ends
+	// when the body hits an error, which the caller's Body.Close guarantees on
+	// every path, or when this function returns.
+	reads := make(chan sseRead)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			block, err := readSSEBlock(reader)
+			select {
+			case reads <- sseRead{block: block, err: err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	var holdExpired <-chan time.Time
+	if streamingPrecommitMaxHold > 0 {
+		holdTimer := time.NewTimer(streamingPrecommitMaxHold)
+		defer holdTimer.Stop()
+		holdExpired = holdTimer.C
+	}
 	for {
-		block, err := readSSEBlock(reader)
+		var block string
+		var err error
+		select {
+		case read := <-reads:
+			block, err = read.block, read.err
+		case <-holdExpired:
+			holdExpired = nil
+			if !committed {
+				// Release headers and the held lifecycle events. A capacity refusal
+				// arriving after this is forwarded in-stream like any committed one.
+				info.PrecommitBlocks = bufferedBlocks
+				info.PrecommitBytes = buffered.Len()
+				info.PrecommitCloseReason = "hold_timeout"
+				commit()
+			}
+			continue
+		}
 		if block != "" {
 			next := responseInfoFromSSEBlock(block)
 			info.merge(next)
@@ -2486,6 +2542,18 @@ var (
 	streamingCapacityRetryLimit   = 8
 	streamingCapacityRetryBackoff = time.Second
 	streamingCapacityRetryMaxWait = 20 * time.Second
+	// streamingPrecommitMaxHold bounds how long the pre-commit window may keep
+	// the client waiting. The window withholds the response headers as well as
+	// the lifecycle events, and with no bound it stayed shut until the first
+	// content event, which for a reasoning model is the end of the first
+	// reasoning item: 27s in one measurement against 1s straight to upstream,
+	// and minutes at xhigh. A client waiting that long for headers is cut by
+	// NAT, proxies and firewalls on the way, Codex reports "error sending
+	// request", resends the whole turn and the model reasons again from
+	// scratch, which is what made throughput collapse while upstream success
+	// stayed at 99.8%. Upstream capacity refusals arrive within the first
+	// seconds, so a short bound keeps the retry window for them.
+	streamingPrecommitMaxHold = 8 * time.Second
 )
 
 // capacityRetryBackoff doubles each round up to a cap, so an early blip costs a
@@ -5052,6 +5120,7 @@ func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accoun
 		PrecommitCloseReason:  info.PrecommitCloseReason,
 		PrecommitBlocks:       info.PrecommitBlocks,
 		PrecommitBytes:        info.PrecommitBytes,
+		PrecommitHoldMs:       info.PrecommitHoldMs,
 		ParentAffinity:        parentAffinity,
 		FailoverFromAccountID: failoverFromAccountID,
 		UsageObserved:         usage.Present,
@@ -10746,6 +10815,7 @@ func applyCapacityRetryEnv() error {
 	}{
 		{"CODEX_POOL_CAPACITY_RETRY_BACKOFF_MS", &streamingCapacityRetryBackoff},
 		{"CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS", &streamingCapacityRetryMaxWait},
+		{"CODEX_POOL_PRECOMMIT_MAX_HOLD_MS", &streamingPrecommitMaxHold},
 	} {
 		raw := strings.TrimSpace(os.Getenv(knob.name))
 		if raw == "" {

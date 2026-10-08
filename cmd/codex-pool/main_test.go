@@ -9649,3 +9649,57 @@ func TestShutdownGraceFromEnv(t *testing.T) {
 		}
 	}
 }
+
+// A reasoning model is silent between the first lifecycle events and the end of
+// its first reasoning item, and the pre-commit window used to withhold even the
+// response headers for that whole time. Remote clients were cut while waiting
+// for headers ("error sending request") and resent the turn from scratch. The
+// window must release headers and the held events once the hold bound passes,
+// while upstream is still silent, and the rest of the stream must follow intact.
+func TestPrecommitReleasesHeadersWhenUpstreamStaysSilent(t *testing.T) {
+	old := streamingPrecommitMaxHold
+	streamingPrecommitMaxHold = 50 * time.Millisecond
+	t.Cleanup(func() { streamingPrecommitMaxHold = old })
+
+	upstream, feed := io.Pipe()
+	recorder := httptest.NewRecorder()
+	committed := make(chan time.Time, 1)
+	done := make(chan streamingProxyResult, 1)
+	start := time.Now()
+	go func() {
+		done <- copyStreamingProxyResponseWithPrecommit(recorder, upstream, precommitByteLimit(0), func() {
+			committed <- time.Now()
+		})
+	}()
+	preamble := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_hold\"}}\n\n" +
+		"event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n" +
+		"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n\n"
+	if _, err := io.WriteString(feed, preamble); err != nil {
+		t.Fatal(err)
+	}
+	// Upstream now "reasons" in silence. The headers must go out anyway.
+	select {
+	case at := <-committed:
+		if held := at.Sub(start); held < 40*time.Millisecond || held > 2*time.Second {
+			t.Fatalf("headers released after %s, want about the 50ms bound", held)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("headers were still withheld while upstream was silent")
+	}
+	rest := "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\"}}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_hold\"}}\n\n"
+	if _, err := io.WriteString(feed, rest); err != nil {
+		t.Fatal(err)
+	}
+	feed.Close()
+	result := <-done
+	if result.RetryableTerminalFailure {
+		t.Fatal("a released stream must not be reported as retryable")
+	}
+	if result.Info.PrecommitCloseReason != "hold_timeout" || result.Info.PrecommitHoldMs < 40 {
+		t.Fatalf("close reason %q after %dms", result.Info.PrecommitCloseReason, result.Info.PrecommitHoldMs)
+	}
+	if got := recorder.Body.String(); got != preamble+rest {
+		t.Fatalf("stream was altered:\n%s", got)
+	}
+}
