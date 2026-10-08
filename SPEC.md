@@ -170,7 +170,7 @@ docker run -d \
 | `CODEX_POOL_CAPACITY_RETRY_LIMIT` | no | `8` | Capacity retry rounds once no identity can serve. `0` disables waiting and surfaces the refusal immediately. |
 | `CODEX_POOL_CAPACITY_RETRY_BACKOFF_MS` | no | `1000` | First capacity retry delay. Each round doubles from here. |
 | `CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS` | no | `20000` | Cap on a single capacity retry delay. Raised to the first delay if set below it. |
-| `CODEX_POOL_PRECOMMIT_MAX_HOLD_MS` | no | `8000` | Longest the pre-commit window may withhold the response, headers included, before committing. Keep it well under the shortest idle timeout between remote clients and the pool. |
+| `CODEX_POOL_PRECOMMIT_MAX_HOLD_MS` | no | `5000` | Longest the pre-commit window may withhold the response, headers included, before committing. Keep it well under the shortest idle timeout between remote clients and the pool. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_MODE` | no | `auto` | `auto` injects a hashed `prompt_cache_key` when the client omitted one. `off`/`passthrough` leave the request unchanged. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_POLICY` | no | `preserve` | Upstream-key policy independent of sticky routing. `preserve` retains a client key and uses the legacy missing-key behavior. `lineage`, `project`, and `user` explicitly replace any client key with a deterministic hashed/bucketed key for that scope. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_SCOPE` | no | `auto` | Coarseness of the injected `prompt_cache_key`. `auto` groups by `X-Codex-Pool-Project` header, else API key, else per-conversation. `project`/`user` force that grouping; `conversation` keeps the historical per-conversation key. Coarser keys let sibling conversations reuse the same static-prefix cache. |
@@ -2075,7 +2075,7 @@ For streaming responses:
   Unbounded, the client got no byte at all for that long (27s against 1s
   straight to upstream in one measurement); remote clients were cut while
   waiting for headers, Codex reported `error sending request` and resent the
-  whole turn. After `CODEX_POOL_PRECOMMIT_MAX_HOLD_MS` (default 8000) with the
+  whole turn. After `CODEX_POOL_PRECOMMIT_MAX_HOLD_MS` (default 5000) with the
   window still open, the pool commits: headers and the held lifecycle events go
   out unchanged, `precommitCloseReason` is `hold_timeout`, and a later capacity
   refusal is forwarded in-stream like any committed one. Upstream capacity
