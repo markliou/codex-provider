@@ -2553,7 +2553,9 @@ var (
 	// scratch, which is what made throughput collapse while upstream success
 	// stayed at 99.8%. Upstream capacity refusals arrive within the first
 	// seconds, so a short bound keeps the retry window for them.
-	streamingPrecommitMaxHold = 8 * time.Second
+	// 5s rather than the first 8s: operator choice, to stay further from remote
+	// idle timeouts while still covering refusals that arrive in the first seconds.
+	streamingPrecommitMaxHold = 5 * time.Second
 )
 
 // capacityRetryBackoff doubles each round up to a cap, so an early blip costs a
