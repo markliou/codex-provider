@@ -1636,6 +1636,11 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	route := a.routingDecision(r, payload, model, requestAPIKey(r))
 	a.applyPromptCacheControls(payload, route)
 	streaming, _ := payload["stream"].(bool)
+	if streaming && !chat {
+		early := newEarlyStreamWriter(w, streamingPrecommitMaxHold)
+		defer early.finish()
+		w = early
+	}
 	throughput := a.beginThroughputMeasurement(streaming)
 	defer a.finishThroughputMeasurement(throughput)
 	updatedBody, err := json.Marshal(payload)
@@ -2381,6 +2386,206 @@ func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResp
 	return result.Info
 }
 
+// streamKeepaliveInterval paces the SSE comments sent while a streaming
+// request's response is still being withheld after its headers went out early.
+var streamKeepaliveInterval = 5 * time.Second
+
+// earlyStreamWriter wraps the client writer of a streaming Responses request.
+//
+// The pre-commit window withholds a response so an upstream capacity refusal
+// can be retried on another identity before anything is client-visible. Two
+// earlier shapes of it each failed in production:
+//   - Unbounded, it withheld the headers too, until the first content event:
+//     27s against 1s straight to upstream, minutes at xhigh. Remote clients
+//     were cut while waiting for headers ("error sending request") and resent
+//     the whole turn.
+//   - Bounded at 5s by committing, it let a capacity refusal that upstream
+//     sends after queueing for longer than that reach the client, because a
+//     committed stream can never be retried. Every capacity failure after that
+//     change was final.
+//
+// So the two jobs are separated. After the hold this writer sends 200 headers
+// and then SSE comments every streamKeepaliveInterval, which Codex ignores,
+// so the connection is never silent, while the window itself stays open and
+// the pool can still retry invisibly, including across capacity backoff waits.
+// The first real write stops the comments. Once headers are out, a status can
+// no longer be sent, so a later error response (writeOpenAIError, an upstream
+// non-2xx) is captured and emitted at finish as an SSE response.failed event
+// carrying the same code and message. Do not collapse this back into a timed
+// commit: that is the version that made capacity refusals final.
+type earlyStreamWriter struct {
+	inner         http.ResponseWriter
+	mu            sync.Mutex
+	headerWritten bool
+	early         bool
+	earlyAt       time.Time
+	real          bool
+	failStatus    int
+	failBody      bytes.Buffer
+	stop          chan struct{}
+	stopped       bool
+	wg            sync.WaitGroup
+}
+
+func newEarlyStreamWriter(w http.ResponseWriter, hold time.Duration) *earlyStreamWriter {
+	e := &earlyStreamWriter{inner: w, stop: make(chan struct{})}
+	if hold <= 0 {
+		return e
+	}
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		timer := time.NewTimer(hold)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-e.stop:
+			return
+		}
+		if !e.startEarly() {
+			return
+		}
+		ticker := time.NewTicker(streamKeepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				e.mu.Lock()
+				if e.real || e.failStatus != 0 {
+					e.mu.Unlock()
+					return
+				}
+				_, _ = e.inner.Write([]byte(": keepalive\n\n"))
+				if flusher, ok := e.inner.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				e.mu.Unlock()
+			case <-e.stop:
+				return
+			}
+		}
+	}()
+	return e
+}
+
+// startEarly sends the 200 SSE headers and an opening comment if nothing has
+// been written yet. It reports whether it did.
+func (e *earlyStreamWriter) startEarly() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.headerWritten {
+		return false
+	}
+	header := e.inner.Header()
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache")
+	e.inner.WriteHeader(http.StatusOK)
+	e.headerWritten = true
+	e.early = true
+	e.earlyAt = time.Now()
+	_, _ = e.inner.Write([]byte(": keepalive\n\n"))
+	if flusher, ok := e.inner.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return true
+}
+
+// headersSentEarly reports whether headers went out before any response
+// content, and when.
+func (e *earlyStreamWriter) headersSentEarly() (bool, time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.early, e.earlyAt
+}
+
+func (e *earlyStreamWriter) Header() http.Header { return e.inner.Header() }
+
+func (e *earlyStreamWriter) WriteHeader(status int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.early {
+		// 200 is already on the wire. An error status becomes an in-stream
+		// failure at finish; anything else is the stream continuing.
+		if status >= http.StatusBadRequest && !e.real && e.failStatus == 0 {
+			e.failStatus = status
+		}
+		return
+	}
+	if e.headerWritten {
+		return
+	}
+	e.headerWritten = true
+	e.inner.WriteHeader(status)
+}
+
+func (e *earlyStreamWriter) Write(p []byte) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.failStatus != 0 {
+		e.failBody.Write(p)
+		return len(p), nil
+	}
+	e.headerWritten = true
+	e.real = true
+	return e.inner.Write(p)
+}
+
+func (e *earlyStreamWriter) Flush() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.failStatus != 0 {
+		return
+	}
+	if flusher, ok := e.inner.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// finish stops the keepalive goroutine and, if an error response arrived after
+// early headers, emits it as an SSE response.failed event. It must run before
+// the handler returns.
+func (e *earlyStreamWriter) finish() {
+	e.mu.Lock()
+	if !e.stopped {
+		e.stopped = true
+		close(e.stop)
+	}
+	e.mu.Unlock()
+	e.wg.Wait()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.failStatus == 0 {
+		return
+	}
+	code, message := "upstream_error", http.StatusText(e.failStatus)
+	var parsed struct {
+		Error struct {
+			Code    any    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(e.failBody.Bytes(), &parsed) == nil {
+		if value, ok := parsed.Error.Code.(string); ok && value != "" {
+			code = value
+		}
+		if parsed.Error.Message != "" {
+			message = parsed.Error.Message
+		}
+	}
+	event, _ := json.Marshal(map[string]any{
+		"type": "response.failed",
+		"response": map[string]any{
+			"object": "response",
+			"status": "failed",
+			"error":  map[string]any{"code": code, "message": message},
+		},
+	})
+	_, _ = e.inner.Write([]byte("event: response.failed\ndata: " + string(event) + "\n\n"))
+	if flusher, ok := e.inner.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 // sseRead is one readSSEBlock result handed from the reader goroutine.
 type sseRead struct {
 	block string
@@ -2429,7 +2634,9 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 		}
 	}()
 	var holdExpired <-chan time.Time
-	if streamingPrecommitMaxHold > 0 {
+	// An earlyStreamWriter keeps the client connection alive itself and leaves
+	// the retry window open, so the timed commit applies only to other writers.
+	if _, managed := w.(*earlyStreamWriter); !managed && streamingPrecommitMaxHold > 0 {
 		holdTimer := time.NewTimer(streamingPrecommitMaxHold)
 		defer holdTimer.Stop()
 		holdExpired = holdTimer.C

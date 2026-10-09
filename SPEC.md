@@ -170,7 +170,7 @@ docker run -d \
 | `CODEX_POOL_CAPACITY_RETRY_LIMIT` | no | `8` | Capacity retry rounds once no identity can serve. `0` disables waiting and surfaces the refusal immediately. |
 | `CODEX_POOL_CAPACITY_RETRY_BACKOFF_MS` | no | `1000` | First capacity retry delay. Each round doubles from here. |
 | `CODEX_POOL_CAPACITY_RETRY_MAX_WAIT_MS` | no | `20000` | Cap on a single capacity retry delay. Raised to the first delay if set below it. |
-| `CODEX_POOL_PRECOMMIT_MAX_HOLD_MS` | no | `5000` | Longest the pre-commit window may withhold the response, headers included, before committing. Keep it well under the shortest idle timeout between remote clients and the pool. |
+| `CODEX_POOL_PRECOMMIT_MAX_HOLD_MS` | no | `5000` | Longest a streaming client waits with no byte at all. After it the pool sends headers and keepalive comments while still holding the response for capacity retries. Keep it well under the shortest idle timeout between remote clients and the pool. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_MODE` | no | `auto` | `auto` injects a hashed `prompt_cache_key` when the client omitted one. `off`/`passthrough` leave the request unchanged. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_POLICY` | no | `preserve` | Upstream-key policy independent of sticky routing. `preserve` retains a client key and uses the legacy missing-key behavior. `lineage`, `project`, and `user` explicitly replace any client key with a deterministic hashed/bucketed key for that scope. |
 | `CODEX_POOL_PROMPT_CACHE_KEY_SCOPE` | no | `auto` | Coarseness of the injected `prompt_cache_key`. `auto` groups by `X-Codex-Pool-Project` header, else API key, else per-conversation. `project`/`user` force that grouping; `conversation` keeps the historical per-conversation key. Coarser keys let sibling conversations reuse the same static-prefix cache. |
@@ -2069,18 +2069,27 @@ For streaming responses:
   indistinguishable from a bound set too low, and the block bound is
   indistinguishable from the byte bound. All are bounded operational metadata: an
   event type, `bounds`, or a count, never upstream payload text.
-- The window is also bounded in time. It withholds the response headers as well
-  as the lifecycle events, and a reasoning model is silent from its first
-  lifecycle events until its first reasoning item ends, which can be minutes.
-  Unbounded, the client got no byte at all for that long (27s against 1s
-  straight to upstream in one measurement); remote clients were cut while
+- The window must not keep the client silent. It withholds the response, and
+  a reasoning model is silent from its first lifecycle events until its first
+  reasoning item ends, which can be minutes. Two earlier designs failed:
+  unbounded, the client got no byte at all, headers included (27s against 1s
+  straight to upstream in one measurement), remote clients were cut while
   waiting for headers, Codex reported `error sending request` and resent the
-  whole turn. After `CODEX_POOL_PRECOMMIT_MAX_HOLD_MS` (default 5000) with the
-  window still open, the pool commits: headers and the held lifecycle events go
-  out unchanged, `precommitCloseReason` is `hold_timeout`, and a later capacity
-  refusal is forwarded in-stream like any committed one. Upstream capacity
-  refusals arrive within the first seconds, so the retry window keeps its
-  purpose. The routing event records the hold in `precommitHoldMs`.
+  whole turn; bounded by committing after 5s, capacity refusals that upstream
+  sends after queueing for longer reached the client, because a committed
+  stream can never be retried, and every capacity failure became final.
+- For a streaming Responses request the two jobs are therefore separate. When
+  nothing has been written after `CODEX_POOL_PRECOMMIT_MAX_HOLD_MS` (default
+  5000), the pool sends `200` SSE headers and then an SSE comment
+  (`: keepalive`) every 5s, which Codex ignores, while the pre-commit window
+  stays open: a late capacity refusal is still retried on another identity, and
+  capacity backoff waits are covered too. The first real write stops the
+  comments. Because a status can no longer be sent, an error response written
+  after that point (a pool error or an upstream non-2xx) is emitted as an SSE
+  `response.failed` event with the same `code` and `message`. Writers other
+  than this one (chat-completion conversion, tests) keep the timed commit with
+  close reason `hold_timeout`. The routing event records the hold in
+  `precommitHoldMs`.
 - Once any SSE bytes are committed downstream, never retry another account or
   splice a second response stream. In particular, never retry after any output,
   reasoning, tool, hosted-tool, unknown semantic event, or a preamble forced to
