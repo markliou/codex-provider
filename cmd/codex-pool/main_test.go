@@ -9703,3 +9703,144 @@ func TestPrecommitReleasesHeadersWhenUpstreamStaysSilent(t *testing.T) {
 		t.Fatalf("stream was altered:\n%s", got)
 	}
 }
+
+// syncRecorder is a ResponseRecorder that is safe to read while the
+// keepalive goroutine writes, and that reports when headers went out.
+type syncRecorder struct {
+	mu       sync.Mutex
+	rec      *httptest.ResponseRecorder
+	headerAt chan struct{}
+	once     sync.Once
+}
+
+func newSyncRecorder() *syncRecorder {
+	return &syncRecorder{rec: httptest.NewRecorder(), headerAt: make(chan struct{})}
+}
+func (s *syncRecorder) Header() http.Header { return s.rec.Header() }
+func (s *syncRecorder) WriteHeader(code int) {
+	s.mu.Lock()
+	s.rec.WriteHeader(code)
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.headerAt) })
+}
+func (s *syncRecorder) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rec.Write(p)
+}
+func (s *syncRecorder) Flush() {}
+func (s *syncRecorder) body() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rec.Body.String()
+}
+
+// The 5s timed commit let a capacity refusal that upstream sends after queueing
+// reach the client: every capacity failure after that change was final. With
+// the early writer, headers and keepalives go out at the hold but the retry
+// window stays open, so a late refusal is still retryable and nothing but
+// comments has reached the client.
+func TestEarlyHeadersKeepRetryWindowOpenForLateCapacityRefusal(t *testing.T) {
+	oldHold, oldInterval := streamingPrecommitMaxHold, streamKeepaliveIntervalForTest(t, 20*time.Millisecond)
+	streamingPrecommitMaxHold = 30 * time.Millisecond
+	t.Cleanup(func() { streamingPrecommitMaxHold = oldHold; _ = oldInterval })
+
+	client := newSyncRecorder()
+	early := newEarlyStreamWriter(client, streamingPrecommitMaxHold)
+	upstream, feed := io.Pipe()
+	done := make(chan streamingProxyResult, 1)
+	go func() {
+		done <- copyStreamingProxyResponseWithPrecommit(early, upstream, precommitByteLimit(0), func() {
+			early.WriteHeader(http.StatusOK)
+		})
+	}()
+	if _, err := io.WriteString(feed, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_q\"}}\n\nevent: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.headerAt:
+	case <-time.After(2 * time.Second):
+		t.Fatal("headers were not sent early while upstream queued the request")
+	}
+	time.Sleep(80 * time.Millisecond) // let a few keepalives through
+	if _, err := io.WriteString(feed, "event: error\ndata: {\"type\":\"error\",\"code\":\"server_is_overloaded\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_q\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	result := <-done
+	feed.Close()
+	early.finish()
+	if !result.RetryableTerminalFailure {
+		t.Fatalf("a late capacity refusal must stay retryable after early headers: %#v", result.Info)
+	}
+	if client.rec.Code != http.StatusOK || client.rec.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("early headers = %d %q", client.rec.Code, client.rec.Header().Get("Content-Type"))
+	}
+	body := client.body()
+	if strings.Contains(body, "data:") || strings.Count(body, ": keepalive") < 2 {
+		t.Fatalf("only keepalive comments may reach the client before a retry: %q", body)
+	}
+}
+
+// Once 200 is on the wire a status can no longer be sent, so an error response
+// written afterwards must reach the client as an SSE response.failed carrying
+// the same code and message.
+func TestEarlyHeadersConvertLaterErrorResponseIntoStreamFailure(t *testing.T) {
+	client := newSyncRecorder()
+	early := newEarlyStreamWriter(client, time.Millisecond)
+	<-client.headerAt
+	writeOpenAIError(early, http.StatusServiceUnavailable, "all_accounts_cooling_down", "every account is cooling down")
+	early.finish()
+	body := client.body()
+	if client.rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", client.rec.Code)
+	}
+	if !strings.Contains(body, "event: response.failed") || !strings.Contains(body, `"code":"all_accounts_cooling_down"`) || !strings.Contains(body, "every account is cooling down") {
+		t.Fatalf("error was not converted into a stream failure: %q", body)
+	}
+	// "invalid_request_error" is only in writeOpenAIError's raw JSON body.
+	if strings.Contains(body, "invalid_request_error") {
+		t.Fatalf("raw JSON error body leaked into the stream: %q", body)
+	}
+}
+
+// A response that starts within the hold is untouched: no early headers, no
+// comments, the upstream status and bytes exactly as written.
+func TestEarlyWriterIsTransparentWhenResponseStartsInTime(t *testing.T) {
+	client := newSyncRecorder()
+	early := newEarlyStreamWriter(client, time.Hour)
+	early.Header().Set("Content-Type", "text/event-stream")
+	early.WriteHeader(http.StatusOK)
+	_, _ = early.Write([]byte("event: response.created\ndata: {}\n\n"))
+	early.finish()
+	if body := client.body(); body != "event: response.created\ndata: {}\n\n" {
+		t.Fatalf("body = %q", body)
+	}
+	if sent, _ := early.headersSentEarly(); sent {
+		t.Fatal("headers were reported early for a prompt response")
+	}
+}
+
+// Keepalives stop at the first real write so they never interleave with the
+// model's output.
+func TestEarlyKeepalivesStopAtFirstRealWrite(t *testing.T) {
+	streamKeepaliveIntervalForTest(t, 10*time.Millisecond)
+	client := newSyncRecorder()
+	early := newEarlyStreamWriter(client, time.Millisecond)
+	<-client.headerAt
+	time.Sleep(40 * time.Millisecond)
+	_, _ = early.Write([]byte("event: response.created\ndata: {}\n\n"))
+	before := client.body()
+	time.Sleep(60 * time.Millisecond)
+	early.finish()
+	if after := client.body(); after != before {
+		t.Fatalf("keepalives continued after real output:\nbefore %q\nafter  %q", before, after)
+	}
+}
+
+func streamKeepaliveIntervalForTest(t *testing.T, interval time.Duration) time.Duration {
+	t.Helper()
+	old := streamKeepaliveInterval
+	streamKeepaliveInterval = interval
+	t.Cleanup(func() { streamKeepaliveInterval = old })
+	return old
+}
