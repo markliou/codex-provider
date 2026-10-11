@@ -2386,14 +2386,15 @@ func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResp
 	return result.Info
 }
 
-// streamKeepaliveInterval is the longest a streaming client may go without a
-// byte. Codex's HTTP client (reqwest) drops a connection that receives nothing
-// for about 5s, whatever its 300s stream_idle_timeout says: another proxy
-// measured Codex giving up at time.idle=4.81s and later saw ~2s watchdogs in
-// practice (OmniRoute #2544, keepaliveThreshold.ts), and Codex reports it as
-// "error sending request". Our first version sent a comment every 5s, exactly
-// on that line, and the error kept coming back. Stay well under the tightest
-// observed watchdog.
+// streamKeepaliveInterval is the longest a streaming response may go without a
+// byte. The client is not what needs it: Codex CLI 0.130.0, 0.141.0 and 0.162.1
+// were measured waiting 120s with no headers and 60s of mid-stream silence on
+// a direct connection without failing (a report from another proxy, OmniRoute
+// #2544, blamed a ~5s Codex timeout, which did not reproduce). What can cut a
+// silent connection is the path between remote clients and this pool: home
+// router NAT, ISP, corporate proxies and VPNs, whose idle timeouts are not
+// ours to set. Remote clients here still report "error sending request", so
+// the stream is kept continuously active instead of relying on any of them.
 var streamKeepaliveInterval = 1500 * time.Millisecond
 
 // streamKeepaliveTick is how often the keepalive goroutine checks for silence.
@@ -2800,8 +2801,8 @@ var (
 	//
 	// For a streaming Responses request this is now when earlyStreamWriter sends
 	// headers and starts keepalives, not a commit, so it can be short without
-	// costing any retry: 1s is half the tightest client watchdog observed in
-	// practice (see streamKeepaliveInterval).
+	// costing any retry; a short wait keeps the connection active for whatever
+	// idle timeout sits on the remote path (see streamKeepaliveInterval).
 	streamingPrecommitMaxHold = time.Second
 	// unmanagedPrecommitCommitAfter is the timed commit for writers that are not
 	// an earlyStreamWriter (chat-completion streams). They cannot send early
