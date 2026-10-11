@@ -2386,9 +2386,18 @@ func copyStreamingProxyResponse(w http.ResponseWriter, body io.Reader) proxyResp
 	return result.Info
 }
 
-// streamKeepaliveInterval paces the SSE comments sent while a streaming
-// request's response is still being withheld after its headers went out early.
-var streamKeepaliveInterval = 5 * time.Second
+// streamKeepaliveInterval is the longest a streaming client may go without a
+// byte. Codex's HTTP client (reqwest) drops a connection that receives nothing
+// for about 5s, whatever its 300s stream_idle_timeout says: another proxy
+// measured Codex giving up at time.idle=4.81s and later saw ~2s watchdogs in
+// practice (OmniRoute #2544, keepaliveThreshold.ts), and Codex reports it as
+// "error sending request". Our first version sent a comment every 5s, exactly
+// on that line, and the error kept coming back. Stay well under the tightest
+// observed watchdog.
+var streamKeepaliveInterval = 1500 * time.Millisecond
+
+// streamKeepaliveTick is how often the keepalive goroutine checks for silence.
+var streamKeepaliveTick = 250 * time.Millisecond
 
 // earlyStreamWriter wraps the client writer of a streaming Responses request.
 //
@@ -2405,21 +2414,30 @@ var streamKeepaliveInterval = 5 * time.Second
 //     change was final.
 //
 // So the two jobs are separated. After the hold this writer sends 200 headers
-// and then SSE comments every streamKeepaliveInterval, which Codex ignores,
-// so the connection is never silent, while the window itself stays open and
-// the pool can still retry invisibly, including across capacity backoff waits.
-// The first real write stops the comments. Once headers are out, a status can
-// no longer be sent, so a later error response (writeOpenAIError, an upstream
-// non-2xx) is captured and emitted at finish as an SSE response.failed event
-// carrying the same code and message. Do not collapse this back into a timed
-// commit: that is the version that made capacity refusals final.
+// and then SSE comments, which Codex ignores, so the connection is never
+// silent, while the window itself stays open and the pool can still retry
+// invisibly, including across capacity backoff waits. Comments continue for
+// the whole stream, not only before the first output: a reasoning model goes
+// silent again between output items for as long as it thinks, and that
+// silence trips the same client timeout. They are written only on an SSE
+// response and only between whole writes, and every streaming write is one
+// complete SSE block, so a comment never lands inside an event. Once headers
+// are out early, a status can no longer be sent, so a later error response
+// (writeOpenAIError, an upstream non-2xx) is captured and emitted at finish as
+// an SSE response.failed event carrying the same code and message. Do not
+// collapse this back into a timed commit: that is the version that made
+// capacity refusals final.
 type earlyStreamWriter struct {
 	inner         http.ResponseWriter
 	mu            sync.Mutex
+	created       time.Time
+	hold          time.Duration
 	headerWritten bool
+	sse           bool
 	early         bool
 	earlyAt       time.Time
 	real          bool
+	lastWrite     time.Time
 	failStatus    int
 	failBody      bytes.Buffer
 	stop          chan struct{}
@@ -2428,44 +2446,46 @@ type earlyStreamWriter struct {
 }
 
 func newEarlyStreamWriter(w http.ResponseWriter, hold time.Duration) *earlyStreamWriter {
-	e := &earlyStreamWriter{inner: w, stop: make(chan struct{})}
-	if hold <= 0 {
-		return e
-	}
+	e := &earlyStreamWriter{inner: w, stop: make(chan struct{}), created: time.Now(), hold: hold}
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		timer := time.NewTimer(hold)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-e.stop:
-			return
-		}
-		if !e.startEarly() {
-			return
-		}
-		ticker := time.NewTicker(streamKeepaliveInterval)
+		ticker := time.NewTicker(streamKeepaliveTick)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				e.mu.Lock()
-				if e.real || e.failStatus != 0 {
-					e.mu.Unlock()
-					return
-				}
-				_, _ = e.inner.Write([]byte(": keepalive\n\n"))
-				if flusher, ok := e.inner.(http.Flusher); ok {
-					flusher.Flush()
-				}
-				e.mu.Unlock()
+				e.tick(time.Now())
 			case <-e.stop:
 				return
 			}
 		}
 	}()
 	return e
+}
+
+// tick sends early headers once the hold has passed with nothing written, and
+// a keepalive comment whenever an SSE response has been silent for
+// streamKeepaliveInterval.
+func (e *earlyStreamWriter) tick(now time.Time) {
+	e.mu.Lock()
+	if !e.headerWritten {
+		due := e.hold > 0 && now.Sub(e.created) >= e.hold
+		e.mu.Unlock()
+		if due {
+			e.startEarly()
+		}
+		return
+	}
+	defer e.mu.Unlock()
+	if !e.sse || e.failStatus != 0 || now.Sub(e.lastWrite) < streamKeepaliveInterval {
+		return
+	}
+	_, _ = e.inner.Write([]byte(": keepalive\n\n"))
+	e.lastWrite = now
+	if flusher, ok := e.inner.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 // startEarly sends the 200 SSE headers and an opening comment if nothing has
@@ -2481,8 +2501,10 @@ func (e *earlyStreamWriter) startEarly() bool {
 	header.Set("Cache-Control", "no-cache")
 	e.inner.WriteHeader(http.StatusOK)
 	e.headerWritten = true
+	e.sse = true
 	e.early = true
 	e.earlyAt = time.Now()
+	e.lastWrite = e.earlyAt
 	_, _ = e.inner.Write([]byte(": keepalive\n\n"))
 	if flusher, ok := e.inner.(http.Flusher); ok {
 		flusher.Flush()
@@ -2515,7 +2537,17 @@ func (e *earlyStreamWriter) WriteHeader(status int) {
 		return
 	}
 	e.headerWritten = true
+	e.markSSELocked(status)
 	e.inner.WriteHeader(status)
+}
+
+// markSSELocked records whether the response is a successful SSE stream, the
+// only kind a keepalive comment may be written into: in a JSON body it would
+// corrupt the response.
+func (e *earlyStreamWriter) markSSELocked(status int) {
+	contentType := strings.ToLower(e.inner.Header().Get("Content-Type"))
+	e.sse = status < http.StatusBadRequest && strings.Contains(contentType, "text/event-stream")
+	e.lastWrite = time.Now()
 }
 
 func (e *earlyStreamWriter) Write(p []byte) (int, error) {
@@ -2525,8 +2557,13 @@ func (e *earlyStreamWriter) Write(p []byte) (int, error) {
 		e.failBody.Write(p)
 		return len(p), nil
 	}
-	e.headerWritten = true
+	if !e.headerWritten {
+		// An implicit 200, as net/http would send it.
+		e.headerWritten = true
+		e.markSSELocked(http.StatusOK)
+	}
 	e.real = true
+	e.lastWrite = time.Now()
 	return e.inner.Write(p)
 }
 
@@ -2636,8 +2673,8 @@ func copyStreamingProxyResponseWithPrecommit(w http.ResponseWriter, body io.Read
 	var holdExpired <-chan time.Time
 	// An earlyStreamWriter keeps the client connection alive itself and leaves
 	// the retry window open, so the timed commit applies only to other writers.
-	if _, managed := w.(*earlyStreamWriter); !managed && streamingPrecommitMaxHold > 0 {
-		holdTimer := time.NewTimer(streamingPrecommitMaxHold)
+	if _, managed := w.(*earlyStreamWriter); !managed && unmanagedPrecommitCommitAfter > 0 {
+		holdTimer := time.NewTimer(unmanagedPrecommitCommitAfter)
 		defer holdTimer.Stop()
 		holdExpired = holdTimer.C
 	}
@@ -2760,9 +2797,17 @@ var (
 	// scratch, which is what made throughput collapse while upstream success
 	// stayed at 99.8%. Upstream capacity refusals arrive within the first
 	// seconds, so a short bound keeps the retry window for them.
-	// 5s rather than the first 8s: operator choice, to stay further from remote
-	// idle timeouts while still covering refusals that arrive in the first seconds.
-	streamingPrecommitMaxHold = 5 * time.Second
+	//
+	// For a streaming Responses request this is now when earlyStreamWriter sends
+	// headers and starts keepalives, not a commit, so it can be short without
+	// costing any retry: 1s is half the tightest client watchdog observed in
+	// practice (see streamKeepaliveInterval).
+	streamingPrecommitMaxHold = time.Second
+	// unmanagedPrecommitCommitAfter is the timed commit for writers that are not
+	// an earlyStreamWriter (chat-completion streams). They cannot send early
+	// headers without committing, so they keep the earlier 5s bound rather than
+	// the 1s header hold, which would close their retry window almost at once.
+	unmanagedPrecommitCommitAfter = 5 * time.Second
 )
 
 // capacityRetryBackoff doubles each round up to a cap, so an early blip costs a

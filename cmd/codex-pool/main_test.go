@@ -9657,9 +9657,10 @@ func TestShutdownGraceFromEnv(t *testing.T) {
 // window must release headers and the held events once the hold bound passes,
 // while upstream is still silent, and the rest of the stream must follow intact.
 func TestPrecommitReleasesHeadersWhenUpstreamStaysSilent(t *testing.T) {
-	old := streamingPrecommitMaxHold
-	streamingPrecommitMaxHold = 50 * time.Millisecond
-	t.Cleanup(func() { streamingPrecommitMaxHold = old })
+	// A plain recorder is not an earlyStreamWriter, so it takes the timed commit.
+	old := unmanagedPrecommitCommitAfter
+	unmanagedPrecommitCommitAfter = 50 * time.Millisecond
+	t.Cleanup(func() { unmanagedPrecommitCommitAfter = old })
 
 	upstream, feed := io.Pipe()
 	recorder := httptest.NewRecorder()
@@ -9820,27 +9821,56 @@ func TestEarlyWriterIsTransparentWhenResponseStartsInTime(t *testing.T) {
 	}
 }
 
-// Keepalives stop at the first real write so they never interleave with the
-// model's output.
-func TestEarlyKeepalivesStopAtFirstRealWrite(t *testing.T) {
+// Codex's HTTP client drops a connection after about 5s without a byte, and a
+// reasoning model goes silent mid-stream for as long as it thinks. Keepalives
+// must therefore resume during any silence after real output, as whole blocks
+// between whole writes, and stop again while output flows.
+func TestKeepalivesCoverSilenceAfterRealOutput(t *testing.T) {
+	streamKeepaliveIntervalForTest(t, 30*time.Millisecond)
+	client := newSyncRecorder()
+	early := newEarlyStreamWriter(client, time.Hour)
+	early.Header().Set("Content-Type", "text/event-stream")
+	early.WriteHeader(http.StatusOK)
+	_, _ = early.Write([]byte("event: response.created\ndata: {}\n\n"))
+	time.Sleep(150 * time.Millisecond) // the model "thinks"
+	_, _ = early.Write([]byte("event: response.completed\ndata: {}\n\n"))
+	early.finish()
+	body := client.body()
+	if !strings.HasPrefix(body, "event: response.created\ndata: {}\n\n: keepalive\n\n") {
+		t.Fatalf("no keepalive during the silence after real output: %q", body)
+	}
+	if !strings.HasSuffix(body, "event: response.completed\ndata: {}\n\n") {
+		t.Fatalf("stream was altered: %q", body)
+	}
+	for _, block := range strings.Split(strings.TrimSuffix(body, "\n\n"), "\n\n") {
+		if block != ": keepalive" && !strings.HasPrefix(block, "event: ") {
+			t.Fatalf("a keepalive landed inside an event: %q", body)
+		}
+	}
+}
+
+// A keepalive comment in a JSON body would corrupt it, so a non-SSE response
+// that starts in time never receives one.
+func TestKeepalivesNeverEnterANonSSEResponse(t *testing.T) {
 	streamKeepaliveIntervalForTest(t, 10*time.Millisecond)
 	client := newSyncRecorder()
-	early := newEarlyStreamWriter(client, time.Millisecond)
-	<-client.headerAt
-	time.Sleep(40 * time.Millisecond)
-	_, _ = early.Write([]byte("event: response.created\ndata: {}\n\n"))
-	before := client.body()
-	time.Sleep(60 * time.Millisecond)
+	early := newEarlyStreamWriter(client, time.Hour)
+	writeOpenAIError(early, http.StatusTooManyRequests, "rate_limited", "slow down")
+	time.Sleep(80 * time.Millisecond)
 	early.finish()
-	if after := client.body(); after != before {
-		t.Fatalf("keepalives continued after real output:\nbefore %q\nafter  %q", before, after)
+	if body := client.body(); strings.Contains(body, "keepalive") || client.rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status %d body %q", client.rec.Code, body)
 	}
 }
 
 func streamKeepaliveIntervalForTest(t *testing.T, interval time.Duration) time.Duration {
 	t.Helper()
-	old := streamKeepaliveInterval
+	old, oldTick := streamKeepaliveInterval, streamKeepaliveTick
 	streamKeepaliveInterval = interval
-	t.Cleanup(func() { streamKeepaliveInterval = old })
+	streamKeepaliveTick = interval / 4
+	if streamKeepaliveTick < time.Millisecond {
+		streamKeepaliveTick = time.Millisecond
+	}
+	t.Cleanup(func() { streamKeepaliveInterval, streamKeepaliveTick = old, oldTick })
 	return old
 }
