@@ -2023,12 +2023,27 @@ func (a *app) prepareUpstreamRequest(candidate account, body []byte, chat bool) 
 	return endpoint, outbound, convertResponse, nil
 }
 
+// codexMetadataHeaderAllowlist is what the pool relays from the Codex client.
+// It deliberately includes the session/thread, request-ID, originator,
+// User-Agent, and beta-feature headers a native Codex CLI request carries, so
+// upstream sees the same request shape as Codex talking to it directly (for
+// example, session-scoped routing and caching keyed on session-id) instead of a
+// generic Go client. Keep it an allowlist: client authorization, cookies,
+// hop-by-hop headers, and pool-only compatibility headers such as
+// X-Codex-Thread-ID must never be relayed.
 var codexMetadataHeaderAllowlist = []string{
 	"X-Codex-Parent-Thread-ID",
 	"X-OpenAI-Subagent",
 	"X-Codex-Turn-Metadata",
 	"X-Codex-Window-ID",
 	"X-Codex-Installation-ID",
+	"Session-Id",
+	"Session_id",
+	"Thread-Id",
+	"X-Client-Request-Id",
+	"Originator",
+	"User-Agent",
+	"X-Codex-Beta-Features",
 }
 
 func (a *app) forward(ctx context.Context, candidate account, endpoint string, body []byte, inbound http.Header) (*http.Response, error) {

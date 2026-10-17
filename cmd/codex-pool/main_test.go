@@ -5565,6 +5565,13 @@ func TestResponsesProxyForwardsOnlyCodexMetadataHeaderAllowlist(t *testing.T) {
 			"X-Codex-Turn-Metadata":    `{"thread_id":"child-thread"}`,
 			"X-Codex-Window-ID":        "window-a",
 			"X-Codex-Installation-ID":  "installation-a",
+			"Session-Id":               "session-a",
+			"Session_id":               "legacy-session-a",
+			"Thread-Id":                "child-thread",
+			"X-Client-Request-Id":      "request-a",
+			"Originator":               "codex_exec",
+			"User-Agent":               "codex_exec/0.141.0 (Debian 12.0.0; x86_64)",
+			"X-Codex-Beta-Features":    "remote_compaction_v2",
 		} {
 			if got := r.Header.Get(name); got != want {
 				t.Fatalf("%s = %q, want %q", name, got, want)
@@ -5594,6 +5601,13 @@ func TestResponsesProxyForwardsOnlyCodexMetadataHeaderAllowlist(t *testing.T) {
 	req.Header.Set("X-Codex-Turn-Metadata", `{"thread_id":"child-thread"}`)
 	req.Header.Set("X-Codex-Window-ID", "window-a")
 	req.Header.Set("X-Codex-Installation-ID", "installation-a")
+	req.Header.Set("Session-Id", "session-a")
+	req.Header.Set("Session_id", "legacy-session-a")
+	req.Header.Set("Thread-Id", "child-thread")
+	req.Header.Set("X-Client-Request-Id", "request-a")
+	req.Header.Set("Originator", "codex_exec")
+	req.Header.Set("User-Agent", "codex_exec/0.141.0 (Debian 12.0.0; x86_64)")
+	req.Header.Set("X-Codex-Beta-Features", "remote_compaction_v2")
 	recorder := httptest.NewRecorder()
 	a.publicMux().ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {

@@ -655,7 +655,16 @@ X-OpenAI-Subagent
 X-Codex-Turn-Metadata
 X-Codex-Window-ID
 X-Codex-Installation-ID
+Session-Id
+Session_id
+Thread-Id
+X-Client-Request-Id
+Originator
+User-Agent
+X-Codex-Beta-Features
 ```
+
+The session/thread, request-ID, originator, User-Agent, and beta-feature headers are the ones a native Codex CLI request carries; relaying them keeps the upstream request shape the same as Codex calling upstream directly. The pool-only `X-Codex-Thread-ID` compatibility header is not relayed.
 
 Do not forward client authorization, API keys, hop-by-hop headers, or unrelated client-controlled headers.
 
