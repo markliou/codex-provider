@@ -5615,6 +5615,74 @@ func TestResponsesProxyForwardsOnlyCodexMetadataHeaderAllowlist(t *testing.T) {
 	}
 }
 
+func TestClientFingerprintIsRecordedLocallyAndNeverSentUpstream(t *testing.T) {
+	const userAgent = "codex_exec/0.141.0 (Debian 12.0.0; x86_64) xterm"
+	var upstreamHeaders http.Header
+	var upstreamBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHeaders = r.Header.Clone()
+		body, _ := io.ReadAll(r.Body)
+		upstreamBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_fingerprint","object":"response","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	a := testApp(t, []account{{ID: "provider", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL + "/v1", UpstreamAPIKey: "upstream-key"}})
+	turnMetadata := `{"thread_id":"thread-a","request_kind":"memory consolidation"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Originator", "codex_exec")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("X-Codex-Turn-Metadata", turnMetadata)
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	// Upstream must see the client's own values verbatim, not the shortened
+	// telemetry labels, and no diagnostic field may reach the body.
+	if got := upstreamHeaders.Get("User-Agent"); got != userAgent {
+		t.Fatalf("upstream User-Agent = %q, want the client's verbatim %q", got, userAgent)
+	}
+	if got := upstreamHeaders.Get("X-Codex-Turn-Metadata"); got != turnMetadata {
+		t.Fatalf("upstream turn metadata = %q, want verbatim %q", got, turnMetadata)
+	}
+	for _, leaked := range []string{"clientOriginator", "clientUserAgent", "clientRequestKind", "memory_consolidation"} {
+		if strings.Contains(upstreamBody, leaked) {
+			t.Fatalf("diagnostic %q leaked into upstream body: %s", leaked, upstreamBody)
+		}
+		for name, values := range upstreamHeaders {
+			if strings.Contains(name+strings.Join(values, ","), leaked) {
+				t.Fatalf("diagnostic %q leaked into upstream header %s", leaked, name)
+			}
+		}
+	}
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.state.RoutingCacheEvents) != 1 {
+		t.Fatalf("routing events = %d, want 1", len(a.state.RoutingCacheEvents))
+	}
+	event := a.state.RoutingCacheEvents[0]
+	if event.ClientOriginator != "codex_exec" || event.ClientUserAgent != "codex_exec/0.141.0" || event.ClientRequestKind != "memory_consolidation" {
+		t.Fatalf("fingerprint = %q / %q / %q", event.ClientOriginator, event.ClientUserAgent, event.ClientRequestKind)
+	}
+}
+
+func TestTelemetryLabelIsBoundedTokenText(t *testing.T) {
+	if got := telemetryLabel(" codex_exec "); got != "codex_exec" {
+		t.Fatalf("label = %q", got)
+	}
+	if got := telemetryLabel("a\nb\"c<d>"); got != "a_b_c_d_" {
+		t.Fatalf("label = %q, want control and markup characters replaced", got)
+	}
+	if got := telemetryLabel(strings.Repeat("x", 200)); len(got) != 64 {
+		t.Fatalf("label length = %d, want 64", len(got))
+	}
+}
+
 func TestDeviceAuthFailoverAfterRateLimit(t *testing.T) {
 	firstHits := 0
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
