@@ -60,6 +60,13 @@
               <input id="preserve-pro-quota-switch" type="checkbox" role="switch">
               <span class="switch-ui" aria-hidden="true"></span>
             </label>
+            <!-- On by default: a main agent and its subagents share one account.
+                 Off restores the old first-request-only parent preference. -->
+            <label class="switch-row" for="lineage-affinity-switch" title="Keep the main agent and its subagents on the same account">
+              <span class="switch-label">Keep subagents together</span>
+              <input id="lineage-affinity-switch" type="checkbox" role="switch">
+              <span class="switch-ui" aria-hidden="true"></span>
+            </label>
             <button id="add-account-button" class="button primary" type="button">Add account</button>
           </div>
         </div>

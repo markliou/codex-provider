@@ -165,6 +165,7 @@ type config struct {
 	ModelAliases     map[string]string `json:"modelAliases"`
 	Accounts         []account         `json:"accounts"`
 	PreserveProQuota *bool             `json:"preserveProQuota,omitempty"`
+	LineageAffinity  *bool             `json:"lineageAffinity,omitempty"`
 	CreatedAt        time.Time         `json:"createdAt"`
 	UpdatedAt        time.Time         `json:"updatedAt"`
 }
@@ -580,6 +581,7 @@ type app struct {
 	promptCacheBuckets   int
 	promptCacheRetention string
 	preserveProQuota     bool
+	lineageAffinity      bool
 	listenAddress        string
 	publicDashboard      bool
 	codexBaseURL         string
@@ -695,6 +697,13 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Lineage affinity defaults on: splitting a main agent and its subagents
+	// across accounts was the reported bug, so only an explicit opt-out may
+	// restore the old first-request-only parent preference.
+	lineageAffinity, err := boolFromEnvDefault("CODEX_POOL_LINEAGE_AFFINITY", true)
+	if err != nil {
+		return nil, err
+	}
 	// Product contract: the combined-port root is a public control page, while
 	// management actions require password auth. A previous hardening pass flipped
 	// this default and broke the expected landing page, so keep the default true
@@ -724,6 +733,7 @@ func newAppFromEnv() (*app, error) {
 		promptCacheBuckets:   promptCacheBuckets,
 		promptCacheRetention: promptCacheRetention,
 		preserveProQuota:     preserveProQuota,
+		lineageAffinity:      lineageAffinity,
 		listenAddress:        listenAddress,
 		publicDashboard:      publicDashboard,
 		codexBaseURL:         strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
@@ -782,6 +792,9 @@ func (a *app) load() error {
 	}
 	if a.config.PreserveProQuota != nil {
 		a.preserveProQuota = *a.config.PreserveProQuota
+	}
+	if a.config.LineageAffinity != nil {
+		a.lineageAffinity = *a.config.LineageAffinity
 	}
 	if configuredDefault := strings.TrimSpace(os.Getenv("CODEX_POOL_DEFAULT_MODEL")); configuredDefault != "" {
 		a.config.DefaultModel = configuredDefault
@@ -3307,20 +3320,30 @@ func (a *app) handleAdminState(w http.ResponseWriter, _ *http.Request) {
 func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		PreserveProQuota *bool `json:"preserveProQuota"`
+		LineageAffinity  *bool `json:"lineageAffinity"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&request); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid settings JSON")
 		return
 	}
-	if request.PreserveProQuota == nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "preserveProQuota is required")
+	// Each Console switch posts only its own field, so an omitted field must
+	// leave that setting untouched rather than reset it.
+	if request.PreserveProQuota == nil && request.LineageAffinity == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "preserveProQuota or lineageAffinity is required")
 		return
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.preserveProQuota = *request.PreserveProQuota
-	value := a.preserveProQuota
-	a.config.PreserveProQuota = &value
+	if request.PreserveProQuota != nil {
+		a.preserveProQuota = *request.PreserveProQuota
+		value := a.preserveProQuota
+		a.config.PreserveProQuota = &value
+	}
+	if request.LineageAffinity != nil {
+		a.lineageAffinity = *request.LineageAffinity
+		value := a.lineageAffinity
+		a.config.LineageAffinity = &value
+	}
 	if err := a.saveLocked(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "storage_error", "unable to persist settings")
 		return
@@ -3329,7 +3352,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now), "quotaFloorPercent": quotaExhaustionFloorPercent}
+	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "lineageAffinity": a.lineageAffinity, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now), "quotaFloorPercent": quotaExhaustionFloorPercent}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {
@@ -4096,17 +4119,60 @@ func (a *app) modelsLocked(routable map[string]bool) []string {
 }
 
 func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (account, error) {
-	return a.selectAccountWithPreference(stickyKey, model, "", excluded)
+	return a.selectAccountWithPreference(stickyKey, stickyKey, model, "", false, excluded)
 }
 
 func (a *app) selectAccountForRoute(route routingDecision, model string, excluded map[string]bool) (account, error) {
-	return a.selectAccountWithPreference(route.StickyKey, model, route.PreferredParentAccountID, excluded)
+	balanceKey := route.BalanceKey
+	if balanceKey == "" {
+		balanceKey = route.StickyKey
+	}
+	return a.selectAccountWithPreference(route.StickyKey, balanceKey, model, route.LineageAccountID, route.LineageAffinity, excluded)
 }
 
-func (a *app) selectAccountWithPreference(stickyKey, model, preferredParentAccountID string, excluded map[string]bool) (account, error) {
+// lineagePreferenceLocked applies the lineage (or, with lineage affinity off,
+// parent) account preference. It is never a hard pin: the account must pass
+// every normal eligibility, duplicate-identity, cooldown, and Pro-preservation
+// gate, otherwise an unhealthy lineage account would block failover. A Pro
+// account under Pro preservation yields to the balanceKey replacement directly
+// rather than to this thread's own sticky account, which may differ per member
+// and would split the lineage. holdForRepair keeps a lineage on an account that
+// is completing sign-in repair, the same rule as a live sticky session.
+func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string, excluded map[string]bool, holdForRepair bool, now time.Time) (account, bool, error) {
+	lineage := a.accountLocked(lineageAccountID)
+	if lineage == nil {
+		return account{}, false, nil
+	}
+	if a.selectableAccountLocked(*lineage, model, excluded, now) {
+		if !a.preserveProQuota || !a.proAccountLocked(*lineage) {
+			return *lineage, true, nil
+		}
+		if replacement, ok := a.preferredAccountForStickyLocked(balanceKey, model, excluded, now); ok && !a.proAccountLocked(replacement) {
+			return replacement, true, nil
+		}
+		return *lineage, true, nil
+	}
+	if holdForRepair && !excluded[lineage.ID] && a.accountAuthVerificationPendingLocked(*lineage) {
+		return account{}, false, errAccountAuthRepairPending
+	}
+	return account{}, false, nil
+}
+
+func (a *app) selectAccountWithPreference(stickyKey, balanceKey, model, lineageAccountID string, lineageFirst bool, excluded map[string]bool) (account, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
+	// With lineage affinity (the default), the lineage account wins over the
+	// thread's own sticky binding so a main agent and its subagents never stay
+	// split across accounts (one account's usage, one KV-cache locality). When
+	// it is ineligible, the thread's own sticky route and then the
+	// lineage-shared balanceKey decide, so members that fail over independently
+	// still converge, and the first success becomes the new lineage account.
+	if lineageFirst && lineageAccountID != "" {
+		if selected, ok, err := a.lineagePreferenceLocked(lineageAccountID, balanceKey, model, excluded, true, now); err != nil || ok {
+			return selected, err
+		}
+	}
 	stickyChanged := false
 	if existing, ok := a.state.StickySessions[stickyKey]; ok && !excluded[existing.AccountID] {
 		if a.stickySessionExpiredLocked(existing, now) {
@@ -4114,7 +4180,7 @@ func (a *app) selectAccountWithPreference(stickyKey, model, preferredParentAccou
 			stickyChanged = true
 		} else if item := a.accountLocked(existing.AccountID); item != nil && a.usableLocked(*item, model, now) {
 			if a.preserveProQuota && a.proAccountLocked(*item) {
-				if replacement, ok := a.preferredAccountForStickyLocked(stickyKey, model, excluded, now); ok && replacement.ID != item.ID && !a.proAccountLocked(replacement) {
+				if replacement, ok := a.preferredAccountForStickyLocked(balanceKey, model, excluded, now); ok && replacement.ID != item.ID && !a.proAccountLocked(replacement) {
 					return replacement, nil
 				}
 			}
@@ -4132,21 +4198,15 @@ func (a *app) selectAccountWithPreference(stickyKey, model, preferredParentAccou
 	if stickyChanged {
 		_ = a.saveLocked()
 	}
-	// Parent affinity applies only while assigning an unbound child thread. It
-	// must stay a soft preference behind every normal eligibility, duplicate-
-	// identity, cooldown, and Pro-preservation gate; turning this into a hard pin
-	// would let an unhealthy parent account block or weaken normal failover.
-	if preferredParentAccountID != "" {
-		if parent := a.accountLocked(preferredParentAccountID); parent != nil && a.selectableAccountLocked(*parent, model, excluded, now) {
-			if !a.preserveProQuota || !a.proAccountLocked(*parent) {
-				return *parent, nil
-			}
-			if replacement, ok := a.preferredAccountForStickyLocked(stickyKey, model, excluded, now); !ok || a.proAccountLocked(replacement) {
-				return *parent, nil
-			}
+	// With lineage affinity switched off, keep the legacy contract: the parent
+	// account is only a soft preference for a child that has no usable sticky
+	// route of its own, so children may stay on other accounts afterwards.
+	if !lineageFirst && lineageAccountID != "" {
+		if selected, ok, _ := a.lineagePreferenceLocked(lineageAccountID, balanceKey, model, excluded, false, now); ok {
+			return selected, nil
 		}
 	}
-	selected, ok := a.preferredAccountForStickyLocked(stickyKey, model, excluded, now)
+	selected, ok := a.preferredAccountForStickyLocked(balanceKey, model, excluded, now)
 	if !ok {
 		// Every candidate is blocked. A transient upstream-overload cooldown is a
 		// probabilistic hint, not proof the account will refuse again, so failing
@@ -5192,9 +5252,9 @@ func (a *app) markSuccessWithMeasurement(route routingDecision, model, accountID
 		}
 		a.state.ResponseBindings[info.ResponseID] = responseBinding{ResponseID: info.ResponseID, StickyKey: key, ModelID: model, AccountID: accountID, CreatedAt: now, ExpiresAt: now.Add(a.stickyTTL())}
 	}
-	parentAffinityHit := route.ParentAffinityAttempted && route.PreferredParentAccountID != "" && route.PreferredParentAccountID == accountID
+	parentAffinityHit := route.ParentAffinityAttempted && route.LineageAccountID != "" && route.LineageAccountID == accountID
 	parentAffinityFallback := route.ParentAffinityAttempted && !parentAffinityHit
-	if route.ParentAffinityAttempted && route.PreferredParentAccountID != "" && route.PreferredParentAccountID != accountID {
+	if route.ParentAffinityAttempted && route.LineageAccountID != "" && route.LineageAccountID != accountID {
 		lineageFailover = true
 	}
 	routingOutcome, failoverFromAccountID := a.routingOutcomeLocked(route, model, accountID, prior, info, parentAffinityHit, parentAffinityFallback, now)
@@ -5280,12 +5340,17 @@ func (a *app) routingOutcomeLocked(route routingDecision, model, accountID strin
 	if prior.AccountID != "" && prior.AccountID == accountID {
 		return "sticky_reuse", ""
 	}
+	if route.LineageAffinity && prior.AccountID != "" && route.LineageAccountID == accountID {
+		// A bound thread moved without an upstream retry because its lineage
+		// (main agent or a sibling subagent) now lives on another account.
+		return "lineage_follow", prior.AccountID
+	}
 	return "new_route_assignment", ""
 }
 
 func normalizedRoutingOutcome(value string) string {
 	switch value {
-	case "sticky_reuse", "new_route_assignment", "parent_affinity", "parent_affinity_fallback", "quota_failover", "rate_limit_failover", "stream_capacity_failover", "stream_transient_failover", "auth_failover", "transport_failover", "repeated_5xx_failover":
+	case "sticky_reuse", "new_route_assignment", "parent_affinity", "parent_affinity_fallback", "lineage_follow", "quota_failover", "rate_limit_failover", "stream_capacity_failover", "stream_transient_failover", "auth_failover", "transport_failover", "repeated_5xx_failover":
 		return value
 	default:
 		return ""
@@ -5336,7 +5401,7 @@ func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accoun
 	parentAffinity := "not_attempted"
 	if route.ParentAffinityAttempted {
 		parentAffinity = "fallback"
-		if route.PreferredParentAccountID != "" && route.PreferredParentAccountID == accountID {
+		if route.LineageAccountID != "" && route.LineageAccountID == accountID {
 			parentAffinity = "hit"
 		}
 	}
@@ -5750,32 +5815,51 @@ func currentStatusStickyKey(r *http.Request, model string) (string, string) {
 }
 
 type routingDecision struct {
-	StickyKey                string
-	UpstreamPromptCacheKey   string
-	Source                   string
-	SourceValue              string
-	Identity                 requestIdentity
-	ClientPromptCacheKey     string
-	PreferredParentAccountID string
-	ParentAffinityAttempted  bool
+	StickyKey              string
+	UpstreamPromptCacheKey string
+	Source                 string
+	SourceValue            string
+	Identity               requestIdentity
+	ClientPromptCacheKey   string
+	// LineageAccountID is the account the request's Codex lineage (main agent
+	// plus every subagent) currently lives on. With LineageAffinity, selection
+	// prefers it over the thread's own sticky binding so main and child threads
+	// share one account. Without it, it is only the parent's account, used as a
+	// soft preference after the thread's own sticky route.
+	LineageAccountID string
+	LineageAffinity  bool
+	// BalanceKey seeds deterministic new-route assignment. With LineageAffinity,
+	// lineage members share it so a main agent and its subagents that
+	// independently need a new or failover account still converge on one.
+	BalanceKey              string
+	ParentAffinityAttempted bool
 }
 
-// routingDecision deliberately keeps account affinity and the upstream prompt
-// cache key separate. Codex main/child threads need independent sticky routes,
-// while an operator may explicitly group their backend cache keys; a bound
+// routingDecision deliberately keeps the sticky key and the upstream prompt
+// cache key separate. Codex main/child threads keep independent sticky keys
+// (so response chains, thread bindings, and cache-key buckets stay per thread),
+// but they share one account through LineageAccountID; a bound
 // previous_response_id remains authoritative across client metadata skew.
 func (a *app) routingDecision(r *http.Request, payload map[string]any, model, apiKey string) routingDecision {
 	identity := requestIdentityFrom(r, payload)
 	identity, parentAccountID, parentFound := a.resolveRequestIdentity(identity, model)
 	clientPromptCacheKey := stringValue(payload["prompt_cache_key"])
+	lineageAffinity := a.lineageAffinityEnabled()
 	finish := func(route routingDecision) routingDecision {
 		route.Identity = identity
 		route.ClientPromptCacheKey = clientPromptCacheKey
-		route.PreferredParentAccountID = parentAccountID
-		route.ParentAffinityAttempted = identity.IsSubagent && identityParentID(identity) != "" && !a.liveStickySession(route.StickyKey)
-		if !parentFound {
-			route.PreferredParentAccountID = ""
+		route.LineageAffinity = lineageAffinity
+		route.BalanceKey = route.StickyKey
+		if lineageAffinity && identity.LineageRootID != "" {
+			route.BalanceKey = "lineage:" + identity.LineageRootID
+			if accountID, found := a.lineageAccountID(identity.LineageRootID); found {
+				route.LineageAccountID = accountID
+			}
 		}
+		if route.LineageAccountID == "" && parentFound {
+			route.LineageAccountID = parentAccountID
+		}
+		route.ParentAffinityAttempted = identity.IsSubagent && identityParentID(identity) != "" && !a.liveStickySession(route.StickyKey)
 		route.UpstreamPromptCacheKey = a.upstreamPromptCacheKey(r, model, apiKey, route)
 		return route
 	}
@@ -5934,8 +6018,7 @@ func (a *app) resolveRequestIdentity(identity requestIdentity, model string) (re
 	parentID := identityParentID(identity)
 	now := time.Now().UTC()
 	a.mu.RLock()
-	parent, parentFound := a.state.ThreadBindings[threadBindingStateKey(model, parentID)]
-	parentFound = parentFound && parent.ExpiresAt.After(now)
+	parent, parentFound := a.liveThreadBindingLocked(model, parentID, now)
 	a.mu.RUnlock()
 	if identity.LineageRootID == "" {
 		switch {
@@ -5953,6 +6036,57 @@ func (a *app) resolveRequestIdentity(identity requestIdentity, model string) (re
 		return identity, parent.AccountID, true
 	}
 	return identity, "", false
+}
+
+// liveThreadBindingLocked finds a thread's TTL-live binding, preferring the
+// requested model. Subagents frequently run a different model than the main
+// agent, so a same-model-only lookup would miss the parent and split the
+// lineage onto another account; fall back to the most recent binding for the
+// thread under any model.
+func (a *app) liveThreadBindingLocked(model, threadID string, now time.Time) (threadBinding, bool) {
+	if threadID == "" {
+		return threadBinding{}, false
+	}
+	if binding, ok := a.state.ThreadBindings[threadBindingStateKey(model, threadID)]; ok && binding.ExpiresAt.After(now) {
+		return binding, true
+	}
+	var best threadBinding
+	found := false
+	for _, binding := range a.state.ThreadBindings {
+		if binding.ThreadID != threadID || !binding.ExpiresAt.After(now) {
+			continue
+		}
+		if !found || binding.LastSuccessAt.After(best.LastSuccessAt) {
+			best = binding
+			found = true
+		}
+	}
+	return best, found
+}
+
+// lineageAccountID returns the account where any thread of the lineage (main
+// agent or subagent, any model) most recently succeeded. "Most recent" is the
+// lineage's current home: when one member fails over, the rest follow it on
+// their next request instead of staying split across accounts.
+func (a *app) lineageAccountID(lineageRootID string) (string, bool) {
+	if lineageRootID == "" {
+		return "", false
+	}
+	now := time.Now().UTC()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	var best threadBinding
+	found := false
+	for _, binding := range a.state.ThreadBindings {
+		if binding.LineageRootID != lineageRootID || binding.AccountID == "" || !binding.ExpiresAt.After(now) {
+			continue
+		}
+		if !found || binding.LastSuccessAt.After(best.LastSuccessAt) || (binding.LastSuccessAt.Equal(best.LastSuccessAt) && binding.AccountID < best.AccountID) {
+			best = binding
+			found = true
+		}
+	}
+	return best.AccountID, found
 }
 
 func (a *app) requestIdentityForSticky(stickyKey, model string) (requestIdentity, bool) {
@@ -5974,6 +6108,12 @@ func (a *app) requestIdentityForSticky(stickyKey, model string) (requestIdentity
 		return identity, true
 	}
 	return requestIdentity{}, false
+}
+
+func (a *app) lineageAffinityEnabled() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.lineageAffinity
 }
 
 func (a *app) liveStickySession(stickyKey string) bool {

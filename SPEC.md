@@ -177,6 +177,7 @@ docker run -d \
 | `CODEX_POOL_PROMPT_CACHE_BUCKETS` | no | `4` | Number of buckets (1–256) a coarse cache key is split across, keyed by the stable per-conversation routing key, to stay under OpenAI's ~15 RPM-per-(prefix+key) cache-routing limit. Raise for hot pools; set `1` to maximize sharing. |
 | `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | `24h` | Upstream prompt cache retention. Defaults to `24h` (extended retention) to maximize cache hit rate across conversation turns. Set `passthrough` to leave requests untouched, or `in_memory` for the shorter built-in retention. |
 | `CODEX_POOL_PRESERVE_PRO_QUOTA` | no | `false` | Initial default for the admin Console `Use Pro last` switch. Once saved in `/data/config.json`, the Console setting takes precedence. |
+| `CODEX_POOL_LINEAGE_AFFINITY` | no | `true` | Initial default for the admin Console `Keep subagents together` switch (section 6.2.1). Once saved in `/data/config.json`, the Console setting takes precedence. |
 
 ### 2.2 Startup safety checks
 
@@ -621,7 +622,11 @@ history inheritance = fork_turns, executed by Codex runtime
 backend KV/prompt-cache behavior = upstream prompt prefix + prompt_cache_key
 ```
 
-On the first request for an unbound child thread, resolve the parent's TTL-live thread binding and softly prefer its account. The preference must pass the same enabled, in-pool, authentication, quota, model, cooldown, duplicate-identity, and Pro-preservation checks as normal selection. If the parent account is ineligible or fails, use normal selection and failover. Success creates a separate child sticky binding; it must never merge the child route with the parent route.
+Lineage affinity is controlled by the admin Console `Keep subagents together` switch (`lineageAffinity`) and is on by default. When on, a main agent and all of its subagents (the whole lineage) share one account. The lineage account is the account of the lineage's most recently successful TTL-live thread binding under any model; subagents often use a different model than the main agent, so parent lookup must also fall back to the parent's binding under another model. Every request for a lineage thread — unbound or already bound, main or child — prefers the lineage account ahead of the thread's own sticky binding. When one member fails over, the others follow it on their next request instead of staying split.
+
+The preference must pass the same enabled, in-pool, authentication, quota, model, cooldown, duplicate-identity, and Pro-preservation checks as normal selection; it is never a hard pin. If the lineage account is completing sign-in repair, return the same retryable error as a live sticky session instead of scattering the lineage. If it is otherwise ineligible or fails, use the thread's own sticky binding, then deterministic assignment seeded by the lineage root (not the thread), so members that fail over independently converge on the same replacement. Each thread still keeps its own sticky key, thread binding, and response chain; only the account is shared.
+
+When the switch is off, the legacy contract applies: only a child thread with no usable sticky route of its own softly prefers its parent's account (behind its own sticky route, without holding for sign-in repair), deterministic assignment is seeded per thread, and a bound child keeps its own account even after the parent moves. `lineage_follow` is never reported in this mode.
 
 Persist TTL-bounded thread bindings with thread, session, parent, lineage root, subagent kind, model, account, sticky key, upstream cache key, and activity timestamps. Reuse the sticky TTL and pruning lifecycle. Nested children inherit the known root; when only an immediate parent is known, use it as the temporary root and update the child binding after fuller parent state becomes available.
 
@@ -682,6 +687,7 @@ sticky_reuse
 new_route_assignment
 parent_affinity
 parent_affinity_fallback
+lineage_follow
 quota_failover
 rate_limit_failover
 stream_capacity_failover
@@ -691,7 +697,7 @@ transport_failover
 repeated_5xx_failover
 ```
 
-The first four describe selection without an upstream retry. A `*_failover`
+The first five describe selection without an upstream retry. `lineage_follow` means an already-bound thread moved to the lineage account because its main agent or a sibling subagent now lives there. A `*_failover`
 outcome identifies why the successful request moved away from the prior or
 failed account. Routing counters and request diagnostics must use these stable
 values so operators can distinguish healthy distribution from cache-breaking
@@ -1881,11 +1887,12 @@ Request:
 
 ```json
 {
-  "preserveProQuota": true
+  "preserveProQuota": true,
+  "lineageAffinity": true
 }
 ```
 
-`preserveProQuota` backs the admin Console `Use Pro last` switch and is persisted in `/data/config.json`.
+At least one field is required; an omitted field leaves that setting unchanged, so each Console switch posts only its own field. `preserveProQuota` backs the `Use Pro last` switch and `lineageAffinity` backs the `Keep subagents together` switch (default on). Both are persisted in `/data/config.json` and returned in the admin state.
 
 ---
 
@@ -1901,7 +1908,7 @@ Required behavior:
 2. Parse model and thinking suffix.
 3. Resolve alias.
 4. Normalize Codex thread/parent identity and derive an independent sticky route and upstream cache key.
-5. Pick account using sticky failover, including soft parent affinity for a new child.
+5. Pick account using sticky failover, preferring the shared lineage account for main and child threads.
 6. Refresh access token if expired.
 7. Send the upstream request with only allowlisted Codex compatibility headers.
 8. Stream SSE if request asks for stream without rewriting tool-call arguments.
