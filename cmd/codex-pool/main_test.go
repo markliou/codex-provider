@@ -51,7 +51,7 @@ func testApp(t *testing.T, accounts []account) *app {
 		// never reaches the code paths that log.
 		logger:  log.New(io.Discard, "", 0),
 		dataDir: dir, apiKeys: [][]byte{[]byte("client-key")}, adminUser: "admin", adminHash: []byte(hash),
-		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, routingStrategy: routingStrategyFailover, promptCacheKeyMode: "auto", publicDashboard: true, codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second}, streamClient: &http.Client{Timeout: time.Second},
+		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, routingStrategy: routingStrategyFailover, lineageAffinity: true, promptCacheKeyMode: "auto", publicDashboard: true, codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second}, streamClient: &http.Client{Timeout: time.Second},
 	}
 }
 
@@ -3191,6 +3191,49 @@ func TestAdminSettingsTogglePreserveProQuota(t *testing.T) {
 	}
 }
 
+func TestAdminSettingsToggleLineageAffinityKeepsOtherSettings(t *testing.T) {
+	a := testApp(t, nil)
+	a.preserveProQuota = true
+	cookies, csrf := adminSession(t, a)
+	post := func(body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(body))
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		request.Header.Set("X-CSRF-Token", csrf)
+		recorder := httptest.NewRecorder()
+		a.adminMux().ServeHTTP(recorder, request)
+		return recorder
+	}
+	recorder := post(`{"lineageAffinity":false}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("lineage affinity disable returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if a.lineageAffinity {
+		t.Fatal("settings update did not disable lineageAffinity")
+	}
+	if !a.preserveProQuota {
+		t.Fatal("lineage-only settings update reset preserveProQuota")
+	}
+	if !strings.Contains(recorder.Body.String(), `"lineageAffinity":false`) {
+		t.Fatalf("settings response did not include disabled lineageAffinity: %s", recorder.Body.String())
+	}
+	var saved config
+	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.LineageAffinity == nil || *saved.LineageAffinity {
+		t.Fatalf("settings update did not persist disabled lineageAffinity: %#v", saved.LineageAffinity)
+	}
+
+	if recorder := post(`{"lineageAffinity":true}`); recorder.Code != http.StatusOK || !a.lineageAffinity {
+		t.Fatalf("lineage affinity enable returned %d, enabled=%v", recorder.Code, a.lineageAffinity)
+	}
+	if recorder := post(`{}`); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("empty settings update returned %d, want 400", recorder.Code)
+	}
+}
+
 func TestCreateCodexDeviceAuthAccountStagesUntilLogin(t *testing.T) {
 	a := testApp(t, nil)
 	cookies, csrf := adminSession(t, a)
@@ -4010,11 +4053,165 @@ func TestChildSoftPrefersEligibleParentAndNestedLineageRoot(t *testing.T) {
 
 	nestedPayload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": `{"thread_id":"nested-thread","parent_thread_id":"child-thread","subagent_kind":"thread_spawn"}`}, "prompt_cache_key": "nested-key"}
 	nestedRoute := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), nestedPayload, "gpt-test", "client-key")
-	if nestedRoute.Identity.LineageRootID != "root-thread" || nestedRoute.PreferredParentAccountID != "parent-account" {
+	if nestedRoute.Identity.LineageRootID != "root-thread" || nestedRoute.LineageAccountID != "parent-account" {
 		t.Fatalf("nested lineage was not inherited: %#v", nestedRoute)
 	}
 	if nestedRoute.StickyKey == childRoute.StickyKey {
 		t.Fatalf("nested child reused parent sticky key %q", nestedRoute.StickyKey)
+	}
+}
+
+func TestBoundChildFollowsMainAgentAfterMainMovesAccount(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "account-a", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test", UpstreamAPIKey: "a"},
+		{ID: "account-b", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test", UpstreamAPIKey: "b"},
+	})
+	request := func(metadata string) routingDecision {
+		payload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": metadata}}
+		return a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), payload, "gpt-test", "client-key")
+	}
+	mainMetadata := `{"thread_id":"main"}`
+	childMetadata := `{"thread_id":"child","parent_thread_id":"main","subagent_kind":"thread_spawn"}`
+	a.markSuccess(request(mainMetadata), "gpt-test", "account-a", proxyResponseInfo{})
+	a.markSuccess(request(childMetadata), "gpt-test", "account-a", proxyResponseInfo{})
+
+	// The main agent fails over to account-b; the bound child must follow it on
+	// its next request instead of staying on its own sticky account-a.
+	time.Sleep(time.Millisecond)
+	a.markSuccess(request(mainMetadata), "gpt-test", "account-b", proxyResponseInfo{})
+	childRoute := request(childMetadata)
+	if childRoute.LineageAccountID != "account-b" {
+		t.Fatalf("child lineage account = %q, want account-b", childRoute.LineageAccountID)
+	}
+	selected, err := a.selectAccountForRoute(childRoute, "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "account-b" {
+		t.Fatalf("bound child selected %q, want main agent's account-b", selected.ID)
+	}
+	a.markSuccess(childRoute, "gpt-test", selected.ID, proxyResponseInfo{})
+	if got := a.state.RoutingCacheEvents[len(a.state.RoutingCacheEvents)-1].RoutingOutcome; got != "lineage_follow" {
+		t.Fatalf("child follow outcome = %q, want lineage_follow", got)
+	}
+
+	// The reverse direction: a child that fails over pulls the main agent along.
+	time.Sleep(time.Millisecond)
+	a.markSuccess(request(childMetadata), "gpt-test", "account-a", proxyResponseInfo{})
+	selected, err = a.selectAccountForRoute(request(mainMetadata), "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "account-a" {
+		t.Fatalf("main agent selected %q, want child's newer account-a", selected.ID)
+	}
+}
+
+func TestChildFindsParentBoundUnderDifferentModel(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "parent-account", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://parent.example.test", UpstreamAPIKey: "parent"},
+		{ID: "pool-first", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://first.example.test", UpstreamAPIKey: "first"},
+	})
+	now := time.Now().UTC()
+	a.state.ThreadBindings[threadBindingStateKey("gpt-main", "main")] = threadBinding{ThreadID: "main", LineageRootID: "main", ModelID: "gpt-main", AccountID: "parent-account", StickyKey: "gpt-main:thread:main", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+	payload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": `{"thread_id":"child","parent_thread_id":"main","subagent_kind":"thread_spawn"}`}}
+	route := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), payload, "gpt-test", "client-key")
+	if route.Identity.LineageRootID != "main" {
+		t.Fatalf("cross-model child lineage root = %q, want main", route.Identity.LineageRootID)
+	}
+	selected, err := a.selectAccountForRoute(route, "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "parent-account" {
+		t.Fatalf("cross-model child selected %q, want parent-account", selected.ID)
+	}
+}
+
+func TestUnboundLineageMembersConvergeOnSameNewAccount(t *testing.T) {
+	accounts := make([]account, 0, 6)
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("account-%d", i)
+		accounts = append(accounts, account{ID: id, Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://" + id + ".example.test", UpstreamAPIKey: id})
+	}
+	a := testApp(t, accounts)
+	// Balanced routing hashes the route key; failover mode would pick the same
+	// top-priority account for everyone and prove nothing.
+	a.routingStrategy = routingStrategyBalanced
+	request := func(metadata string) routingDecision {
+		payload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": metadata}}
+		return a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), payload, "gpt-test", "client-key")
+	}
+	mainRoute := request(`{"thread_id":"main"}`)
+	mainSelected, err := a.selectAccountForRoute(mainRoute, "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No binding exists yet (concurrent first turns), so only the lineage-seeded
+	// balance key can keep these together.
+	for _, child := range []string{"child-a", "child-b", "child-c", "child-d"} {
+		route := request(fmt.Sprintf(`{"thread_id":%q,"parent_thread_id":"main","subagent_kind":"thread_spawn"}`, child))
+		if route.StickyKey == mainRoute.StickyKey {
+			t.Fatalf("child %s reused the main sticky key", child)
+		}
+		selected, err := a.selectAccountForRoute(route, "gpt-test", map[string]bool{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if selected.ID != mainSelected.ID {
+			t.Fatalf("unbound child %s selected %q, main selected %q", child, selected.ID, mainSelected.ID)
+		}
+	}
+}
+
+func TestLineageAffinityOffRestoresFirstRequestOnlyParentPreference(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "account-a", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test", UpstreamAPIKey: "a"},
+		{ID: "account-b", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test", UpstreamAPIKey: "b"},
+	})
+	a.lineageAffinity = false
+	request := func(metadata string) routingDecision {
+		payload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": metadata}}
+		return a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), payload, "gpt-test", "client-key")
+	}
+	mainMetadata := `{"thread_id":"main"}`
+	childMetadata := `{"thread_id":"child","parent_thread_id":"main","subagent_kind":"thread_spawn"}`
+	a.markSuccess(request(mainMetadata), "gpt-test", "account-b", proxyResponseInfo{})
+
+	// An unbound child still softly prefers its parent's account.
+	childRoute := request(childMetadata)
+	if childRoute.BalanceKey != childRoute.StickyKey {
+		t.Fatalf("lineage-off balance key = %q, want per-thread %q", childRoute.BalanceKey, childRoute.StickyKey)
+	}
+	selected, err := a.selectAccountForRoute(childRoute, "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "account-b" {
+		t.Fatalf("unbound child selected %q, want parent's account-b", selected.ID)
+	}
+	a.markSuccess(childRoute, "gpt-test", selected.ID, proxyResponseInfo{})
+
+	// Once bound, the child keeps its own route even after the parent moves.
+	time.Sleep(time.Millisecond)
+	a.markSuccess(request(mainMetadata), "gpt-test", "account-a", proxyResponseInfo{})
+	selected, err = a.selectAccountForRoute(request(childMetadata), "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "account-b" {
+		t.Fatalf("lineage-off bound child selected %q, want its own sticky account-b", selected.ID)
+	}
+}
+
+func TestLineageAffinityDefaultsOnAndEnvCanDisable(t *testing.T) {
+	t.Setenv("CODEX_POOL_LINEAGE_AFFINITY", "")
+	if enabled, err := boolFromEnvDefault("CODEX_POOL_LINEAGE_AFFINITY", true); err != nil || !enabled {
+		t.Fatalf("unset lineage affinity = %v, %v; want enabled by default", enabled, err)
+	}
+	t.Setenv("CODEX_POOL_LINEAGE_AFFINITY", "false")
+	if enabled, err := boolFromEnvDefault("CODEX_POOL_LINEAGE_AFFINITY", true); err != nil || enabled {
+		t.Fatalf("explicit false lineage affinity = %v, %v", enabled, err)
 	}
 }
 

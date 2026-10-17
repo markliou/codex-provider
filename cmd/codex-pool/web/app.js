@@ -659,6 +659,12 @@
       preserveSwitch.checked = Boolean(serviceState?.preserveProQuota);
       preserveSwitch.disabled = false;
     }
+    const lineageSwitch = $("#lineage-affinity-switch");
+    if (lineageSwitch) {
+      // Missing means an older server; the product default is on.
+      lineageSwitch.checked = serviceState?.lineageAffinity !== false;
+      lineageSwitch.disabled = false;
+    }
     const routingPill = $("#routing-strategy-pill");
     if (routingPill) {
       const balanced = serviceState?.routingStrategy === "sticky_balanced";
@@ -1114,6 +1120,7 @@
     new_route_assignment: "New route",
     parent_affinity: "Parent affinity",
     parent_affinity_fallback: "Affinity fallback",
+    lineage_follow: "Lineage follow",
     quota_failover: "Quota failover",
     rate_limit_failover: "Rate-limit failover",
     stream_capacity_failover: "Stream capacity failover",
@@ -1358,12 +1365,14 @@
     }
   }
 
-  async function updatePreserveProQuota(event) {
+  // Each switch posts only its own field; the server leaves omitted settings
+  // untouched, so one switch can never reset another.
+  const updateSetting = (field, fallback) => async (event) => {
     const input = event.currentTarget;
-    const previous = state.data?.serviceState?.preserveProQuota ?? false;
+    const previous = state.data?.serviceState?.[field] ?? fallback;
     input.disabled = true;
     try {
-      const response = await api("/settings", { method: "POST", body: JSON.stringify({ preserveProQuota: input.checked }) });
+      const response = await api("/settings", { method: "POST", body: JSON.stringify({ [field]: input.checked }) });
       state.data = { ...(state.data || {}), serviceState: response.state };
       renderSettings(response.state);
       $("#service-status").textContent = "Settings updated";
@@ -1373,7 +1382,9 @@
       input.disabled = false;
       notify(error.message, true);
     }
-  }
+  };
+  const updatePreserveProQuota = updateSetting("preserveProQuota", false);
+  const updateLineageAffinity = updateSetting("lineageAffinity", true);
 
   async function watchLoginJob(jobId) {
     let attempts = 0;
@@ -1493,6 +1504,7 @@
   $("#logout-button").addEventListener("click", async () => { try { await api("/logout", { method: "POST" }); } catch (_) {} sessionStorage.removeItem("codexPoolCsrf"); state.csrfToken = ""; showPublicDashboard(); });
   $("#add-account-button").addEventListener("click", createAccountAndStartLogin);
   $("#preserve-pro-quota-switch").addEventListener("change", updatePreserveProQuota);
+  $("#lineage-affinity-switch").addEventListener("change", updateLineageAffinity);
   $("#close-device-auth-button").addEventListener("click", () => closeDeviceAuth(true));
   $("#device-auth-dialog").addEventListener("click", (event) => {
     const button = event.target.closest("[data-copy-target]");

@@ -217,6 +217,10 @@ Pool treats the local slot ID as the management identity, but routing also track
 
 Use the `Use Pro last` switch in the admin Console to defer Pro accounts until no eligible non-Pro account is available. When this mode is enabled, a session that temporarily moved to Pro because other accounts were cooling down moves back to a non-Pro account once one becomes eligible again. Duplicate slots for the same upstream identity are still not immediate retry capacity, but the representative for that identity is chosen from healthy local credential copies with usable quota before Pro is selected. The switch is stored in `/data/config.json`; `CODEX_POOL_PRESERVE_PRO_QUOTA=true` only sets the initial default before the Console setting is saved.
 
+### Keep Subagents Together
+
+The `Keep subagents together` switch in the admin Console is on by default. A Codex main agent and every subagent it spawns (its lineage, across models) then share one account: each request prefers the account where any lineage member last succeeded, so when one member fails over the others follow on their next request. The preference still passes every normal eligibility, quota, cooldown, duplicate-identity, and `Use Pro last` check. Turn it off to restore the earlier behavior, where a subagent prefers its parent's account only on its first request and then keeps its own sticky route. The switch is stored in `/data/config.json`; `CODEX_POOL_LINEAGE_AFFINITY=false` only sets the initial default before the Console setting is saved.
+
 ### Per-account Quota Protection
 
 Each Codex device-auth row has an optional local-slot threshold, disabled by
