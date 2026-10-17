@@ -2520,7 +2520,7 @@ func TestStickySessionWaitsForAuthRepairInsteadOfFailingOver(t *testing.T) {
 	original := stickySession{Key: key, ModelID: "gpt-test", AccountID: "slot-one", CreatedAt: now.Add(-time.Hour), LastSuccessAt: now.Add(-time.Minute)}
 	a.state.StickySessions[key] = original
 
-	selected, err := a.selectAccountForRoute(routingDecision{StickyKey: key}, "gpt-test", map[string]bool{})
+	selected, err := a.selectAccountForRoute(&routingDecision{StickyKey: key}, "gpt-test", map[string]bool{})
 	if !errors.Is(err, errAccountAuthRepairPending) {
 		t.Fatalf("sticky repair selection = %#v, %v; want retryable repair error", selected, err)
 	}
@@ -4031,7 +4031,7 @@ func TestChildSoftPrefersEligibleParentAndNestedLineageRoot(t *testing.T) {
 	a.state.ThreadBindings[threadBindingStateKey("gpt-test", "root-thread")] = threadBinding{ThreadID: "root-thread", LineageRootID: "root-thread", ModelID: "gpt-test", AccountID: "parent-account", StickyKey: "gpt-test:thread:root-thread", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
 	childPayload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": `{"thread_id":"child-thread","parent_thread_id":"root-thread","subagent_kind":"thread_spawn"}`}, "prompt_cache_key": "child-key"}
 	childRoute := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), childPayload, "gpt-test", "client-key")
-	selected, err := a.selectAccountForRoute(childRoute, "gpt-test", map[string]bool{})
+	selected, err := a.selectAccountForRoute(&childRoute, "gpt-test", map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4083,7 +4083,7 @@ func TestBoundChildFollowsMainAgentAfterMainMovesAccount(t *testing.T) {
 	if childRoute.LineageAccountID != "account-b" {
 		t.Fatalf("child lineage account = %q, want account-b", childRoute.LineageAccountID)
 	}
-	selected, err := a.selectAccountForRoute(childRoute, "gpt-test", map[string]bool{})
+	selected, err := a.selectAccountForRoute(&childRoute, "gpt-test", map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4098,7 +4098,8 @@ func TestBoundChildFollowsMainAgentAfterMainMovesAccount(t *testing.T) {
 	// The reverse direction: a child that fails over pulls the main agent along.
 	time.Sleep(time.Millisecond)
 	a.markSuccess(request(childMetadata), "gpt-test", "account-a", proxyResponseInfo{})
-	selected, err = a.selectAccountForRoute(request(mainMetadata), "gpt-test", map[string]bool{})
+	mainRoute := request(mainMetadata)
+	selected, err = a.selectAccountForRoute(&mainRoute, "gpt-test", map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4119,7 +4120,7 @@ func TestChildFindsParentBoundUnderDifferentModel(t *testing.T) {
 	if route.Identity.LineageRootID != "main" {
 		t.Fatalf("cross-model child lineage root = %q, want main", route.Identity.LineageRootID)
 	}
-	selected, err := a.selectAccountForRoute(route, "gpt-test", map[string]bool{})
+	selected, err := a.selectAccountForRoute(&route, "gpt-test", map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4143,7 +4144,7 @@ func TestUnboundLineageMembersConvergeOnSameNewAccount(t *testing.T) {
 		return a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), payload, "gpt-test", "client-key")
 	}
 	mainRoute := request(`{"thread_id":"main"}`)
-	mainSelected, err := a.selectAccountForRoute(mainRoute, "gpt-test", map[string]bool{})
+	mainSelected, err := a.selectAccountForRoute(&mainRoute, "gpt-test", map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4154,13 +4155,157 @@ func TestUnboundLineageMembersConvergeOnSameNewAccount(t *testing.T) {
 		if route.StickyKey == mainRoute.StickyKey {
 			t.Fatalf("child %s reused the main sticky key", child)
 		}
-		selected, err := a.selectAccountForRoute(route, "gpt-test", map[string]bool{})
+		selected, err := a.selectAccountForRoute(&route, "gpt-test", map[string]bool{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if selected.ID != mainSelected.ID {
 			t.Fatalf("unbound child %s selected %q, main selected %q", child, selected.ID, mainSelected.ID)
 		}
+	}
+}
+
+func strictLineageTestApp(t *testing.T, accounts []account) (*app, func(model, metadata string) routingDecision) {
+	t.Helper()
+	a := testApp(t, accounts)
+	return a, func(model, metadata string) routingDecision {
+		payload := map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": metadata}}
+		return a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), payload, model, "client-key")
+	}
+}
+
+const (
+	strictMainMetadata  = `{"thread_id":"main"}`
+	strictChildMetadata = `{"thread_id":"child","parent_thread_id":"main","subagent_kind":"thread_spawn"}`
+)
+
+func TestStrictLineageStaleInFlightSuccessDoesNotMoveLineageBack(t *testing.T) {
+	a, request := strictLineageTestApp(t, []account{
+		{ID: "account-a", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test", UpstreamAPIKey: "a"},
+		{ID: "account-b", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://b.example.test", UpstreamAPIKey: "b"},
+	})
+	a.markSuccess(request("gpt-test", strictMainMetadata), "gpt-test", "account-a", proxyResponseInfo{})
+	// The main agent's next request is routed (and in flight) on account-a...
+	inFlightMain := request("gpt-test", strictMainMetadata)
+	if _, err := a.selectAccountForRoute(&inFlightMain, "gpt-test", map[string]bool{}); err != nil {
+		t.Fatal(err)
+	}
+	// ...while the child deliberately moves the lineage to account-b.
+	child := request("gpt-test", strictChildMetadata)
+	child.LineageAccountID = "account-a"
+	a.markSuccess(child, "gpt-test", "account-b", proxyResponseInfo{})
+	// The in-flight main request then completes on account-a. That success is
+	// stale and must not drag the lineage back.
+	a.markSuccess(inFlightMain, "gpt-test", "account-a", proxyResponseInfo{})
+	if got := a.state.LineageBindings["main"].AccountID; got != "account-b" {
+		t.Fatalf("lineage binding = %q after stale success, want account-b", got)
+	}
+	next := request("gpt-test", strictMainMetadata)
+	selected, err := a.selectAccountForRoute(&next, "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "account-b" {
+		t.Fatalf("main agent selected %q, want lineage account-b", selected.ID)
+	}
+}
+
+func TestStrictLineageNeverFallsBackToThreadOwnSticky(t *testing.T) {
+	a, request := strictLineageTestApp(t, []account{
+		{ID: "lineage", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://lineage.example.test", UpstreamAPIKey: "lineage"},
+		{ID: "replacement", Enabled: true, InPool: true, Priority: 50, UpstreamBaseURL: "https://replacement.example.test", UpstreamAPIKey: "replacement"},
+		{ID: "child-old", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://old.example.test", UpstreamAPIKey: "old"},
+	})
+	now := time.Now().UTC()
+	a.state.LineageBindings = map[string]lineageBinding{"main": {LineageRootID: "main", AccountID: "lineage", CreatedAt: now, MovedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}}
+	// The child's own sticky route still points at a healthy but different account.
+	a.state.StickySessions["gpt-test:thread:child"] = stickySession{Key: "gpt-test:thread:child", ModelID: "gpt-test", AccountID: "child-old", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+	a.state.Cooldowns["lineage"] = []cooldown{{ModelID: "gpt-test", NextRetryAt: now.Add(time.Hour), Reason: "rate_limited"}}
+	route := request("gpt-test", strictChildMetadata)
+	selected, err := a.selectAccountForRoute(&route, "gpt-test", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "replacement" {
+		t.Fatalf("child selected %q, want the lineage replacement, never its own sticky child-old", selected.ID)
+	}
+	a.markSuccess(route, "gpt-test", selected.ID, proxyResponseInfo{})
+	if got := a.state.LineageBindings["main"]; got.AccountID != "replacement" || got.FailoverFrom != "lineage" {
+		t.Fatalf("lineage binding after deliberate move = %#v", got)
+	}
+}
+
+func TestStrictLineageRetryJoinsSiblingMove(t *testing.T) {
+	a, request := strictLineageTestApp(t, []account{
+		{ID: "account-a", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://a.example.test", UpstreamAPIKey: "a"},
+		{ID: "account-c", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: "https://c.example.test", UpstreamAPIKey: "c"},
+		{ID: "account-b", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://b.example.test", UpstreamAPIKey: "b"},
+	})
+	a.markSuccess(request("gpt-test", strictMainMetadata), "gpt-test", "account-a", proxyResponseInfo{})
+	mainRoute := request("gpt-test", strictMainMetadata)
+	if selected, err := a.selectAccountForRoute(&mainRoute, "gpt-test", map[string]bool{}); err != nil || selected.ID != "account-a" {
+		t.Fatalf("first attempt = %#v, %v", selected, err)
+	}
+	// While the main agent's first attempt fails on account-a, a sibling moves
+	// the lineage to account-b.
+	child := request("gpt-test", strictChildMetadata)
+	child.LineageAccountID = "account-a"
+	a.markSuccess(child, "gpt-test", "account-b", proxyResponseInfo{})
+	selected, err := a.selectAccountForRoute(&mainRoute, "gpt-test", map[string]bool{"account-a": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "account-b" {
+		t.Fatalf("retry selected %q, want the sibling's lineage account-b over higher-priority account-c", selected.ID)
+	}
+}
+
+func TestStrictLineageReplacementServesEveryLineageModel(t *testing.T) {
+	a, request := strictLineageTestApp(t, []account{
+		{ID: "main-only", Enabled: true, InPool: true, Priority: 100, AllowedModels: []string{"gpt-main"}, UpstreamBaseURL: "https://main.example.test", UpstreamAPIKey: "main"},
+		{ID: "mini-only", Enabled: true, InPool: true, Priority: 90, AllowedModels: []string{"gpt-mini"}, UpstreamBaseURL: "https://mini.example.test", UpstreamAPIKey: "mini"},
+		{ID: "both", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://both.example.test", UpstreamAPIKey: "both"},
+	})
+	a.markSuccess(request("gpt-main", strictMainMetadata), "gpt-main", "main-only", proxyResponseInfo{})
+	child := request("gpt-mini", strictChildMetadata)
+	selected, err := a.selectAccountForRoute(&child, "gpt-mini", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "both" {
+		t.Fatalf("child selected %q, want an account the main agent's model can follow to", selected.ID)
+	}
+	a.markSuccess(child, "gpt-mini", selected.ID, proxyResponseInfo{})
+	mainRoute := request("gpt-main", strictMainMetadata)
+	selected, err = a.selectAccountForRoute(&mainRoute, "gpt-main", map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID != "both" {
+		t.Fatalf("main agent selected %q, want to follow the lineage to both", selected.ID)
+	}
+}
+
+func TestLineageBindingsArePrunedAndClearedWithAccount(t *testing.T) {
+	a := testApp(t, nil)
+	now := time.Now().UTC()
+	a.state.LineageBindings = map[string]lineageBinding{
+		"expired": {LineageRootID: "expired", AccountID: "one", ExpiresAt: now.Add(-time.Minute)},
+		"active":  {LineageRootID: "active", AccountID: "one", ExpiresAt: now.Add(time.Hour)},
+		"other":   {LineageRootID: "other", AccountID: "two", ExpiresAt: now.Add(time.Hour)},
+	}
+	if !a.pruneExpiredRuntimeStateLocked(now) {
+		t.Fatal("expired lineage binding was not pruned")
+	}
+	if _, ok := a.state.LineageBindings["expired"]; ok {
+		t.Fatal("expired lineage binding survived pruning")
+	}
+	a.clearStickyForAccountLocked("one")
+	if _, ok := a.state.LineageBindings["active"]; ok {
+		t.Fatal("lineage binding survived clearing its account")
+	}
+	if _, ok := a.state.LineageBindings["other"]; !ok {
+		t.Fatal("clearing one account removed another account's lineage binding")
 	}
 }
 
@@ -4183,7 +4328,7 @@ func TestLineageAffinityOffRestoresFirstRequestOnlyParentPreference(t *testing.T
 	if childRoute.BalanceKey != childRoute.StickyKey {
 		t.Fatalf("lineage-off balance key = %q, want per-thread %q", childRoute.BalanceKey, childRoute.StickyKey)
 	}
-	selected, err := a.selectAccountForRoute(childRoute, "gpt-test", map[string]bool{})
+	selected, err := a.selectAccountForRoute(&childRoute, "gpt-test", map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4195,7 +4340,8 @@ func TestLineageAffinityOffRestoresFirstRequestOnlyParentPreference(t *testing.T
 	// Once bound, the child keeps its own route even after the parent moves.
 	time.Sleep(time.Millisecond)
 	a.markSuccess(request(mainMetadata), "gpt-test", "account-a", proxyResponseInfo{})
-	selected, err = a.selectAccountForRoute(request(childMetadata), "gpt-test", map[string]bool{})
+	boundChild := request(childMetadata)
+	selected, err = a.selectAccountForRoute(&boundChild, "gpt-test", map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4280,7 +4426,7 @@ func TestIneligibleParentFallsBackWithoutBypassingSafeguards(t *testing.T) {
 			a.state.ThreadBindings[threadBindingStateKey("gpt-test", "parent")] = threadBinding{ThreadID: "parent", LineageRootID: "parent", ModelID: "gpt-test", AccountID: "parent-account", StickyKey: "gpt-test:thread:parent", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
 			tc.configure(a)
 			route := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": `{"thread_id":"child","parent_thread_id":"parent","subagent_kind":"thread_spawn"}`}}, "gpt-test", "client-key")
-			selected, err := a.selectAccountForRoute(route, "gpt-test", map[string]bool{})
+			selected, err := a.selectAccountForRoute(&route, "gpt-test", map[string]bool{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -4305,7 +4451,7 @@ func TestChildAffinityDoesNotBypassDuplicateIdentityRepresentative(t *testing.T)
 	now := time.Now().UTC()
 	a.state.ThreadBindings[threadBindingStateKey("gpt-test", "parent")] = threadBinding{ThreadID: "parent", LineageRootID: "parent", ModelID: "gpt-test", AccountID: "parent-slot", StickyKey: "gpt-test:thread:parent", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
 	route := a.routingDecision(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), map[string]any{"client_metadata": map[string]any{"x-codex-turn-metadata": `{"thread_id":"child","parent_thread_id":"parent","subagent_kind":"thread_spawn"}`}}, "gpt-test", "client-key")
-	selected, err := a.selectAccountForRoute(route, "gpt-test", map[string]bool{})
+	selected, err := a.selectAccountForRoute(&route, "gpt-test", map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}

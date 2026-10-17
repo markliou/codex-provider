@@ -386,6 +386,23 @@ type threadBinding struct {
 	ExpiresAt      time.Time `json:"expiresAt"`
 }
 
+// lineageBinding pins a whole Codex lineage (main agent plus every subagent,
+// across models) to one account under lineage affinity. It is deliberately
+// explicit instead of "wherever a member last succeeded": a request that was
+// already in flight on the old account must not drag the lineage back after
+// a member moved it, or members would flip-flop between accounts. Only a
+// request that observed the current binding and then moved away (see
+// recordLineageSuccessLocked) may change it.
+type lineageBinding struct {
+	LineageRootID string    `json:"lineageRootId"`
+	AccountID     string    `json:"accountId"`
+	FailoverFrom  string    `json:"failoverFrom,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
+	MovedAt       time.Time `json:"movedAt"`
+	LastSuccessAt time.Time `json:"lastSuccessAt"`
+	ExpiresAt     time.Time `json:"expiresAt"`
+}
+
 type promptCacheStat struct {
 	AccountID                      string `json:"accountId"`
 	ModelID                        string `json:"modelId"`
@@ -526,6 +543,7 @@ type state struct {
 	StickySessions   map[string]stickySession   `json:"stickySessions"`
 	ResponseBindings map[string]responseBinding `json:"responseBindings,omitempty"`
 	ThreadBindings   map[string]threadBinding   `json:"threadBindings,omitempty"`
+	LineageBindings  map[string]lineageBinding  `json:"lineageBindings,omitempty"`
 	Cooldowns        map[string][]cooldown      `json:"cooldowns"`
 	Health           map[string]accountHealth   `json:"health"`
 	Quotas           map[string]quotaSnapshot   `json:"quotas,omitempty"`
@@ -1672,7 +1690,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	capacityRetries := 0
 	attemptLimit := a.proxyAttemptLimit()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
-		candidate, err := a.selectAccountForRoute(route, model, excluded)
+		candidate, err := a.selectAccountForRoute(&route, model, excluded)
 		if err != nil {
 			if errors.Is(err, errAccountAuthRepairPending) {
 				writeOpenAIError(w, http.StatusServiceUnavailable, "account_authenticating", "the session account is completing sign-in repair; retry shortly")
@@ -4119,15 +4137,102 @@ func (a *app) modelsLocked(routable map[string]bool) []string {
 }
 
 func (a *app) selectAccount(stickyKey, model string, excluded map[string]bool) (account, error) {
-	return a.selectAccountWithPreference(stickyKey, stickyKey, model, "", false, excluded)
+	return a.selectAccountWithPreference(stickyKey, stickyKey, model, "", excluded)
 }
 
-func (a *app) selectAccountForRoute(route routingDecision, model string, excluded map[string]bool) (account, error) {
+// selectAccountForRoute takes the route by pointer because strict lineage
+// selection records the lineage account it observed on this attempt;
+// markSuccess needs exactly that value to tell a deliberate lineage move from a
+// stale in-flight success.
+func (a *app) selectAccountForRoute(route *routingDecision, model string, excluded map[string]bool) (account, error) {
 	balanceKey := route.BalanceKey
 	if balanceKey == "" {
 		balanceKey = route.StickyKey
 	}
-	return a.selectAccountWithPreference(route.StickyKey, balanceKey, model, route.LineageAccountID, route.LineageAffinity, excluded)
+	if route.LineageAffinity && route.Identity.LineageRootID != "" {
+		return a.selectLineageAccount(route, balanceKey, model, excluded)
+	}
+	return a.selectAccountWithPreference(route.StickyKey, balanceKey, model, route.LineageAccountID, excluded)
+}
+
+// selectLineageAccount is strict lineage affinity: every thread of a lineage
+// uses the lineage account, and the thread's own sticky route is never a
+// fallback, because falling back to it is exactly how a main agent and its
+// subagents ended up split. The operator explicitly accepts the cost: moving
+// the lineage re-prefills the main agent on the new account.
+//
+// The lineage account is re-read on every attempt so a retry joins a move a
+// sibling already made instead of hashing to its own replacement. When it is
+// unusable for this request, the replacement is chosen by the lineage-shared
+// balanceKey among accounts usable for every model the lineage has used, so all
+// members that need to move converge on one account; that success becomes the
+// new lineage binding and the rest follow on their next request. Eligibility,
+// duplicate-identity, cooldown, quota, and Pro-preservation gates still apply:
+// strict binding must never turn into sending traffic to an unusable account.
+func (a *app) selectLineageAccount(route *routingDecision, balanceKey, model string, excluded map[string]bool) (account, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now().UTC()
+	root := route.Identity.LineageRootID
+	lineageAccountID, _ := a.lineageAccountIDLocked(root, now)
+	route.LineageAccountID = lineageAccountID
+	models := a.lineageModelsLocked(root, model, now)
+	if lineageAccountID != "" {
+		if selected, ok, err := a.lineagePreferenceLocked(lineageAccountID, balanceKey, model, models, excluded, true, now); err != nil || ok {
+			return selected, err
+		}
+	}
+	if selected, ok := a.preferredLineageAccountLocked(balanceKey, model, models, excluded, now); ok {
+		return selected, nil
+	}
+	if fallback, ok := a.overloadedFallbackAccountLocked(model, excluded, now); ok {
+		return fallback, nil
+	}
+	return account{}, errors.New("no eligible account is available for the requested model")
+}
+
+// lineageModelsLocked lists every model the lineage has a live thread binding
+// for, plus the current request's model.
+func (a *app) lineageModelsLocked(lineageRootID, model string, now time.Time) []string {
+	seen := map[string]bool{model: true}
+	models := []string{model}
+	for _, binding := range a.state.ThreadBindings {
+		if binding.LineageRootID != lineageRootID || !binding.ExpiresAt.After(now) || seen[binding.ModelID] || binding.ModelID == "" {
+			continue
+		}
+		seen[binding.ModelID] = true
+		models = append(models, binding.ModelID)
+	}
+	sort.Strings(models[1:])
+	return models
+}
+
+// preferredLineageAccountLocked picks the lineage's new account among accounts
+// usable for every lineage model, so a subagent on another model cannot move
+// the lineage somewhere the main agent cannot follow. Only when no account
+// serves every model does it fall back to the request's model alone; refusing
+// the request outright would be worse than the unavoidable split.
+func (a *app) preferredLineageAccountLocked(balanceKey, model string, models []string, excluded map[string]bool, now time.Time) (account, bool) {
+	eligible := a.eligibleAccountsLocked(model, excluded, now)
+	if len(models) > 1 {
+		joint := make([]account, 0, len(eligible))
+		for _, item := range eligible {
+			usable := true
+			for _, other := range models {
+				if other != model && !a.usableLocked(item, other, now) {
+					usable = false
+					break
+				}
+			}
+			if usable {
+				joint = append(joint, item)
+			}
+		}
+		if len(joint) > 0 {
+			eligible = joint
+		}
+	}
+	return a.pickBalancedAccountLocked(balanceKey, eligible)
 }
 
 // lineagePreferenceLocked applies the lineage (or, with lineage affinity off,
@@ -4136,9 +4241,10 @@ func (a *app) selectAccountForRoute(route routingDecision, model string, exclude
 // gate, otherwise an unhealthy lineage account would block failover. A Pro
 // account under Pro preservation yields to the balanceKey replacement directly
 // rather than to this thread's own sticky account, which may differ per member
-// and would split the lineage. holdForRepair keeps a lineage on an account that
-// is completing sign-in repair, the same rule as a live sticky session.
-func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string, excluded map[string]bool, holdForRepair bool, now time.Time) (account, bool, error) {
+// and would split the lineage; models (strict mode) keeps that replacement
+// usable for the whole lineage. holdForRepair keeps a lineage on an account
+// that is completing sign-in repair, the same rule as a live sticky session.
+func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string, models []string, excluded map[string]bool, holdForRepair bool, now time.Time) (account, bool, error) {
 	lineage := a.accountLocked(lineageAccountID)
 	if lineage == nil {
 		return account{}, false, nil
@@ -4147,7 +4253,14 @@ func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string
 		if !a.preserveProQuota || !a.proAccountLocked(*lineage) {
 			return *lineage, true, nil
 		}
-		if replacement, ok := a.preferredAccountForStickyLocked(balanceKey, model, excluded, now); ok && !a.proAccountLocked(replacement) {
+		var replacement account
+		var ok bool
+		if models != nil {
+			replacement, ok = a.preferredLineageAccountLocked(balanceKey, model, models, excluded, now)
+		} else {
+			replacement, ok = a.preferredAccountForStickyLocked(balanceKey, model, excluded, now)
+		}
+		if ok && !a.proAccountLocked(replacement) {
 			return replacement, true, nil
 		}
 		return *lineage, true, nil
@@ -4158,21 +4271,12 @@ func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string
 	return account{}, false, nil
 }
 
-func (a *app) selectAccountWithPreference(stickyKey, balanceKey, model, lineageAccountID string, lineageFirst bool, excluded map[string]bool) (account, error) {
+// selectAccountWithPreference serves routes without strict lineage affinity:
+// non-Codex routes, and Codex threads while the Console switch is off.
+func (a *app) selectAccountWithPreference(stickyKey, balanceKey, model, parentAccountID string, excluded map[string]bool) (account, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now().UTC()
-	// With lineage affinity (the default), the lineage account wins over the
-	// thread's own sticky binding so a main agent and its subagents never stay
-	// split across accounts (one account's usage, one KV-cache locality). When
-	// it is ineligible, the thread's own sticky route and then the
-	// lineage-shared balanceKey decide, so members that fail over independently
-	// still converge, and the first success becomes the new lineage account.
-	if lineageFirst && lineageAccountID != "" {
-		if selected, ok, err := a.lineagePreferenceLocked(lineageAccountID, balanceKey, model, excluded, true, now); err != nil || ok {
-			return selected, err
-		}
-	}
 	stickyChanged := false
 	if existing, ok := a.state.StickySessions[stickyKey]; ok && !excluded[existing.AccountID] {
 		if a.stickySessionExpiredLocked(existing, now) {
@@ -4201,8 +4305,8 @@ func (a *app) selectAccountWithPreference(stickyKey, balanceKey, model, lineageA
 	// With lineage affinity switched off, keep the legacy contract: the parent
 	// account is only a soft preference for a child that has no usable sticky
 	// route of its own, so children may stay on other accounts afterwards.
-	if !lineageFirst && lineageAccountID != "" {
-		if selected, ok, _ := a.lineagePreferenceLocked(lineageAccountID, balanceKey, model, excluded, false, now); ok {
+	if parentAccountID != "" {
+		if selected, ok, _ := a.lineagePreferenceLocked(parentAccountID, balanceKey, model, nil, excluded, false, now); ok {
 			return selected, nil
 		}
 	}
@@ -4339,7 +4443,10 @@ func (a *app) eligibleAccountsLocked(model string, excluded map[string]bool, now
 // first turns for the same session select the same credential before a success
 // has had time to persist the sticky binding.
 func (a *app) preferredAccountForStickyLocked(stickyKey, model string, excluded map[string]bool, now time.Time) (account, bool) {
-	eligible := a.eligibleAccountsLocked(model, excluded, now)
+	return a.pickBalancedAccountLocked(stickyKey, a.eligibleAccountsLocked(model, excluded, now))
+}
+
+func (a *app) pickBalancedAccountLocked(stickyKey string, eligible []account) (account, bool) {
 	if len(eligible) == 0 {
 		return account{}, false
 	}
@@ -5246,6 +5353,9 @@ func (a *app) markSuccessWithMeasurement(route routingDecision, model, accountID
 			ExpiresAt:      now.Add(a.stickyTTL()),
 		}
 	}
+	if route.LineageAffinity && route.Identity.LineageRootID != "" {
+		a.recordLineageSuccessLocked(route, accountID, now)
+	}
 	if info.ResponseID != "" {
 		if a.state.ResponseBindings == nil {
 			a.state.ResponseBindings = map[string]responseBinding{}
@@ -5263,6 +5373,42 @@ func (a *app) markSuccessWithMeasurement(route routingDecision, model, accountID
 	a.state.RequestCount++
 	a.state.SuccessCount++
 	_ = a.saveLocked()
+}
+
+// recordLineageSuccessLocked moves the lineage binding only for a deliberate
+// move: the request observed the current binding (route.LineageAccountID, set
+// on its last selection attempt) and still succeeded elsewhere because that
+// account was unusable for it. A success on another account by a request that
+// observed an older binding is stale (it was in flight while a sibling moved
+// the lineage) and must not move the lineage back.
+func (a *app) recordLineageSuccessLocked(route routingDecision, accountID string, now time.Time) {
+	if a.state.LineageBindings == nil {
+		a.state.LineageBindings = map[string]lineageBinding{}
+	}
+	root := route.Identity.LineageRootID
+	current, ok := a.state.LineageBindings[root]
+	ok = ok && current.AccountID != "" && current.ExpiresAt.After(now)
+	switch {
+	case !ok:
+		current = lineageBinding{LineageRootID: root, AccountID: accountID, CreatedAt: now, MovedAt: now}
+		if route.LineageAccountID != "" && route.LineageAccountID != accountID {
+			current.FailoverFrom = route.LineageAccountID
+		}
+	case current.AccountID == accountID:
+	case route.LineageAccountID == current.AccountID:
+		current.FailoverFrom = current.AccountID
+		current.AccountID = accountID
+		current.MovedAt = now
+	default:
+		// Stale success: keep the lineage where it is, but the lineage is
+		// clearly still active, so keep it alive.
+		current.ExpiresAt = now.Add(a.stickyTTL())
+		a.state.LineageBindings[root] = current
+		return
+	}
+	current.LastSuccessAt = now
+	current.ExpiresAt = now.Add(a.stickyTTL())
+	a.state.LineageBindings[root] = current
 }
 
 func (a *app) recordPromptCacheUsageLocked(accountID, model string, usage promptCacheUsage, now time.Time) {
@@ -5602,6 +5748,12 @@ func (a *app) pruneExpiredRuntimeStateLocked(now time.Time) bool {
 			changed = true
 		}
 	}
+	for id, binding := range a.state.LineageBindings {
+		if !binding.ExpiresAt.After(now) {
+			delete(a.state.LineageBindings, id)
+			changed = true
+		}
+	}
 	if a.pruneRoutingCacheEventsLocked(now) {
 		changed = true
 	}
@@ -5705,6 +5857,11 @@ func (a *app) clearStickyForAccountLocked(id string) {
 	for key, item := range a.state.ThreadBindings {
 		if item.AccountID == id {
 			delete(a.state.ThreadBindings, key)
+		}
+	}
+	for key, item := range a.state.LineageBindings {
+		if item.AccountID == id {
+			delete(a.state.LineageBindings, key)
 		}
 	}
 	if len(a.state.RoutingCacheEvents) > 0 {
@@ -5822,10 +5979,12 @@ type routingDecision struct {
 	Identity               requestIdentity
 	ClientPromptCacheKey   string
 	// LineageAccountID is the account the request's Codex lineage (main agent
-	// plus every subagent) currently lives on. With LineageAffinity, selection
-	// prefers it over the thread's own sticky binding so main and child threads
-	// share one account. Without it, it is only the parent's account, used as a
-	// soft preference after the thread's own sticky route.
+	// plus every subagent) is pinned to. With LineageAffinity, strict selection
+	// uses it instead of the thread's own sticky binding and refreshes it on
+	// every attempt, so it holds the binding this request last observed (which
+	// markSuccess needs to reject stale moves). Without LineageAffinity, it is
+	// only the parent's account, a soft preference after the thread's own
+	// sticky route.
 	LineageAccountID string
 	LineageAffinity  bool
 	// BalanceKey seeds deterministic new-route assignment. With LineageAffinity,
@@ -6064,17 +6223,24 @@ func (a *app) liveThreadBindingLocked(model, threadID string, now time.Time) (th
 	return best, found
 }
 
-// lineageAccountID returns the account where any thread of the lineage (main
-// agent or subagent, any model) most recently succeeded. "Most recent" is the
-// lineage's current home: when one member fails over, the rest follow it on
-// their next request instead of staying split across accounts.
 func (a *app) lineageAccountID(lineageRootID string) (string, bool) {
-	if lineageRootID == "" {
-		return "", false
-	}
 	now := time.Now().UTC()
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	return a.lineageAccountIDLocked(lineageRootID, now)
+}
+
+// lineageAccountIDLocked returns the lineage's pinned account. Without a live
+// lineage binding (a lineage first seen before bindings existed, or switched
+// back on), it seeds from the member thread that most recently succeeded, any
+// model, so existing sessions join their current account instead of a new one.
+func (a *app) lineageAccountIDLocked(lineageRootID string, now time.Time) (string, bool) {
+	if lineageRootID == "" {
+		return "", false
+	}
+	if binding, ok := a.state.LineageBindings[lineageRootID]; ok && binding.AccountID != "" && binding.ExpiresAt.After(now) {
+		return binding.AccountID, true
+	}
 	var best threadBinding
 	found := false
 	for _, binding := range a.state.ThreadBindings {
@@ -8873,6 +9039,11 @@ func (a *app) accountHasPriorIdentityLocked(item account) bool {
 		}
 	}
 	for _, binding := range a.state.ThreadBindings {
+		if binding.AccountID == item.ID {
+			return true
+		}
+	}
+	for _, binding := range a.state.LineageBindings {
 		if binding.AccountID == item.ID {
 			return true
 		}
