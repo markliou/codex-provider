@@ -470,6 +470,13 @@ type routingCacheEvent struct {
 	CacheReuseBalance     *int64   `json:"cacheReuseBalance,omitempty"`
 	CacheHit              bool     `json:"cacheHit"`
 	ColdCacheEligible     bool     `json:"coldCacheEligible"`
+	// Client* say which Codex feature (or other tool) sent the request, so
+	// identity-less traffic that routing can only spread by prompt hash can be
+	// attributed. They are read from the inbound request and kept in local
+	// telemetry only; nothing here is ever added to the upstream request.
+	ClientOriginator  string `json:"clientOriginator,omitempty"`
+	ClientUserAgent   string `json:"clientUserAgent,omitempty"`
+	ClientRequestKind string `json:"clientRequestKind,omitempty"`
 }
 
 // throughputBucket is an in-memory aggregate used for the 48-hour chart and
@@ -5614,6 +5621,9 @@ func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accoun
 		CacheReuseBalance:     reuseBalance,
 		CacheHit:              usage.Present && usage.CachedTokens > 0,
 		ColdCacheEligible:     usage.Present && usage.InputTokens >= promptCacheMinTokens && usage.CachedTokens == 0,
+		ClientOriginator:      route.Client.Originator,
+		ClientUserAgent:       route.Client.UserAgent,
+		ClientRequestKind:     route.Client.RequestKind,
 	}
 	a.pruneRoutingCacheEventsLocked(now)
 	a.state.RoutingCacheEvents = append(a.state.RoutingCacheEvents, event)
@@ -6007,6 +6017,52 @@ type routingDecision struct {
 	// independently need a new or failover account still converge on one.
 	BalanceKey              string
 	ParentAffinityAttempted bool
+	// Client is local diagnostic metadata about the sender. It is recorded in
+	// routing events only and must never be relayed or added upstream; the
+	// upstream request carries exactly what the Codex client sent.
+	Client clientFingerprint
+}
+
+type clientFingerprint struct {
+	Originator  string
+	UserAgent   string
+	RequestKind string
+}
+
+// clientFingerprintFrom keeps only short, low-cardinality labels: the
+// originator, the user-agent's product token (the OS/terminal comment after
+// it is dropped), and the turn metadata request_kind. Each value is bounded
+// and reduced to token characters so a client cannot write arbitrary text
+// into persisted telemetry.
+func clientFingerprintFrom(r *http.Request, payload map[string]any) clientFingerprint {
+	userAgent, _, _ := strings.Cut(strings.TrimSpace(r.Header.Get("User-Agent")), " ")
+	requestKind := metadataString(metadataObject(r.Header.Get("X-Codex-Turn-Metadata")), "request_kind")
+	if requestKind == "" {
+		clientMetadata := metadataObject(payload["client_metadata"])
+		requestKind = metadataString(metadataObject(firstMetadataValue(clientMetadata, "x-codex-turn-metadata", "x_codex_turn_metadata")), "request_kind")
+	}
+	return clientFingerprint{
+		Originator:  telemetryLabel(r.Header.Get("Originator")),
+		UserAgent:   telemetryLabel(userAgent),
+		RequestKind: telemetryLabel(requestKind),
+	}
+}
+
+func telemetryLabel(value string) string {
+	const maxLen = 64
+	var builder strings.Builder
+	for _, char := range strings.TrimSpace(value) {
+		if builder.Len() >= maxLen {
+			break
+		}
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char >= '0' && char <= '9', strings.ContainsRune("._-/:+", char):
+			builder.WriteRune(char)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	return builder.String()
 }
 
 // routingDecision deliberately keeps the sticky key and the upstream prompt
@@ -6035,6 +6091,7 @@ func (a *app) routingDecision(r *http.Request, payload map[string]any, model, ap
 		}
 		route.ParentAffinityAttempted = identity.IsSubagent && identityParentID(identity) != "" && !a.liveStickySession(route.StickyKey)
 		route.UpstreamPromptCacheKey = a.upstreamPromptCacheKey(r, model, apiKey, route)
+		route.Client = clientFingerprintFrom(r, payload)
 		return route
 	}
 	if previousResponseID := stringValue(payload["previous_response_id"]); previousResponseID != "" {
@@ -9769,6 +9826,7 @@ func (a *app) routingCacheEventViewsLocked(now time.Time) []map[string]any {
 			"cacheWriteTokens": event.CacheWriteTokens, "uncachedInputTokens": event.UncachedInputTokens,
 			"cacheReadRate": event.CacheReadRate, "cacheWriteRate": event.CacheWriteRate, "cacheReuseBalance": event.CacheReuseBalance,
 			"cacheHit": event.CacheHit, "coldCacheEligible": event.ColdCacheEligible,
+			"clientOriginator": event.ClientOriginator, "clientUserAgent": event.ClientUserAgent, "clientRequestKind": event.ClientRequestKind,
 		})
 		// Browser APIs need a compact diagnostic view, not the full persisted
 		// rolling buffer. Keep this server-side limit even though the UI also
