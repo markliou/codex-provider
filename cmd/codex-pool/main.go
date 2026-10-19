@@ -5119,7 +5119,29 @@ func (a *app) placementWeightLocked(item account, active map[string]int) float64
 		multiplier = baseWeeklyWeight
 	}
 	carried := float64(1 + active[item.ID])
-	return remaining * multiplier / (carried * carried)
+	return remaining * multiplier * resetCreditExpiryBoost(snapshot.Quota, time.Now()) / (carried * carried)
+}
+
+// resetCreditExpiryWindow matches the dashboard's red outline: an available
+// reset credit expiring within seven days.
+const resetCreditExpiryWindow = 7 * 24 * time.Hour
+
+// resetCreditExpiryBoost raises an account's share of new sessions while it
+// holds a reset credit about to expire, from x2 at seven days out to x7 at
+// expiry. A credit only resets a window that has been spent, so drawing on the
+// account first gives its owner the chance to spend the credit before it is
+// lost. It only weighs placement among accounts that are free to take a new
+// session: a busy account still keeps its allowance for its own sessions, and
+// spending the credit stays the owner's decision.
+func resetCreditExpiryBoost(quota *accountQuota, now time.Time) float64 {
+	if quota == nil || quota.ResetCredits == nil || quota.ResetCredits.AvailableCount == nil || *quota.ResetCredits.AvailableCount <= 0 || quota.ResetCredits.ExpiresAt == nil {
+		return 1
+	}
+	left := time.Unix(*quota.ResetCredits.ExpiresAt, 0).Sub(now)
+	if left <= 0 || left > resetCreditExpiryWindow {
+		return 1
+	}
+	return 2 + 5*(1-float64(left)/float64(resetCreditExpiryWindow))
 }
 
 // placementScoreLocked is the weighted rendezvous score weight / -ln(u), with

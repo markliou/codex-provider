@@ -6206,6 +6206,60 @@ func TestSessionPlacementPrefersIdleAccountsAndAvoidsAHerd(t *testing.T) {
 	}
 }
 
+// An account holding a reset credit about to expire takes a larger share of new
+// sessions, but only among accounts free to take one.
+func TestExpiringResetCreditRaisesPlacementShareAmongIdleAccounts(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "a", Enabled: true, InPool: true, Priority: 100},
+		{ID: "b", Enabled: true, InPool: true, Priority: 100},
+	})
+	a.routingStrategy = routingStrategyBalanced
+	week := int64(10080)
+	one := int64(1)
+	snapshot := func(id string, expiresIn time.Duration) quotaSnapshot {
+		value := 50.0
+		quota := &accountQuota{Windows: []quotaWindow{{Label: "Week", WindowMinutes: &week, RemainingPercent: &value, Present: true, Observed: true}}}
+		if expiresIn != 0 {
+			at := time.Now().Add(expiresIn).Unix()
+			quota.ResetCredits = &quotaResetCredits{AvailableCount: &one, ExpiresAt: &at}
+		}
+		return quotaSnapshot{AccountID: id, Quota: quota}
+	}
+	share := func() float64 {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		toA := 0
+		for i := 0; i < 400; i++ {
+			picked, _ := a.pickBalancedAccountLocked(fmt.Sprintf("lineage:s-%d", i), []account{a.config.Accounts[0], a.config.Accounts[1]})
+			if picked.ID == "a" {
+				toA++
+			}
+		}
+		return float64(toA) / 400
+	}
+
+	a.state.Quotas["a"] = snapshot("a", 24*time.Hour)
+	a.state.Quotas["b"] = snapshot("b", 0)
+	if got := share(); got < .78 || got > .94 {
+		t.Fatalf("a credit expiring in a day: a took %.2f of new sessions, want about 0.86", got)
+	}
+	a.state.Quotas["a"] = snapshot("a", 10*24*time.Hour)
+	if got := share(); got < .4 || got > .6 {
+		t.Fatalf("a credit outside the seven-day window must not tilt placement: %.2f", got)
+	}
+	a.state.Quotas["a"] = snapshot("a", 24*time.Hour)
+	a.noteSessionPlacement("lineage:running", "a")
+	a.mu.Lock()
+	picked, _ := a.pickBalancedAccountLocked("lineage:new", []account{a.config.Accounts[0], a.config.Accounts[1]})
+	a.mu.Unlock()
+	if picked.ID != "b" {
+		t.Fatal("an expiring credit must not make a busy account take new sessions while another is idle")
+	}
+	if boost := resetCreditExpiryBoost(snapshot("x", time.Minute).Quota, time.Now()); boost < 6.9 || boost > 7 {
+		t.Fatalf("boost at expiry = %.2f, want about 7", boost)
+	}
+}
+
 func TestCodexClientVersionComesOnlyFromACodexUserAgent(t *testing.T) {
 	for ua, want := range map[string]string{
 		"codex_exec/0.163.0 (Alpine Linux 3.21.7; x86_64) unknown (codex_exec; 0.163.0)": "0.163.0",
