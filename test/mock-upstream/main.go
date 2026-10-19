@@ -43,7 +43,8 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"last": server.last, "events": server.events})
 	})
 	mux.HandleFunc("POST /v1/responses", server.handleResponse)
-	mux.HandleFunc("POST /backend-api/responses", server.handleDeviceAuthResponse)
+	// The Codex backend path a native Codex CLI signed in with ChatGPT uses.
+	mux.HandleFunc("POST /backend-api/codex/responses", server.handleDeviceAuthResponse)
 	mux.HandleFunc("GET /backend-api/wham/usage", server.handleDeviceAuthUsage)
 	log.Printf("mock upstream listening on :4010")
 	log.Fatal(http.ListenAndServe(":4010", mux))
@@ -350,8 +351,8 @@ func (s *mockServer) handleDeviceAuthResponse(w http.ResponseWriter, r *http.Req
 		writeJSON(w, status, map[string]any{"error": map[string]string{"message": "device auth rejected"}})
 		return
 	}
-	var request map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+	request, ok := deviceAuthRequest(r)
+	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": "invalid JSON"}})
 		return
 	}
@@ -364,18 +365,39 @@ func (s *mockServer) handleDeviceAuthResponse(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, response)
 }
 
+// deviceAuthRequest reads the fields the mock needs. codex-upstream sends the
+// body zstd-compressed, as a native Codex does, and the standard library has no
+// zstd decoder, so for a compressed body the model comes from the
+// x-codex-routing-hint header and streaming from the Accept header, which a
+// Codex request always sets.
+func deviceAuthRequest(r *http.Request) (map[string]any, bool) {
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "zstd") {
+		model := strings.TrimPrefix(strings.SplitN(r.Header.Get("X-Codex-Routing-Hint"), ";", 2)[0], "model=")
+		return map[string]any{"model": model, "stream": strings.Contains(r.Header.Get("Accept"), "text/event-stream")}, model != ""
+	}
+	var request map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		return nil, false
+	}
+	return request, true
+}
+
 func (s *mockServer) handleDeviceAuthUsage(w http.ResponseWriter, r *http.Request) {
 	accountID := r.Header.Get("ChatGPT-Account-ID")
 	if accountID != "test-acct-a" && accountID != "test-acct-b" {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"code": "invalid_account"}})
 		return
 	}
+	// The weekly window is already counting down. An untouched window (0% used,
+	// reset a full window away) would make the pool spend a quota-priming
+	// request on each account, and the failover test would count those as
+	// client traffic.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"plan_type": "team",
 		"rate_limit": map[string]any{
 			"allowed":          true,
 			"primary_window":   map[string]any{"used_percent": 0, "limit_window_seconds": 18000, "reset_after_seconds": 18000},
-			"secondary_window": map[string]any{"used_percent": 0, "limit_window_seconds": 604800, "reset_after_seconds": 604800},
+			"secondary_window": map[string]any{"used_percent": 10, "limit_window_seconds": 604800, "reset_after_seconds": 500000},
 		},
 	})
 }

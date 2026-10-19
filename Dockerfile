@@ -16,6 +16,20 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -ldflags="-s -w -X main.buildVersion=${CODEX_POOL_VERSION} -X main.buildCommit=${CODEX_POOL_COMMIT} -X main.buildBuiltAt=${CODEX_POOL_BUILT_AT}" \
     -o /out/codex-pool ./cmd/codex-pool
 
+# codex-upstream sends the pool's Codex-backend requests with Codex's own HTTP
+# client. Alpine's native musl target and Rust 1.95 match how the official
+# Codex Linux release is built, and --locked keeps the Codex-seeded lock.
+FROM rust:1.95-alpine AS upstream
+
+RUN apk add --no-cache musl-dev perl make gcc linux-headers git
+WORKDIR /src
+COPY upstream/Cargo.toml upstream/Cargo.lock ./
+COPY upstream/src ./src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked && \
+    mkdir -p /out && cp target/release/codex-upstream /out/codex-upstream
+
 FROM node:22-bookworm-slim AS codex-cli
 
 RUN npm install --global @openai/codex@0.141.0
@@ -32,10 +46,11 @@ RUN groupadd --system codexpool && \
 COPY --from=build /out/codex-pool /usr/local/bin/codex-pool
 COPY --from=codex-cli /usr/local/lib/node_modules/@openai/codex /usr/local/lib/node_modules/@openai/codex
 COPY --from=cliproxy /CLIProxyAPI/CLIProxyAPI /usr/local/bin/cliproxy-sidecar
+COPY --from=upstream /out/codex-upstream /usr/local/bin/codex-upstream
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY cliproxy-supervisor.sh /usr/local/bin/cliproxy-supervisor.sh
 RUN ln -sf ../lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex && \
-    chmod 0755 /usr/local/bin/codex-pool /usr/local/bin/cliproxy-sidecar /usr/local/bin/docker-entrypoint.sh /usr/local/bin/cliproxy-supervisor.sh
+    chmod 0755 /usr/local/bin/codex-pool /usr/local/bin/codex-upstream /usr/local/bin/cliproxy-sidecar /usr/local/bin/docker-entrypoint.sh /usr/local/bin/cliproxy-supervisor.sh
 VOLUME ["/data"]
 EXPOSE 8317
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

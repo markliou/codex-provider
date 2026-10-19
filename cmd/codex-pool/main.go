@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -477,6 +478,7 @@ type routingCacheEvent struct {
 	ClientOriginator  string `json:"clientOriginator,omitempty"`
 	ClientUserAgent   string `json:"clientUserAgent,omitempty"`
 	ClientRequestKind string `json:"clientRequestKind,omitempty"`
+	ClientTurnState   string `json:"clientTurnState,omitempty"`
 }
 
 // throughputBucket is an in-memory aggregate used for the 48-hour chart and
@@ -623,6 +625,11 @@ type app struct {
 	client               *http.Client
 	streamClient         *http.Client
 	logger               *log.Logger
+
+	// codexTransportURL is the loopback codex-upstream hop that sends direct
+	// Codex-backend requests with Codex's own HTTP client. Empty sends them from
+	// Go, which tests use; the container supervisor always sets it.
+	codexTransportURL string
 }
 
 func main() {
@@ -764,6 +771,7 @@ func newAppFromEnv() (*app, error) {
 		codexBaseURL:         strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
 		codexGatewayMode:     codexGatewayMode,
 		cliproxyBaseURL:      strings.TrimRight(envOr("CODEX_POOL_CLIPROXY_BASE_URL", cliproxyBaseURLDefault), "/"),
+		codexTransportURL:    strings.TrimRight(strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_TRANSPORT_URL")), "/"),
 		cliproxyAPIKey:       strings.TrimSpace(os.Getenv("CODEX_POOL_CLIPROXY_API_KEY")),
 		jobs:                 map[string]*loginJob{},
 		loginCancels:         map[string]context.CancelFunc{},
@@ -803,6 +811,9 @@ func streamingHTTPClient() *http.Client {
 	}
 	transport := base.Clone()
 	transport.ResponseHeaderTimeout = upstreamFirstByteTimeout
+	// A native Codex sends no Accept-Encoding on a Responses request; Go would
+	// add "gzip" on its own, so the upstream request would no longer match.
+	transport.DisableCompression = true
 	return &http.Client{Transport: transport}
 }
 
@@ -900,11 +911,13 @@ func (a *app) load() error {
 			a.config.Accounts[i].QuotaProtectionThreshold = 0
 		}
 	}
-	if a.codexGatewayMode != "direct" {
-		for _, account := range a.config.Accounts {
-			if isCodexDeviceAuth(account) {
-				_ = a.syncCliproxyAuth(account, false)
-			}
+	for _, account := range a.config.Accounts {
+		if !isCodexDeviceAuth(account) {
+			continue
+		}
+		a.reconcileCodexCredential(account)
+		if a.codexGatewayMode != "direct" {
+			_ = a.syncCliproxyAuth(account, false)
 		}
 	}
 	if len(a.config.Accounts) == 0 && os.Getenv("CODEX_POOL_UPSTREAM_BASE_URL") != "" {
@@ -987,13 +1000,25 @@ func (a *app) serveUntilStopped(ctx context.Context, listener net.Listener, hand
 	a.logger.Printf("stop signal received: draining %d in-flight request(s) for up to %s", a.inFlight.Load(), grace)
 	drainCtx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
-	if err := server.Shutdown(drainCtx); err != nil {
+	err := server.Shutdown(drainCtx)
+	// Shutdown does not wait for hijacked connections, so responses still
+	// streaming on a Responses WebSocket are waited for here, within the same
+	// grace. Idle sockets are not counted and close when the process exits;
+	// Codex reconnects to the new container.
+	for err == nil && a.inFlight.Load() > 0 {
+		select {
+		case <-drainCtx.Done():
+			err = drainCtx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if err != nil {
 		a.logger.Printf("shutdown grace expired with %d request(s) still in flight; they will be cut", a.inFlight.Load())
 	} else {
 		a.logger.Printf("drain complete; all in-flight requests finished")
 	}
 	a.mu.Lock()
-	err := a.saveLocked()
+	err = a.saveLocked()
 	a.mu.Unlock()
 	if err != nil {
 		a.logger.Printf("final state save failed: %v", err)
@@ -1267,6 +1292,9 @@ func (a *app) mux() http.Handler {
 	mux.HandleFunc("GET /v1/codex-pool/status", a.requireAPIKey(a.handleCurrentStatus))
 	mux.HandleFunc("GET /v1/models", a.requireAPIKey(a.handleModels))
 	mux.HandleFunc("POST /v1/responses", a.trackInFlight(a.requireAPIKey(a.handleResponses)))
+	// A Responses WebSocket stays open across turns, so it is not counted as
+	// in flight; each response running on it is (see wsSession).
+	mux.HandleFunc("GET /v1/responses", a.requireAPIKey(a.handleResponsesWebSocket))
 	mux.HandleFunc("POST /v1/responses/compact", a.trackInFlight(a.requireAPIKey(a.handleResponses)))
 	mux.HandleFunc("POST /v1/chat/completions", a.trackInFlight(a.requireAPIKey(a.handleChatCompletions)))
 	mux.HandleFunc("GET /internal/inflight", a.handleInFlight)
@@ -1634,6 +1662,14 @@ func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": items})
 }
 
+func payloadUnchanged(raw []byte, payload map[string]any) bool {
+	var original map[string]any
+	if err := json.Unmarshal(raw, &original); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(original, payload)
+}
+
 func (a *app) handleResponses(w http.ResponseWriter, r *http.Request) {
 	a.handleProxy(w, r, false)
 }
@@ -1643,6 +1679,7 @@ func (a *app) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
+	compact := !chat && strings.HasSuffix(r.URL.Path, "/responses/compact")
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 	if err != nil || len(body) > maxRequestBody {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "request body is invalid or too large")
@@ -1686,6 +1723,13 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "unable to encode request")
 		return
 	}
+	// Forward the client's own bytes whenever the pool left the request as it
+	// arrived. Re-encoding a decoded map sorts every object's keys, tool
+	// parameter schemas included, and rewrites number formatting, so even an
+	// untouched request reached upstream in a byte layout no native Codex sends.
+	if payloadUnchanged(body, payload) {
+		updatedBody = body
+	}
 	requestID := requestOperationalID(r)
 	failoverFromAccountID := ""
 	failoverOutcome := ""
@@ -1695,6 +1739,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	// is not transient and must stay excluded.
 	capacityExcluded := map[string]bool{}
 	capacityRetries := 0
+	turnStateIssuer := a.stickySessionAccountID(route.StickyKey)
 	attemptLimit := a.proxyAttemptLimit()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
 		candidate, err := a.selectAccountForRoute(&route, model, excluded)
@@ -1720,7 +1765,14 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", err.Error())
 			return
 		}
-		response, err := a.forward(r.Context(), candidate, endpoint, outBody, r.Header)
+		if compact && a.usesCodexBackendDirectly(candidate) {
+			// A native Codex sends remote compaction to the Codex backend's own
+			// compact endpoint, not to the Responses stream.
+			endpoint += "/compact"
+		}
+		inbound, turnState := turnStateForAttempt(r.Header, turnStateIssuer, candidate.ID)
+		route.Client.TurnState = turnState
+		response, err := a.forward(r.Context(), candidate, endpoint, outBody, inbound)
 		if err != nil {
 			if requestContextFinished(r.Context(), err) {
 				// The caller timed out or disconnected. Stop immediately and avoid
@@ -1976,7 +2028,7 @@ func (a *app) prepareUpstreamRequest(candidate account, body []byte, chat bool) 
 	if a.usesCliproxySidecar(candidate) {
 		base = a.cliproxyBaseURL
 	} else if base == "" && isCodexDeviceAuth(candidate) {
-		base = a.codexBaseURL
+		base = a.codexResponsesBaseURL()
 	}
 	if base == "" {
 		return "", nil, false, errors.New("selected account has no upstreamBaseUrl")
@@ -2030,31 +2082,115 @@ func (a *app) prepareUpstreamRequest(candidate account, body []byte, chat bool) 
 	return endpoint, outbound, convertResponse, nil
 }
 
-// codexMetadataHeaderAllowlist is what the pool relays from the Codex client.
-// It deliberately includes the session/thread, request-ID, originator,
-// User-Agent, and beta-feature headers a native Codex CLI request carries, so
-// upstream sees the same request shape as Codex talking to it directly (for
-// example, session-scoped routing and caching keyed on session-id) instead of a
-// generic Go client. Keep it an allowlist: client authorization, cookies,
-// hop-by-hop headers, and pool-only compatibility headers such as
-// X-Codex-Thread-ID must never be relayed.
-var codexMetadataHeaderAllowlist = []string{
-	"X-Codex-Parent-Thread-ID",
-	"X-OpenAI-Subagent",
-	"X-Codex-Turn-Metadata",
-	"X-Codex-Window-ID",
-	"X-Codex-Installation-ID",
-	"Session-Id",
-	"Session_id",
-	"Thread-Id",
-	"X-Client-Request-Id",
-	"Originator",
-	"User-Agent",
-	"X-Codex-Beta-Features",
+// The pool relays the Codex client's own request headers by name and by the
+// prefixes Codex owns, so upstream sees the request a native Codex CLI sends
+// (session-scoped routing and caching key on session-id/thread-id, turn state
+// keeps a turn on one backend, memgen/guardian/subagent markers select the
+// serving path) instead of a generic Go client, and a header a newer Codex adds
+// under its own prefix is relayed without waiting for a pool release. It is
+// still an allowlist: client authorization, API keys, cookies, hop-by-hop and
+// proxy headers never match it, and the exclusions below keep pool-only routing
+// headers and pool-owned upstream identity headers from being relayed.
+var codexRequestHeaderNames = map[string]bool{
+	"session-id":          true,
+	"session_id":          true,
+	"thread-id":           true,
+	"x-client-request-id": true,
+	"originator":          true,
+	"user-agent":          true,
+	"openai-beta":         true,
+	"version":             true,
+	"traceparent":         true,
+	"tracestate":          true,
+}
+
+var codexRequestHeaderPrefixes = []string{"x-codex-", "x-openai-", "x-responsesapi-"}
+
+// poolOnlyRequestHeaders are never relayed even though they match a Codex
+// prefix: X-Codex-Pool-* and the X-Codex-*-ID compatibility headers are routing
+// inputs for this pool only, and X-OpenAI-Fedramp describes the upstream
+// account, so the pool sets it from the selected credential rather than letting
+// a client choose it. X-Codex-Turn-State is relayed, but only to the account
+// that issued it; the attempt loop withholds it from any other account (see
+// turnStateForAttempt), so keep that gate whenever this rule changes.
+var poolOnlyRequestHeaders = map[string]bool{
+	"x-codex-thread-id":             true,
+	"x-codex-session-id":            true,
+	"x-codex-lineage-root-id":       true,
+	"x-codex-thread-source":         true,
+	"x-codex-forked-from-thread-id": true,
+	"x-openai-fedramp":              true,
+}
+
+func relayedCodexRequestHeader(name string) bool {
+	lower := strings.ToLower(name)
+	if poolOnlyRequestHeaders[lower] || strings.HasPrefix(lower, "x-codex-pool-") {
+		return false
+	}
+	if codexRequestHeaderNames[lower] {
+		return true
+	}
+	for _, prefix := range codexRequestHeaderPrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// usesCodexBackendDirectly reports whether the pool itself talks to the Codex
+// backend with the account's ChatGPT credential, as a native Codex CLI does.
+func (a *app) usesCodexBackendDirectly(candidate account) bool {
+	return isCodexDeviceAuth(candidate) && !a.usesCliproxySidecar(candidate) && candidate.UpstreamAPIKey == ""
 }
 
 func (a *app) forward(ctx context.Context, candidate account, endpoint string, body []byte, inbound http.Header) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if !a.usesCodexBackendDirectly(candidate) {
+		return a.forwardOnce(ctx, candidate, endpoint, body, inbound, codexAuthInfo{})
+	}
+	body, aggregate, err := codexBackendRequestBody(endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	auth, err := a.refreshedCodexAuthContext(ctx, candidate)
+	if err != nil {
+		return nil, err
+	}
+	response, err := a.forwardOnce(ctx, candidate, endpoint, body, inbound, auth)
+	if err == nil && response.StatusCode == http.StatusUnauthorized {
+		response, err = a.retryCodexBackendAfterRejection(ctx, candidate, endpoint, body, inbound, auth, response)
+	}
+	if err != nil || !aggregate {
+		return response, err
+	}
+	return aggregateCodexStream(response), nil
+}
+
+// retryCodexBackendAfterRejection handles a 401 from the Codex backend.
+func (a *app) retryCodexBackendAfterRejection(ctx context.Context, candidate account, endpoint string, body []byte, inbound http.Header, auth codexAuthInfo, response *http.Response) (*http.Response, error) {
+	// A native Codex answers a 401 by refreshing its token and retrying once
+	// before treating the credential as bad. The pool owns this account's token
+	// in direct mode, so it does the same: an access token upstream stopped
+	// accepting before its expiry must not fail the account over or send it to
+	// repair. Only a second 401, or a refresh that cannot produce a new token,
+	// reaches the caller's auth-failure handling.
+	rejected, _ := io.ReadAll(io.LimitReader(response.Body, maxRequestBody))
+	_ = response.Body.Close()
+	refreshed, refreshErr := a.refreshCodexAuthAfterRejection(ctx, candidate, auth.AccessToken)
+	if refreshErr != nil || refreshed.AccessToken == "" || refreshed.AccessToken == auth.AccessToken {
+		response.Body = io.NopCloser(bytes.NewReader(rejected))
+		return response, nil
+	}
+	return a.forwardOnce(ctx, candidate, endpoint, body, inbound, refreshed)
+}
+
+func (a *app) forwardOnce(ctx context.Context, candidate account, endpoint string, body []byte, inbound http.Header, auth codexAuthInfo) (*http.Response, error) {
+	viaTransport := a.codexTransportURL != "" && a.usesCodexBackendDirectly(candidate)
+	target := endpoint
+	if viaTransport {
+		target = a.codexTransportURL + "/forward"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -2073,11 +2209,7 @@ func (a *app) forward(ctx context.Context, candidate account, endpoint string, b
 		req.Header.Set("Authorization", "Bearer "+a.cliproxyAPIKey)
 	} else if candidate.UpstreamAPIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+candidate.UpstreamAPIKey)
-	} else if isCodexDeviceAuth(candidate) {
-		auth, err := a.refreshedCodexAuthContext(ctx, candidate)
-		if err != nil {
-			return nil, err
-		}
+	} else if a.usesCodexBackendDirectly(candidate) {
 		if auth.AccountID == "" {
 			auth.AccountID = candidate.AccountID
 		}
@@ -2088,16 +2220,285 @@ func (a *app) forward(ctx context.Context, candidate account, endpoint string, b
 		if auth.FedRAMP {
 			req.Header.Set("X-OpenAI-Fedramp", "true")
 		}
+		if hint := codexRoutingHint(body, inbound); hint != "" {
+			req.Header.Set("X-Codex-Routing-Hint", hint)
+		}
+		if version := codexClientVersion(inbound); version != "" && req.Header.Get("Version") == "" {
+			req.Header.Set("Version", version)
+		}
 	}
-	return a.streamClient.Do(req)
+	if !viaTransport {
+		return a.streamClient.Do(req)
+	}
+	req.Header.Set("X-Codex-Upstream-Url", endpoint)
+	// One client per account in codex-upstream, as each native Codex process
+	// keeps its own connections for its one account.
+	req.Header.Set("X-Codex-Upstream-Identity", candidate.ID)
+	// A native Codex zstd-compresses its Responses requests to the Codex
+	// backend; compaction requests are sent uncompressed.
+	if strings.HasSuffix(endpoint, "/responses") {
+		req.Header.Set("X-Codex-Upstream-Compression", "zstd")
+	}
+	response, err := a.streamClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	// codex-upstream answers 502 with this header only when it could not reach
+	// upstream at all. Surface that as a transport error, as a direct dial
+	// failure would be, so it fails over instead of reading as an upstream 5xx.
+	if kind := response.Header.Get("X-Codex-Upstream-Error"); kind != "" {
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		_ = response.Body.Close()
+		return nil, fmt.Errorf("codex upstream %s: %s", kind, strings.TrimSpace(string(detail)))
+	}
+	return response, nil
+}
+
+// codexClientVersion is the "version" header a native Codex sends to the Codex
+// backend (its own release, from the built-in provider). A custom-provider
+// client omits it, so it is taken from the client's own User-Agent product
+// token (codex_exec/0.163.0, codex-tui/0.163.0, ...). Other clients get none.
+func codexClientVersion(inbound http.Header) string {
+	product, _, _ := strings.Cut(strings.TrimSpace(inbound.Get("User-Agent")), " ")
+	name, version, ok := strings.Cut(product, "/")
+	if !ok || !strings.HasPrefix(strings.ToLower(name), "codex") || version == "" {
+		return ""
+	}
+	for _, char := range version {
+		if !(char >= '0' && char <= '9' || char == '.' || char == '-' || char >= 'a' && char <= 'z') {
+			return ""
+		}
+	}
+	return version
+}
+
+// codexBackendUnsupportedFields are Responses API parameters the Codex backend
+// rejects. A native Codex never sends them; other clients of this pool (an app
+// calling the OpenAI-style API, pool quota priming, chat-completions
+// conversion) may.
+var codexBackendUnsupportedFields = []string{
+	"max_output_tokens", "max_completion_tokens", "temperature", "top_p", "truncation", "user",
+	"context_management", "safety_identifier", "stream_options", "previous_response_id", "prompt_cache_retention",
+}
+
+// codexBackendRequestBody makes a request the Codex backend would reject into
+// the closest one it accepts, and reports whether the client asked for a
+// non-streaming answer that has to be assembled from the stream. The Codex
+// backend only streams, only accepts store=false and list input, and has no
+// system role. The sidecar used to rewrite every request this way; here a
+// request that already has that shape, which is every request a native Codex
+// sends, is returned byte for byte, so only foreign requests are changed and
+// Codex requests stay native. The compact endpoint is not a Responses stream
+// and is forwarded as sent.
+func codexBackendRequestBody(endpoint string, raw []byte) ([]byte, bool, error) {
+	if strings.HasSuffix(endpoint, "/responses/compact") {
+		return raw, false, nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return raw, false, nil
+	}
+	changed := false
+	aggregate := false
+	if text, ok := payload["input"].(string); ok {
+		payload["input"] = []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": text}}}}
+		changed = true
+	}
+	if stream, _ := payload["stream"].(bool); !stream {
+		payload["stream"] = true
+		aggregate = true
+		changed = true
+	}
+	if store, ok := payload["store"].(bool); !ok || store {
+		payload["store"] = false
+		changed = true
+	}
+	for _, field := range codexBackendUnsupportedFields {
+		if _, ok := payload[field]; ok {
+			delete(payload, field)
+			changed = true
+		}
+	}
+	if input, ok := payload["input"].([]any); ok {
+		for _, raw := range input {
+			if item, _ := raw.(map[string]any); item != nil && item["role"] == "system" {
+				item["role"] = "developer"
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return raw, false, nil
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false, err
+	}
+	return encoded, aggregate, nil
+}
+
+// aggregateCodexStream answers a client that asked for a non-streaming
+// response: it reads the Codex backend's stream to its terminal event and
+// returns the single Responses JSON document, or an error status the caller's
+// non-streaming failover already understands. The completed event can arrive
+// with an empty output list, so the output is rebuilt from the items the
+// stream reported. Upstream response headers (request id, turn state, model)
+// are kept.
+func aggregateCodexStream(response *http.Response) *http.Response {
+	if response.StatusCode < 200 || response.StatusCode > 299 || !isStreamingProxyResponse(response) {
+		return response
+	}
+	defer response.Body.Close()
+	reader := bufio.NewReader(io.LimitReader(response.Body, 64<<20))
+	itemsByIndex := map[int]json.RawMessage{}
+	var itemsInOrder []json.RawMessage
+	reply := func(status int, payload any) *http.Response {
+		body, _ := json.Marshal(payload)
+		headers := response.Header.Clone()
+		headers.Set("Content-Type", "application/json")
+		headers.Del("Content-Length")
+		return &http.Response{StatusCode: status, Status: http.StatusText(status), Header: headers, Body: io.NopCloser(bytes.NewReader(body)), ContentLength: int64(len(body)), Request: response.Request, Proto: response.Proto, ProtoMajor: response.ProtoMajor, ProtoMinor: response.ProtoMinor}
+	}
+	for {
+		block, err := readSSEBlock(reader)
+		if strings.TrimSpace(block) != "" {
+			eventType := responseEventTypeFromSSEBlock(block)
+			_, data := sseBlockEventAndData(block)
+			var event map[string]any
+			_ = json.Unmarshal([]byte(data), &event)
+			switch eventType {
+			case "response.output_item.done":
+				if item, ok := event["item"]; ok {
+					encoded, _ := json.Marshal(item)
+					if index, ok := event["output_index"].(float64); ok {
+						itemsByIndex[int(index)] = encoded
+					} else {
+						itemsInOrder = append(itemsInOrder, encoded)
+					}
+				}
+			case "response.completed", "response.incomplete":
+				completed, _ := event["response"].(map[string]any)
+				if completed == nil {
+					return reply(http.StatusBadGateway, map[string]any{"error": map[string]any{"code": "bad_gateway", "message": "upstream completed without a response"}})
+				}
+				if output, _ := completed["output"].([]any); len(output) == 0 {
+					indexes := make([]int, 0, len(itemsByIndex))
+					for index := range itemsByIndex {
+						indexes = append(indexes, index)
+					}
+					sort.Ints(indexes)
+					rebuilt := make([]any, 0, len(indexes)+len(itemsInOrder))
+					for _, index := range indexes {
+						rebuilt = append(rebuilt, itemsByIndex[index])
+					}
+					for _, item := range itemsInOrder {
+						rebuilt = append(rebuilt, item)
+					}
+					completed["output"] = rebuilt
+				}
+				return reply(http.StatusOK, completed)
+			case "response.failed", "error":
+				errorPayload, _ := event["error"].(map[string]any)
+				if failed, _ := event["response"].(map[string]any); failed != nil && errorPayload == nil {
+					errorPayload, _ = failed["error"].(map[string]any)
+				}
+				if errorPayload == nil {
+					errorPayload = map[string]any{"code": claimString(event, "code"), "message": claimString(event, "message")}
+				}
+				return reply(codexStreamFailureStatus(terminalFailureClass(eventType, claimString(errorPayload, "code"))), map[string]any{"error": errorPayload})
+			}
+		}
+		if err != nil {
+			return reply(http.StatusBadGateway, map[string]any{"error": map[string]any{"code": "bad_gateway", "message": "upstream stream ended before the response completed"}})
+		}
+	}
+}
+
+// codexStreamFailureStatus maps an in-stream failure onto the status the
+// non-streaming path already routes on: capacity moves to another identity
+// like a 429, an auth failure is the account's credential, a request error is
+// the caller's, and anything else is an upstream fault.
+func codexStreamFailureStatus(class string) int {
+	switch class {
+	case "capacity":
+		return http.StatusTooManyRequests
+	case "authentication":
+		return http.StatusUnauthorized
+	case "request":
+		return http.StatusBadRequest
+	default:
+		return http.StatusBadGateway
+	}
 }
 
 func forwardCodexMetadataHeaders(outbound, inbound http.Header) {
-	for _, name := range codexMetadataHeaderAllowlist {
-		if value := strings.TrimSpace(inbound.Get(name)); value != "" {
-			outbound.Set(name, value)
+	for name, values := range inbound {
+		if !relayedCodexRequestHeader(name) {
+			continue
+		}
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				outbound.Add(name, value)
+			}
 		}
 	}
+}
+
+// codexRoutingHint is the x-codex-routing-hint a native Codex signed in with
+// ChatGPT attaches to every Codex-backend request ("model=<model>", plus
+// ";tier=<service_tier>" when one is set), except guardian reviewer requests.
+// Upstream uses it to route the request to the right serving pool before it
+// reads the body. A custom-provider Codex client never sends it, because it
+// does not know it is talking to the Codex backend, so the pool adds exactly
+// the value Codex itself would have sent; a hint the client did send wins.
+func codexRoutingHint(body []byte, inbound http.Header) string {
+	if strings.TrimSpace(inbound.Get("X-Codex-Routing-Hint")) != "" || strings.EqualFold(strings.TrimSpace(inbound.Get("X-Codex-Guardian")), "reviewer") {
+		return ""
+	}
+	var fields struct {
+		Model       string `json:"model"`
+		ServiceTier string `json:"service_tier"`
+	}
+	if err := json.Unmarshal(body, &fields); err != nil || strings.TrimSpace(fields.Model) == "" {
+		return ""
+	}
+	if tier := strings.TrimSpace(fields.ServiceTier); tier != "" {
+		return "model=" + strings.TrimSpace(fields.Model) + ";tier=" + tier
+	}
+	return "model=" + strings.TrimSpace(fields.Model)
+}
+
+// stickySessionAccountID is the account that served this route's last
+// successful response, which is the only account whose turn state Codex can be
+// holding: the client only ever receives the committed attempt's headers and
+// response.metadata, and that success is what updates the sticky session.
+func (a *app) stickySessionAccountID(stickyKey string) string {
+	now := time.Now().UTC()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	session, found := a.state.StickySessions[stickyKey]
+	if !found || a.stickySessionExpiredLocked(session, now) {
+		return ""
+	}
+	return session.AccountID
+}
+
+// turnStateForAttempt relays the client's X-Codex-Turn-State only to the
+// account that issued it. A native Codex never presents one account's turn
+// token to another account, so after a failover, a lineage move, or with no
+// known issuer the header is withheld and the attempt looks like a native
+// request that starts a turn fresh. It returns the headers to forward and the
+// disposition for local telemetry ("relayed", "withheld", or "" when absent).
+func turnStateForAttempt(inbound http.Header, issuerAccountID, candidateAccountID string) (http.Header, string) {
+	if strings.TrimSpace(inbound.Get("X-Codex-Turn-State")) == "" {
+		return inbound, ""
+	}
+	if issuerAccountID != "" && issuerAccountID == candidateAccountID {
+		return inbound, "relayed"
+	}
+	withheld := inbound.Clone()
+	withheld.Del("X-Codex-Turn-State")
+	return withheld, "withheld"
 }
 
 func upstreamAuthFailureStatus(status int) bool {
@@ -2199,6 +2600,14 @@ func (a *app) fetchGatewayModels(ctx context.Context) map[string]bool {
 		}
 	}
 	return models
+}
+
+// codexResponsesBaseURL is where a native Codex CLI signed in with ChatGPT
+// sends Responses requests: the Codex backend under /codex. The bare
+// backend-api root is only for quota, account, and subscription endpoints, and
+// sending inference there instead reaches a different API.
+func (a *app) codexResponsesBaseURL() string {
+	return strings.TrimRight(a.codexBaseURL, "/") + "/codex"
 }
 
 func (a *app) usesCliproxySidecar(item account) bool {
@@ -2369,8 +2778,21 @@ func safeHeaderValue(value string) string {
 	}, strings.TrimSpace(value))
 }
 
+// proxyResponseHeaderAllowlist is what Codex gets back from upstream's
+// response headers. X-Codex-Turn-State is the token Codex echoes on the next
+// request of the same turn so upstream keeps that turn on the backend that
+// already holds its state; dropping it made every follow-up request look like
+// a fresh one. OpenAI-Model and X-Reasoning-Included are what a native Codex
+// reads from the same response. Deliberately not relayed: X-Models-Etag (the
+// pool serves its own model catalog, and an upstream etag that never matches
+// it would make Codex refetch the catalog) and per-account rate-limit headers
+// (they describe one pooled account, not the pool Codex is talking to). Once
+// early SSE headers have gone out these cannot be added any more; upstream's
+// response.metadata event carries the same values in the stream.
+var proxyResponseHeaderAllowlist = []string{"Content-Type", "Cache-Control", "X-Request-Id", "X-Codex-Turn-State", "OpenAI-Model", "X-Reasoning-Included"}
+
 func copyProxyResponseHeaders(w http.ResponseWriter, response *http.Response) {
-	for _, header := range []string{"Content-Type", "Cache-Control", "X-Request-Id"} {
+	for _, header := range proxyResponseHeaderAllowlist {
 		if value := response.Header.Get(header); value != "" {
 			w.Header().Set(header, value)
 		}
@@ -2936,6 +3358,16 @@ func precommitCountsTowardBlockBound(block string) bool {
 func precommitLifecycleSSEBlock(block string) bool {
 	switch responseEventTypeFromSSEBlock(block) {
 	case "response.created", "response.in_progress", "response.queued":
+		return true
+	case "response.metadata":
+		// Upstream started sending response.metadata right after
+		// response.created, before any output. As an unlisted event it failed
+		// closed and committed the stream, so every server_is_overloaded behind
+		// it reached Codex as a final failure instead of a retry on another
+		// identity: from 2026-10-19 all client-visible capacity failures closed
+		// the window here. It describes the response, not model output, so it
+		// stays buffered; it is still forwarded when the window commits and is
+		// discarded only with the rest of a failed attempt, like response.created.
 		return true
 	case "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
 		// These announce an empty shell — an output item, a content part, a
@@ -5624,6 +6056,7 @@ func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accoun
 		ClientOriginator:      route.Client.Originator,
 		ClientUserAgent:       route.Client.UserAgent,
 		ClientRequestKind:     route.Client.RequestKind,
+		ClientTurnState:       route.Client.TurnState,
 	}
 	a.pruneRoutingCacheEventsLocked(now)
 	a.state.RoutingCacheEvents = append(a.state.RoutingCacheEvents, event)
@@ -6027,6 +6460,9 @@ type clientFingerprint struct {
 	Originator  string
 	UserAgent   string
 	RequestKind string
+	// TurnState is what the final attempt did with the client's
+	// X-Codex-Turn-State; it is set per attempt, not read from the request.
+	TurnState string
 }
 
 // clientFingerprintFrom keeps only short, low-cardinality labels: the
@@ -7000,6 +7436,67 @@ func (a *app) syncCliproxyAuthLocked(item account, force bool) error {
 	return nil
 }
 
+// reconcileCodexCredential keeps one current refresh token per account across
+// a gateway-mode switch. Refresh tokens rotate on use, so only the copy that was
+// refreshed last is still valid: the sidecar record after running in sidecar
+// mode, auth.json after running direct. Each mode refreshes only its own copy,
+// so on startup it first adopts the other copy when that one is newer.
+// Skipping this makes the first refresh after a switch spend a revoked token
+// and log the account out.
+func (a *app) reconcileCodexCredential(item account) {
+	data, err := os.ReadFile(a.cliproxyAuthPath(item.ID))
+	if err != nil {
+		return
+	}
+	var record cliproxyCodexAuthFile
+	if err := json.Unmarshal(data, &record); err != nil || strings.TrimSpace(record.AccessToken) == "" {
+		return
+	}
+	sidecarIssued, ok := jwtIssuedAt(record.AccessToken)
+	if !ok {
+		return
+	}
+	lock := a.codexAuthLock(item.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	auth, err := a.readCodexAuthFile(item)
+	if err != nil || auth.Tokens == nil {
+		return
+	}
+	fileIssued, fileOK := jwtIssuedAt(auth.Tokens.AccessToken)
+	if a.codexGatewayMode != "direct" {
+		if fileOK && fileIssued.After(sidecarIssued) {
+			if err := a.syncCliproxyAuthLocked(item, true); err != nil && a.logger != nil {
+				a.logger.Printf("credential reconcile for %s: sidecar copy update failed: %s", item.ID, err)
+			}
+		}
+		return
+	}
+	if fileOK && !sidecarIssued.After(fileIssued) {
+		return
+	}
+	if record.IDToken != "" {
+		auth.Tokens.IDToken = record.IDToken
+	}
+	auth.Tokens.AccessToken = record.AccessToken
+	if record.RefreshToken != "" {
+		auth.Tokens.RefreshToken = record.RefreshToken
+	}
+	if refreshed, err := time.Parse(time.RFC3339, record.LastRefresh); err == nil {
+		refreshed = refreshed.UTC()
+		auth.LastRefresh = &refreshed
+	}
+	if err := writeJSONAtomic(filepath.Join(a.accountCodexHome(item.ID), "auth.json"), auth); err != nil {
+		if a.logger != nil {
+			a.logger.Printf("credential reconcile for %s: adopting the sidecar credential failed: %s", item.ID, err)
+		}
+		return
+	}
+	if a.logger != nil {
+		a.logger.Printf("credential reconcile for %s: adopted the newer sidecar credential", item.ID)
+	}
+}
+
 func (a *app) updateCliproxyAuthMetadata(item account) error {
 	if !a.usesCliproxySidecar(item) {
 		return nil
@@ -7106,6 +7603,31 @@ func (a *app) refreshCodexAuthIfNeeded(item account) error {
 }
 
 func (a *app) refreshCodexAuthIfNeededContext(ctx context.Context, item account) error {
+	return a.refreshCodexAuthContext(ctx, item, false)
+}
+
+// refreshCodexAuthAfterRejection refreshes the credential upstream rejected,
+// unless a concurrent request already replaced it. Refresh tokens rotate on
+// use, so refreshing again with a token another request just rotated would
+// spend it twice; the caller retries with whatever is current instead.
+func (a *app) refreshCodexAuthAfterRejection(ctx context.Context, item account, rejectedAccessToken string) (codexAuthInfo, error) {
+	lock := a.codexAuthLock(item.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	current, err := a.codexAuth(item)
+	if err != nil {
+		return codexAuthInfo{}, err
+	}
+	if current.AccessToken != rejectedAccessToken {
+		return current, nil
+	}
+	if err := a.refreshCodexAuthContext(ctx, item, true); err != nil {
+		return codexAuthInfo{}, err
+	}
+	return a.codexAuth(item)
+}
+
+func (a *app) refreshCodexAuthContext(ctx context.Context, item account, force bool) error {
 	home := a.accountCodexHome(item.ID)
 	path := filepath.Join(home, "auth.json")
 	auth, err := a.readCodexAuthFile(item)
@@ -7115,9 +7637,11 @@ func (a *app) refreshCodexAuthIfNeededContext(ctx context.Context, item account)
 	if auth.Tokens.RefreshToken == "" {
 		return nil
 	}
-	expiry, ok := jwtExpiry(auth.Tokens.AccessToken)
-	if !ok || time.Until(expiry) > codexTokenRefreshWindow {
-		return nil
+	if !force {
+		expiry, ok := jwtExpiry(auth.Tokens.AccessToken)
+		if !ok || time.Until(expiry) > codexTokenRefreshWindow {
+			return nil
+		}
 	}
 	refreshed, err := a.requestCodexTokenRefreshContext(ctx, auth.Tokens.RefreshToken)
 	if err != nil {
@@ -8746,6 +9270,19 @@ func jwtPayload(token string) map[string]any {
 	return claims
 }
 
+// jwtIssuedAt orders two credentials for the same account: a later iat (or,
+// without one, a later exp) is the token a more recent refresh produced.
+func jwtIssuedAt(token string) (time.Time, bool) {
+	claims := jwtPayload(token)
+	if claims == nil {
+		return time.Time{}, false
+	}
+	if iat, ok := claims["iat"].(float64); ok && iat > 0 {
+		return time.Unix(int64(iat), 0), true
+	}
+	return jwtExpiry(token)
+}
+
 func jwtExpiry(token string) (time.Time, bool) {
 	claims := jwtPayload(token)
 	if claims == nil {
@@ -9826,7 +10363,7 @@ func (a *app) routingCacheEventViewsLocked(now time.Time) []map[string]any {
 			"cacheWriteTokens": event.CacheWriteTokens, "uncachedInputTokens": event.UncachedInputTokens,
 			"cacheReadRate": event.CacheReadRate, "cacheWriteRate": event.CacheWriteRate, "cacheReuseBalance": event.CacheReuseBalance,
 			"cacheHit": event.CacheHit, "coldCacheEligible": event.ColdCacheEligible,
-			"clientOriginator": event.ClientOriginator, "clientUserAgent": event.ClientUserAgent, "clientRequestKind": event.ClientRequestKind,
+			"clientOriginator": event.ClientOriginator, "clientUserAgent": event.ClientUserAgent, "clientRequestKind": event.ClientRequestKind, "clientTurnState": event.ClientTurnState,
 		})
 		// Browser APIs need a compact diagnostic view, not the full persisted
 		// rolling buffer. Keep this server-side limit even though the UI also
@@ -11305,7 +11842,12 @@ func envOrValue(value, fallback string) string {
 }
 
 func codexGatewayModeFromEnv() (string, error) {
-	mode := strings.ToLower(strings.TrimSpace(envOr("CODEX_POOL_CODEX_GATEWAY_MODE", "sidecar")))
+	// direct is the default because the pool must send upstream what a native
+	// Codex CLI sends; the sidecar rewrote and dropped Codex headers, dropped the
+	// response turn state, and injected tools. sidecar stays selectable so a
+	// deployment can switch back without losing its credentials (see
+	// reconcileCodexCredential).
+	mode := strings.ToLower(strings.TrimSpace(envOr("CODEX_POOL_CODEX_GATEWAY_MODE", "direct")))
 	switch mode {
 	case "sidecar", "direct":
 		return mode, nil

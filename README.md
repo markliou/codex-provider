@@ -100,13 +100,15 @@ Only one device-auth job runs at a time; reloading the admin page recovers its
 verification URL/code, and pool participation cannot be changed while repair
 is pending.
 
-### Bundled CLIProxy Sidecar
+### Codex Gateway
 
-Codex device-auth inference is relayed through the pinned CLIProxyAPI binary bundled in the same container. It listens only on `127.0.0.1:8319`; it is not published with Docker and does not add an admin page or public endpoint. `codex-pool` remains the only public API and UI service.
+By default Pool sends Codex device-auth inference straight to the Codex backend with the selected account's credential, the way a native Codex CLI signed in with ChatGPT does. It relays the headers Codex sends, forwards an unchanged request body byte for byte, refreshes the account token itself (once more on a `401`, then retrying the same account), and adds the `ChatGPT-Account-ID` and `X-Codex-Routing-Hint` headers a native Codex sends to that backend.
 
-For every selected account, Pool writes an isolated CLIProxy auth record under `/data/cliproxy/auths/<account-id>.json` with a unique model prefix. Pool selects that exact prefix, so it continues to own sticky bindings, quota-based exclusion, cooldowns, and account failover. CLIProxyAPI is the only process that refreshes the copied OAuth credential; quota polling reads that current sidecar record and does not race the refresh token. Do not edit either credential directory by hand.
+The final hop is `codex-upstream`, a small loopback-only Rust process in the same container built from Codex's own HTTP client crate (Codex `rust-v0.163.0`, same locked dependency versions, musl, vendored OpenSSL), so the TLS handshake, HTTP/2 settings, header order and zstd request compression are those of a native Codex CLI. Pool keeps every routing, credential, and failover decision. To follow a newer Codex release, update the tag in `upstream/Cargo.toml`, reseed `upstream/Cargo.lock` from that release's `codex-rs/Cargo.lock`, and match its Rust toolchain in the Dockerfile.
 
-`CODEX_POOL_CODEX_GATEWAY_MODE=sidecar` is the default. `direct` exists only as a compatibility/test override and bypasses the sidecar; it is not the normal deployment mode. `CODEX_POOL_CLIPROXY_BASE_URL` and `CODEX_POOL_CLIPROXY_API_KEY` are internal test/compatibility overrides and should not be set in a normal `docker run` deployment.
+Codex can also use the Responses WebSocket through Pool, as it does with the Codex backend directly: set `supports_websockets = true` on the Codex model provider that points at Pool. Codex then uploads tools and instructions once and sends only new input per request, which is the cheapest path for upstream. Pool binds each socket to one account; if that account must change, Pool closes the socket and Codex reconnects and resends in full.
+
+`CODEX_POOL_CODEX_GATEWAY_MODE=sidecar` switches back to the pinned CLIProxyAPI binary bundled in the same container. It listens only on `127.0.0.1:8319`, is not published with Docker, and owns refreshes of its own copy of each credential under `/data/cliproxy/auths/<account-id>.json`. On startup either mode first adopts the other mode's credential when it is newer, so switching modes does not log accounts out. Do not edit either credential directory by hand. `CODEX_POOL_CLIPROXY_BASE_URL` and `CODEX_POOL_CLIPROXY_API_KEY` are internal test/compatibility overrides and should not be set in a normal `docker run` deployment.
 
 Quota is read from the authenticated Codex/ChatGPT backend after login and then
 refreshed every five minutes. The dashboard labels every reported base or
@@ -292,7 +294,7 @@ Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key
 - Model aliases and `(thinking-tier)` suffix translation.
 - Thread-aware sticky balancing and failover with idle TTL, soft parent-account affinity, independent prompt-cache-key policy, per-model cooldowns, optional Pro-quota preservation, response-id continuation binding, and JSON persistence in `/data`. New sessions distribute across equal-priority healthy accounts; when an upstream account returns `429` or repeated server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
 - Main/subagent cache-read, cache-write, request-hit, cold-start, affinity, and failover observability, a bounded and redacted 24-hour request correlation panel, a public 48-hour in-memory throughput/prompt-cache-hit time series, and management-only per-account throughput.
-- Bundled, loopback-only CLIProxyAPI sidecar for Codex device-auth requests. Pool pins each request to the selected account through a sidecar model prefix, while the sidecar owns OAuth refreshes.
+- Direct Codex-backend gateway for device-auth requests, matching a native Codex CLI request, with an optional bundled loopback-only CLIProxyAPI sidecar mode.
 - Public pool participation toggles, strict same-identity repair for invalid in-pool credentials, and editable owner notes on `/admin`, plus authenticated owner controls for add/remove account, broader same-slot device-auth repair jobs, per-slot quota protection, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Protected`, `Exhausted`, `Cooldown`, `Error`, `Login needed`, `Signing in`, `Duplicate`, `Disabled`, or `Standby`.
 - Codex quota refresh from `/backend-api/wham/usage`, including duration-bearing primary/secondary/additional windows, credits, spend controls, reset credits, the separately cached nearest reset-credit expiry date, reached reason, raw/normalized plan metadata, freshness, sanitized quota errors, and five-minute dashboard refresh.
 

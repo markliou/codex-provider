@@ -2616,7 +2616,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 		"/admin":                      "Pool status",
 		"/admin/assets/app.css":       ".badge.error",
 		"/admin/assets/app.js":        "Low quota",
-		"/admin/manifest.webmanifest": `"background_color": "#f2eee3"`,
+		"/admin/manifest.webmanifest": `"background_color": "#fff6ee"`,
 	}
 	for path, expected := range checks {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -2641,7 +2641,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), adminVersionPlaceholder) || !strings.Contains(recorder.Body.String(), "vtest+abcdef12") {
 		t.Fatal("admin page did not inject build metadata version")
 	}
-	for _, expected := range []string{`<meta name="color-scheme" content="light">`, `<meta name="theme-color" content="#143740">`} {
+	for _, expected := range []string{`<meta name="color-scheme" content="light">`, `<meta name="theme-color" content="#ff7a59">`} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page omitted light theme metadata %q", expected)
 		}
@@ -2651,7 +2651,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page still includes %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"ACCESS", "Continue", "Password", "Add account", "Use Pro last", "Balanced sticky", "routing-strategy-pill", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown", "Copy verification link", "Copy verification code", `data-theme="coastal"`, `id="theme-select"`, "Choose dashboard theme", ">Coastal<", ">Forest<", ">Indigo<", ">Ember<", ">Slate<"} {
+	for _, expected := range []string{"ACCESS", "Continue", "Password", "Add account", "Use Pro last", "Balanced sticky", "routing-strategy-pill", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown", "Copy verification link", "Copy verification code", `data-theme="sunrise"`, `id="theme-select"`, "Choose dashboard theme", ">Sunrise<", ">Lagoon<", ">Meadow<", ">Orchid<", ">Citrus<", `class="rail"`, `class="rail-nav"`, `id="accounts-section"`, `id="active-routes"`} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page does not include low-key label %q", expected)
 		}
@@ -2818,12 +2818,12 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if strings.Contains(cssRecorder.Body.String(), ".quota-blocked") {
 		t.Fatal("admin CSS still styles removed redundant quota exhaustion text")
 	}
-	for _, expected := range []string{"#f2eee3", "#176b87", "#d95136", "#0d8f78", "#f2c14e"} {
+	for _, expected := range []string{"#fff6ee", "#ff7a59", "#6c5ce7", "#0d8f78", "#f2c14e"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
-			t.Fatalf("admin CSS omitted warm coastal theme color %q", expected)
+			t.Fatalf("admin CSS omitted default sunrise theme color %q", expected)
 		}
 	}
-	for _, expected := range []string{`:root[data-theme="forest"]`, `:root[data-theme="indigo"]`, `:root[data-theme="ember"]`, `:root[data-theme="slate"]`, ".theme-picker", "--body-background", "--topbar-bg", "--summary-featured-bg", "--throughput-bg", "--table-head-bg"} {
+	for _, expected := range []string{`:root[data-theme="lagoon"]`, `:root[data-theme="meadow"]`, `:root[data-theme="orchid"]`, `:root[data-theme="citrus"]`, ".theme-picker", "--body-background", "--rail-bg", "--hero-bg", "--summary-featured-bg", "--throughput-bg", "--table-head-bg", "prefers-reduced-motion", `.app-shell:has(#login-view:not([hidden])) .rail-nav`} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS omitted selectable pool theme behavior %q", expected)
 		}
@@ -5580,7 +5580,7 @@ func TestResponsesProxyForwardsOnlyCodexMetadataHeaderAllowlist(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer upstream-key" {
 			t.Fatalf("client authorization leaked or upstream auth missing: %q", r.Header.Get("Authorization"))
 		}
-		for _, forbidden := range []string{"Cookie", "X-Unrelated-Client-Header", "X-Codex-Thread-ID"} {
+		for _, forbidden := range []string{"Cookie", "X-Unrelated-Client-Header", "X-Codex-Thread-ID", "X-Codex-Routing-Hint"} {
 			if got := r.Header.Get(forbidden); got != "" {
 				t.Fatalf("non-allowlisted header %s leaked upstream: %q", forbidden, got)
 			}
@@ -5680,6 +5680,530 @@ func TestTelemetryLabelIsBoundedTokenText(t *testing.T) {
 	}
 	if got := telemetryLabel(strings.Repeat("x", 200)); len(got) != 64 {
 		t.Fatalf("label length = %d, want 64", len(got))
+	}
+}
+
+// X-Codex-Turn-State keeps a turn on the upstream backend that holds its
+// state. A native Codex presents it only to the account that issued it, so the
+// pool must relay it to that account, withhold it from a failover account, and
+// hand Codex the turn state of the account that actually served the response.
+func TestTurnStateIsRelayedOnlyToTheAccountThatIssuedIt(t *testing.T) {
+	var firstSaw, secondSaw []string
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstSaw = append(firstSaw, r.Header.Get("X-Codex-Turn-State"))
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondSaw = append(secondSaw, r.Header.Get("X-Codex-Turn-State"))
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Codex-Turn-State", "ts-second")
+		w.Header().Set("OpenAI-Model", "gpt-test")
+		w.Header().Set("X-Reasoning-Included", "true")
+		w.Header().Set("X-Models-Etag", "upstream-etag")
+		w.Header().Set("X-Codex-Primary-Used-Percent", "40")
+		_, _ = w.Write([]byte(`{"id":"resp_turn_state","object":"response","output":[]}`))
+	}))
+	defer second.Close()
+	a := testApp(t, []account{
+		{ID: "first", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL, UpstreamAPIKey: "first-key"},
+		{ID: "second", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: second.URL, UpstreamAPIKey: "second-key"},
+	})
+	now := time.Now().UTC()
+	stickyKey := "gpt-test:thread:thread-ts"
+	a.state.StickySessions[stickyKey] = stickySession{Key: stickyKey, ModelID: "gpt-test", AccountID: "first", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+
+	send := func(turnState string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+		req.Header.Set("Authorization", "Bearer client-key")
+		req.Header.Set("X-Codex-Turn-Metadata", `{"thread_id":"thread-ts"}`)
+		req.Header.Set("X-Codex-Turn-State", turnState)
+		recorder := httptest.NewRecorder()
+		a.publicMux().ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+		}
+		return recorder
+	}
+	lastTurnState := func() string {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		events := a.state.RoutingCacheEvents
+		return events[len(events)-1].ClientTurnState
+	}
+
+	recorder := send("ts-first")
+	if len(firstSaw) != 1 || firstSaw[0] != "ts-first" {
+		t.Fatalf("issuing account must get its turn state: %q", firstSaw)
+	}
+	if len(secondSaw) != 1 || secondSaw[0] != "" {
+		t.Fatalf("failover account must not get another account's turn state: %q", secondSaw)
+	}
+	if got := lastTurnState(); got != "withheld" {
+		t.Fatalf("turn state disposition = %q, want withheld", got)
+	}
+	for name, want := range map[string]string{"X-Codex-Turn-State": "ts-second", "OpenAI-Model": "gpt-test", "X-Reasoning-Included": "true"} {
+		if got := recorder.Header().Get(name); got != want {
+			t.Fatalf("response %s = %q, want %q", name, got, want)
+		}
+	}
+	for _, name := range []string{"X-Models-Etag", "X-Codex-Primary-Used-Percent"} {
+		if got := recorder.Header().Get(name); got != "" {
+			t.Fatalf("response header %s must not be relayed: %q", name, got)
+		}
+	}
+
+	// The success moved the thread to the second account, so the turn state it
+	// issued now goes back to it.
+	send("ts-second")
+	if len(secondSaw) != 2 || secondSaw[1] != "ts-second" {
+		t.Fatalf("issuing account must get its own turn state back: %q", secondSaw)
+	}
+	if got := lastTurnState(); got != "relayed" {
+		t.Fatalf("turn state disposition = %q, want relayed", got)
+	}
+}
+
+func TestTurnStateWithoutKnownIssuerIsWithheldWithoutTouchingTheInboundRequest(t *testing.T) {
+	inbound := http.Header{}
+	inbound.Set("X-Codex-Turn-State", "ts")
+	forwarded, disposition := turnStateForAttempt(inbound, "", "any")
+	if disposition != "withheld" || forwarded.Get("X-Codex-Turn-State") != "" {
+		t.Fatalf("unknown issuer: disposition=%q header=%q", disposition, forwarded.Get("X-Codex-Turn-State"))
+	}
+	if inbound.Get("X-Codex-Turn-State") != "ts" {
+		t.Fatal("withholding must not mutate the inbound request headers a later attempt reads")
+	}
+	if _, disposition := turnStateForAttempt(http.Header{}, "a", "a"); disposition != "" {
+		t.Fatalf("absent turn state disposition = %q, want empty", disposition)
+	}
+}
+
+// Direct mode is the default because the upstream request must be the one a
+// native Codex CLI sends: the Codex backend path, the client's own body bytes,
+// every Codex-owned header, the account's ChatGPT credential, and the routing
+// hint Codex adds for the Codex backend. Pool-only routing headers and a
+// client-chosen FedRAMP flag must not reach upstream.
+func TestDirectCodexGatewaySendsTheNativeCodexRequest(t *testing.T) {
+	const raw = `{"model":"gpt-test","stream":true,"input":[{"type":"message","role":"user","content":"hi"}],"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}],"store":false,"prompt_cache_key":"thread-native","n":1.50}`
+	var gotPath string
+	var gotHeaders http.Header
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotHeaders = r.Header.Clone()
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_native","object":"response","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "device", AccountID: "acct-up", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.codexBaseURL = upstream.URL + "/backend-api"
+	writeCodexDeviceAuth(t, a, "device", "acct-up", "user@example.test")
+	auth, err := a.codexAuth(a.config.Accounts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Cookie", "client-cookie")
+	req.Header.Set("Session-Id", "session-native")
+	req.Header.Set("Thread-Id", "thread-native")
+	req.Header.Set("X-Codex-Window-ID", "window-native")
+	req.Header.Set("X-OpenAI-Memgen-Request", "true")
+	req.Header.Set("Traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+	req.Header.Set("X-Codex-Pool-Session", "pool-only")
+	req.Header.Set("X-Codex-Thread-ID", "pool-only-thread")
+	req.Header.Set("X-OpenAI-Fedramp", "true")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if gotPath != "/backend-api/codex/responses" {
+		t.Fatalf("upstream path = %q, want the Codex backend /backend-api/codex/responses", gotPath)
+	}
+	if gotBody != raw {
+		t.Fatalf("an unchanged request must reach upstream byte for byte:\n got %s\nwant %s", gotBody, raw)
+	}
+	for name, want := range map[string]string{
+		"Authorization":           "Bearer " + auth.AccessToken,
+		"ChatGPT-Account-ID":      "acct-up",
+		"X-Codex-Routing-Hint":    "model=gpt-test",
+		"Session-Id":              "session-native",
+		"Thread-Id":               "thread-native",
+		"X-Codex-Window-ID":       "window-native",
+		"X-OpenAI-Memgen-Request": "true",
+		"Traceparent":             "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+	} {
+		if got := gotHeaders.Get(name); got != want {
+			t.Fatalf("upstream %s = %q, want %q", name, got, want)
+		}
+	}
+	for _, name := range []string{"Cookie", "X-Codex-Pool-Session", "X-Codex-Thread-ID", "X-OpenAI-Fedramp"} {
+		if got := gotHeaders.Get(name); got != "" {
+			t.Fatalf("%s must not reach upstream: %q", name, got)
+		}
+	}
+}
+
+func TestCodexBackendRequestBodyChangesOnlyForeignRequests(t *testing.T) {
+	native := []byte(`{"model":"m","stream":true,"store":false,"input":[{"type":"message","role":"developer","content":"x"}],"service_tier":"flex"}`)
+	got, aggregate, err := codexBackendRequestBody("https://h/backend-api/codex/responses", native)
+	if err != nil || aggregate || string(got) != string(native) {
+		t.Fatalf("a native Codex request must pass byte for byte: aggregate=%v err=%v body=%s", aggregate, err, got)
+	}
+	foreign := []byte(`{"model":"m","input":"hello","max_output_tokens":10,"temperature":0.2,"top_p":1,"user":"u","previous_response_id":"r","prompt_cache_retention":"24h"}`)
+	got, aggregate, err = codexBackendRequestBody("https://h/backend-api/codex/responses", foreign)
+	if err != nil || !aggregate {
+		t.Fatalf("a non-streaming request must be assembled from the stream: aggregate=%v err=%v", aggregate, err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["stream"] != true || payload["store"] != false {
+		t.Fatalf("the Codex backend needs stream=true and store=false: %s", got)
+	}
+	for _, field := range []string{"max_output_tokens", "temperature", "top_p", "user", "previous_response_id", "prompt_cache_retention"} {
+		if _, ok := payload[field]; ok {
+			t.Fatalf("unsupported %s must be removed: %s", field, got)
+		}
+	}
+	input, _ := payload["input"].([]any)
+	if len(input) != 1 || !strings.Contains(string(got), `"text":"hello"`) {
+		t.Fatalf("string input must become a user message: %s", got)
+	}
+	system := []byte(`{"model":"m","stream":true,"store":false,"input":[{"type":"message","role":"system","content":"rules"}]}`)
+	got, aggregate, _ = codexBackendRequestBody("https://h/backend-api/codex/responses", system)
+	if aggregate || !strings.Contains(string(got), `"role":"developer"`) {
+		t.Fatalf("the system role must become developer: %s", got)
+	}
+	compact := []byte(`{"model":"m","input":[]}`)
+	if got, aggregate, _ := codexBackendRequestBody("https://h/backend-api/codex/responses/compact", compact); aggregate || string(got) != string(compact) {
+		t.Fatalf("compaction must be forwarded as sent: %s", got)
+	}
+}
+
+// The Codex backend only streams. A non-streaming client still gets one JSON
+// response, and an overload inside the stream fails over like a 429.
+func TestDirectCodexGatewayAnswersNonStreamingClientsFromTheStream(t *testing.T) {
+	var firstBodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if r.Header.Get("ChatGPT-Account-ID") == "acct-first" {
+			firstBodies = append(firstBodies, string(body))
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_busy\"}}\n\n")
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_busy\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"busy\"}}}\n\n")
+			return
+		}
+		item := `{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"assembled"}]}`
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\"}}\n\n")
+		_, _ = fmt.Fprintf(w, "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":%s}\n\n", item)
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{
+		{ID: "first", AccountID: "acct-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
+		{ID: "second", AccountID: "acct-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10},
+	})
+	a.codexBaseURL = upstream.URL + "/backend-api"
+	writeCodexDeviceAuth(t, a, "first", "acct-first", "first@example.test")
+	writeCodexDeviceAuth(t, a, "second", "acct-second", "second@example.test")
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hi","max_output_tokens":50}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(firstBodies) != 1 || !strings.Contains(firstBodies[0], `"stream":true`) || !strings.Contains(firstBodies[0], `"store":false`) || strings.Contains(firstBodies[0], "max_output_tokens") {
+		t.Fatalf("the Codex backend must get a streaming store=false request: %q", firstBodies)
+	}
+	var reply map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &reply); err != nil {
+		t.Fatalf("a non-streaming client must get one JSON response: %v %s", err, recorder.Body.String())
+	}
+	if reply["id"] != "resp_ok" || !strings.Contains(recorder.Body.String(), "assembled") {
+		t.Fatalf("the output must be rebuilt from the stream: %s", recorder.Body.String())
+	}
+}
+
+func TestDirectCodexGatewaySendsCompactionToTheCompactEndpoint(t *testing.T) {
+	var gotPath, gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_compact","object":"response.compaction","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "device", AccountID: "acct-up", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+	a.codexBaseURL = upstream.URL + "/backend-api"
+	writeCodexDeviceAuth(t, a, "device", "acct-up", "user@example.test")
+	const raw = `{"model":"gpt-test","input":[{"type":"message","role":"user","content":"hi"}],"instructions":"","prompt_cache_key":"k"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if gotPath != "/backend-api/codex/responses/compact" || gotBody != raw {
+		t.Fatalf("compaction must reach the native compact endpoint unchanged: path=%q body=%s", gotPath, gotBody)
+	}
+}
+
+// In the container every direct Codex-backend request takes its last hop
+// through codex-upstream (Codex's own HTTP client). The pool must hand it the
+// real endpoint, the account it is sending as, and Codex's compression choice,
+// and a hop that could not reach upstream must fail over like a dial error.
+func TestDirectCodexGatewaySendsThroughCodexUpstream(t *testing.T) {
+	type hop struct{ url, identity, compression, version, hint, auth string }
+	var hops []hop
+	transport := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/forward" {
+			t.Errorf("transport path = %q", r.URL.Path)
+		}
+		hops = append(hops, hop{r.Header.Get("X-Codex-Upstream-Url"), r.Header.Get("X-Codex-Upstream-Identity"), r.Header.Get("X-Codex-Upstream-Compression"), r.Header.Get("Version"), r.Header.Get("X-Codex-Routing-Hint"), r.Header.Get("Authorization")})
+		if r.Header.Get("X-Codex-Upstream-Identity") == "first" {
+			w.Header().Set("X-Codex-Upstream-Error", "connection")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("connection refused"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_via_transport","object":"response","output":[]}`))
+	}))
+	defer transport.Close()
+	a := testApp(t, []account{
+		{ID: "first", AccountID: "acct-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
+		{ID: "second", AccountID: "acct-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10},
+	})
+	a.codexBaseURL = "https://chatgpt.example.test/backend-api"
+	a.codexTransportURL = transport.URL
+	writeCodexDeviceAuth(t, a, "first", "acct-first", "first@example.test")
+	writeCodexDeviceAuth(t, a, "second", "acct-second", "second@example.test")
+	second, err := a.codexAuth(a.config.Accounts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":true,"store":false,"input":[]}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("User-Agent", "codex-tui/0.163.0 (Mac OS 26.0.0; arm64) iTerm.app/3.6.6 (codex-tui; 0.163.0)")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "resp_via_transport") {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(hops) != 2 || hops[0].identity != "first" || hops[1].identity != "second" {
+		t.Fatalf("a transport failure must fail over to the next account: %+v", hops)
+	}
+	want := hop{"https://chatgpt.example.test/backend-api/codex/responses", "second", "zstd", "0.163.0", "model=gpt-test", "Bearer " + second.AccessToken}
+	if hops[1] != want {
+		t.Fatalf("transport hop = %+v, want %+v", hops[1], want)
+	}
+}
+
+func TestCodexClientVersionComesOnlyFromACodexUserAgent(t *testing.T) {
+	for ua, want := range map[string]string{
+		"codex_exec/0.163.0 (Alpine Linux 3.21.7; x86_64) unknown (codex_exec; 0.163.0)": "0.163.0",
+		"codex-tui/0.163.0 (Mac OS 26.0.0; arm64)":                                       "0.163.0",
+		"Python-urllib/3.12":                  "",
+		"codex_exec/0.163.0\r\nX-Injected: 1": "",
+		"":                                    "",
+	} {
+		h := http.Header{}
+		h.Set("User-Agent", ua)
+		if got := codexClientVersion(h); got != want {
+			t.Fatalf("version for %q = %q, want %q", ua, got, want)
+		}
+	}
+}
+
+func TestRoutingHintFollowsNativeCodexRules(t *testing.T) {
+	header := func(pairs ...string) http.Header {
+		h := http.Header{}
+		for i := 0; i+1 < len(pairs); i += 2 {
+			h.Set(pairs[i], pairs[i+1])
+		}
+		return h
+	}
+	cases := []struct {
+		name    string
+		body    string
+		inbound http.Header
+		want    string
+	}{
+		{"model only", `{"model":"gpt-x"}`, header(), "model=gpt-x"},
+		{"service tier", `{"model":"gpt-x","service_tier":"priority"}`, header(), "model=gpt-x;tier=priority"},
+		{"guardian reviewer gets none", `{"model":"gpt-x"}`, header("X-Codex-Guardian", "reviewer"), ""},
+		{"client hint wins", `{"model":"gpt-x"}`, header("X-Codex-Routing-Hint", "model=other"), ""},
+		{"no model", `{"input":"hi"}`, header(), ""},
+	}
+	for _, tc := range cases {
+		if got := codexRoutingHint([]byte(tc.body), tc.inbound); got != tc.want {
+			t.Fatalf("%s: hint = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Only a request the pool actually changed is re-encoded.
+func TestPoolReencodesTheBodyOnlyWhenItChangesTheRequest(t *testing.T) {
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_changed","object":"response","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "provider", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL + "/v1", UpstreamAPIKey: "upstream-key"}})
+	const raw = `{"model":"gpt-test(high)","input":"hi","prompt_cache_key":"k"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if gotBody == raw || !strings.Contains(gotBody, `"effort":"high"`) || !strings.Contains(gotBody, `"model":"gpt-test"`) {
+		t.Fatalf("a request the pool changed must carry the change: %s", gotBody)
+	}
+}
+
+// A native Codex refreshes and retries once on a 401. In direct mode the pool
+// owns the token and must do the same on the same account, rather than failing
+// the account over or sending it to repair.
+func TestDirectCodexGatewayRefreshesOnceOnUnauthorizedAndRetriesTheSameAccount(t *testing.T) {
+	fresh := fakeJWTClaims(map[string]any{"exp": time.Now().Add(time.Hour).Unix(), "n": 2})
+	refreshHits := 0
+	refresh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"access_token":%q,"refresh_token":"<rotated-refresh>"}`, fresh)
+	}))
+	defer refresh.Close()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", refresh.URL)
+	firstHits, secondHits := 0, 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("ChatGPT-Account-ID") == "acct-second" {
+			secondHits++
+		} else {
+			firstHits++
+			if r.Header.Get("Authorization") != "Bearer "+fresh {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":{"code":"token_expired"}}`))
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_refreshed","object":"response","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{
+		{ID: "first", AccountID: "acct-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
+		{ID: "second", AccountID: "acct-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10},
+	})
+	a.codexBaseURL = upstream.URL + "/backend-api"
+	writeCodexDeviceAuth(t, a, "first", "acct-first", "first@example.test")
+	writeCodexDeviceAuth(t, a, "second", "acct-second", "second@example.test")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if refreshHits != 1 || firstHits != 2 || secondHits != 0 {
+		t.Fatalf("want one refresh and a retry on the same account: refresh=%d first=%d second=%d", refreshHits, firstHits, secondHits)
+	}
+	file, err := a.readCodexAuthFile(a.config.Accounts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Tokens.AccessToken != fresh || file.Tokens.RefreshToken != "<rotated-refresh>" {
+		t.Fatal("the refreshed credential must be persisted for the next request")
+	}
+}
+
+// Refresh tokens rotate on use, so after a gateway-mode switch only the copy
+// refreshed last is valid; each mode must adopt it before refreshing its own.
+func TestReconcileCodexCredentialAdoptsTheNewerCopyAcrossModeSwitches(t *testing.T) {
+	older := fakeJWTClaims(map[string]any{"iat": 1000, "exp": 4102444800})
+	newer := fakeJWTClaims(map[string]any{"iat": 2000, "exp": 4102444800})
+	setup := func(t *testing.T, mode, fileAccess, sidecarAccess string) (*app, account) {
+		a := testApp(t, []account{{ID: "device", AccountID: "acct-up", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
+		a.codexGatewayMode = mode
+		item := a.config.Accounts[0]
+		home := a.accountCodexHome(item.ID)
+		if err := os.MkdirAll(home, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"refresh_token":"<file-refresh>","account_id":"acct-up"}}`, fileAccess)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(a.cliproxyAuthPath(item.ID)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(a.cliproxyAuthPath(item.ID), []byte(fmt.Sprintf(`{"type":"codex","access_token":%q,"refresh_token":"<sidecar-refresh>","account_id":"acct-up","prefix":"codex-pool-device","last_refresh":"2026-10-19T00:00:00Z"}`, sidecarAccess)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return a, item
+	}
+	fileRefresh := func(t *testing.T, a *app, item account) string {
+		file, err := a.readCodexAuthFile(item)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return file.Tokens.RefreshToken
+	}
+	sidecarRefresh := func(t *testing.T, a *app, item account) string {
+		data, err := os.ReadFile(a.cliproxyAuthPath(item.ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var record cliproxyCodexAuthFile
+		if err := json.Unmarshal(data, &record); err != nil {
+			t.Fatal(err)
+		}
+		return record.RefreshToken
+	}
+
+	a, item := setup(t, "direct", older, newer)
+	a.reconcileCodexCredential(item)
+	if got := fileRefresh(t, a, item); got != "<sidecar-refresh>" {
+		t.Fatalf("direct mode must adopt the newer sidecar credential, auth.json refresh = %q", got)
+	}
+
+	a, item = setup(t, "direct", newer, older)
+	a.reconcileCodexCredential(item)
+	if got := fileRefresh(t, a, item); got != "<file-refresh>" {
+		t.Fatalf("direct mode must keep its own newer credential, auth.json refresh = %q", got)
+	}
+
+	a, item = setup(t, "sidecar", newer, older)
+	a.reconcileCodexCredential(item)
+	if got := sidecarRefresh(t, a, item); got != "<file-refresh>" {
+		t.Fatalf("switching back to sidecar must hand it the newer auth.json credential, sidecar refresh = %q", got)
+	}
+}
+
+func TestCodexGatewayModeDefaultsToDirect(t *testing.T) {
+	t.Setenv("CODEX_POOL_CODEX_GATEWAY_MODE", "")
+	mode, err := codexGatewayModeFromEnv()
+	if err != nil || mode != "direct" {
+		t.Fatalf("default gateway mode = %q, %v; want direct", mode, err)
+	}
+	t.Setenv("CODEX_POOL_CODEX_GATEWAY_MODE", "sidecar")
+	if mode, err := codexGatewayModeFromEnv(); err != nil || mode != "sidecar" {
+		t.Fatalf("sidecar must stay selectable: %q, %v", mode, err)
 	}
 }
 
@@ -8928,6 +9452,44 @@ func TestNamedKeepaliveEventsKeepTheRetryWindowOpen(t *testing.T) {
 	}
 	if len(a.state.RoutingCacheEvents) != 1 || a.state.RoutingCacheEvents[0].PrecommitCloseReason == "keepalive" {
 		t.Fatalf("keepalive event still recorded as the close reason: %#v", a.state.RoutingCacheEvents)
+	}
+}
+
+// Production capacity failures on 2026-10-19 all recorded close reason
+// "response.metadata": upstream sends it before any output, and as an unlisted
+// event it committed the stream one block before the overload behind it. The
+// retry must happen, and the successful attempt's metadata must still reach
+// the client.
+func TestResponseMetadataKeepsTheRetryWindowOpen(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_meta\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_meta\"}}\n\n")
+		_, _ = fmt.Fprintf(w, "event: response.metadata\ndata: {\"type\":\"response.metadata\",\"attempt\":%d}\n\n", hits)
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_meta\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_meta\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	body := recorder.Body.String()
+	if hits != 2 || !strings.Contains(body, "recovered") {
+		t.Fatalf("response.metadata closed the retry window: hits=%d body=%s", hits, body)
+	}
+	if strings.Contains(body, `"attempt":1`) || !strings.Contains(body, `"attempt":2`) {
+		t.Fatalf("client must get only the successful attempt's metadata: %s", body)
+	}
+	if strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("retried capacity failure leaked to the client: %s", body)
 	}
 }
 
