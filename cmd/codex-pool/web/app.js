@@ -1,11 +1,11 @@
 (() => {
   const themeStorageKey = "codexPoolAdminTheme";
   const themeMetaColors = Object.freeze({
-    coastal: "#143740",
-    forest: "#19483b",
-    indigo: "#2e356f",
-    ember: "#5a2d28",
-    slate: "#263548",
+    sunrise: "#ff7a59",
+    lagoon: "#0aa2d4",
+    meadow: "#4caf50",
+    orchid: "#b44fe0",
+    citrus: "#f59f00",
   });
   const themeNames = new Set(Object.keys(themeMetaColors));
   const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public", resetCreditNotice: null, openQuotaDetails: new Set(), quotaFloorPercent: 0 };
@@ -24,7 +24,9 @@
   // account state, or any server-side pool configuration. Invalid or
   // unavailable storage must fall back silently so the dashboard still loads.
   const applyTheme = (requestedTheme, persist = false) => {
-    const theme = themeNames.has(requestedTheme) ? requestedTheme : "coastal";
+    // A theme saved before the redesign (coastal, forest, ...) is no longer a
+    // choice and falls back to the default instead of an unstyled page.
+    const theme = themeNames.has(requestedTheme) ? requestedTheme : "sunrise";
     document.documentElement.dataset.theme = theme;
     const select = $("#theme-select");
     if (select) select.value = theme;

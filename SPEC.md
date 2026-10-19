@@ -916,12 +916,20 @@ Notes:
 - Actual consumed tokens are tracked in usage stats.
 - Absolute remaining Codex token quota may not be available from upstream. Display both quota-window percentages and token usage counters.
 - Quota progress colors are an operational warning scale: healthy capacity uses the cool Jade/Wasabi range, then becomes amber, Persimmon, and finally red as remaining capacity approaches zero. Do not use one neutral color for all values or make a near-zero bar appear healthy.
-- The dashboard offers five light, readable themes: Coastal (the default warm
-  off-white canvas), Forest, Indigo, Ember, and Slate. Management mode exposes
-  the selector, and the selected theme is browser-local presentation state
-  persisted in `localStorage`; it must not change routing, authentication,
-  account state, or server-side pool configuration. Preserve labels, shapes,
-  text, and the semantic warning palette so status is never communicated by
+- The dashboard uses a playful light layout: a floating navigation rail (a
+  top bar on narrow screens) whose section links hide on the unlock screen, a
+  hero banner holding the page title and operator controls, bento summary
+  tiles, pill-shaped capacity tracks, and card sections. Motion (entrance,
+  hover lift, background blobs) is decorative and stops under
+  `prefers-reduced-motion`.
+- It offers five light, readable themes: Sunrise (the default warm coral and
+  violet), Lagoon, Meadow, Orchid, and Citrus. A theme saved before this set
+  falls back to Sunrise. Management mode exposes the selector, and the selected
+  theme is browser-local presentation state persisted in `localStorage`; it
+  must not change routing, authentication, account state, or server-side pool
+  configuration. Themes change only the surrounding atmosphere: the semantic
+  status and quota warning palette is the same in every theme. Preserve
+  labels, shapes, text, and that palette so status is never communicated by
   color alone.
 - The account summary cards must partition every configured slot into exactly
   one of Ready, Low/Limited, Cooling down, Out of pool, Duplicate, or

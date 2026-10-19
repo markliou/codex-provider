@@ -2616,7 +2616,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 		"/admin":                      "Pool status",
 		"/admin/assets/app.css":       ".badge.error",
 		"/admin/assets/app.js":        "Low quota",
-		"/admin/manifest.webmanifest": `"background_color": "#f2eee3"`,
+		"/admin/manifest.webmanifest": `"background_color": "#fff6ee"`,
 	}
 	for path, expected := range checks {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -2641,7 +2641,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), adminVersionPlaceholder) || !strings.Contains(recorder.Body.String(), "vtest+abcdef12") {
 		t.Fatal("admin page did not inject build metadata version")
 	}
-	for _, expected := range []string{`<meta name="color-scheme" content="light">`, `<meta name="theme-color" content="#143740">`} {
+	for _, expected := range []string{`<meta name="color-scheme" content="light">`, `<meta name="theme-color" content="#ff7a59">`} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page omitted light theme metadata %q", expected)
 		}
@@ -2651,7 +2651,7 @@ func TestAdminDashboardAssets(t *testing.T) {
 			t.Fatalf("admin page still includes %q", forbidden)
 		}
 	}
-	for _, expected := range []string{"ACCESS", "Continue", "Password", "Add account", "Use Pro last", "Balanced sticky", "routing-strategy-pill", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown", "Copy verification link", "Copy verification code", `data-theme="coastal"`, `id="theme-select"`, "Choose dashboard theme", ">Coastal<", ">Forest<", ">Indigo<", ">Ember<", ">Slate<"} {
+	for _, expected := range []string{"ACCESS", "Continue", "Password", "Add account", "Use Pro last", "Balanced sticky", "routing-strategy-pill", "SERVICE STATUS", "Active routes", "device-auth-url", "device-auth-code", "device-auth-countdown", "Copy verification link", "Copy verification code", `data-theme="sunrise"`, `id="theme-select"`, "Choose dashboard theme", ">Sunrise<", ">Lagoon<", ">Meadow<", ">Orchid<", ">Citrus<", `class="rail"`, `class="rail-nav"`, `id="accounts-section"`, `id="active-routes"`} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("admin page does not include low-key label %q", expected)
 		}
@@ -2818,12 +2818,12 @@ func TestAdminDashboardAssets(t *testing.T) {
 	if strings.Contains(cssRecorder.Body.String(), ".quota-blocked") {
 		t.Fatal("admin CSS still styles removed redundant quota exhaustion text")
 	}
-	for _, expected := range []string{"#f2eee3", "#176b87", "#d95136", "#0d8f78", "#f2c14e"} {
+	for _, expected := range []string{"#fff6ee", "#ff7a59", "#6c5ce7", "#0d8f78", "#f2c14e"} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
-			t.Fatalf("admin CSS omitted warm coastal theme color %q", expected)
+			t.Fatalf("admin CSS omitted default sunrise theme color %q", expected)
 		}
 	}
-	for _, expected := range []string{`:root[data-theme="forest"]`, `:root[data-theme="indigo"]`, `:root[data-theme="ember"]`, `:root[data-theme="slate"]`, ".theme-picker", "--body-background", "--topbar-bg", "--summary-featured-bg", "--throughput-bg", "--table-head-bg"} {
+	for _, expected := range []string{`:root[data-theme="lagoon"]`, `:root[data-theme="meadow"]`, `:root[data-theme="orchid"]`, `:root[data-theme="citrus"]`, ".theme-picker", "--body-background", "--rail-bg", "--hero-bg", "--summary-featured-bg", "--throughput-bg", "--table-head-bg", "prefers-reduced-motion", `.app-shell:has(#login-view:not([hidden])) .rail-nav`} {
 		if !strings.Contains(cssRecorder.Body.String(), expected) {
 			t.Fatalf("admin CSS omitted selectable pool theme behavior %q", expected)
 		}
