@@ -2160,8 +2160,20 @@ func (a *app) forward(ctx context.Context, candidate account, endpoint string, b
 	if err == nil && response.StatusCode == http.StatusUnauthorized {
 		response, err = a.retryCodexBackendAfterRejection(ctx, candidate, endpoint, body, inbound, auth, response)
 	}
-	if err != nil || !aggregate {
+	if err != nil {
 		return response, err
+	}
+	// The Codex backend answers a Responses stream with no Content-Type at all
+	// (a native Codex reads the stream regardless). Every request sent to
+	// /responses streams, so a success without a Content-Type is that stream.
+	// Without this the pool took it for a plain body: the pre-commit window,
+	// and with it the capacity retry on another account, never ran, usage and
+	// terminal events went unrecorded, and a non-streaming client got raw SSE.
+	if strings.HasSuffix(endpoint, "/responses") && response.StatusCode >= 200 && response.StatusCode < 300 && strings.TrimSpace(response.Header.Get("Content-Type")) == "" {
+		response.Header.Set("Content-Type", "text/event-stream")
+	}
+	if !aggregate {
+		return response, nil
 	}
 	return aggregateCodexStream(response), nil
 }
