@@ -6010,6 +6010,46 @@ func TestDirectCodexGatewaySendsThroughCodexUpstream(t *testing.T) {
 	}
 }
 
+// The real Codex backend streams with no Content-Type header. The pool must
+// still treat it as a stream: a capacity failure before any output is retried
+// on another account, and the completed response is recorded with its usage.
+func TestCodexBackendStreamWithoutContentTypeIsStillAStream(t *testing.T) {
+	transport := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header()["Content-Type"] = nil
+		if r.Header.Get("X-Codex-Upstream-Identity") == "first" {
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_busy\"}}\n\n")
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_busy\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"usage\":{\"input_tokens\":50,\"input_tokens_details\":{\"cached_tokens\":40},\"output_tokens\":2}}}\n\n")
+	}))
+	defer transport.Close()
+	a := testApp(t, []account{
+		{ID: "first", AccountID: "acct-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
+		{ID: "second", AccountID: "acct-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10},
+	})
+	a.codexBaseURL = "https://chatgpt.example.test/backend-api"
+	a.codexTransportURL = transport.URL
+	writeCodexDeviceAuth(t, a, "first", "acct-first", "first@example.test")
+	writeCodexDeviceAuth(t, a, "second", "acct-second", "second@example.test")
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":true,"store":false,"input":[]}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	body := recorder.Body.String()
+	if strings.Contains(body, "server_is_overloaded") || !strings.Contains(body, "resp_ok") {
+		t.Fatalf("the overload before output must be retried on the next account: %s", body)
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	events := a.state.RoutingCacheEvents
+	if len(events) != 1 || events[0].TerminalEvent != "response.completed" || events[0].CachedTokens != 40 || events[0].AccountID != "second" {
+		t.Fatalf("the completed stream must be recorded with its usage: %#v", events)
+	}
+}
+
 func TestCodexClientVersionComesOnlyFromACodexUserAgent(t *testing.T) {
 	for ua, want := range map[string]string{
 		"codex_exec/0.163.0 (Alpine Linux 3.21.7; x86_64) unknown (codex_exec; 0.163.0)": "0.163.0",
