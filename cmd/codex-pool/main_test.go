@@ -5683,6 +5683,103 @@ func TestTelemetryLabelIsBoundedTokenText(t *testing.T) {
 	}
 }
 
+// X-Codex-Turn-State keeps a turn on the upstream backend that holds its
+// state. A native Codex presents it only to the account that issued it, so the
+// pool must relay it to that account, withhold it from a failover account, and
+// hand Codex the turn state of the account that actually served the response.
+func TestTurnStateIsRelayedOnlyToTheAccountThatIssuedIt(t *testing.T) {
+	var firstSaw, secondSaw []string
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstSaw = append(firstSaw, r.Header.Get("X-Codex-Turn-State"))
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondSaw = append(secondSaw, r.Header.Get("X-Codex-Turn-State"))
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Codex-Turn-State", "ts-second")
+		w.Header().Set("OpenAI-Model", "gpt-test")
+		w.Header().Set("X-Reasoning-Included", "true")
+		w.Header().Set("X-Models-Etag", "upstream-etag")
+		w.Header().Set("X-Codex-Primary-Used-Percent", "40")
+		_, _ = w.Write([]byte(`{"id":"resp_turn_state","object":"response","output":[]}`))
+	}))
+	defer second.Close()
+	a := testApp(t, []account{
+		{ID: "first", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: first.URL, UpstreamAPIKey: "first-key"},
+		{ID: "second", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: second.URL, UpstreamAPIKey: "second-key"},
+	})
+	now := time.Now().UTC()
+	stickyKey := "gpt-test:thread:thread-ts"
+	a.state.StickySessions[stickyKey] = stickySession{Key: stickyKey, ModelID: "gpt-test", AccountID: "first", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+
+	send := func(turnState string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+		req.Header.Set("Authorization", "Bearer client-key")
+		req.Header.Set("X-Codex-Turn-Metadata", `{"thread_id":"thread-ts"}`)
+		req.Header.Set("X-Codex-Turn-State", turnState)
+		recorder := httptest.NewRecorder()
+		a.publicMux().ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+		}
+		return recorder
+	}
+	lastTurnState := func() string {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		events := a.state.RoutingCacheEvents
+		return events[len(events)-1].ClientTurnState
+	}
+
+	recorder := send("ts-first")
+	if len(firstSaw) != 1 || firstSaw[0] != "ts-first" {
+		t.Fatalf("issuing account must get its turn state: %q", firstSaw)
+	}
+	if len(secondSaw) != 1 || secondSaw[0] != "" {
+		t.Fatalf("failover account must not get another account's turn state: %q", secondSaw)
+	}
+	if got := lastTurnState(); got != "withheld" {
+		t.Fatalf("turn state disposition = %q, want withheld", got)
+	}
+	for name, want := range map[string]string{"X-Codex-Turn-State": "ts-second", "OpenAI-Model": "gpt-test", "X-Reasoning-Included": "true"} {
+		if got := recorder.Header().Get(name); got != want {
+			t.Fatalf("response %s = %q, want %q", name, got, want)
+		}
+	}
+	for _, name := range []string{"X-Models-Etag", "X-Codex-Primary-Used-Percent"} {
+		if got := recorder.Header().Get(name); got != "" {
+			t.Fatalf("response header %s must not be relayed: %q", name, got)
+		}
+	}
+
+	// The success moved the thread to the second account, so the turn state it
+	// issued now goes back to it.
+	send("ts-second")
+	if len(secondSaw) != 2 || secondSaw[1] != "ts-second" {
+		t.Fatalf("issuing account must get its own turn state back: %q", secondSaw)
+	}
+	if got := lastTurnState(); got != "relayed" {
+		t.Fatalf("turn state disposition = %q, want relayed", got)
+	}
+}
+
+func TestTurnStateWithoutKnownIssuerIsWithheldWithoutTouchingTheInboundRequest(t *testing.T) {
+	inbound := http.Header{}
+	inbound.Set("X-Codex-Turn-State", "ts")
+	forwarded, disposition := turnStateForAttempt(inbound, "", "any")
+	if disposition != "withheld" || forwarded.Get("X-Codex-Turn-State") != "" {
+		t.Fatalf("unknown issuer: disposition=%q header=%q", disposition, forwarded.Get("X-Codex-Turn-State"))
+	}
+	if inbound.Get("X-Codex-Turn-State") != "ts" {
+		t.Fatal("withholding must not mutate the inbound request headers a later attempt reads")
+	}
+	if _, disposition := turnStateForAttempt(http.Header{}, "a", "a"); disposition != "" {
+		t.Fatalf("absent turn state disposition = %q, want empty", disposition)
+	}
+}
+
 func TestDeviceAuthFailoverAfterRateLimit(t *testing.T) {
 	firstHits := 0
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

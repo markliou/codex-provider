@@ -477,6 +477,7 @@ type routingCacheEvent struct {
 	ClientOriginator  string `json:"clientOriginator,omitempty"`
 	ClientUserAgent   string `json:"clientUserAgent,omitempty"`
 	ClientRequestKind string `json:"clientRequestKind,omitempty"`
+	ClientTurnState   string `json:"clientTurnState,omitempty"`
 }
 
 // throughputBucket is an in-memory aggregate used for the 48-hour chart and
@@ -1695,6 +1696,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	// is not transient and must stay excluded.
 	capacityExcluded := map[string]bool{}
 	capacityRetries := 0
+	turnStateIssuer := a.stickySessionAccountID(route.StickyKey)
 	attemptLimit := a.proxyAttemptLimit()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
 		candidate, err := a.selectAccountForRoute(&route, model, excluded)
@@ -1720,7 +1722,9 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", err.Error())
 			return
 		}
-		response, err := a.forward(r.Context(), candidate, endpoint, outBody, r.Header)
+		inbound, turnState := turnStateForAttempt(r.Header, turnStateIssuer, candidate.ID)
+		route.Client.TurnState = turnState
+		response, err := a.forward(r.Context(), candidate, endpoint, outBody, inbound)
 		if err != nil {
 			if requestContextFinished(r.Context(), err) {
 				// The caller timed out or disconnected. Stop immediately and avoid
@@ -2051,6 +2055,10 @@ var codexMetadataHeaderAllowlist = []string{
 	"Originator",
 	"User-Agent",
 	"X-Codex-Beta-Features",
+	// X-Codex-Turn-State is relayed only to the account that issued it; the
+	// attempt loop withholds it from any other account (see
+	// turnStateForAttempt), so keep the allowlist entry and that gate together.
+	"X-Codex-Turn-State",
 }
 
 func (a *app) forward(ctx context.Context, candidate account, endpoint string, body []byte, inbound http.Header) (*http.Response, error) {
@@ -2098,6 +2106,39 @@ func forwardCodexMetadataHeaders(outbound, inbound http.Header) {
 			outbound.Set(name, value)
 		}
 	}
+}
+
+// stickySessionAccountID is the account that served this route's last
+// successful response, which is the only account whose turn state Codex can be
+// holding: the client only ever receives the committed attempt's headers and
+// response.metadata, and that success is what updates the sticky session.
+func (a *app) stickySessionAccountID(stickyKey string) string {
+	now := time.Now().UTC()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	session, found := a.state.StickySessions[stickyKey]
+	if !found || a.stickySessionExpiredLocked(session, now) {
+		return ""
+	}
+	return session.AccountID
+}
+
+// turnStateForAttempt relays the client's X-Codex-Turn-State only to the
+// account that issued it. A native Codex never presents one account's turn
+// token to another account, so after a failover, a lineage move, or with no
+// known issuer the header is withheld and the attempt looks like a native
+// request that starts a turn fresh. It returns the headers to forward and the
+// disposition for local telemetry ("relayed", "withheld", or "" when absent).
+func turnStateForAttempt(inbound http.Header, issuerAccountID, candidateAccountID string) (http.Header, string) {
+	if strings.TrimSpace(inbound.Get("X-Codex-Turn-State")) == "" {
+		return inbound, ""
+	}
+	if issuerAccountID != "" && issuerAccountID == candidateAccountID {
+		return inbound, "relayed"
+	}
+	withheld := inbound.Clone()
+	withheld.Del("X-Codex-Turn-State")
+	return withheld, "withheld"
 }
 
 func upstreamAuthFailureStatus(status int) bool {
@@ -2369,8 +2410,21 @@ func safeHeaderValue(value string) string {
 	}, strings.TrimSpace(value))
 }
 
+// proxyResponseHeaderAllowlist is what Codex gets back from upstream's
+// response headers. X-Codex-Turn-State is the token Codex echoes on the next
+// request of the same turn so upstream keeps that turn on the backend that
+// already holds its state; dropping it made every follow-up request look like
+// a fresh one. OpenAI-Model and X-Reasoning-Included are what a native Codex
+// reads from the same response. Deliberately not relayed: X-Models-Etag (the
+// pool serves its own model catalog, and an upstream etag that never matches
+// it would make Codex refetch the catalog) and per-account rate-limit headers
+// (they describe one pooled account, not the pool Codex is talking to). Once
+// early SSE headers have gone out these cannot be added any more; upstream's
+// response.metadata event carries the same values in the stream.
+var proxyResponseHeaderAllowlist = []string{"Content-Type", "Cache-Control", "X-Request-Id", "X-Codex-Turn-State", "OpenAI-Model", "X-Reasoning-Included"}
+
 func copyProxyResponseHeaders(w http.ResponseWriter, response *http.Response) {
-	for _, header := range []string{"Content-Type", "Cache-Control", "X-Request-Id"} {
+	for _, header := range proxyResponseHeaderAllowlist {
 		if value := response.Header.Get(header); value != "" {
 			w.Header().Set(header, value)
 		}
@@ -5634,6 +5688,7 @@ func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accoun
 		ClientOriginator:      route.Client.Originator,
 		ClientUserAgent:       route.Client.UserAgent,
 		ClientRequestKind:     route.Client.RequestKind,
+		ClientTurnState:       route.Client.TurnState,
 	}
 	a.pruneRoutingCacheEventsLocked(now)
 	a.state.RoutingCacheEvents = append(a.state.RoutingCacheEvents, event)
@@ -6037,6 +6092,9 @@ type clientFingerprint struct {
 	Originator  string
 	UserAgent   string
 	RequestKind string
+	// TurnState is what the final attempt did with the client's
+	// X-Codex-Turn-State; it is set per attempt, not read from the request.
+	TurnState string
 }
 
 // clientFingerprintFrom keeps only short, low-cardinality labels: the
@@ -9836,7 +9894,7 @@ func (a *app) routingCacheEventViewsLocked(now time.Time) []map[string]any {
 			"cacheWriteTokens": event.CacheWriteTokens, "uncachedInputTokens": event.UncachedInputTokens,
 			"cacheReadRate": event.CacheReadRate, "cacheWriteRate": event.CacheWriteRate, "cacheReuseBalance": event.CacheReuseBalance,
 			"cacheHit": event.CacheHit, "coldCacheEligible": event.ColdCacheEligible,
-			"clientOriginator": event.ClientOriginator, "clientUserAgent": event.ClientUserAgent, "clientRequestKind": event.ClientRequestKind,
+			"clientOriginator": event.ClientOriginator, "clientUserAgent": event.ClientUserAgent, "clientRequestKind": event.ClientRequestKind, "clientTurnState": event.ClientTurnState,
 		})
 		// Browser APIs need a compact diagnostic view, not the full persisted
 		// rolling buffer. Keep this server-side limit even though the UI also

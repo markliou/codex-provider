@@ -662,7 +662,12 @@ X-Client-Request-Id
 Originator
 User-Agent
 X-Codex-Beta-Features
+X-Codex-Turn-State
 ```
+
+`X-Codex-Turn-State` is the token upstream issues so the follow-up requests of one turn stay on the backend that holds the turn's state. A native Codex presents it only to the account that issued it, so Pool relays it only when the attempt goes to the account that served the route's last successful response (its sticky session); after a failover or lineage move, or with no known issuer, Pool withholds it and the attempt starts the turn fresh as a native request would. Routing events record the disposition as `clientTurnState` (`relayed` or `withheld`).
+
+Relay back to Codex only this upstream response-header allowlist: `Content-Type`, `Cache-Control`, `X-Request-Id`, `X-Codex-Turn-State`, `OpenAI-Model`, `X-Reasoning-Included`. Do not relay `X-Models-Etag`, because Pool serves its own model catalog and an upstream etag would make Codex refetch it, or per-account rate-limit headers, which describe one pooled account. Headers cannot be added after early SSE headers are sent; upstream's `response.metadata` event carries the same values inside the stream.
 
 The session/thread, request-ID, originator, User-Agent, and beta-feature headers are the ones a native Codex CLI request carries; relaying them keeps the upstream request shape the same as Codex calling upstream directly. The pool-only `X-Codex-Thread-ID` compatibility header is not relayed.
 
