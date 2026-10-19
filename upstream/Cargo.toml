@@ -9,9 +9,10 @@ publish = false
 # targets, and Cargo.lock is seeded from that release's lock so reqwest, hyper,
 # h2, native-tls and the vendored OpenSSL resolve to the same versions. When
 # moving to a new Codex release, change the tag and reseed the lock together
-# (see README "Codex upstream transport").
+# (see README "Codex Gateway").
 [dependencies]
 codex-http-client = { git = "https://github.com/openai/codex", tag = "rust-v0.163.0" }
+codex-websocket-client = { git = "https://github.com/openai/codex", tag = "rust-v0.163.0" }
 bytes = "1"
 futures = "0.3"
 http = "1"
@@ -21,6 +22,10 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+# Same versions and features as the Codex workspace; the fork below supplies
+# the permessage-deflate extension Codex negotiates.
+tokio-tungstenite = { version = "0.28.0", features = ["proxy", "rustls-tls-native-roots"] }
+tungstenite = { version = "0.27.0", features = ["deflate", "proxy"] }
 
 # The official Linux release links a vendored OpenSSL for its default TLS
 # backend; linking the system one would change the TLS handshake.
@@ -30,3 +35,12 @@ openssl-sys = { version = "*", features = ["vendored"] }
 [profile.release]
 codegen-units = 1
 lto = "fat"
+
+# Codex patches crates.io's tungstenite with OpenAI's forks; a git dependency
+# does not inherit a workspace's patches, so they are repeated here.
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+
+[patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }

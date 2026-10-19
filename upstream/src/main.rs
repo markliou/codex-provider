@@ -5,8 +5,12 @@
 //! retry and failover. This process only performs the final hop with Codex's
 //! own HTTP client crate, so the TLS handshake, HTTP/2 framing, Cloudflare
 //! cookie handling, zstd request compression and header order are Codex's
-//! rather than a Go client's. Keep it a transport: routing decisions here would
-//! split responsibility with the pool the way the CLIProxyAPI sidecar did.
+//! rather than a Go client's. The Responses WebSocket is relayed the same way:
+//! the upstream connection is opened with Codex's own WebSocket connector and
+//! its permessage-deflate configuration, and messages pass through unchanged,
+//! so prewarm and incremental requests reach upstream exactly as Codex sent
+//! them. Keep it a transport: routing decisions here would split
+//! responsibility with the pool the way the CLIProxyAPI sidecar did.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -15,6 +19,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use bytes::Bytes;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_websocket_client::WebSocketConnector;
+use futures::SinkExt;
 use codex_http_client::EncodedJsonBody;
 use codex_http_client::HttpClientBuilder;
 use codex_http_client::HttpTransport;
@@ -40,6 +48,15 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Error as WsError;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::extensions::ExtensionsConfig;
+use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 /// Control headers the pool sets for this hop. They are consumed here and are
 /// never sent upstream.
@@ -96,17 +113,74 @@ const NOT_FORWARDED: &[&str] = &[
     UPSTREAM_COMPRESSION,
 ];
 
+/// Handshake header order of a native Codex 0.163.0 Responses WebSocket,
+/// captured on the wire. The WebSocket library writes host, connection,
+/// upgrade, version and key first and the extension offer last; Codex's own
+/// headers sit between them in this order, and other Codex headers follow the
+/// routing hint. A native handshake carries no turn state.
+const WS_ORDER: &[&str] = &[
+    "chatgpt-account-id",
+    "authorization",
+    "user-agent",
+    "originator",
+    "openai-beta",
+    "version",
+    "x-codex-beta-features",
+    "x-client-request-id",
+    "session-id",
+    "thread-id",
+    "x-codex-window-id",
+    "x-codex-turn-metadata",
+    "x-codex-routing-hint",
+];
+const WS_NOT_FORWARDED: &[&str] = &[
+    "host",
+    "connection",
+    "upgrade",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-extensions",
+    "sec-websocket-protocol",
+    "x-codex-turn-state",
+    "content-length",
+    UPSTREAM_URL,
+    UPSTREAM_IDENTITY,
+    UPSTREAM_COMPRESSION,
+];
+/// Upstream handshake headers that belong to that connection, not to the
+/// pool's leg, and are not copied onto the 101 the pool receives.
+const WS_UPGRADE_HEADERS: &[&str] = &[
+    "connection",
+    "upgrade",
+    "sec-websocket-accept",
+    "sec-websocket-extensions",
+    "sec-websocket-protocol",
+    "content-length",
+    "transfer-encoding",
+];
+
 type ResponseBody = UnsyncBoxBody<Bytes, std::io::Error>;
 
-#[derive(Default)]
 struct Transports {
     // One client per upstream identity, as each native Codex process has its
-    // own connection pool and Cloudflare cookie jar for its one account.
-    // Sharing one would carry one account's cookies into another's requests.
+    // own connection pool for its one account, so one account's requests never
+    // ride another account's connection. Cloudflare infrastructure cookies are
+    // process-global in Codex itself (codex-http-client keeps only those and
+    // the __oailb routing cookie, never account cookies), so they stay shared.
     by_identity: Mutex<HashMap<String, ReqwestTransport>>,
+    // Codex's WebSocket connector for its default factory (transport default
+    // proxy, no PSP cookie): explicit Codex TLS from native roots and any
+    // configured custom CA.
+    websocket: WebSocketConnector,
 }
 
 impl Transports {
+    fn new() -> std::io::Result<Self> {
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        let websocket = WebSocketConnector::new(&factory).map_err(std::io::Error::other)?;
+        Ok(Self { by_identity: Mutex::new(HashMap::new()), websocket })
+    }
+
     fn for_identity(&self, identity: &str) -> ReqwestTransport {
         let mut clients = self.by_identity.lock().unwrap_or_else(|e| e.into_inner());
         clients
@@ -260,6 +334,151 @@ async fn forward(transports: Arc<Transports>, request: hyper::Request<Incoming>)
     }
 }
 
+/// Codex's Responses WebSocket configuration: default limits plus the
+/// permessage-deflate offer.
+fn websocket_config() -> WebSocketConfig {
+    let mut extensions = ExtensionsConfig::default();
+    extensions.permessage_deflate = Some(DeflateConfig::default());
+    let mut config = WebSocketConfig::default();
+    config.extensions = extensions;
+    config
+}
+
+/// Names of the headers the WebSocket library puts into a client request
+/// itself (`into_client_request`) and later removes to write them first.
+const WS_LIBRARY_HEADERS: usize = 5;
+
+/// Builds the header map to append to the library's client request so the
+/// handshake is written in native wire order. The library removes its own
+/// five headers before writing the rest, and each removal swaps the map's last
+/// entry into the freed slot, so the last five appended headers come out
+/// first and in reverse. A native Codex goes through the same writer; this
+/// appends the wire order with its first five names rotated to the end,
+/// reversed, so the writer restores it. Verified against a native capture.
+fn ordered_websocket_headers(incoming: &HeaderMap) -> HeaderMap {
+    let mut names: Vec<HeaderName> = Vec::new();
+    for name in WS_ORDER {
+        if let Ok(header) = HeaderName::from_bytes(name.as_bytes())
+            && incoming.contains_key(&header)
+        {
+            names.push(header);
+        }
+    }
+    for name in incoming.keys() {
+        let lower = name.as_str();
+        if WS_ORDER.contains(&lower) || WS_NOT_FORWARDED.contains(&lower) || names.contains(name) {
+            continue;
+        }
+        names.push(name.clone());
+    }
+    if names.len() >= WS_LIBRARY_HEADERS {
+        let leading: Vec<HeaderName> = names.drain(..WS_LIBRARY_HEADERS).rev().collect();
+        names.extend(leading);
+    }
+    let mut headers = HeaderMap::new();
+    for name in names {
+        for value in incoming.get_all(&name) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    headers
+}
+
+/// Opens the upstream Responses WebSocket for one pool connection and, once it
+/// is up, accepts the pool's upgrade and relays messages both ways unchanged.
+/// An upstream handshake refusal is answered as the same HTTP status, headers
+/// and body without upgrading, so the pool can fail over before the client
+/// has sent anything upstream.
+async fn websocket(transports: Arc<Transports>, mut request: hyper::Request<Incoming>) -> Response<ResponseBody> {
+    let Some(url) = header_str(request.headers(), UPSTREAM_URL).map(str::to_string) else {
+        return plain(StatusCode::BAD_REQUEST, None, "missing x-codex-upstream-url");
+    };
+    let Some(key) = header_str(request.headers(), "sec-websocket-key").map(str::to_string) else {
+        return plain(StatusCode::BAD_REQUEST, None, "missing sec-websocket-key");
+    };
+    let mut upstream_request = match url.as_str().into_client_request() {
+        Ok(upstream_request) => upstream_request,
+        Err(error) => return plain(StatusCode::BAD_REQUEST, None, format!("upstream url: {error}")),
+    };
+    upstream_request.headers_mut().extend(ordered_websocket_headers(request.headers()));
+    let (upstream, handshake) = match transports.websocket.connect(upstream_request, websocket_config()).await {
+        Ok(connected) => connected,
+        Err(WsError::Http(refused)) => {
+            let (parts, body) = refused.into_parts();
+            return plain(parts.status, Some(parts.headers), body.unwrap_or_default());
+        }
+        Err(error) => return transport_failure("connection", error.to_string()),
+    };
+
+    let mut response = plain(StatusCode::SWITCHING_PROTOCOLS, None, Bytes::new());
+    for (name, value) in handshake.headers() {
+        if !WS_UPGRADE_HEADERS.contains(&name.as_str()) {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+    let headers = response.headers_mut();
+    headers.insert(http::header::CONNECTION, HeaderValue::from_static("upgrade"));
+    headers.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+    if let Ok(accept) = HeaderValue::from_str(&derive_accept_key(key.as_bytes())) {
+        headers.insert(http::header::SEC_WEBSOCKET_ACCEPT, accept);
+    }
+    tokio::spawn(async move {
+        let Ok(upgraded) = hyper::upgrade::on(&mut request).await else {
+            return;
+        };
+        // The pool's leg is loopback and uncompressed; only the upstream leg
+        // negotiates Codex's deflate extension.
+        let local = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
+        relay(local, upstream).await;
+    });
+    response
+}
+
+async fn relay<L, U>(local: L, upstream: U)
+where
+    L: futures::Stream<Item = Result<Message, WsError>> + futures::Sink<Message, Error = WsError> + Unpin,
+    U: futures::Stream<Item = Result<Message, WsError>> + futures::Sink<Message, Error = WsError> + Unpin,
+{
+    let (mut local_tx, mut local_rx) = local.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+    let to_upstream = async {
+        while let Some(Ok(message)) = local_rx.next().await {
+            let closing = message.is_close();
+            // Pings and pongs on the pool's leg are answered by that leg.
+            if message.is_ping() || message.is_pong() {
+                continue;
+            }
+            if upstream_tx.send(message).await.is_err() || closing {
+                break;
+            }
+        }
+        let _ = upstream_tx.close().await;
+    };
+    let to_local = async {
+        while let Some(Ok(message)) = upstream_rx.next().await {
+            let closing = message.is_close();
+            if message.is_ping() || message.is_pong() {
+                continue;
+            }
+            if local_tx.send(message).await.is_err() || closing {
+                break;
+            }
+        }
+        let _ = local_tx.close().await;
+    };
+    tokio::select! {
+        () = to_upstream => {}
+        () = to_local => {}
+    }
+}
+
+async fn route(transports: Arc<Transports>, request: hyper::Request<Incoming>) -> Result<Response<ResponseBody>, Infallible> {
+    if request.uri().path() == "/ws" {
+        return Ok(websocket(transports, request).await);
+    }
+    forward(transports, request).await
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let addr: SocketAddr = std::env::var("CODEX_UPSTREAM_ADDR")
@@ -272,7 +491,7 @@ async fn main() -> std::io::Result<()> {
         return Err(std::io::Error::other("CODEX_UPSTREAM_ADDR must be a loopback address"));
     }
     let listener = TcpListener::bind(addr).await?;
-    let transports = Arc::new(Transports::default());
+    let transports = Arc::new(Transports::new()?);
     eprintln!("codex-upstream listening on {addr}");
     loop {
         let (stream, _) = tokio::select! {
@@ -281,8 +500,11 @@ async fn main() -> std::io::Result<()> {
         };
         let transports = transports.clone();
         tokio::spawn(async move {
-            let service = service_fn(move |request| forward(transports.clone(), request));
-            let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), service).await;
+            let service = service_fn(move |request| route(transports.clone(), request));
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
+                .await;
         });
     }
 }

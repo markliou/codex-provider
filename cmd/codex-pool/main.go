@@ -1000,13 +1000,25 @@ func (a *app) serveUntilStopped(ctx context.Context, listener net.Listener, hand
 	a.logger.Printf("stop signal received: draining %d in-flight request(s) for up to %s", a.inFlight.Load(), grace)
 	drainCtx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
-	if err := server.Shutdown(drainCtx); err != nil {
+	err := server.Shutdown(drainCtx)
+	// Shutdown does not wait for hijacked connections, so responses still
+	// streaming on a Responses WebSocket are waited for here, within the same
+	// grace. Idle sockets are not counted and close when the process exits;
+	// Codex reconnects to the new container.
+	for err == nil && a.inFlight.Load() > 0 {
+		select {
+		case <-drainCtx.Done():
+			err = drainCtx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if err != nil {
 		a.logger.Printf("shutdown grace expired with %d request(s) still in flight; they will be cut", a.inFlight.Load())
 	} else {
 		a.logger.Printf("drain complete; all in-flight requests finished")
 	}
 	a.mu.Lock()
-	err := a.saveLocked()
+	err = a.saveLocked()
 	a.mu.Unlock()
 	if err != nil {
 		a.logger.Printf("final state save failed: %v", err)
@@ -1280,6 +1292,9 @@ func (a *app) mux() http.Handler {
 	mux.HandleFunc("GET /v1/codex-pool/status", a.requireAPIKey(a.handleCurrentStatus))
 	mux.HandleFunc("GET /v1/models", a.requireAPIKey(a.handleModels))
 	mux.HandleFunc("POST /v1/responses", a.trackInFlight(a.requireAPIKey(a.handleResponses)))
+	// A Responses WebSocket stays open across turns, so it is not counted as
+	// in flight; each response running on it is (see wsSession).
+	mux.HandleFunc("GET /v1/responses", a.requireAPIKey(a.handleResponsesWebSocket))
 	mux.HandleFunc("POST /v1/responses/compact", a.trackInFlight(a.requireAPIKey(a.handleResponses)))
 	mux.HandleFunc("POST /v1/chat/completions", a.trackInFlight(a.requireAPIKey(a.handleChatCompletions)))
 	mux.HandleFunc("GET /internal/inflight", a.handleInFlight)
@@ -2217,7 +2232,7 @@ func (a *app) forwardOnce(ctx context.Context, candidate account, endpoint strin
 	}
 	req.Header.Set("X-Codex-Upstream-Url", endpoint)
 	// One client per account in codex-upstream, as each native Codex process
-	// keeps its own connections and Cloudflare cookies for its one account.
+	// keeps its own connections for its one account.
 	req.Header.Set("X-Codex-Upstream-Identity", candidate.ID)
 	// A native Codex zstd-compresses its Responses requests to the Codex
 	// backend; compaction requests are sent uncompressed.
