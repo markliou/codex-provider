@@ -5,7 +5,7 @@ if [ "$#" -gt 0 ]; then
   exec /usr/local/bin/codex-pool "$@"
 fi
 
-if [ "${CODEX_POOL_CODEX_GATEWAY_MODE:-sidecar}" = "direct" ]; then
+if [ "${CODEX_POOL_CODEX_GATEWAY_MODE:-direct}" = "direct" ]; then
   exec /usr/local/bin/codex-pool
 fi
 

@@ -43,7 +43,8 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"last": server.last, "events": server.events})
 	})
 	mux.HandleFunc("POST /v1/responses", server.handleResponse)
-	mux.HandleFunc("POST /backend-api/responses", server.handleDeviceAuthResponse)
+	// The Codex backend path a native Codex CLI signed in with ChatGPT uses.
+	mux.HandleFunc("POST /backend-api/codex/responses", server.handleDeviceAuthResponse)
 	mux.HandleFunc("GET /backend-api/wham/usage", server.handleDeviceAuthUsage)
 	log.Printf("mock upstream listening on :4010")
 	log.Fatal(http.ListenAndServe(":4010", mux))
@@ -370,12 +371,16 @@ func (s *mockServer) handleDeviceAuthUsage(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]string{"code": "invalid_account"}})
 		return
 	}
+	// The weekly window is already counting down. An untouched window (0% used,
+	// reset a full window away) would make the pool spend a quota-priming
+	// request on each account, and the failover test would count those as
+	// client traffic.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"plan_type": "team",
 		"rate_limit": map[string]any{
 			"allowed":          true,
 			"primary_window":   map[string]any{"used_percent": 0, "limit_window_seconds": 18000, "reset_after_seconds": 18000},
-			"secondary_window": map[string]any{"used_percent": 0, "limit_window_seconds": 604800, "reset_after_seconds": 604800},
+			"secondary_window": map[string]any{"used_percent": 10, "limit_window_seconds": 604800, "reset_after_seconds": 500000},
 		},
 	})
 }

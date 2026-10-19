@@ -159,7 +159,7 @@ docker run -d \
 | `CODEX_POOL_CODEX_BASE_URL` | no | `https://chatgpt.com/backend-api` | Codex/ChatGPT backend base URL used for quota reads and the legacy direct gateway. |
 | `CODEX_POOL_CODEX_USAGE_URL` | no | `CODEX_POOL_CODEX_BASE_URL + /wham/usage` | Optional quota endpoint override for tests or compatible backends. |
 | `CODEX_POOL_CODEX_RESET_CREDITS_URL` | no | `CODEX_POOL_CODEX_BASE_URL + /wham/rate-limit-reset-credits` | Optional reset-credit details endpoint override for tests or compatible backends. |
-| `CODEX_POOL_CODEX_GATEWAY_MODE` | no | `sidecar` | `sidecar` routes device-auth inference through the bundled loopback-only CLIProxyAPI executor. `direct` is a compatibility/test override. |
+| `CODEX_POOL_CODEX_GATEWAY_MODE` | no | `direct` | `direct` sends device-auth inference from Pool to the Codex backend (`CODEX_POOL_CODEX_BASE_URL` + `/codex/responses`) with the account's credential, as a native Codex CLI does. `sidecar` routes it through the bundled loopback-only CLIProxyAPI executor instead, which rewrites Codex headers and request tools. |
 | `CODEX_POOL_ROUTING_STRATEGY` | no | `sticky_balanced` | `sticky_balanced` deterministically distributes new sessions across the highest-priority eligible account tier. `sticky_failover` preserves the legacy behavior that sends new sessions to the first preferred account. |
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
@@ -189,7 +189,17 @@ The service must refuse to start when:
 4. Admin password hash equals a known example value.
 5. The combined listener binds to `0.0.0.0` or another non-loopback address while `CODEX_POOL_ALLOW_REMOTE_ADMIN` is not `true`.
 
-### 2.3 Bundled Codex sidecar
+### 2.3 Codex gateway modes
+
+Direct mode is the default. Pool sends each device-auth request to the Codex backend itself, so the upstream request is the one a native Codex CLI sends (see 6.2.2). The sidecar was the default until it was measured rewriting what Codex sent: it dropped `Thread-Id`, `Session-Id` and `X-Codex-Window-ID`, replaced them with its own `session_id`, dropped the upstream `X-Codex-Turn-State` response header, and injected an `image_generation` tool and an empty `instructions` field that a native Codex request does not carry.
+
+In direct mode Pool is the only process that refreshes an account's credential, in its `auth.json`, under the per-account auth lock. It refreshes before a request when the access token is within five minutes of expiry, and on a `401` it refreshes once and retries the same account, as a native Codex does; only a second `401`, or a refresh that cannot produce a new token, is treated as an account auth failure. A refresh that finds the token already replaced by a concurrent request reuses it instead of spending the rotated refresh token again.
+
+The Codex backend only streams, only accepts `store: false` and list `input`, has no `system` role, and rejects some Responses parameters. A request already in that shape, which is every request a native Codex sends, is forwarded byte for byte. Only a foreign request (an OpenAI-style app, pool quota priming, chat-completions conversion) is changed, and only as far as needed: string `input` becomes one user message, `stream` becomes `true`, `store` becomes `false`, `system` input roles become `developer`, and `max_output_tokens`, `max_completion_tokens`, `temperature`, `top_p`, `truncation`, `user`, `context_management`, `safety_identifier`, `stream_options`, `previous_response_id` and `prompt_cache_retention` are removed. When the client did not ask to stream, Pool reads the stream to its terminal event and answers with one Responses JSON document, rebuilding `output` from `response.output_item.done` items when the completed event carries none; an in-stream failure is answered as `429` (capacity), `401` (authentication), `400` (request) or `502`, so the non-streaming failover handles it. `POST /v1/responses/compact` goes to the Codex backend's `/responses/compact`, as a native Codex sends it, unchanged.
+
+Refresh tokens rotate on use, so after a mode switch only the copy refreshed last is valid. On startup each mode adopts the other mode's copy when it is newer by access-token `iat` (or `exp`): direct mode copies a newer sidecar record into `auth.json`, and sidecar mode rewrites its record from a newer `auth.json`. Skipping this would make the first refresh after a switch spend a revoked token and log the account out.
+
+The sidecar remains available with `CODEX_POOL_CODEX_GATEWAY_MODE=sidecar`; the rest of this section describes that mode.
 
 The image must bundle a pinned CLIProxyAPI executable and run it in the same container on `127.0.0.1:8319`. Do not expose or publish that port. The pool remains the only public OpenAI-compatible API and the only management UI.
 
@@ -647,29 +657,25 @@ Persist TTL-bounded thread bindings with thread, session, parent, lineage root, 
 
 Pool is transparent to Codex MultiAgent V2 tool semantics. A `spawn_agent` schema containing `fork_turns` must reach upstream unchanged, and streamed or non-streamed tool-call arguments must return unchanged for `none`, positive integer strings, `all`, and omitted values. Codex decides whether to spawn and constructs the child history; Pool must not choose a fork tier, summarize history, or rewrite child input.
 
-Forward only this Codex compatibility-header allowlist when present:
+Relay the Codex client's request headers that match this allowlist, by name or by a Codex-owned prefix:
 
 ```text
-X-Codex-Parent-Thread-ID
-X-OpenAI-Subagent
-X-Codex-Turn-Metadata
-X-Codex-Window-ID
-X-Codex-Installation-ID
-Session-Id
-Session_id
-Thread-Id
-X-Client-Request-Id
-Originator
-User-Agent
-X-Codex-Beta-Features
-X-Codex-Turn-State
+Session-Id, Session_id, Thread-Id, X-Client-Request-Id, Originator, User-Agent,
+OpenAI-Beta, Version, Traceparent, Tracestate
+X-Codex-*, X-OpenAI-*, X-Responsesapi-*
 ```
+
+Never relay the pool-only `X-Codex-Pool-*` headers, the pool-only compatibility headers `X-Codex-Thread-ID`, `X-Codex-Session-ID`, `X-Codex-Lineage-Root-ID`, `X-Codex-Thread-Source` and `X-Codex-Forked-From-Thread-ID`, or a client-supplied `X-OpenAI-Fedramp`, which Pool sets from the selected credential. The prefixes cover the headers Codex adds for specific paths (for example `X-OpenAI-Memgen-Request`, `X-Codex-Guardian`, `X-OpenAI-Subagent`, `X-Codex-Parent-Thread-ID`, `X-Codex-Turn-Metadata`, `X-Codex-Window-ID`, `X-Codex-Beta-Features`) and any header a newer Codex adds under them.
+
+In direct mode Pool also sets what a native Codex signed in with ChatGPT sends to the Codex backend and a custom-provider client cannot: `Authorization` with the account's access token, `ChatGPT-Account-ID`, `X-OpenAI-Fedramp` for FedRAMP accounts, and `X-Codex-Routing-Hint` (`model=<model>`, plus `;tier=<service_tier>` when set; omitted for `X-Codex-Guardian: reviewer` requests and when the client sent its own hint).
+
+When Pool did not change the request (no model suffix or alias, no prompt-cache or hosted-tool edit), it forwards the client's body bytes unchanged. A decoded and re-encoded body sorts object keys, including tool parameter schemas, and rewrites numbers, so it would no longer be the bytes Codex sent.
 
 `X-Codex-Turn-State` is the token upstream issues so the follow-up requests of one turn stay on the backend that holds the turn's state. A native Codex presents it only to the account that issued it, so Pool relays it only when the attempt goes to the account that served the route's last successful response (its sticky session); after a failover or lineage move, or with no known issuer, Pool withholds it and the attempt starts the turn fresh as a native request would. Routing events record the disposition as `clientTurnState` (`relayed` or `withheld`).
 
 Relay back to Codex only this upstream response-header allowlist: `Content-Type`, `Cache-Control`, `X-Request-Id`, `X-Codex-Turn-State`, `OpenAI-Model`, `X-Reasoning-Included`. Do not relay `X-Models-Etag`, because Pool serves its own model catalog and an upstream etag would make Codex refetch it, or per-account rate-limit headers, which describe one pooled account. Headers cannot be added after early SSE headers are sent; upstream's `response.metadata` event carries the same values inside the stream.
 
-The session/thread, request-ID, originator, User-Agent, and beta-feature headers are the ones a native Codex CLI request carries; relaying them keeps the upstream request shape the same as Codex calling upstream directly. The pool-only `X-Codex-Thread-ID` compatibility header is not relayed.
+These are the headers a native Codex CLI request carries; relaying them keeps the upstream request shape the same as Codex calling upstream directly.
 
 Do not forward client authorization, API keys, hop-by-hop headers, or unrelated client-controlled headers.
 
