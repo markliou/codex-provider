@@ -6050,6 +6050,80 @@ func TestCodexBackendStreamWithoutContentTypeIsStillAStream(t *testing.T) {
 	}
 }
 
+// An upstream overload is the server's condition, not the account's: the same
+// account is retried behind a backoff, as a native Codex does, so the lineage
+// and its cache stay put. Only an overload that outlasts the schedule moves on.
+func TestOverloadRetriesTheSameAccountBeforeMovingTheLineage(t *testing.T) {
+	run := func(t *testing.T, failures int) (map[string]int, *app) {
+		hits := map[string]int{}
+		var mu sync.Mutex
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			account := r.Header.Get("ChatGPT-Account-ID")
+			mu.Lock()
+			hits[account]++
+			n := hits[account]
+			mu.Unlock()
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_x\"}}\n\n")
+			if account == "acct-first" && n <= failures {
+				_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+				return
+			}
+			_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n")
+			_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_x\"}}\n\n")
+		}))
+		t.Cleanup(upstream.Close)
+		a := testApp(t, []account{
+			{ID: "first", AccountID: "acct-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
+			{ID: "second", AccountID: "acct-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10},
+		})
+		a.codexBaseURL = upstream.URL + "/backend-api"
+		writeCodexDeviceAuth(t, a, "first", "acct-first", "first@example.test")
+		writeCodexDeviceAuth(t, a, "second", "acct-second", "second@example.test")
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":true,"store":false,"input":[]}`))
+		req.Header.Set("Authorization", "Bearer client-key")
+		req.Header.Set("X-Codex-Turn-Metadata", `{"thread_id":"thread-main"}`)
+		recorder := httptest.NewRecorder()
+		a.publicMux().ServeHTTP(recorder, req)
+		if strings.Contains(recorder.Body.String(), "server_is_overloaded") || !strings.Contains(recorder.Body.String(), "response.completed") {
+			t.Fatalf("the overload must be retried before output: %s", recorder.Body.String())
+		}
+		return hits, a
+	}
+	cooling := func(a *app, id string) bool {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		for _, entry := range a.state.Cooldowns[id] {
+			if entry.NextRetryAt.After(time.Now()) {
+				return true
+			}
+		}
+		return false
+	}
+
+	hits, a := run(t, 2)
+	if hits["acct-first"] != 3 || hits["acct-second"] != 0 {
+		t.Fatalf("a passing overload must be retried on the same account: %v", hits)
+	}
+	if cooling(a, "first") {
+		t.Fatal("an overload inside the same-account schedule must not cool the account")
+	}
+	if bound, _ := a.lineageAccountID("thread-main"); bound != "first" {
+		t.Fatalf("the lineage must stay on its account, bound to %q", bound)
+	}
+
+	hits, a = run(t, overloadSameAccountRetryLimit+1)
+	if hits["acct-first"] != overloadSameAccountRetryLimit+1 || hits["acct-second"] != 1 {
+		t.Fatalf("only an overload that outlasts the schedule moves on: %v", hits)
+	}
+	if !cooling(a, "first") {
+		t.Fatal("the account that kept refusing must cool down")
+	}
+	if bound, _ := a.lineageAccountID("thread-main"); bound != "second" {
+		t.Fatalf("the whole lineage moves with the request, bound to %q", bound)
+	}
+}
+
 func TestCodexClientVersionComesOnlyFromACodexUserAgent(t *testing.T) {
 	for ua, want := range map[string]string{
 		"codex_exec/0.163.0 (Alpine Linux 3.21.7; x86_64) unknown (codex_exec; 0.163.0)": "0.163.0",
@@ -8172,6 +8246,9 @@ func TestResponseInfoFromSSEBlockClassifiesTerminalEvents(t *testing.T) {
 	}
 }
 
+// The capacity tests below use rate_limit_exceeded, an account's own allowance,
+// which moves to another account at once. An upstream overload first retries
+// the same account (see TestOverloadRetriesTheSameAccountBeforeMovingTheLineage).
 func TestEarlyCapacityStreamingFailureRetriesBeforeCommit(t *testing.T) {
 	firstHits := 0
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -8179,7 +8256,7 @@ func TestEarlyCapacityStreamingFailureRetriesBeforeCommit(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n\n")
 		_, _ = io.WriteString(w, "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_failed\"}}\n\n")
-		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"secret upstream detail\"},\"usage\":{\"input_tokens\":2048,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":1024}}}}\n\n")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"secret upstream detail\"},\"usage\":{\"input_tokens\":2048,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":1024}}}}\n\n")
 	}))
 	defer first.Close()
 	secondHits := 0
@@ -8529,8 +8606,9 @@ func TestRecordingACooldownPrunesExpiredOnes(t *testing.T) {
 	}
 }
 
-// The retry order is the contract: every available identity is swept before any
-// wait, then the whole set is swept again behind a longer wait. A wait-per-
+// The retry order is the contract: an overload is first retried on the bound
+// account, then every available identity is swept before any wait, then the
+// whole set is swept again behind a longer wait. A wait-per-
 // account loop would pay the schedule once per identity instead of once per
 // sweep, and a pool with a healthy backup would sit waiting on a refusal it
 // could have routed around immediately.
@@ -8580,9 +8658,10 @@ func TestCapacityRefusalSweepsEveryAccountBeforeWaiting(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), "recovered") {
 		t.Fatalf("the sweep never reached a recovered identity: order=%v body=%s", order, recorder.Body.String())
 	}
-	// Every identity once, in priority order, before the second visit to any of
-	// them: that is a sweep, not a per-account wait loop.
-	want := []string{"first", "second", "third", "first", "second", "third"}
+	// The bound account first spends its same-account overload schedule; then
+	// every other identity is tried once, in priority order, before the second
+	// visit to any of them: that is a sweep, not a per-account wait loop.
+	want := []string{"first", "first", "first", "first", "second", "third", "first", "second", "third"}
 	if len(order) != len(want) {
 		t.Fatalf("attempt order = %v, want %v", order, want)
 	}
@@ -9081,7 +9160,7 @@ func TestEarlyCapacityStreamingFailureWithoutFallbackPreservesUpstreamSSE(t *tes
 		hits++
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_only\"}}\n\n")
-		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_only\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"selected model is at capacity\"}}}\n\n")
+		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_only\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"selected model is at capacity\"}}}\n\n")
 	}))
 	defer upstream.Close()
 	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
