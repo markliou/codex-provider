@@ -104,6 +104,8 @@ is pending.
 
 By default Pool sends Codex device-auth inference straight to the Codex backend with the selected account's credential, the way a native Codex CLI signed in with ChatGPT does. It relays the headers Codex sends, forwards an unchanged request body byte for byte, refreshes the account token itself (once more on a `401`, then retrying the same account), and adds the `ChatGPT-Account-ID` and `X-Codex-Routing-Hint` headers a native Codex sends to that backend.
 
+The final hop is `codex-upstream`, a small loopback-only Rust process in the same container built from Codex's own HTTP client crate (Codex `rust-v0.163.0`, same locked dependency versions, musl, vendored OpenSSL), so the TLS handshake, HTTP/2 settings, header order and zstd request compression are those of a native Codex CLI. Pool keeps every routing, credential, and failover decision. To follow a newer Codex release, update the tag in `upstream/Cargo.toml`, reseed `upstream/Cargo.lock` from that release's `codex-rs/Cargo.lock`, and match its Rust toolchain in the Dockerfile.
+
 `CODEX_POOL_CODEX_GATEWAY_MODE=sidecar` switches back to the pinned CLIProxyAPI binary bundled in the same container. It listens only on `127.0.0.1:8319`, is not published with Docker, and owns refreshes of its own copy of each credential under `/data/cliproxy/auths/<account-id>.json`. On startup either mode first adopts the other mode's credential when it is newer, so switching modes does not log accounts out. Do not edit either credential directory by hand. `CODEX_POOL_CLIPROXY_BASE_URL` and `CODEX_POOL_CLIPROXY_API_KEY` are internal test/compatibility overrides and should not be set in a normal `docker run` deployment.
 
 Quota is read from the authenticated Codex/ChatGPT backend after login and then

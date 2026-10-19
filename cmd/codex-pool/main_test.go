@@ -5959,6 +5959,73 @@ func TestDirectCodexGatewaySendsCompactionToTheCompactEndpoint(t *testing.T) {
 	}
 }
 
+// In the container every direct Codex-backend request takes its last hop
+// through codex-upstream (Codex's own HTTP client). The pool must hand it the
+// real endpoint, the account it is sending as, and Codex's compression choice,
+// and a hop that could not reach upstream must fail over like a dial error.
+func TestDirectCodexGatewaySendsThroughCodexUpstream(t *testing.T) {
+	type hop struct{ url, identity, compression, version, hint, auth string }
+	var hops []hop
+	transport := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/forward" {
+			t.Errorf("transport path = %q", r.URL.Path)
+		}
+		hops = append(hops, hop{r.Header.Get("X-Codex-Upstream-Url"), r.Header.Get("X-Codex-Upstream-Identity"), r.Header.Get("X-Codex-Upstream-Compression"), r.Header.Get("Version"), r.Header.Get("X-Codex-Routing-Hint"), r.Header.Get("Authorization")})
+		if r.Header.Get("X-Codex-Upstream-Identity") == "first" {
+			w.Header().Set("X-Codex-Upstream-Error", "connection")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("connection refused"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_via_transport","object":"response","output":[]}`))
+	}))
+	defer transport.Close()
+	a := testApp(t, []account{
+		{ID: "first", AccountID: "acct-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
+		{ID: "second", AccountID: "acct-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10},
+	})
+	a.codexBaseURL = "https://chatgpt.example.test/backend-api"
+	a.codexTransportURL = transport.URL
+	writeCodexDeviceAuth(t, a, "first", "acct-first", "first@example.test")
+	writeCodexDeviceAuth(t, a, "second", "acct-second", "second@example.test")
+	second, err := a.codexAuth(a.config.Accounts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":true,"store":false,"input":[]}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("User-Agent", "codex-tui/0.163.0 (Mac OS 26.0.0; arm64) iTerm.app/3.6.6 (codex-tui; 0.163.0)")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "resp_via_transport") {
+		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(hops) != 2 || hops[0].identity != "first" || hops[1].identity != "second" {
+		t.Fatalf("a transport failure must fail over to the next account: %+v", hops)
+	}
+	want := hop{"https://chatgpt.example.test/backend-api/codex/responses", "second", "zstd", "0.163.0", "model=gpt-test", "Bearer " + second.AccessToken}
+	if hops[1] != want {
+		t.Fatalf("transport hop = %+v, want %+v", hops[1], want)
+	}
+}
+
+func TestCodexClientVersionComesOnlyFromACodexUserAgent(t *testing.T) {
+	for ua, want := range map[string]string{
+		"codex_exec/0.163.0 (Alpine Linux 3.21.7; x86_64) unknown (codex_exec; 0.163.0)": "0.163.0",
+		"codex-tui/0.163.0 (Mac OS 26.0.0; arm64)":                                       "0.163.0",
+		"Python-urllib/3.12":                  "",
+		"codex_exec/0.163.0\r\nX-Injected: 1": "",
+		"":                                    "",
+	} {
+		h := http.Header{}
+		h.Set("User-Agent", ua)
+		if got := codexClientVersion(h); got != want {
+			t.Fatalf("version for %q = %q, want %q", ua, got, want)
+		}
+	}
+}
+
 func TestRoutingHintFollowsNativeCodexRules(t *testing.T) {
 	header := func(pairs ...string) http.Header {
 		h := http.Header{}

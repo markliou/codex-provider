@@ -351,8 +351,8 @@ func (s *mockServer) handleDeviceAuthResponse(w http.ResponseWriter, r *http.Req
 		writeJSON(w, status, map[string]any{"error": map[string]string{"message": "device auth rejected"}})
 		return
 	}
-	var request map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+	request, ok := deviceAuthRequest(r)
+	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": "invalid JSON"}})
 		return
 	}
@@ -363,6 +363,23 @@ func (s *mockServer) handleDeviceAuthResponse(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// deviceAuthRequest reads the fields the mock needs. codex-upstream sends the
+// body zstd-compressed, as a native Codex does, and the standard library has no
+// zstd decoder, so for a compressed body the model comes from the
+// x-codex-routing-hint header and streaming from the Accept header, which a
+// Codex request always sets.
+func deviceAuthRequest(r *http.Request) (map[string]any, bool) {
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "zstd") {
+		model := strings.TrimPrefix(strings.SplitN(r.Header.Get("X-Codex-Routing-Hint"), ";", 2)[0], "model=")
+		return map[string]any{"model": model, "stream": strings.Contains(r.Header.Get("Accept"), "text/event-stream")}, model != ""
+	}
+	var request map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		return nil, false
+	}
+	return request, true
 }
 
 func (s *mockServer) handleDeviceAuthUsage(w http.ResponseWriter, r *http.Request) {

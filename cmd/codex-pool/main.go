@@ -625,6 +625,11 @@ type app struct {
 	client               *http.Client
 	streamClient         *http.Client
 	logger               *log.Logger
+
+	// codexTransportURL is the loopback codex-upstream hop that sends direct
+	// Codex-backend requests with Codex's own HTTP client. Empty sends them from
+	// Go, which tests use; the container supervisor always sets it.
+	codexTransportURL string
 }
 
 func main() {
@@ -766,6 +771,7 @@ func newAppFromEnv() (*app, error) {
 		codexBaseURL:         strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
 		codexGatewayMode:     codexGatewayMode,
 		cliproxyBaseURL:      strings.TrimRight(envOr("CODEX_POOL_CLIPROXY_BASE_URL", cliproxyBaseURLDefault), "/"),
+		codexTransportURL:    strings.TrimRight(strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_TRANSPORT_URL")), "/"),
 		cliproxyAPIKey:       strings.TrimSpace(os.Getenv("CODEX_POOL_CLIPROXY_API_KEY")),
 		jobs:                 map[string]*loginJob{},
 		loginCancels:         map[string]context.CancelFunc{},
@@ -2164,7 +2170,12 @@ func (a *app) retryCodexBackendAfterRejection(ctx context.Context, candidate acc
 }
 
 func (a *app) forwardOnce(ctx context.Context, candidate account, endpoint string, body []byte, inbound http.Header, auth codexAuthInfo) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	viaTransport := a.codexTransportURL != "" && a.usesCodexBackendDirectly(candidate)
+	target := endpoint
+	if viaTransport {
+		target = a.codexTransportURL + "/forward"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -2197,8 +2208,53 @@ func (a *app) forwardOnce(ctx context.Context, candidate account, endpoint strin
 		if hint := codexRoutingHint(body, inbound); hint != "" {
 			req.Header.Set("X-Codex-Routing-Hint", hint)
 		}
+		if version := codexClientVersion(inbound); version != "" && req.Header.Get("Version") == "" {
+			req.Header.Set("Version", version)
+		}
 	}
-	return a.streamClient.Do(req)
+	if !viaTransport {
+		return a.streamClient.Do(req)
+	}
+	req.Header.Set("X-Codex-Upstream-Url", endpoint)
+	// One client per account in codex-upstream, as each native Codex process
+	// keeps its own connections and Cloudflare cookies for its one account.
+	req.Header.Set("X-Codex-Upstream-Identity", candidate.ID)
+	// A native Codex zstd-compresses its Responses requests to the Codex
+	// backend; compaction requests are sent uncompressed.
+	if strings.HasSuffix(endpoint, "/responses") {
+		req.Header.Set("X-Codex-Upstream-Compression", "zstd")
+	}
+	response, err := a.streamClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	// codex-upstream answers 502 with this header only when it could not reach
+	// upstream at all. Surface that as a transport error, as a direct dial
+	// failure would be, so it fails over instead of reading as an upstream 5xx.
+	if kind := response.Header.Get("X-Codex-Upstream-Error"); kind != "" {
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		_ = response.Body.Close()
+		return nil, fmt.Errorf("codex upstream %s: %s", kind, strings.TrimSpace(string(detail)))
+	}
+	return response, nil
+}
+
+// codexClientVersion is the "version" header a native Codex sends to the Codex
+// backend (its own release, from the built-in provider). A custom-provider
+// client omits it, so it is taken from the client's own User-Agent product
+// token (codex_exec/0.163.0, codex-tui/0.163.0, ...). Other clients get none.
+func codexClientVersion(inbound http.Header) string {
+	product, _, _ := strings.Cut(strings.TrimSpace(inbound.Get("User-Agent")), " ")
+	name, version, ok := strings.Cut(product, "/")
+	if !ok || !strings.HasPrefix(strings.ToLower(name), "codex") || version == "" {
+		return ""
+	}
+	for _, char := range version {
+		if !(char >= '0' && char <= '9' || char == '.' || char == '-' || char >= 'a' && char <= 'z') {
+			return ""
+		}
+	}
+	return version
 }
 
 // codexBackendUnsupportedFields are Responses API parameters the Codex backend

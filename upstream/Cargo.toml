@@ -1,0 +1,32 @@
+[package]
+name = "codex-upstream"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The upstream request must be the one a native Codex CLI sends, so the
+# transport is Codex's own HTTP client crate at the Codex release the pool
+# targets, and Cargo.lock is seeded from that release's lock so reqwest, hyper,
+# h2, native-tls and the vendored OpenSSL resolve to the same versions. When
+# moving to a new Codex release, change the tag and reseed the lock together
+# (see README "Codex upstream transport").
+[dependencies]
+codex-http-client = { git = "https://github.com/openai/codex", tag = "rust-v0.163.0" }
+bytes = "1"
+futures = "0.3"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+
+# The official Linux release links a vendored OpenSSL for its default TLS
+# backend; linking the system one would change the TLS handshake.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl-sys = { version = "*", features = ["vendored"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
