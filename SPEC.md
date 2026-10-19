@@ -199,8 +199,9 @@ In the container the last hop of every direct request goes through `codex-upstre
 
 - One client socket is bound to one account's upstream socket, opened by `codex-upstream` with Codex's own `codex-websocket-client` connector, the OpenAI tungstenite forks Codex patches in, and its permessage-deflate offer. The handshake (header set and order, TLS ClientHello) was measured equal to a native Codex; it carries the client's Codex headers, the account's credential and `ChatGPT-Account-ID`, the routing hint and `version`, and no turn state.
 - Messages pass through byte for byte both ways. Pool reads them only to record each response (usage, terminal event) like an HTTP request; a `generate: false` prewarm is not recorded.
+- Upstream events get the same pre-commit rule as the HTTP stream: lifecycle events are held until the first event carrying content. An overload before that point is retried by resending the identical request on the same socket (same account, same connection state, which is what a Codex retry would send) up to three times after 1 s, 2 s and 4 s. When that is spent, or the account's allowance or credential failed before content, the account is cooled and the socket closed without showing the failure; Codex treats a dropped socket as a retryable stream error, reconnects, and resends in full, and routing moves the whole lineage. A failure after content reached Codex is relayed unchanged.
 - The account is chosen at the first `response.create`, since the handshake has no model, with the same failover as HTTP before anything reaches upstream (a refused handshake is marked and the next account tried). If no account can serve it, Pool sends the backend's wrapped `{"type":"error","status":...}` event and closes.
-- When a later request belongs on another account (lineage move, cooled account), or a response fails with an account-allowance, transient, or authentication class (an overload is kept on the socket until it outlasts the same-account schedule, see 12.3), Pool closes the client socket (after relaying the failure event) instead of switching upstream sockets: incremental requests reference responses that exist only on the old connection. A native Codex reconnects and resends in full, and routing places that request.
+- When a later request belongs on another account (lineage move, cooled account), or a response that already showed content fails with an account-allowance, transient, or authentication class, Pool closes the client socket instead of switching upstream sockets: incremental requests reference responses that exist only on the old connection. A native Codex reconnects and resends in full, and routing places that request.
 - A running response counts as in flight for the drain and the deploy idle wait; an idle socket between turns does not. Shutdown waits for running socket responses within the grace. Pool pings the client leg every 20 s so NATs and proxies on the internet-facing leg do not drop it.
 - Without `codex-upstream` (sidecar mode, tests) Pool answers the upgrade with `426`, which Codex treats as "use HTTP".
 
@@ -2082,9 +2083,9 @@ For streaming responses:
   outlasts that schedule, or any account-allowance failure
   (`rate_limit_exceeded`, `usage_not_included`, `insufficient_quota`) or server
   fault, proceeds to the sweep below, and a success there moves the whole
-  lineage. On a Responses WebSocket the overload event is relayed and the
-  socket kept, so Codex retries on the same account; the socket is closed and
-  the account cooled only after more than three consecutive overloads.
+  lineage. On a Responses WebSocket the same schedule runs inside the pool,
+  because a native Codex does not retry an overload that carries no retry
+  advice: it shows "Selected model is at capacity" and stops the turn.
 - The order of recovery after that is itself the contract, and it is: sweep
   every other available identity first with no wait at all; only once every one of them has refused, wait
   out a single backoff round, restore all of them, and sweep the whole set again
