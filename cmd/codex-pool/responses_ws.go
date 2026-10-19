@@ -39,6 +39,10 @@ type wsSession struct {
 	upstream *wsConn
 	account  account
 	active   *wsResponse
+	// overloads counts consecutive overloaded responses on this socket. Codex
+	// retries an overload on the same socket, as it would against the backend;
+	// only when the same-account schedule is spent does the pool move on.
+	overloads int
 }
 
 type wsResponse struct {
@@ -265,7 +269,21 @@ func (s *wsSession) relayUpstream(upstream *wsConn) {
 		if response == nil || info.TerminalEvent == "" {
 			continue
 		}
-		s.finish(response, true)
+		overloaded := info.TerminalEvent != "response.completed" && transientOverloadCode(response.info.TerminalErrorCode)
+		s.mu.Lock()
+		if overloaded {
+			s.overloads++
+		} else {
+			s.overloads = 0
+		}
+		holdAccount := overloaded && s.overloads <= overloadSameAccountRetryLimit
+		s.mu.Unlock()
+		s.finishResponse(response, true, !holdAccount)
+		if holdAccount {
+			// The overload has reached Codex, which retries on this socket and
+			// so on this account, keeping the lineage and its cache in place.
+			continue
+		}
 		if info.TerminalEvent != "response.completed" && (retryableTerminalFailureClass(response.info.TerminalFailureClass) || response.info.TerminalFailureClass == "authentication") {
 			// The failure event has reached Codex; the next request must not
 			// land on this account's socket.
@@ -279,6 +297,12 @@ func (s *wsSession) relayUpstream(upstream *wsConn) {
 // finish records a response exactly once. delivered is false when the
 // request never reached upstream or the socket died before a terminal event.
 func (s *wsSession) finish(response *wsResponse, delivered bool) {
+	s.finishResponse(response, delivered, true)
+}
+
+// finishResponse is finish with control over the account cooldown a failure
+// applies; an overload still inside the same-account schedule applies none.
+func (s *wsSession) finishResponse(response *wsResponse, delivered, coolDown bool) {
 	response.finished.Do(func() {
 		a := s.a
 		// Released last, after the response is recorded, so the drain never
@@ -301,7 +325,7 @@ func (s *wsSession) finish(response *wsResponse, delivered bool) {
 			measurement.Success = true
 			a.markSuccessWithMeasurement(response.route, response.model, response.accountID, info, measurement)
 		default:
-			a.markTerminalResponseFailureWithMeasurement(response.route, response.model, response.accountID, info, measurement)
+			a.markTerminalResponseFailure(response.route, response.model, response.accountID, info, measurement, coolDown)
 		}
 	})
 }

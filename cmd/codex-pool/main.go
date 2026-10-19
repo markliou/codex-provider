@@ -1739,6 +1739,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	// is not transient and must stay excluded.
 	capacityExcluded := map[string]bool{}
 	capacityRetries := 0
+	overloadRetries := 0
 	turnStateIssuer := a.stickySessionAccountID(route.StickyKey)
 	attemptLimit := a.proxyAttemptLimit()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
@@ -1913,11 +1914,35 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 				commitProxyResponseHeaders(w, response)
 			})
 			info = result.Info
+			if result.RetryableTerminalFailure && transientOverloadCode(info.TerminalErrorCode) && overloadRetries < overloadSameAccountRetryLimit {
+				// Upstream overload is the server's condition, not this account's
+				// allowance, so the same account is retried after a short backoff,
+				// as a native Codex (which has only one account) does. Moving at
+				// once would split the main agent from its subagents and throw away
+				// the account's KV cache, so the next account pays a full prefill.
+				// Only when this schedule is spent does the sweep below move the
+				// whole lineage. No cooldown here: it would make the account
+				// unselectable for its own retry.
+				overloadRetries++
+				_ = response.Body.Close()
+				a.markRetryableTerminalResponseFailure(candidate.ID, model, info, false)
+				select {
+				case <-r.Context().Done():
+					throughput.Cancelled = true
+					return
+				case <-time.After(overloadRetryBackoff << (overloadRetries - 1)):
+				}
+				attempt--
+				continue
+			}
 			if result.RetryableTerminalFailure {
 				excluded[candidate.ID] = true
 				capacityExcluded[candidate.ID] = true
-				// The rule this block implements, in order, and the order is the
-				// point: sweep every other available identity first with no wait,
+				// Account allowance failures (rate_limit_exceeded,
+				// usage_not_included, insufficient_quota), server faults, and an
+				// overload that outlasted the same-account schedule above reach
+				// here. The rule this block implements, in order, and the order is
+				// the point: sweep every other available identity first with no wait,
 				// because another account is always cheaper than any delay; only
 				// when every one of them has refused, wait out one backoff round,
 				// restore all of them, and sweep again from the top; each round
@@ -3297,6 +3322,27 @@ var (
 	// the 1s header hold, which would close their retry window almost at once.
 	unmanagedPrecommitCommitAfter = 5 * time.Second
 )
+
+// overloadSameAccountRetryLimit is how many times an overload is retried on the
+// same account (after 1s, 2s and 4s at the default backoff) before the pool
+// moves the lineage to another account.
+const overloadSameAccountRetryLimit = 3
+
+// overloadRetryBackoff is the first same-account overload wait; each retry
+// doubles it. A variable only so tests can shorten it.
+var overloadRetryBackoff = time.Second
+
+// transientOverloadCode reports an upstream overload, as opposed to an
+// account's own allowance being spent: retrying the same account is the
+// native answer to the former, moving to another account to the latter.
+func transientOverloadCode(code string) bool {
+	switch sanitizedErrorCode(code) {
+	case "server_is_overloaded", "slow_down":
+		return true
+	default:
+		return false
+	}
+}
 
 // capacityRetryBackoff doubles each round up to a cap, so an early blip costs a
 // second while a sustained refusal is not retried in a tight loop.
@@ -5720,6 +5766,13 @@ func (a *app) markRetryableTerminalResponseFailure(accountID, model string, info
 }
 
 func (a *app) markTerminalResponseFailureWithMeasurement(route routingDecision, model, accountID string, info proxyResponseInfo, measurement *throughputMeasurement) {
+	a.markTerminalResponseFailure(route, model, accountID, info, measurement, true)
+}
+
+// markTerminalResponseFailure records a failed response. coolDown false keeps a
+// capacity or transient failure from cooling the account, for an overload the
+// session is still allowed to retry on the same account.
+func (a *app) markTerminalResponseFailure(route routingDecision, model, accountID string, info proxyResponseInfo, measurement *throughputMeasurement, coolDown bool) {
 	a.logTerminalResponseFailure(accountID, model, info, false)
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -5740,7 +5793,9 @@ func (a *app) markTerminalResponseFailureWithMeasurement(route routingDecision, 
 		health.LastFailureReason = reason
 		health.ConsecutiveFailure++
 		a.state.Health[accountID] = health
-		a.appendCooldownLocked(accountID, model, reason, now.Add(retryableTerminalCooldown(reason)), now)
+		if coolDown {
+			a.appendCooldownLocked(accountID, model, reason, now.Add(retryableTerminalCooldown(reason)), now)
+		}
 	case "authentication":
 		health := a.state.Health[accountID]
 		health.LastFailureAt = now
