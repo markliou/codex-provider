@@ -577,7 +577,18 @@ balancing, not mutable request round-robin:
 
 1. Concurrent first requests for the same sticky key choose the same account
    even before the first successful response persists a binding.
-2. Different sticky keys distribute statistically across the eligible accounts.
+2. Different sticky keys spread their consumption across the eligible accounts
+   so no single allowance drains early and every account's remote KV cache
+   stays in use, while an account already carrying a session keeps its
+   remaining allowance for it. A new session goes to an idle account when there
+   is one, weighted by remaining allowance (the tighter quota window) times the
+   plan's weekly multiplier; only when every account is busy does it share one,
+   weighted by that product divided by the square of one plus the sessions the
+   account carries. A session counts against its account from the request that
+   placed it (not its first success) until 30 minutes after its last request,
+   and follows it across a failover, so an account whose window just reset
+   takes one new session and the next goes elsewhere. The score is a weighted
+   rendezvous hash of the balance key and the upstream identity.
 3. Existing TTL-live sticky bindings remain authoritative and are never
    rebalanced merely because another account becomes available.
 4. Selection balances only within the highest-priority eligible tier, preserving

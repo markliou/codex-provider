@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -630,6 +631,10 @@ type app struct {
 	// Codex-backend requests with Codex's own HTTP client. Empty sends them from
 	// Go, which tests use; the container supervisor always sets it.
 	codexTransportURL string
+
+	// sessionPlacements is in-memory placement load, guarded by mu: which
+	// account each recently active session is on (see noteSessionPlacement).
+	sessionPlacements map[string]sessionPlacement
 }
 
 func main() {
@@ -1761,6 +1766,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			return
 		}
 		throughput.AccountID = candidate.ID
+		a.noteSessionPlacement(route.BalanceKey, candidate.ID)
 		endpoint, outBody, convertResponse, err := a.prepareUpstreamRequest(candidate, updatedBody, chat)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "bad_gateway", err.Error())
@@ -5012,17 +5018,116 @@ func (a *app) pickBalancedAccountLocked(stickyKey string, eligible []account) (a
 		}
 	}
 
+	// Session placement. Separate sessions spread their consumption so no
+	// single allowance drains early and every account's remote KV cache stays
+	// in use, but an account already carrying sessions keeps its remaining
+	// allowance for them rather than taking new ones. So a new session (or a
+	// lineage that must move) goes to an idle account when there is one,
+	// chosen by remaining allowance times plan multiplier; only when every
+	// account is busy does it share one, with the weight falling with the
+	// square of the sessions already there. "Busy" counts a session from the
+	// moment it is placed, not from its first success, so an account whose
+	// window just reset takes one new session and the next goes elsewhere
+	// instead of the whole queue sticking to it. The hash keeps the choice
+	// deterministic for one balance key, so lineage members placed together
+	// converge, and a bound lineage never reaches here.
+	now := time.Now().UTC()
+	active := a.activeSessionCountsLocked(now, stickyKey)
+	idle := make([]account, 0, len(tier))
+	for _, item := range tier {
+		if active[item.ID] == 0 {
+			idle = append(idle, item)
+		}
+	}
+	if len(idle) > 0 {
+		tier = idle
+	}
 	selected := tier[0]
-	selectedScore := a.stickyBalanceScore(stickyKey, selected)
+	selectedScore := a.placementScoreLocked(stickyKey, selected, active)
 	for _, item := range tier[1:] {
-		score := a.stickyBalanceScore(stickyKey, item)
-		comparison := bytes.Compare(score[:], selectedScore[:])
-		if comparison > 0 || (comparison == 0 && item.ID < selected.ID) {
+		score := a.placementScoreLocked(stickyKey, item, active)
+		if score > selectedScore || (score == selectedScore && item.ID < selected.ID) {
 			selected = item
 			selectedScore = score
 		}
 	}
 	return selected, true
+}
+
+// placementActiveWindow is how recently a session must have sent a request
+// through an account to count as a session that account is carrying.
+const placementActiveWindow = 30 * time.Minute
+
+type sessionPlacement struct {
+	accountID string
+	at        time.Time
+}
+
+// noteSessionPlacement records that the session behind balanceKey (a whole
+// lineage, or one routed conversation) is now being served by accountID. It is
+// called for every attempt, so a session counts against its account from the
+// first request, before any success, and moves with it on failover.
+func (a *app) noteSessionPlacement(balanceKey, accountID string) {
+	if balanceKey == "" || accountID == "" {
+		return
+	}
+	now := time.Now().UTC()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.sessionPlacements == nil {
+		a.sessionPlacements = map[string]sessionPlacement{}
+	}
+	a.sessionPlacements[balanceKey] = sessionPlacement{accountID: accountID, at: now}
+	for key, placement := range a.sessionPlacements {
+		if now.Sub(placement.at) > placementActiveWindow {
+			delete(a.sessionPlacements, key)
+		}
+	}
+}
+
+// activeSessionCountsLocked counts the sessions each account is carrying,
+// leaving out the session being placed so it never counts against itself.
+func (a *app) activeSessionCountsLocked(now time.Time, ownKey string) map[string]int {
+	counts := map[string]int{}
+	for key, placement := range a.sessionPlacements {
+		if key != ownKey && now.Sub(placement.at) <= placementActiveWindow {
+			counts[placement.accountID]++
+		}
+	}
+	return counts
+}
+
+// placementWeightLocked is an account's share of new sessions: remaining
+// allowance (the tighter of its windows, never below 1 so an eligible account
+// stays reachable) times its weekly plan multiplier, divided by the square of
+// one plus the sessions it already carries.
+func (a *app) placementWeightLocked(item account, active map[string]int) float64 {
+	snapshot := a.state.Quotas[item.ID]
+	remaining := 100.0
+	if snapshot.Quota != nil {
+		remaining = float64(remainingQuotaHint(*snapshot.Quota))
+	}
+	if remaining < 1 {
+		remaining = 1
+	}
+	multiplier, _ := accountWeeklyWeight(
+		chooseString(snapshot.PlanFamily, item.PlanFamily),
+		chooseString(snapshot.PlanLimit, item.PlanLimit),
+		chooseString(snapshot.SeatType, item.SeatType),
+	)
+	if multiplier <= 0 {
+		multiplier = baseWeeklyWeight
+	}
+	carried := float64(1 + active[item.ID])
+	return remaining * multiplier / (carried * carried)
+}
+
+// placementScoreLocked is the weighted rendezvous score weight / -ln(u), with
+// u in (0, 1) drawn from the balance key and the account's upstream identity.
+func (a *app) placementScoreLocked(stickyKey string, item account, active map[string]int) float64 {
+	sum := a.stickyBalanceScore(stickyKey, item)
+	u := (float64(binary.BigEndian.Uint64(sum[:8])>>11) + 0.5) / float64(uint64(1)<<53)
+	return a.placementWeightLocked(item, active) / -math.Log(u)
 }
 
 func (a *app) stickyBalanceScore(stickyKey string, item account) [sha256.Size]byte {
