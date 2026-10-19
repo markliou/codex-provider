@@ -171,6 +171,7 @@ func (s *wsSession) startResponse(message []byte, payload map[string]any) bool {
 	} else if !s.dial(&route, model, message) {
 		return false
 	}
+	a.noteSessionPlacement(route.BalanceKey, bound.ID)
 
 	s.mu.Lock()
 	response := &wsResponse{route: route, model: model, accountID: s.account.ID, warmup: warmup, message: message}
@@ -203,6 +204,7 @@ func (s *wsSession) dial(route *routingDecision, model string, firstMessage []by
 			break
 		}
 		excluded[candidate.ID] = true
+		a.noteSessionPlacement(route.BalanceKey, candidate.ID)
 		if !a.usesCodexBackendDirectly(candidate) {
 			// API-key providers have no Codex WebSocket; their sessions use HTTP.
 			continue

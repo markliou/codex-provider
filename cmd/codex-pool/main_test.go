@@ -6124,6 +6124,88 @@ func TestOverloadRetriesTheSameAccountBeforeMovingTheLineage(t *testing.T) {
 	}
 }
 
+// Separate sessions spread their consumption without crowding an account that
+// is already serving sessions: a new session goes to an idle account, chosen by
+// remaining allowance, and an account whose window just reset takes one new
+// session before the next goes elsewhere.
+func TestSessionPlacementPrefersIdleAccountsAndAvoidsAHerd(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "a", Enabled: true, InPool: true, Priority: 100},
+		{ID: "b", Enabled: true, InPool: true, Priority: 100},
+		{ID: "c", Enabled: true, InPool: true, Priority: 100},
+	})
+	a.routingStrategy = routingStrategyBalanced
+	week := int64(10080)
+	setRemaining := func(id string, remaining float64) {
+		value := remaining
+		a.state.Quotas[id] = quotaSnapshot{AccountID: id, Quota: &accountQuota{Windows: []quotaWindow{{Label: "Week", WindowMinutes: &week, RemainingPercent: &value, Present: true, Observed: true}}}}
+	}
+	pick := func(key string, ids ...string) string {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		eligible := []account{}
+		for _, item := range a.config.Accounts {
+			for _, id := range ids {
+				if item.ID == id {
+					eligible = append(eligible, item)
+				}
+			}
+		}
+		picked, _ := a.pickBalancedAccountLocked(key, eligible)
+		return picked.ID
+	}
+	reset := func() { a.mu.Lock(); a.sessionPlacements = nil; a.mu.Unlock() }
+
+	// Among idle accounts, remaining allowance decides.
+	setRemaining("a", 90)
+	setRemaining("b", 10)
+	toA := 0
+	for i := 0; i < 400; i++ {
+		if pick(fmt.Sprintf("lineage:idle-%d", i), "a", "b") == "a" {
+			toA++
+		}
+	}
+	if share := float64(toA) / 400; share < .8 || share > .97 {
+		t.Fatalf("idle 90%% vs 10%% left: a took %.2f of new sessions, want about 0.9", share)
+	}
+
+	// An account carrying a session keeps its allowance for it while another
+	// account is idle, however much more it has left.
+	a.noteSessionPlacement("lineage:running", "a")
+	for i := 0; i < 50; i++ {
+		if got := pick(fmt.Sprintf("lineage:new-%d", i), "a", "b"); got != "b" {
+			t.Fatalf("a new session went to the busy account while another was idle")
+		}
+	}
+	// The running session itself is not counted against its own account.
+	a.mu.Lock()
+	if counts := a.activeSessionCountsLocked(time.Now().UTC(), "lineage:running"); counts["a"] != 0 {
+		a.mu.Unlock()
+		t.Fatal("a session must not count against itself")
+	}
+	a.mu.Unlock()
+
+	// A just-reset account takes one new session, not the whole queue.
+	reset()
+	setRemaining("a", 40)
+	setRemaining("b", 40)
+	setRemaining("c", 100)
+	placed := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		key := fmt.Sprintf("lineage:burst-%d", i)
+		got := pick(key, "a", "b", "c")
+		if placed[got] {
+			t.Fatalf("burst session %d joined %s, which already had a new session while another account was idle", i, got)
+		}
+		placed[got] = true
+		a.noteSessionPlacement(key, got)
+	}
+
+	if pick("lineage:steady", "a", "b", "c") != pick("lineage:steady", "a", "b", "c") {
+		t.Fatal("placement must be deterministic for one balance key")
+	}
+}
+
 func TestCodexClientVersionComesOnlyFromACodexUserAgent(t *testing.T) {
 	for ua, want := range map[string]string{
 		"codex_exec/0.163.0 (Alpine Linux 3.21.7; x86_64) unknown (codex_exec; 0.163.0)": "0.163.0",
