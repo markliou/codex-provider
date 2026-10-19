@@ -1947,7 +1947,9 @@ For streaming responses:
   client-visible.
 - Before the first client-visible byte, Pool may buffer only a bounded
   lifecycle-only preamble consisting of `response.created`,
-  `response.in_progress`, `response.queued`, the empty shell announcements
+  `response.in_progress`, `response.queued`, `response.metadata` (sent by
+  upstream before any output; it describes the response and is forwarded when
+  the window commits), the empty shell announcements
   `response.output_item.added`, `response.content_part.added` and
   `response.reasoning_summary_part.added`, a bare `error` event, named
   `keepalive`/`ping` events, and SSE comment/reconnection metadata. The buffer is limited to 64 KiB plus the size

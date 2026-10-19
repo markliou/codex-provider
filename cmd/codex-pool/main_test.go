@@ -8931,6 +8931,44 @@ func TestNamedKeepaliveEventsKeepTheRetryWindowOpen(t *testing.T) {
 	}
 }
 
+// Production capacity failures on 2026-10-19 all recorded close reason
+// "response.metadata": upstream sends it before any output, and as an unlisted
+// event it committed the stream one block before the overload behind it. The
+// retry must happen, and the successful attempt's metadata must still reach
+// the client.
+func TestResponseMetadataKeepsTheRetryWindowOpen(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_meta\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_meta\"}}\n\n")
+		_, _ = fmt.Fprintf(w, "event: response.metadata\ndata: {\"type\":\"response.metadata\",\"attempt\":%d}\n\n", hits)
+		if hits == 1 {
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_meta\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_meta\"}}\n\n")
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello","stream":true}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	body := recorder.Body.String()
+	if hits != 2 || !strings.Contains(body, "recovered") {
+		t.Fatalf("response.metadata closed the retry window: hits=%d body=%s", hits, body)
+	}
+	if strings.Contains(body, `"attempt":1`) || !strings.Contains(body, `"attempt":2`) {
+		t.Fatalf("client must get only the successful attempt's metadata: %s", body)
+	}
+	if strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("retried capacity failure leaked to the client: %s", body)
+	}
+}
+
 // The backoff must escalate and cap, so an early blip costs about a second while
 // a sustained refusal is not retried in a tight loop.
 func TestCapacityRetryBackoffEscalatesToACap(t *testing.T) {

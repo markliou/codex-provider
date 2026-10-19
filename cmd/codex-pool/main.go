@@ -2937,6 +2937,16 @@ func precommitLifecycleSSEBlock(block string) bool {
 	switch responseEventTypeFromSSEBlock(block) {
 	case "response.created", "response.in_progress", "response.queued":
 		return true
+	case "response.metadata":
+		// Upstream started sending response.metadata right after
+		// response.created, before any output. As an unlisted event it failed
+		// closed and committed the stream, so every server_is_overloaded behind
+		// it reached Codex as a final failure instead of a retry on another
+		// identity: from 2026-10-19 all client-visible capacity failures closed
+		// the window here. It describes the response, not model output, so it
+		// stays buffered; it is still forwarded when the window commits and is
+		// discarded only with the rest of a failed attempt, like response.created.
+		return true
 	case "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
 		// These announce an empty shell — an output item, a content part, a
 		// reasoning summary part — and carry no text, arguments or reasoning of
