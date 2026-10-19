@@ -201,9 +201,9 @@ func TestResponsesWebSocketFailsOverARefusedHandshake(t *testing.T) {
 	}
 }
 
-// After an account's allowance is spent the event reaches Codex and the socket
-// closes, so Codex reconnects and resends in full instead of reusing the
-// account.
+// When an account's allowance is spent before any output, Codex is shown
+// nothing: the socket closes, Codex reconnects and resends in full, and the
+// cooled account is not chosen again.
 func TestResponsesWebSocketClosesAfterACapacityFailure(t *testing.T) {
 	upstream := &fakeCodexUpstream{script: func(string) []string {
 		return []string{
@@ -216,12 +216,8 @@ func TestResponsesWebSocketClosesAfterACapacityFailure(t *testing.T) {
 	if err := conn.WriteMessage(wsOpText, []byte(`{"type":"response.create","model":"gpt-test","input":[]}`)); err != nil {
 		t.Fatal(err)
 	}
-	events := readUntilTerminal(t, conn)
-	if len(events) != 2 || !strings.Contains(events[1], "rate_limit_exceeded") {
-		t.Fatalf("the failure must reach Codex unchanged: %q", events)
-	}
-	if _, _, err := conn.ReadMessage(); err == nil {
-		t.Fatal("the client socket must close after a capacity failure")
+	if events := readUntilTerminal(t, conn); len(events) != 0 {
+		t.Fatalf("nothing of a failure before output may reach Codex, which would stop the turn: %q", events)
 	}
 	waitInFlightZero(t, a)
 	a.mu.RLock()
@@ -231,7 +227,7 @@ func TestResponsesWebSocketClosesAfterACapacityFailure(t *testing.T) {
 		cooled = cooled || entry.NextRetryAt.After(time.Now())
 	}
 	if !cooled {
-		t.Fatal("the overloaded account must cool down so the reconnect goes elsewhere")
+		t.Fatal("the spent account must cool down so the reconnect goes elsewhere")
 	}
 }
 
@@ -247,27 +243,28 @@ func TestResponsesWebSocketKeepsTheSocketThroughAnOverload(t *testing.T) {
 		n := calls
 		mu.Unlock()
 		if n == 1 {
-			return []string{`{"type":"response.created","response":{"id":"resp_busy"}}`, `{"type":"response.failed","response":{"id":"resp_busy","error":{"code":"server_is_overloaded"}}}`}
+			return []string{`{"type":"response.created","response":{"id":"resp_busy"}}`, `{"type":"error","status":503,"error":{"code":"server_is_overloaded","message":"busy"}}`}
 		}
 		return completedEvents("resp_ok")
 	}}
 	a, url := wsTestPool(t, upstream)
 	conn := dialPool(t, url)
+	turn := `{"type":"response.create","model":"gpt-test","previous_response_id":"resp_prev","input":[]}`
 	for round := 0; round < 2; round++ {
-		if err := conn.WriteMessage(wsOpText, []byte(`{"type":"response.create","model":"gpt-test","input":[]}`)); err != nil {
+		if err := conn.WriteMessage(wsOpText, []byte(turn)); err != nil {
 			t.Fatalf("round %d: socket closed: %v", round, err)
 		}
 		events := readUntilTerminal(t, conn)
-		if len(events) != 2 {
-			t.Fatalf("round %d: events = %q", round, events)
+		if len(events) != 2 || strings.Contains(strings.Join(events, ""), "server_is_overloaded") {
+			t.Fatalf("round %d: the overload must be retried before Codex sees it: %q", round, events)
 		}
 	}
 	waitInFlightZero(t, a)
 	upstream.mu.Lock()
-	handshakes := len(upstream.handshakes)
+	handshakes, messages := len(upstream.handshakes), append([]string(nil), upstream.messages...)
 	upstream.mu.Unlock()
-	if handshakes != 1 {
-		t.Fatalf("the retry must reuse the same upstream socket, got %d handshakes", handshakes)
+	if handshakes != 1 || len(messages) != 3 || messages[0] != turn || messages[1] != turn {
+		t.Fatalf("the retry must resend the same request on the same socket: handshakes=%d messages=%q", handshakes, messages)
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -275,6 +272,39 @@ func TestResponsesWebSocketKeepsTheSocketThroughAnOverload(t *testing.T) {
 		if entry.NextRetryAt.After(time.Now()) {
 			t.Fatal("an overload inside the same-account schedule must not cool the account")
 		}
+	}
+}
+
+// An overload that outlasts the same-account schedule cools the account and
+// drops the socket without showing Codex the failure, so Codex reconnects and
+// the lineage moves.
+func TestResponsesWebSocketMovesOnWhenTheOverloadOutlastsTheSchedule(t *testing.T) {
+	upstream := &fakeCodexUpstream{script: func(string) []string {
+		return []string{`{"type":"response.created","response":{"id":"resp_busy"}}`, `{"type":"response.failed","response":{"id":"resp_busy","error":{"code":"server_is_overloaded"}}}`}
+	}}
+	a, url := wsTestPool(t, upstream)
+	conn := dialPool(t, url)
+	if err := conn.WriteMessage(wsOpText, []byte(`{"type":"response.create","model":"gpt-test","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if events := readUntilTerminal(t, conn); len(events) != 0 {
+		t.Fatalf("the exhausted overload must not reach Codex: %q", events)
+	}
+	waitInFlightZero(t, a)
+	upstream.mu.Lock()
+	sent := len(upstream.messages)
+	upstream.mu.Unlock()
+	if sent != overloadSameAccountRetryLimit+1 {
+		t.Fatalf("upstream got %d sends, want %d", sent, overloadSameAccountRetryLimit+1)
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	cooled := false
+	for _, entry := range a.state.Cooldowns["first"] {
+		cooled = cooled || entry.NextRetryAt.After(time.Now())
+	}
+	if !cooled {
+		t.Fatal("the account that kept refusing must cool down")
 	}
 }
 

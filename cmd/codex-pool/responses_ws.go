@@ -39,10 +39,7 @@ type wsSession struct {
 	upstream *wsConn
 	account  account
 	active   *wsResponse
-	// overloads counts consecutive overloaded responses on this socket. Codex
-	// retries an overload on the same socket, as it would against the backend;
-	// only when the same-account schedule is spent does the pool move on.
-	overloads int
+	closed   chan struct{}
 }
 
 type wsResponse struct {
@@ -53,6 +50,14 @@ type wsResponse struct {
 	info       proxyResponseInfo
 	throughput *throughputMeasurement
 	finished   sync.Once
+
+	// The fields below belong to the upstream relay goroutine. message is the
+	// request as sent, kept so an overload can be retried with the same bytes;
+	// buffered holds the lifecycle preamble Codex has not been shown yet.
+	message         []byte
+	buffered        [][]byte
+	committed       bool
+	overloadRetries int
 }
 
 // handleResponsesWebSocket serves GET /v1/responses upgrades. Without
@@ -68,7 +73,7 @@ func (a *app) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid websocket handshake")
 		return
 	}
-	session := &wsSession{a: a, client: client, handshake: r, apiKey: requestAPIKey(r)}
+	session := &wsSession{a: a, client: client, handshake: r, apiKey: requestAPIKey(r), closed: make(chan struct{})}
 	session.run()
 }
 
@@ -168,7 +173,7 @@ func (s *wsSession) startResponse(message []byte, payload map[string]any) bool {
 	}
 
 	s.mu.Lock()
-	response := &wsResponse{route: route, model: model, accountID: s.account.ID, warmup: warmup}
+	response := &wsResponse{route: route, model: model, accountID: s.account.ID, warmup: warmup, message: message}
 	if !warmup {
 		response.throughput = a.beginThroughputMeasurement(true)
 		response.throughput.AccountID = s.account.ID
@@ -242,6 +247,21 @@ func (s *wsSession) dial(route *routingDecision, model string, firstMessage []by
 	return false
 }
 
+// wsPrecommitMaxBlocks bounds the lifecycle preamble held back from Codex.
+const wsPrecommitMaxBlocks = 64
+
+// relayUpstream forwards upstream events to Codex with the same pre-commit
+// rule as the HTTP stream. Lifecycle events are held until the first event
+// carrying content, because a native Codex does not retry an overload that
+// arrives without retry advice: it shows "Selected model is at capacity" and
+// stops the turn. While nothing has reached Codex, an overload is retried on
+// this socket, so on this account and against the same connection state, by
+// resending the identical request after the same-account backoff, which is
+// exactly what a Codex retry would send. When that schedule is spent, or the
+// account's allowance or credential failed, the account is cooled and the
+// socket closed without showing the failure: Codex treats a dropped socket as
+// retryable, reconnects and resends in full, and routing moves the whole
+// lineage. A failure after content has reached Codex is relayed as it is.
 func (s *wsSession) relayUpstream(upstream *wsConn) {
 	for {
 		opcode, message, err := upstream.ReadMessage()
@@ -249,49 +269,96 @@ func (s *wsSession) relayUpstream(upstream *wsConn) {
 			s.upstreamGone(upstream)
 			return
 		}
-		if s.client.WriteMessage(opcode, message) != nil {
-			upstream.Close()
-			return
-		}
-		if opcode != wsOpText {
-			continue
-		}
-		info := responseInfoFromSSEBlock("data: " + string(message) + "\n\n")
 		s.mu.Lock()
 		response := s.active
-		if response != nil {
+		s.mu.Unlock()
+		if opcode != wsOpText || response == nil || response.committed {
+			if s.client.WriteMessage(opcode, message) != nil {
+				upstream.Close()
+				return
+			}
+			if opcode == wsOpText && response != nil && !s.record(response, message) {
+				upstream.Close()
+				return
+			}
+			continue
+		}
+		block := "data: " + string(message) + "\n\n"
+		info := responseInfoFromSSEBlock(block)
+		if info.TerminalEvent == "" && precommitLifecycleSSEBlock(block) && len(response.buffered) < wsPrecommitMaxBlocks {
 			response.info.merge(info)
-			if info.TerminalEvent != "" {
+			response.buffered = append(response.buffered, message)
+			continue
+		}
+		if info.TerminalEvent != "" && info.TerminalEvent != "response.completed" {
+			if transientOverloadCode(info.TerminalErrorCode) && response.overloadRetries < overloadSameAccountRetryLimit {
+				response.overloadRetries++
+				response.buffered = nil
+				response.info = proxyResponseInfo{}
+				s.a.markRetryableTerminalResponseFailure(response.accountID, response.model, info, false)
+				select {
+				case <-s.closed:
+					return
+				case <-time.After(overloadRetryBackoff << (response.overloadRetries - 1)):
+				}
+				if upstream.WriteMessage(wsOpText, response.message) != nil {
+					s.upstreamGone(upstream)
+					return
+				}
+				continue
+			}
+			if retryableTerminalFailureClass(info.TerminalFailureClass) || info.TerminalFailureClass == "authentication" {
+				s.a.markRetryableTerminalResponseFailure(response.accountID, response.model, info, true)
+				s.mu.Lock()
 				s.active = nil
+				s.mu.Unlock()
+				s.finish(response, false)
+				s.client.CloseWith(1012, "upstream account unavailable")
+				upstream.Close()
+				return
 			}
 		}
-		s.mu.Unlock()
-		if response == nil || info.TerminalEvent == "" {
-			continue
+		// First content, or a failure that is the caller's own: release the
+		// held preamble and stream from here on.
+		response.committed = true
+		for _, held := range response.buffered {
+			if s.client.WriteMessage(wsOpText, held) != nil {
+				upstream.Close()
+				return
+			}
 		}
-		overloaded := info.TerminalEvent != "response.completed" && transientOverloadCode(response.info.TerminalErrorCode)
-		s.mu.Lock()
-		if overloaded {
-			s.overloads++
-		} else {
-			s.overloads = 0
-		}
-		holdAccount := overloaded && s.overloads <= overloadSameAccountRetryLimit
-		s.mu.Unlock()
-		s.finishResponse(response, true, !holdAccount)
-		if holdAccount {
-			// The overload has reached Codex, which retries on this socket and
-			// so on this account, keeping the lineage and its cache in place.
-			continue
-		}
-		if info.TerminalEvent != "response.completed" && (retryableTerminalFailureClass(response.info.TerminalFailureClass) || response.info.TerminalFailureClass == "authentication") {
-			// The failure event has reached Codex; the next request must not
-			// land on this account's socket.
-			s.client.CloseWith(1012, "upstream account unavailable")
+		response.buffered = nil
+		if s.client.WriteMessage(wsOpText, message) != nil || !s.record(response, message) {
 			upstream.Close()
 			return
 		}
 	}
+}
+
+// record accumulates a relayed event into the response and finishes it at its
+// terminal event. It reports false when the socket was closed because the
+// account must not serve the next request.
+func (s *wsSession) record(response *wsResponse, message []byte) bool {
+	info := responseInfoFromSSEBlock("data: " + string(message) + "\n\n")
+	response.info.merge(info)
+	if info.TerminalEvent == "" {
+		return true
+	}
+	s.mu.Lock()
+	if s.active == response {
+		s.active = nil
+	}
+	s.mu.Unlock()
+	failed := info.TerminalEvent != "response.completed"
+	overloaded := failed && transientOverloadCode(response.info.TerminalErrorCode)
+	s.finishResponse(response, true, !overloaded)
+	if failed && !overloaded && (retryableTerminalFailureClass(response.info.TerminalFailureClass) || response.info.TerminalFailureClass == "authentication") {
+		// The failure reached Codex after output; the next request must not
+		// land on this account's socket.
+		s.client.CloseWith(1012, "upstream account unavailable")
+		return false
+	}
+	return true
 }
 
 // finish records a response exactly once. delivered is false when the
@@ -345,6 +412,7 @@ func (s *wsSession) upstreamGone(upstream *wsConn) {
 }
 
 func (s *wsSession) shutdown() {
+	close(s.closed)
 	s.mu.Lock()
 	upstream := s.upstream
 	response := s.active
