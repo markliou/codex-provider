@@ -3414,7 +3414,17 @@ func precommitCountsTowardBlockBound(block string) bool {
 }
 
 func precommitLifecycleSSEBlock(block string) bool {
-	switch responseEventTypeFromSSEBlock(block) {
+	eventType := responseEventTypeFromSSEBlock(block)
+	// The Codex backend opens a Responses WebSocket with codex.rate_limits and
+	// codex.response.metadata before response.created, and ends it with
+	// responsesapi.websocket_timing. These are the backend's informational
+	// and telemetry events, never model output. Treated as unknown they
+	// committed the socket on its first event, so every overload behind them
+	// reached Codex, which stops the turn on an overload without retry advice.
+	if strings.HasPrefix(eventType, "codex.") || strings.HasPrefix(eventType, "responsesapi.") {
+		return true
+	}
+	switch eventType {
 	case "response.created", "response.in_progress", "response.queued":
 		return true
 	case "response.metadata":
