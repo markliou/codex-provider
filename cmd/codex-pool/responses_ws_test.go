@@ -52,11 +52,20 @@ func (f *fakeCodexUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// nativePreamble is what the real Codex backend sends on a socket before
+// response.created, captured from a live session.
+var nativePreamble = []string{
+	`{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":3}}}`,
+	`{"type":"codex.response.metadata","metadata":{}}`,
+}
+
 func completedEvents(id string) []string {
-	return []string{
-		`{"type":"response.created","response":{"id":"` + id + `"}}`,
-		`{"type":"response.completed","response":{"id":"` + id + `","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":80},"output_tokens":5}}}`,
-	}
+	return append(append([]string(nil), nativePreamble...),
+		`{"type":"response.created","response":{"id":"`+id+`"}}`,
+		`{"type":"response.output_text.delta","delta":"ok"}`,
+		`{"type":"responsesapi.websocket_timing","timing":{}}`,
+		`{"type":"response.completed","response":{"id":"`+id+`","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":80},"output_tokens":5}}}`,
+	)
 }
 
 func wsTestPool(t *testing.T, upstream *fakeCodexUpstream) (*app, string) {
@@ -136,7 +145,7 @@ func TestResponsesWebSocketRelaysCodexMessagesUnchanged(t *testing.T) {
 		if err := conn.WriteMessage(wsOpText, []byte(message)); err != nil {
 			t.Fatal(err)
 		}
-		if events := readUntilTerminal(t, conn); len(events) != 2 || !strings.Contains(events[1], "response.completed") {
+		if events := readUntilTerminal(t, conn); len(events) != len(completedEvents("x")) || !strings.Contains(events[len(events)-1], "response.completed") {
 			t.Fatalf("events not relayed: %q", events)
 		}
 	}
@@ -190,7 +199,7 @@ func TestResponsesWebSocketFailsOverARefusedHandshake(t *testing.T) {
 	if err := conn.WriteMessage(wsOpText, []byte(`{"type":"response.create","model":"gpt-test","input":[]}`)); err != nil {
 		t.Fatal(err)
 	}
-	if events := readUntilTerminal(t, conn); len(events) != 2 {
+	if events := readUntilTerminal(t, conn); len(events) != len(completedEvents("x")) {
 		t.Fatalf("events = %q", events)
 	}
 	waitInFlightZero(t, a)
@@ -206,10 +215,10 @@ func TestResponsesWebSocketFailsOverARefusedHandshake(t *testing.T) {
 // cooled account is not chosen again.
 func TestResponsesWebSocketClosesAfterACapacityFailure(t *testing.T) {
 	upstream := &fakeCodexUpstream{script: func(string) []string {
-		return []string{
+		return append(append([]string(nil), nativePreamble...),
 			`{"type":"response.created","response":{"id":"resp_busy"}}`,
 			`{"type":"response.failed","response":{"id":"resp_busy","error":{"code":"rate_limit_exceeded","message":"limit"}}}`,
-		}
+		)
 	}}
 	a, url := wsTestPool(t, upstream)
 	conn := dialPool(t, url)
@@ -243,7 +252,7 @@ func TestResponsesWebSocketKeepsTheSocketThroughAnOverload(t *testing.T) {
 		n := calls
 		mu.Unlock()
 		if n == 1 {
-			return []string{`{"type":"response.created","response":{"id":"resp_busy"}}`, `{"type":"error","status":503,"error":{"code":"server_is_overloaded","message":"busy"}}`}
+			return append(append([]string(nil), nativePreamble...), `{"type":"response.created","response":{"id":"resp_busy"}}`, `{"type":"error","status":503,"error":{"code":"server_is_overloaded","message":"busy"}}`)
 		}
 		return completedEvents("resp_ok")
 	}}
@@ -255,7 +264,7 @@ func TestResponsesWebSocketKeepsTheSocketThroughAnOverload(t *testing.T) {
 			t.Fatalf("round %d: socket closed: %v", round, err)
 		}
 		events := readUntilTerminal(t, conn)
-		if len(events) != 2 || strings.Contains(strings.Join(events, ""), "server_is_overloaded") {
+		if len(events) != len(completedEvents("x")) || strings.Contains(strings.Join(events, ""), "server_is_overloaded") {
 			t.Fatalf("round %d: the overload must be retried before Codex sees it: %q", round, events)
 		}
 	}
@@ -280,7 +289,7 @@ func TestResponsesWebSocketKeepsTheSocketThroughAnOverload(t *testing.T) {
 // the lineage moves.
 func TestResponsesWebSocketMovesOnWhenTheOverloadOutlastsTheSchedule(t *testing.T) {
 	upstream := &fakeCodexUpstream{script: func(string) []string {
-		return []string{`{"type":"response.created","response":{"id":"resp_busy"}}`, `{"type":"response.failed","response":{"id":"resp_busy","error":{"code":"server_is_overloaded"}}}`}
+		return append(append([]string(nil), nativePreamble...), `{"type":"response.created","response":{"id":"resp_busy"}}`, `{"type":"response.failed","response":{"id":"resp_busy","error":{"code":"server_is_overloaded"}}}`)
 	}}
 	a, url := wsTestPool(t, upstream)
 	conn := dialPool(t, url)
