@@ -2448,7 +2448,7 @@ func aggregateCodexStream(response *http.Response) *http.Response {
 				if errorPayload == nil {
 					errorPayload = map[string]any{"code": claimString(event, "code"), "message": claimString(event, "message")}
 				}
-				return reply(codexStreamFailureStatus(terminalFailureClass(eventType, claimString(errorPayload, "code"))), map[string]any{"error": errorPayload})
+				return reply(codexStreamFailureStatus(terminalFailureClass(eventType, terminalErrorCode(errorPayload))), map[string]any{"error": errorPayload})
 			}
 		}
 		if err != nil {
@@ -3574,13 +3574,13 @@ func responseInfoFromSSEBlock(block string) proxyResponseInfo {
 	if response, ok := payload["response"].(map[string]any); ok {
 		info = responseInfoFromPayload(response)
 		if errorPayload, _ := response["error"].(map[string]any); errorPayload != nil {
-			info.TerminalErrorCode = sanitizedErrorCode(claimString(errorPayload, "code"))
+			info.TerminalErrorCode = terminalErrorCode(errorPayload)
 			info.TerminalErrorMessage = terminalErrorMessage(errorPayload)
 		}
 	} else {
 		info = responseInfoFromPayload(payload)
 		if errorPayload, _ := payload["error"].(map[string]any); errorPayload != nil {
-			info.TerminalErrorCode = sanitizedErrorCode(claimString(errorPayload, "code"))
+			info.TerminalErrorCode = terminalErrorCode(errorPayload)
 			info.TerminalErrorMessage = terminalErrorMessage(errorPayload)
 		}
 	}
@@ -3643,8 +3643,27 @@ func retryableTerminalCooldown(reason string) time.Duration {
 	switch reason {
 	case "server_is_overloaded", "slow_down", "server_error", "internal_server_error":
 		return upstream5xxCooldown
+	case "usage_limit_reached", "usage_not_included", "insufficient_quota":
+		// A spent allowance does not come back in seconds. Hold the account out
+		// until the next quota refresh has seen the spent window, which then keeps
+		// it out (or lets it back the moment its owner resets it); a short
+		// cooldown let new sessions land on it and bounce off in the gap.
+		return quotaRefreshInterval
 	}
 	return 30 * time.Second
+}
+
+// terminalErrorCode names an upstream error by its code, or by its type when it
+// has none. The Codex backend reports a spent allowance by type alone, on a
+// Responses WebSocket as {"type":"error","status":429,"error":{"type":
+// "usage_limit_reached",...}}, the shape Codex itself parses. Read by code only,
+// that failure was "unknown": handed to Codex as final, with no cooldown, while
+// the lineage stayed bound to the spent account.
+func terminalErrorCode(errorPayload map[string]any) string {
+	if code := sanitizedErrorCode(claimString(errorPayload, "code")); code != "" {
+		return code
+	}
+	return sanitizedErrorCode(claimString(errorPayload, "type"))
 }
 
 // terminalErrorMessage pulls upstream's explanation out of a terminal error
@@ -3690,7 +3709,7 @@ func terminalFailureClass(eventType, code string) string {
 		return ""
 	}
 	switch sanitizedErrorCode(code) {
-	case "rate_limit_exceeded", "insufficient_quota", "usage_not_included", "server_is_overloaded", "slow_down":
+	case "rate_limit_exceeded", "insufficient_quota", "usage_not_included", "usage_limit_reached", "server_is_overloaded", "slow_down":
 		return "capacity"
 	// A server-side fault upstream chose to deliver inside the stream. These two
 	// codes are documented and unambiguous, so recognizing them is not the
@@ -5346,7 +5365,37 @@ func (a *app) hasUsableAuthLocked(item account) bool {
 // IP. Treating those slots as separate capacity causes noisy failover and can
 // amplify refresh-token or team-workspace policy failures, so routing only lets
 // one enabled slot per upstream identity become eligible.
+//
+// The identity is the member, not the workspace. The upstream account id of a
+// Business or Team seat is the workspace's, shared by every member, while each
+// member holds their own allowance (see capacityAllowanceKeyLocked). Keyed on
+// the workspace alone, routing let one member of a workspace serve at a time,
+// excluded every member after one member's failure, and gave them all the same
+// placement draw: a pool of five Business seats in two workspaces routed as two
+// accounts, and seats whose reset credit was about to expire sat behind a
+// sibling that was nearly spent. Two slots from one login share an email and
+// stay one identity; a slot whose email is unknown keeps the workspace key,
+// because nothing proves it is a different member.
 func (a *app) upstreamIdentityKeyLocked(item account) string {
+	workspace := a.upstreamWorkspaceKeyLocked(item)
+	if !strings.HasPrefix(workspace, "codex-account:") {
+		return workspace
+	}
+	email := normalizeEmail(item.Email)
+	if email == "" {
+		if auth, err := a.codexAuth(item); err == nil {
+			email = normalizeEmail(auth.Email)
+		}
+	}
+	if email == "" {
+		return workspace
+	}
+	return workspace + "|member:" + email
+}
+
+// upstreamWorkspaceKeyLocked is the upstream account a slot authenticates
+// against: for a Business or Team seat, the workspace every member shares.
+func (a *app) upstreamWorkspaceKeyLocked(item account) string {
 	if !isCodexDeviceAuth(item) {
 		return ""
 	}
@@ -10284,22 +10333,23 @@ type capacityIdentity struct {
 }
 
 // capacityAllowanceKeyLocked names the thing that actually owns one quota
-// allowance, which is narrower than the identity routing deduplicates on.
+// allowance. Routing's identity (upstreamIdentityKeyLocked) now draws the same
+// member line; this key stays separate so the dashboard's grouping does not
+// move if routing's identity is ever tuned.
 //
-// The routing guard keys on the upstream account id so a failed request is not
-// immediately retried against the same credential. For a Business or Team
-// workspace that id is the workspace, and every member shares it while each
-// holds their own allowance: observed live, five slots sharing one workspace id
-// reported five different remaining percentages and two different window
-// shapes. Counting capacity on the routing key would therefore collapse five
-// real allowances into one and hide the rest.
+// For a Business or Team workspace the upstream account id is the workspace,
+// and every member shares it while each holds their own allowance: observed
+// live, five slots sharing one workspace id reported five different remaining
+// percentages and two different window shapes. Counting capacity on the
+// workspace would therefore collapse five real allowances into one and hide the
+// rest.
 //
 // The member's email separates them. Two slots created from one login carry the
 // same email and genuinely share an allowance; two members of one workspace do
 // not. A slot with no email of its own counts alone, because nothing proves it
 // shares with anything.
 func capacityAllowanceKeyLocked(a *app, item account) string {
-	workspace := a.upstreamIdentityKeyLocked(item)
+	workspace := a.upstreamWorkspaceKeyLocked(item)
 	email := normalizeEmail(item.Email)
 	if email == "" {
 		if auth, err := a.codexAuth(item); err == nil {

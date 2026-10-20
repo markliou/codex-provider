@@ -1646,6 +1646,8 @@ sticky bindings; the next request reselects normally.
 
 Device-auth slots are local management records, not proof of separate upstream capacity. If multiple enabled, in-pool slots resolve to the same upstream ChatGPT/Codex account identity, routing must treat only one local slot as the representative for that identity at a time. Duplicate slots must be shown as duplicate/standby in the dashboard and must not be selected as same-request failover capacity after the representative slot fails. This protects the pool from reusing the same upstream account through multiple local device-auth sessions from the same host/IP, which can amplify shared quota, refresh-token revocation, and team-workspace policy failures.
 
+The upstream identity is the workspace member: the upstream account id together with the member's email. For a Business or Team seat the account id is the workspace's and every member shares it, but each member holds their own allowance. Keyed on the account id alone, routing let one member of a workspace serve at a time, excluded every member after one member's failure, and gave them all one placement draw, so a pool of five Business seats in two workspaces routed as two accounts. Two slots from one login share an email and remain one identity; a slot whose email is unknown keeps the account-id identity, because nothing proves it is a different member.
+
 The representative is chosen from currently usable local credential copies, not permanently fixed to the highest-priority slot. ChatGPT/Codex device-auth copies for the same visible upstream identity can carry different quota snapshots or session-scoped rate limits. If the current representative has zero quota, an active cooldown, or a persisted auth/quota metadata error, a healthy duplicate credential slot may become the single representative for a later request. This avoids unnecessary fallback to Pro when a non-Pro identity still has a usable local credential copy.
 
 Quota hints for duplicate slots participate only in representative selection for later requests. They must not allow another same-identity slot to be used as an immediate retry target within the same request after a 429, upstream 5xx, or auth failure from the representative.
@@ -2056,7 +2058,7 @@ For streaming responses:
   sanitized generic failure instead of being guessed as quota/auth.
 - Two classes of terminal failure are retryable: `capacity`
   (`rate_limit_exceeded`, `insufficient_quota`, `usage_not_included`,
-  `server_is_overloaded`, `slow_down`) and `transient` (`server_error`,
+  `usage_limit_reached`, `server_is_overloaded`, `slow_down`) and `transient` (`server_error`,
   `internal_server_error`). Both describe a server-side condition another
   attempt or another identity can serve, and both take the same pre-commit
   retry path and the same bounded retry budget. Recognizing the two transient
@@ -2066,6 +2068,14 @@ For streaming responses:
   `5xx` earned a cooldown and a fallback — one condition with two opposite
   outcomes, decided only by where upstream reported it. An unrecognized code is
   still not retried and still does not touch account health.
+- An error's code is its `code`, or its `type` when it has no code. The Codex
+  backend reports a spent allowance by type alone — on a Responses WebSocket as
+  `{"type":"error","status":429,"error":{"type":"usage_limit_reached",...}}`,
+  the shape Codex itself parses — and read by code only it was `unknown`,
+  handed to Codex as final while the lineage stayed on the spent account. A
+  spent allowance (`usage_limit_reached`, `usage_not_included`,
+  `insufficient_quota`) cools the account for one quota refresh interval, so new
+  sessions do not land on it before the refresh records the spent window.
 - Every upstream terminal failure is logged with the account, model, terminal
   event, sanitized class and code, the request's operational id, whether the
   attempt was retried or final, and upstream's own message bounded and stripped
@@ -2098,7 +2108,8 @@ For streaming responses:
   request, after 1 s, 2 s and 4 s, with no cooldown, so the main agent and its
   subagents stay on one account and keep its KV cache. Only an overload that
   outlasts that schedule, or any account-allowance failure
-  (`rate_limit_exceeded`, `usage_not_included`, `insufficient_quota`) or server
+  (`rate_limit_exceeded`, `usage_not_included`, `usage_limit_reached`,
+  `insufficient_quota`) or server
   fault, proceeds to the sweep below, and a success there moves the whole
   lineage. On a Responses WebSocket the same schedule runs inside the pool,
   because a native Codex does not retry an overload that carries no retry
