@@ -748,7 +748,7 @@ These are the headers a native Codex CLI request carries; relaying them keeps th
 
 Do not forward client authorization, API keys, hop-by-hop headers, or unrelated client-controlled headers.
 
-Routing events also record, for local diagnostics only, which client sent each request: `clientOriginator` (the `Originator` header), `clientUserAgent` (only the `User-Agent` product token, such as `codex_exec/0.141.0`), and `clientRequestKind` (`request_kind` from the turn metadata). Each is reduced to at most 64 token characters. They exist to attribute identity-less traffic that can only be routed by prompt hash. They are read from the inbound request and never added to the upstream request: upstream receives the client's own headers and body fields verbatim, with no pool diagnostic field.
+Routing events also record, for local diagnostics only, which client sent each request: `clientOriginator` (the `Originator` header), `clientUserAgent` (only the `User-Agent` product token, such as `codex_exec/0.163.0`), `clientRequestKind` (`request_kind` from the turn metadata), and `clientEntry` (how the request reached the pool: `native/http`, `native/ws`, `v1/http` or `v1/ws`, telling a Codex on the native endpoint from one on a custom provider). Each is reduced to at most 64 token characters. They exist to attribute identity-less traffic that can only be routed by prompt hash. They are read from the inbound request and never added to the upstream request: upstream receives the client's own headers and body fields verbatim, with no pool diagnostic field.
 
 ### 6.3 Failover rules
 
