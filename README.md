@@ -1,272 +1,120 @@
 # Codex Pool Provider
 
-Dockerized, single-user Codex/ChatGPT account-pool service. The service exposes one OpenAI-compatible `/v1` endpoint to Codex clients, while internally routing requests across Codex accounts authenticated with ChatGPT device auth.
+A Dockerized, single-owner pool of Codex/ChatGPT accounts. Codex clients (CLI,
+Desktop, IDE extension) talk to the pool as if it were OpenAI's Codex backend;
+the pool places each conversation on one of its accounts and sends the request
+upstream exactly as a native Codex of the pinned release would.
 
-No runtime, package manager, test tool, or service dependency is installed on the host. Build, password hashing, testing, and execution all occur in Docker.
+- **Looks native upstream.** Requests leave through `codex-upstream`, a Rust
+  process built from Codex's own HTTP client crate, so TLS, HTTP/2, header order
+  and compression are those of a native Codex. A conformance harness measures
+  this before every deploy (see [Development](#development)).
+- **Keeps a conversation on one account.** A main agent and all its subagents
+  stay bound to one account, so the upstream prompt cache keeps working; it moves
+  only when that account can no longer serve.
+- **Spreads conversations across accounts.** New sessions prefer idle accounts,
+  weighted by remaining allowance and plan size, with extra weight on accounts
+  whose reset credits are about to expire.
+- **Docker only.** Nothing is installed on the host; build, tests and the
+  service all run in containers. All state lives in the `codex-pool-data`
+  volume at `/data`.
 
-## Build
+The full product contract is [SPEC.md](SPEC.md); repository rules are in
+[AGENTS.md](AGENTS.md).
 
-```bash
-docker build -t codex-pool:local .
+## Contents
+
+1. [Quick start](#quick-start)
+2. [Connecting Codex](#connecting-codex)
+3. [Accounts](#accounts)
+4. [Routing](#routing)
+5. [Dashboard](#dashboard)
+6. [How the pool talks upstream](#how-the-pool-talks-upstream)
+7. [Exposure and security](#exposure-and-security)
+8. [Configuration](#configuration)
+9. [Development](#development)
+
+## Quick start
+
+1. Build the image (the script stamps the git version into the dashboard footer,
+   e.g. `v2026.10.20-c722de9`, with `-dirty` for uncommitted changes):
+
+   ```bash
+   sh scripts/build-local-image.sh
+   ```
+
+2. Generate the admin password hash inside the image:
+
+   ```bash
+   docker run --rm -e CODEX_POOL_ADMIN_PASSWORD='choose-a-strong-password' \
+     codex-pool:local hash-password
+   ```
+
+3. Copy [.env.example](.env.example) to `.env` and set at least
+   `CODEX_POOL_API_KEY` (a long random client key) and
+   `CODEX_POOL_ADMIN_PASSWORD_HASH` (the `pbkdf2-sha256:...` value above).
+   Never commit `.env`.
+
+4. Create the volume once and deploy:
+
+   ```bash
+   docker volume create codex-pool-data
+   sh scripts/deploy.sh
+   ```
+
+   [compose.yaml](compose.yaml) publishes port `8317` and joins the
+   `edge_proxy` network, where an HTTPS reverse proxy (Caddy) reaches the pool as
+   `codex-pool:8317`; create that network or remove it if you have no proxy.
+
+5. Open the control page and add accounts (see [Accounts](#accounts)).
+
+| Path | What |
+|---|---|
+| `/` and `/admin` | Control page: public status, and management after password login |
+| `/k/<key>/backend-api/codex/` | Native Codex endpoint (recommended for Codex) |
+| `/v1` | OpenAI-compatible API for custom providers and other clients |
+| `/healthz` | Health check (needs the client key) |
+
+### Deploying updates
+
+`sh scripts/deploy.sh` builds the image, waits until no provider request is in
+flight, then recreates the container. If requests never pause it restarts after
+`CODEX_POOL_DEPLOY_IDLE_WAIT` seconds (default 600; `0` restarts at once) and
+relies on the shutdown drain, which lets in-flight requests finish for up to
+`CODEX_POOL_SHUTDOWN_GRACE` (default `120s`). Codex reconnects on its own after a
+restart. `--force` restarts a pool that predates in-flight tracking.
+
+## Connecting Codex
+
+### Native endpoint (recommended)
+
+Keep Codex's built-in OpenAI provider and your own ChatGPT login (`codex login`),
+and move only its base URL to the pool, with the pool's client key in the path:
+
+```toml
+# ~/.codex/config.toml (read by the Codex CLI, Desktop and IDE extension alike)
+openai_base_url = "https://<pool-host>/k/<pool-api-key>/backend-api/codex"
 ```
 
-Generate an admin password hash inside the image:
+Do not set `model_provider`, and use real model names (for example
+`model = "gpt-5.5"` with `model_reasoning_effort`). Codex then sends the pool
+exactly what it sends OpenAI, and the pool forwards it unchanged, replacing only
+the credential with the selected account's. Your own login is still used,
+directly with `chatgpt.com`, for the account, plugin and analytics calls a native
+Codex makes. Responses over HTTP and WebSocket, compaction, models, image
+generation and the other Codex backend paths are served; voice (realtime) is
+not. Details: SPEC.md 2.3.3.
 
-```bash
-docker run --rm \
-  -e CODEX_POOL_ADMIN_PASSWORD='choose-a-strong-password' \
-  codex-pool:local hash-password
-```
+Use HTTPS for this endpoint: Codex sends your ChatGPT login to the pool in
+`Authorization` (the pool drops it), and the key is in the URL, so no proxy in
+front of the pool may log `/k/` paths.
 
-Copy the emitted `pbkdf2-sha256:...` value into `CODEX_POOL_ADMIN_PASSWORD_HASH` below.
+### Custom provider (`/v1`)
 
-## Run
-
-```bash
-docker run -d \
-  --name codex-pool \
-  --restart unless-stopped \
-  -p <host-bind>:8317 \
-  -v codex-pool-data:/data \
-  -e CODEX_POOL_API_KEY='replace-with-a-long-random-client-key' \
-  -e CODEX_POOL_ADMIN_PASSWORD_HASH='pbkdf2-sha256:...' \
-  -e CODEX_POOL_DEFAULT_MODEL='gpt-6.1-sol(xhigh)' \
-  -e CODEX_POOL_ROUTING_STRATEGY='sticky_balanced' \
-  -e CODEX_POOL_SESSION_AFFINITY_TTL_MS=86400000 \
-  -e CODEX_POOL_ADDR='0.0.0.0:8317' \
-  -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
-  codex-pool:local
-```
-
-One HTTP listener serves both the provider and control surfaces. `CODEX_POOL_ALLOW_REMOTE_ADMIN=true` is required because a non-loopback bind makes `/admin` reachable everywhere `/v1` is reachable. Publish this HTTP service only on a trusted network; API keys, the admin password, and admin session cookies are not encrypted in transit.
-
-When upgrading from a split-port release, remove the `8318` port publication and
-`CODEX_POOL_ADMIN_ADDR`. Keep the client base URL on port `8317`; the control
-page has moved to that same port.
-
-All persistent configuration, sticky sessions, cooldowns, and account data are stored in the `codex-pool-data` Docker volume at `/data`.
-
-Open these paths after startup:
-
-```text
-Public API: http://<host>:<port>/v1
-Control UI: http://<host>:<port>/
-Admin UI:   http://<host>:<port>/admin
-Health:     http://<host>:<port>/healthz
-```
-
-The root and `/admin` serve the same control page on the unified port. Public mode is visible without a password; selecting `Access` unlocks management mode after password authentication. Provider endpoints under `/v1` and `/healthz` continue to require the configured API key.
-
-### Add Codex Accounts
-
-Open the control page, select `Access`, sign in, then select `Add account`. The UI does not ask for any account fields. It creates an independent Codex credential slot, keeps that slot disabled and out of the pool while device auth is in progress, and shows only the verification URL, user code, local copy controls for those two values, and a 15 minute countdown. After you complete the browser login, Pool prepares the sidecar auth record, refreshes quota/account metadata, then enables the slot and adds it to the pool. Subscription tier, upstream account ID, email, and organization are stored as credential metadata. They are shown as secondary status information, but the slot ID remains the primary identity used by routing and management. Do not select models during onboarding; model access is discovered from the authenticated Codex credential and Codex clients can request the model they want later.
-
-The container runs Codex CLI device auth with:
-
-```text
-CODEX_HOME=/data/accounts/<account-id>/.codex
-```
-
-The admin page shows the verification URL and user code. After you complete the browser login, Codex stores `auth.json` under the account's `/data/accounts/<account-id>/.codex` directory. Those credentials never belong in the Git repository or Docker image. Pool treats each completed device-auth credential as its own slot even when two slots report the same email address. Email, subscription tier, and organization fields are descriptive metadata only; they may be shown in the dashboard for recognition, but they are not used as local credential keys, routing keys, or storage paths.
-
-If a credential expires, use **Repair sign-in** on that existing row instead of
-removing and adding the account. Pool temporarily pauses new routing to the
-slot while Codex rewrites its credential, but keeps the slot and its existing
-route bindings intact. When the new credential reports the exact same upstream
-account ID, Pool preserves that slot's cache/affinity counters, reset baseline,
-sticky/thread/response bindings, and routing history. A different or missing
-upstream ID resets those identity-scoped values before the slot is used again;
-email and workspace display names are not trusted as identity substitutes.
-This can preserve the conditions for an upstream KV-cache hit, but Pool cannot
-copy or directly write the upstream KV cache.
-
-When an in-pool credential is invalid, the unauthenticated status page replaces
-**Leave pool** with **Repair** so a shared user can complete the device flow
-without the admin password. This public path is repair-only: it requires the
-final upstream account ID to exactly match the previously verified identity,
-returns only the verification link/code and redacted job status, and never
-exposes or adopts an admin-started login job. A different, missing, or legacy
-unverifiable identity remains blocked for the authenticated owner to resolve.
-
-The repair marker is persisted before Codex starts rewriting credentials. An
-unfinished, failed, or cancelled repair therefore remains out of routing after
-a service restart until the operator retries and completes it successfully.
-Pool also freezes the previously verified upstream account ID for the whole
-repair, so a partial write between `config.json` and runtime state cannot make
-old history appear to belong to newly written credentials.
-Requests already bound to that slot receive retryable HTTP `503` with code
-`account_authenticating` instead of silently failing over and losing affinity.
-Only one device-auth job runs at a time; reloading the admin page recovers its
-verification URL/code, and pool participation cannot be changed while repair
-is pending.
-
-### Codex Gateway
-
-By default Pool sends Codex device-auth inference straight to the Codex backend with the selected account's credential, the way a native Codex CLI signed in with ChatGPT does. It relays the headers Codex sends, forwards an unchanged request body byte for byte, refreshes the account token itself (once more on a `401`, then retrying the same account), and adds the `ChatGPT-Account-ID` and `X-Codex-Routing-Hint` headers a native Codex sends to that backend.
-
-The final hop is `codex-upstream`, a small loopback-only Rust process in the same container built from Codex's own HTTP client crate (Codex `rust-v0.163.0`, same locked dependency versions, musl, vendored OpenSSL), so the TLS handshake, HTTP/2 settings, header order and zstd request compression are those of a native Codex CLI. Pool keeps every routing, credential, and failover decision. To follow a newer Codex release, update the tag in `upstream/Cargo.toml`, reseed `upstream/Cargo.lock` from that release's `codex-rs/Cargo.lock`, and match its Rust toolchain in the Dockerfile.
-
-Codex can also use the Responses WebSocket through Pool, as it does with the Codex backend directly: set `supports_websockets = true` on the Codex model provider that points at Pool. Codex then uploads tools and instructions once and sends only new input per request, which is the cheapest path for upstream. Pool binds each socket to one account; if that account must change, Pool closes the socket and Codex reconnects and resends in full.
-
-`CODEX_POOL_CODEX_GATEWAY_MODE=sidecar` switches back to the pinned CLIProxyAPI binary bundled in the same container. It listens only on `127.0.0.1:8319`, is not published with Docker, and owns refreshes of its own copy of each credential under `/data/cliproxy/auths/<account-id>.json`. On startup either mode first adopts the other mode's credential when it is newer, so switching modes does not log accounts out. Do not edit either credential directory by hand. `CODEX_POOL_CLIPROXY_BASE_URL` and `CODEX_POOL_CLIPROXY_API_KEY` are internal test/compatibility overrides and should not be set in a normal `docker run` deployment.
-
-Quota is read from the authenticated Codex/ChatGPT backend after login and then
-refreshed every five minutes. The dashboard labels every reported base or
-additional window from its actual duration, shows independent percentages and
-reset times, flexible credits, spend control, explicit exhaustion reason,
-reset credits with the nearest available credit's expiry date, and
-server-derived telemetry freshness. Reset-credit details are cached for six
-hours while the count is unchanged so this display does not double the regular
-five-minute quota polling rate; an expiry less than seven days away is shown in
-bold alert red. Missing
-`used_percent` remains `Not reported`; one exhausted window never overwrites
-another window. API-key providers are labeled API-metered and do not receive
-ChatGPT subscription-window semantics. The optional
-`CODEX_POOL_CODEX_USAGE_URL` and
-`CODEX_POOL_CODEX_RESET_CREDITS_URL` overrides exist for tests or backend
-compatibility; normal deployments derive both `/wham/usage` and
-`/wham/rate-limit-reset-credits` from `CODEX_POOL_CODEX_BASE_URL`.
-
-Raw upstream plan, normalized plan family, Business seat, numeric multiplier,
-and quota policy are separate metadata. The pinned Codex account-check response
-does not establish a Standard/Premium seat field, so Business credentials show
-**Seat type: Not reported** instead of inferring a seat from plan/workspace
-name, ordering, or missing Premium data. Generic Pro is not assumed to be
-`20x`; only an exact reported `5x`, `10x`, or `20x` multiplier is displayed.
-
-### Subagent Routing and Prompt Cache Locality
-
-New main sessions use deterministic sticky balancing by default. Equal-priority
-healthy accounts receive different session keys statistically evenly, while
-concurrent first requests for the same key select the same account even before
-the first success persists the route. Existing sessions are never moved merely
-to equalize utilization. Set
-`CODEX_POOL_ROUTING_STRATEGY=sticky_failover` to restore the legacy behavior
-that sends new sessions to the highest-priority account until it becomes
-ineligible.
-
-For current Codex traffic, Pool extracts `thread_id`, `parent_thread_id`, lineage, and subagent fields from `client_metadata` (including `x-codex-turn-metadata`), recognized compatibility headers, and top-level fallbacks. A main thread, child, and sibling each receive an independent `<model>:thread:<thread-id>` sticky route. A bound `previous_response_id` takes precedence so each continuation remains on the account that produced that response even when client metadata changes between versions.
-
-The first request for a child softly prefers the eligible account currently bound to its parent. Quota, authentication, cooldown, duplicate-identity, model access, Pro preservation, and failover checks remain authoritative. Thread and response bindings use the normal sticky TTL and are pruned; nested children inherit the known lineage root without merging thread histories.
-
-Codex MultiAgent V2 owns history inheritance. Pool preserves the upstream `spawn_agent` schema and returned tool-call arguments, including `fork_turns=none`, a positive integer string, `all`, or an omitted value. Pool does not choose a fork mode, rewrite `fork_turns`, or merge parent and child histories.
-
-These identities are deliberately separate:
-
-```text
-Sticky account route = Codex thread_id
-Parent/child lineage = parent_thread_id + lineage_root_id
-History inheritance = fork_turns, executed by Codex
-Backend KV/prompt cache = upstream behavior for prompt_cache_key + prompt prefix
-```
-
-`CODEX_POOL_PROMPT_CACHE_KEY_POLICY=preserve|lineage|project|user` controls only the upstream key. `preserve` is the default and retains a client-provided Codex key. `lineage`, `project`, and `user` are explicit opt-ins that replace it with a deterministic hashed key split across `CODEX_POOL_PROMPT_CACHE_BUCKETS` buckets. They do not change sticky routing or child history.
-
-Under `preserve`, `CODEX_POOL_PROMPT_CACHE_KEY_MODE=auto|off|passthrough` and `CODEX_POOL_PROMPT_CACHE_KEY_SCOPE=auto|conversation|project|user` still govern missing-key injection for non-Codex or compatible clients. `auto` hashes the selected scope; raw project, session, and API-key values are not sent upstream. `CODEX_POOL_PROMPT_CACHE_RETENTION` defaults to `24h`; use `passthrough` to leave retention untouched or `in_memory` for the shorter upstream mode.
-
-The dashboard separates main and subagent cache observations. Its top cache
-summary focuses on **POOL**-observed request, cold-request, and lineage-failover
-counters plus actionable **CALC** rates derived from upstream usage:
-**Token read hit** is `cached_tokens / input_tokens`; **Request hit**
-is the share of usage-observed requests with non-zero cached tokens; and
-**Cold rate** is the share of cache-eligible requests (at least 1,024 input
-tokens) with zero cached tokens. An omitted upstream cache-write field is
-still retained as unavailable data internally, not interpreted as zero.
-
-Per-account main/subagent cells use one green treatment and no source badges.
-They show only the actionable `Read cached / input` row and its calculated
-ratio. Cache-write telemetry remains collected internally but is not displayed,
-because automatic prompt caching can work even when upstream reports zero write
-tokens. Request and cold counters remain available in the cell tooltip instead
-of crowding the table.
-Each account exposes one compact **Affinity/Fallback** Pool column as
-`hit/fallback`; per-account routing-failover totals are retained internally but
-not displayed. The **Reset window** control starts a fresh comparison window
-without deleting lifetime totals.
-
-The management-only **Recent routing & cache** panel correlates successful
-requests with their routing outcome: sticky reuse, a new route, parent
-affinity/fallback, or quota, rate-limit, authentication, transport, or
-repeated-5xx failover. The authenticated browser view shows the newest 50
-entries; the unauthenticated public dashboard receives no request-level traffic
-details. Runtime state retains at most 500 entries and drops entries older than
-24 hours. Raw request, response, thread, lineage, sticky, and prompt-cache
-identifiers are domain-separated hashes before persistence; authenticated
-browser responses omit local/upstream account IDs and use masked account labels.
-
-The default status page **Throughput** panel retains up to 48 hours as one
-10-minute-resolution correlation chart: output tokens/second versus prompt
-cache hit rate. After a restart or with limited history, the display automatically
-uses a 1-, 6-, 12-, 24-, or 48-hour window so real observations remain visible
-without changing their time spacing; point markers keep a single observation
-visible. A failover request is counted once even if it tries several accounts.
-The provider builds the chart from bounded one-minute in-memory aggregates; the
-series resets when the provider restarts and is never written to `runtime.json`.
-Output tokens/second uses upstream output usage divided by wall-clock time, so
-parallel sessions contribute to the same pool throughput. Prompt cache hit rate
-uses cached input divided by input on the identical time buckets, making
-correlation visible without implying causation. Historical token-flow,
-request-rate, and latency series are intentionally omitted to keep this view
-focused. Authenticated per-account rows retain a compact five-minute request
-rate, output throughput, and p95 latency; account attribution and request-level
-traffic details remain behind management authentication.
-
-### Duplicate Upstream Accounts
-
-Pool treats the local slot ID as the management identity, but routing also tracks the upstream ChatGPT/Codex account identity reported by device auth. Multiple local slots that point at the same upstream account are not counted as multiple same-request failover targets. One local slot represents that upstream identity at a time; duplicate slots are skipped inside the failed request so one revoked token, team-workspace policy issue, or shared quota window is not amplified as if it were separate backup accounts. For later requests, a healthy duplicate credential copy can become the representative when the old representative is out of quota, cooling down, or has a persisted auth/quota metadata error.
-
-The upstream identity is the workspace member, not the workspace: members of one Business or Team workspace share its account id but each hold their own allowance, so each member is a separate routing target, and one member's failure never excludes another. Only slots from the same login (same account id and email) are duplicates.
-
-### Preserve Pro Quota
-
-Use the `Use Pro last` switch in the admin Console to defer Pro accounts until no eligible non-Pro account is available. When this mode is enabled, a session that temporarily moved to Pro because other accounts were cooling down moves back to a non-Pro account once one becomes eligible again. Duplicate slots for the same upstream identity are still not immediate retry capacity, but the representative for that identity is chosen from healthy local credential copies with usable quota before Pro is selected. The switch is stored in `/data/config.json`; `CODEX_POOL_PRESERVE_PRO_QUOTA=true` only sets the initial default before the Console setting is saved.
-
-### Keep Subagents Together
-
-The `Keep subagents together` switch in the admin Console is on by default. A Codex main agent and every subagent it spawns (its lineage, across models) are then strictly bound to one account. When that account becomes unusable for any member, the whole lineage moves to one replacement that every lineage model can use, and the other members follow on their next request, accepting that the main agent's context is prefilled again on the new account. A thread never falls back to its own previous account, and a request that was still in flight on the old account cannot pull the lineage back. The binding still passes every normal eligibility, quota, cooldown, duplicate-identity, and `Use Pro last` check. Turn it off to restore the earlier behavior, where a subagent prefers its parent's account only on its first request and then keeps its own sticky route. The switch is stored in `/data/config.json`; `CODEX_POOL_LINEAGE_AFFINITY=false` only sets the initial default before the Console setting is saved.
-
-### Per-account Quota Protection
-
-Each Codex device-auth row has an optional local-slot threshold, disabled by
-default. When enabled, Pool protects an explicitly reported 5-hour window
-first, or an explicitly reported weekly window only when no 5-hour window
-exists. Remaining percentage at or below the configured threshold stops new
-routing to that slot. Missing, stale, timed-out, malformed, transport-failed,
-or upstream-`5xx` quota telemetry does not create a block; a previously
-confirmed violation remains only until an above-threshold observation or the
-observed reset time. This preserves the historical fail-open behavior that
-allows an exhausted non-Pro slot to fail over to a healthy Pro slot during a
-quota API outage. Duplicate local slots still share upstream capacity, so their
-different thresholds are not upstream-wide reservations.
-
-### Unified HTTP Exposure
-
-The provider API and control UI deliberately share one listener. For Docker or another non-loopback deployment, acknowledge that shared exposure with:
-
-```bash
--e CODEX_POOL_ADDR='0.0.0.0:8317' \
--e CODEX_POOL_ALLOW_REMOTE_ADMIN=true
-```
-
-There is no separate admin port to firewall. Anyone who can reach `/v1` can also reach the public control page and the admin login route, although owner-only APIs still require the signed admin session and CSRF token. Because the service does not terminate TLS, do not expose this HTTP listener to the Internet, public Wi-Fi, or another untrusted network.
-
-### Public Status And Protected Management
-
-`GET /` and `GET /admin` on the unified port open the control page. Unauthenticated public pool status and join/leave controls are enabled by default; set `CODEX_POOL_PUBLIC_DASHBOARD=false` only when the public control page should be hidden. The public JSON uses an opaque per-process account reference for this toggle, returns only a partially masked email for account recognition, and includes pool-wide rolling throughput. It never returns full email addresses, account IDs, upstream URLs, API keys, sticky sessions, per-account/request traffic details, quota error codes, or upstream error bodies.
-
-Each account row also has an optional 80-character owner note. The note is
-plain text, persisted with the local slot, and intentionally visible/editable
-on the unauthenticated page so shared users can label whose credential it is;
-do not put secrets in this field.
-
-Authenticate with the admin password to add accounts, remove accounts, repair
-device auth in the same slot, and inspect or clear sticky sessions. Provider,
-public control, and management routes all use the same port. The dashboard
-auto-refreshes every five minutes; use `Refresh` for an immediate status read.
-
-## Codex CLI
-
-Create `~/.codex/config.toml` on the machine running Codex:
+Without changing `openai_base_url`, Codex can use the pool as a custom provider.
+It works the same way, but Codex sends a custom provider a smaller request (no
+MCP resource tools or `image_gen`, no internal metadata), which the pool cannot
+restore:
 
 ```toml
 model = "gpt-6.1-sol(xhigh)"
@@ -274,150 +122,299 @@ model_provider = "codex-pool"
 
 [model_providers.codex-pool]
 name = "Codex Pool"
-base_url = "http://<api-host>:<api-port>/v1"
+base_url = "https://<pool-host>/v1"
 env_key = "CODEX_POOL_API_KEY"
 wire_api = "responses"
+supports_websockets = true   # optional: the Responses WebSocket, cheapest for upstream
 ```
 
-Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key passed to the service container. The checked-in [test config](test/codex-config.toml) uses the same provider contract and was verified with Codex CLI `0.163.0`.
+Set `CODEX_POOL_API_KEY` in Codex's environment to the pool's client key. Model
+aliases and a `(thinking-tier)` suffix are translated on this path. The checked-in
+[test config](test/codex-config.toml) is the same contract.
 
-### Native Codex endpoint (recommended for Codex)
+### Other clients
 
-A custom provider makes Codex send a reduced request (no MCP resource tools or `image_gen`, no internal metadata or guardian fields). To have Codex send the pool exactly what it sends OpenAI, keep the built-in OpenAI provider and your ChatGPT login (`codex login`) and move only its base URL, with the pool's client key in the path:
+`/v1` also serves `GET /v1/models`, `POST /v1/responses` (and `/compact`),
+`POST /v1/chat/completions` (translated to Responses) and image generation. The
+client key is accepted as a Bearer token, a raw `Authorization`, `X-Api-Key`,
+`X-Goog-Api-Key`, or the `key` / `auth_token` query parameters.
 
-```toml
-# ~/.codex/config.toml — used by the Codex CLI, Desktop and IDE extension alike
-openai_base_url = "https://<pool-host>/k/<pool-api-key>/backend-api/codex"
+## Accounts
+
+### Adding an account
+
+On the control page select **Access**, sign in, then **Add account**. The pool
+creates an empty credential slot, keeps it out of the pool, and runs Codex device
+auth inside the container (`CODEX_HOME=/data/accounts/<slot>/.codex`). The page
+shows only the verification URL, the user code and a 15-minute countdown. After
+you finish the browser login, the pool reads the account's plan, email and
+workspace from the credential, refreshes its quota, and adds it to the pool. No
+fields or models are entered by hand.
+
+Each slot is its own credential, even when two slots share an email. The plan,
+email and workspace are shown for recognition only; the slot ID is what
+management uses.
+
+### Repairing a sign-in
+
+When a credential expires, use **Repair sign-in** on the same row instead of
+removing the account. Routing to the slot pauses while Codex rewrites the
+credential; requests already bound to it get a retryable `503`
+`account_authenticating` rather than moving and losing their cache. If the new
+credential is the same upstream account, the slot keeps its bindings, counters and
+history; otherwise those are reset. A repair that does not finish keeps the slot
+out of routing, even across restarts.
+
+On the public page, an invalid in-pool credential shows **Repair** so a shared
+user can finish the device flow without the admin password. That path only
+accepts the same upstream account and never exposes an admin-started job. Only
+one device-auth job runs at a time.
+
+### Duplicates and workspace members
+
+Routing follows the upstream identity, which is the workspace **member**
+(workspace plus email): members of one Business or Team workspace each hold
+their own allowance and are separate targets. Several slots for the same login
+are one target: they never count as backup capacity for each other, and a
+healthy copy can stand in when the current one has failed.
+
+### Per-account protection and notes
+
+- **Quota protection** (off by default): stop new routing to a slot once its
+  reported 5-hour window (else weekly window) is at or below a threshold.
+  Missing or failed quota readings never block a slot.
+- **Owner note**: an 80-character plain-text label, visible and editable on the
+  public page so shared users can mark whose account it is. Never put secrets
+  in it.
+- **Join/Leave pool**: on the public page by default
+  (`CODEX_POOL_PUBLIC_DASHBOARD=false` hides it).
+
+## Routing
+
+### Placing a new conversation
+
+A new conversation goes to an **idle** account when there is one, chosen by a
+weighted rendezvous hash, so concurrent first requests for the same conversation
+agree. The weight is the remaining allowance (the tighter quota window) times the
+plan's multiplier. Only when every account is busy does it share one, with the
+weight divided by (1 + sessions on it)². An account with a reset credit that
+expires within seven days (the red outline on the dashboard) weighs 2× at seven
+days out, rising to 7× at expiry, so it is used first. The pool never spends a
+reset credit; that stays the account owner's decision.
+
+| Plan (as Codex names it) | Shown as | Multiplier |
+|---|---|---|
+| `prolite` | Pro 100 | 5× |
+| `pro` | Pro 200 | 10× (assumed; legacy 20× subscribers read low until 2026-10-29) |
+| `promax` | Pro 500 | 25× |
+| Business Premium seat | | `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` (default 5×, assumed) |
+| everything else | | 1× |
+
+A multiplier the account itself reports always wins over these assumptions, and
+the dashboard marks every reading that rests on an assumption.
+
+### Keeping a conversation together
+
+A Codex thread, every request continuing one of its responses, and, with
+**Keep subagents together** on (the default), its whole lineage of subagents are
+strictly bound to one account. When that account can no longer serve any member,
+the whole lineage moves to one replacement that serves all its models, and pays a
+full prefill there once. It never falls back to its previous account. Turning the
+switch off restores per-thread bindings where a subagent only prefers its
+parent's account on its first request.
+
+The pool reads thread, parent and lineage identity from Codex's
+`client_metadata` and headers. It never changes `spawn_agent` arguments or
+`fork_turns`; history inheritance belongs to Codex.
+
+### Use Pro last
+
+With **Use Pro last** on, accounts are spent in three tiers: ordinary accounts
+first, then Pro 100 (Pro Lite), then Pro 200 and Pro 500. A conversation that had
+to use a higher tier moves down as soon as a lower tier can serve it.
+`CODEX_POOL_PRESERVE_PRO_QUOTA` sets only the initial default; the switch is
+saved in `/data/config.json`.
+
+### When upstream refuses
+
+The pool keeps trying on the same account before it moves a conversation, as a
+native Codex (which has only one account) would:
+
+- **Overloaded** (`server_is_overloaded` and similar): retried on the same
+  account after 1 s, 2 s and 4 s.
+- **Unreachable** (a connection that fails or drops before an answer): retried on
+  the same account after 0.5 s and 1 s. A dropped WebSocket sets no cooldown, so
+  Codex's reconnect returns to the same account.
+- **Allowance spent, rate limit, revoked credential**: the account cools down and
+  the request moves at once.
+- **Every account refusing**: capacity retries wait and try again (up to
+  `CODEX_POOL_CAPACITY_RETRY_LIMIT` rounds) before the refusal reaches Codex.
+
+A streaming response is held until its first content, so a refusal before that is
+retried invisibly; anything after content is relayed as is. Failure classes
+follow Codex's own parsers; a failure the pool cannot classify is passed through
+and counted as **Unrecognized failures**.
+
+### Prompt cache key
+
+`CODEX_POOL_PROMPT_CACHE_KEY_POLICY=preserve` (default) keeps the key Codex
+sends. `lineage`, `project` and `user` replace it with a hashed, bucketed key.
+These settings never affect routing, and the native endpoint never rewrites
+anything.
+
+## Dashboard
+
+The control page refreshes every five minutes (**Refresh** reads at once).
+
+- **Accounts**: state (`Ready`, `Low quota`, `Protected`, `Exhausted`,
+  `Cooldown`, `Error`, `Login needed`, `Signing in`, `Duplicate`, `Disabled`,
+  `Standby`), every quota window with its own percentage and reset time, credits,
+  spend control, and reset credits with the nearest expiry (red within seven
+  days). Quota is read from `/wham/usage` every five minutes; a value upstream
+  does not report shows as `Not reported`.
+- **Cache**: main and subagent cache reads per account, token and request hit
+  rates, cold rate, and affinity/fallback counts. **Reset window** starts a new
+  comparison window without deleting totals.
+- **Recent routing & cache** (management only): the newest 50 requests with how
+  each was routed (sticky reuse, new route, lineage follow, or which kind of
+  failover) and which entry it came through (`native/http`, `native/ws`,
+  `v1/http`, `v1/ws`). Identifiers are stored as hashes; at most 500 entries,
+  24 hours.
+- **Throughput**: up to 48 hours of output tokens per second against prompt-cache
+  hit rate, kept in memory only.
+- **Unrecognized failures**: upstream failures the pool could not classify;
+  anything nonzero needs a look (also `class=unknown` in the log).
+
+The public view shows pool status and join/leave only, with masked emails; it
+never shows account IDs, keys, sessions or request-level details.
+
+## How the pool talks upstream
+
+By default (`CODEX_POOL_CODEX_GATEWAY_MODE=direct`) the pool sends each request
+to the Codex backend itself, with the selected account's credential, and adds
+only what a native Codex adds (`ChatGPT-Account-ID`, `X-Codex-Routing-Hint`). It
+refreshes the account's token five minutes before expiry, and once more on a
+`401` before treating the account as signed out.
+
+The last hop is `codex-upstream`, a loopback-only Rust process in the same
+container built from Codex's HTTP client crate at the pinned release
+(`rust-v0.163.0` in [upstream/Cargo.toml](upstream/Cargo.toml)). It opens one
+connection per request, as Codex does.
+
+The pool's own calls also go out the way Codex makes them. Token refresh, usage,
+account check and reset-credit reads use Codex's endpoints and header order, with
+the identity of the Codex that last used the account. A quota-window prime is one
+read-only turn of the bundled Codex CLI that holds no refresh token.
+
+`CODEX_POOL_CODEX_GATEWAY_MODE=sidecar` switches to the bundled CLIProxyAPI
+sidecar, which is kept only for rollback and is due to be removed (issue #32). It
+rewrites what Codex sends, so do not use it normally. Either mode adopts the
+other's newer credential on startup, so switching does not log accounts out.
+
+## Exposure and security
+
+- **One listener.** The provider API and the control page share port `8317`.
+  A non-loopback bind needs `CODEX_POOL_ALLOW_REMOTE_ADMIN=true`, acknowledging
+  that the admin login is reachable wherever `/v1` is. Owner APIs still need the
+  signed session and CSRF token.
+- **HTTPS.** The pool does not terminate TLS. For anything beyond a trusted LAN,
+  put it behind a TLS reverse proxy (`compose.yaml` joins Caddy's `edge_proxy`
+  network) and sign in to the admin page only over HTTPS. Set
+  `CODEX_POOL_TRUSTED_PROXIES` to the proxy's network so the login lockout counts
+  real clients; `X-Forwarded-For` is believed only from there.
+- **Credentials** live only in `/data/accounts/<slot>/.codex/auth.json` in the
+  volume, never in the repository or the image. Logs redact tokens and keys.
+
+## Configuration
+
+Everything is set in `.env`; [.env.example](.env.example) lists the usual
+settings and SPEC.md 2.1 lists them all. The ones most often changed:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CODEX_POOL_API_KEY` | (required) | Client key for `/v1`, `/healthz` and the native endpoint path |
+| `CODEX_POOL_ADMIN_PASSWORD_HASH` | (required) | Output of `hash-password` |
+| `CODEX_POOL_DEFAULT_MODEL` | `gpt-6.1-sol(xhigh)` | Model when a request names none |
+| `CODEX_POOL_TRUSTED_PROXIES` | none | Reverse proxy addresses/CIDRs |
+| `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | `86400000` | Idle time after which a conversation's binding expires |
+| `CODEX_POOL_ROUTING_STRATEGY` | `sticky_balanced` | `sticky_failover` restores strict priority order |
+| `CODEX_POOL_QUOTA_FLOOR_PERCENT` | `1` | Share of a window held back so overage is not billed to credits |
+| `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` | `5` | Assumed Business Premium seat size |
+| `CODEX_POOL_PRESERVE_PRO_QUOTA` | `false` | Initial **Use Pro last** setting |
+| `CODEX_POOL_LINEAGE_AFFINITY` | `true` | Initial **Keep subagents together** setting |
+| `CODEX_POOL_SHUTDOWN_GRACE` | `120s` | Drain time on stop (keep `stop_grace_period` above it) |
+
+### Data and logs
+
+```text
+/data/config.json                     accounts and Console settings
+/data/accounts/<slot>/.codex/         each account's Codex credential
+/data/state/runtime.json              bindings, cooldowns, health, quota, statistics
+/data/logs/service.log                the pool's log, kept across deploys
 ```
 
-Over the internet, put the pool behind HTTPS before using this: Codex sends your own ChatGPT login to the pool in `Authorization` (the pool drops it), and the key is in the URL. With a TLS reverse proxy such as Caddy (`compose.yaml` joins the pool to the `edge_proxy` network, so Caddy reaches it as `codex-pool:8317`; set `CODEX_POOL_TRUSTED_PROXIES` to the proxy's network):
+Docker's own log goes with the container on every deploy, so
+`/data/logs/service.log` is where to trace anything from before the last deploy.
+It rotates at 20 MiB, keeping three older files.
 
-```toml
-openai_base_url = "https://codex-api.example.com/k/<pool-api-key>/backend-api/codex"
-```
+## Development
 
-Do not set `model_provider`. The pool replaces your login's credential with the selected account's before anything goes upstream; your login is still used, directly with `chatgpt.com`, for the account, plugin and analytics calls a native Codex makes. Because the key is in the URL, make sure no reverse proxy in front of the pool logs `/k/` paths. Details: SPEC.md 2.3.3.
-
-## Implemented Surface
-
-- API-key authentication from Bearer, raw Authorization, `X-Goog-Api-Key`, `X-Api-Key`, `key`, and `auth_token`.
-- `GET /v1/models`, including Codex client model-list mode.
-- `POST /v1/responses` and `/v1/responses/compact`, with streaming passthrough
-  and terminal SSE classification. HTTP `200` streams ending in
-  `response.failed` or `response.incomplete` preserve reported usage but do not
-  refresh success, sticky/thread, or response-binding state. A bounded
-  lifecycle-only SSE preamble may fail over to a different upstream identity
-  when it ends in a capacity-class `response.failed` before any client-visible
-  byte; committed or semantically active streams are never retried.
-- `POST /v1/chat/completions`, including translation to a Responses upstream.
-- Model aliases and `(thinking-tier)` suffix translation.
-- Thread-aware sticky balancing and failover with idle TTL, soft parent-account affinity, independent prompt-cache-key policy, per-model cooldowns, optional Pro-quota preservation, response-id continuation binding, and JSON persistence in `/data`. New sessions distribute across equal-priority healthy accounts; when an upstream account returns `429` or repeated server errors, the request retries other configured accounts and successful failover rewrites the sticky binding.
-- Main/subagent cache-read, cache-write, request-hit, cold-start, affinity, and failover observability, a bounded and redacted 24-hour request correlation panel, a public 48-hour in-memory throughput/prompt-cache-hit time series, and management-only per-account throughput.
-- Direct Codex-backend gateway for device-auth requests, matching a native Codex CLI request, with an optional bundled loopback-only CLIProxyAPI sidecar mode.
-- Public pool participation toggles, strict same-identity repair for invalid in-pool credentials, and editable owner notes on `/admin`, plus authenticated owner controls for add/remove account, broader same-slot device-auth repair jobs, per-slot quota protection, and sticky-session inspection. Account states are explicitly labeled `Ready`, `Low quota`, `Protected`, `Exhausted`, `Cooldown`, `Error`, `Login needed`, `Signing in`, `Duplicate`, `Disabled`, or `Standby`.
-- Codex quota refresh from `/backend-api/wham/usage`, including duration-bearing primary/secondary/additional windows, credits, spend controls, reset credits, the separately cached nearest reset-credit expiry date, reached reason, raw/normalized plan metadata, freshness, sanitized quota errors, and five-minute dashboard refresh.
-
-Codex accounts are created through the admin UI/API as empty device-auth slots, staged out of the pool, then authenticated with device auth before they become routable. The UI does not ask for email, subscription tier, or model selection during onboarding; account metadata is read from the authenticated Codex token after login. A legacy provider API-key gateway path remains for testing and advanced OpenAI-compatible providers, but it is not the default runtime path.
-
-## Verification
-
-The implementation is tested only with Docker:
+All tooling runs in Docker.
 
 ```bash
-docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm \
-  /usr/local/go/bin/go test -v -p 1 -buildvcs=false ./...
-```
+# Go formatting, vet and tests (about four minutes)
+docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm sh -c \
+  'test -z "$(/usr/local/go/bin/gofmt -l ./cmd ./test)" && /usr/local/go/bin/go vet ./... && /usr/local/go/bin/go test -p 1 -buildvcs=false ./...'
 
-Run the Codex CLI/provider integration test with Docker as well:
+# The control page's JavaScript renderers
+sh scripts/test/render-web-assets.sh
 
-```bash
+# Integration tests: a real `codex exec` against a mock upstream
 sh scripts/test/integration-codex-config.sh
-sh scripts/test/integration-cliproxy-sidecar.sh
-sh scripts/test/integration-device-auth-failover.sh
+GATEWAY_MODE=direct sh scripts/test/integration-device-auth-failover.sh
 sh scripts/test/integration-codex-subagent.sh
 sh scripts/test/integration-routing-cache-observability.sh
+sh scripts/test/integration-cliproxy-sidecar.sh   # sidecar mode only
 ```
 
-That script builds the service and mock upstream images, starts them on an isolated Docker network, verifies public dashboard access, verifies protected management APIs, checks public API-key enforcement, then runs a real `codex exec` inside the service image with an ephemeral `CODEX_HOME/config.toml`. The test proves Codex can use:
+### Codex wire conformance
 
-```toml
-[model_providers.codex-pool]
-base_url = "http://codex-pool:8317/v1"
-env_key = "CODEX_POOL_API_KEY"
-wire_api = "responses"
-```
-
-The checked-in [test config](test/codex-config.toml) uses the same provider contract.
-
-`integration-cliproxy-sidecar.sh` starts the real bundled sidecar and verifies its isolated auth conversion plus loopback-only binding. `integration-device-auth-failover.sh` runs a real `codex exec` through the Pool sidecar adapter, forces the first device-auth account to return `429`, and verifies that the request completes through the second account with a persisted cooldown and sticky binding.
-
-`integration-codex-subagent.sh` runs a real Codex MultiAgent V2 session, forces the parent to fail over, returns a `spawn_agent` call from the mock model, and verifies the child's independent sticky binding, parent-account affinity, native cache key, response chain, lineage state, and metrics.
-
-`integration-routing-cache-observability.sh` uses isolated, non-live Docker
-image tags and a mock upstream to verify new-route, sticky-reuse, and
-rate-limit-failover correlation; read/write token observations; cold-eligible
-classification; bounded persisted diagnostics; and redaction of raw route and
-account identifiers. It deliberately never retags the live
-`codex-pool:local` image.
-
-### Codex Wire Conformance
-
-The pool must look like a native Codex of the pinned release in both directions (SPEC.md 2.3.2). Two scripts check it, both in Docker:
+The pool must behave like a native Codex of the pinned release in both
+directions (SPEC.md 2.3.2). Before any deploy that changes how it talks to
+upstream, both checks must pass; there is no CI.
 
 ```bash
 sh scripts/conformance/codex-conformance.sh check        # how the pool reads upstream, against Codex's source
-sh scripts/conformance/wire-capture.sh                   # what the pool sends upstream, against a native Codex
+sh scripts/conformance/wire-capture.sh                   # what the pool sends, against a native Codex
 sh scripts/conformance/codex-conformance.sh releases     # Codex releases newer than the pin
 sh scripts/conformance/codex-conformance.sh diff <tag>   # every change to the watched Codex files up to <tag>
 ```
 
-`check` verifies that every upstream shape in `cmd/codex-pool/testdata/codex-upstream-failures.json` still exists in the Codex source it was copied from, and that every error code Codex's parsers name has a shape there (the Go tests hold the pool's classification to those shapes). `wire-capture.sh` runs the same turn from the native Codex CLI and from Codex behind a pool built from the working tree, over HTTP and WebSocket and through the native endpoint, against a fake `chatgpt.com` on an internal network, and compares TLS ClientHello (JA4), HTTP/2 SETTINGS, connections per request, header order and values, and bodies. It also checks the pool's own calls (token refresh, usage, account check, reset credits) and a quota prime by the bundled Codex CLI. It fails on any difference the pool introduces. It also reports the client gap: Codex sends a custom provider (the pool) a smaller body than its own backend, which forwarding cannot repair (SPEC.md 2.3.2). Output lands in `scripts/conformance/out/` (git-ignored).
+- `check` confirms that every upstream shape in
+  `cmd/codex-pool/testdata/codex-upstream-failures.json` is still in the Codex
+  source it was copied from, and that every error code Codex parses has a shape
+  there.
+- `wire-capture.sh` runs the same turns from a native Codex CLI and through a pool
+  built from the working tree, against a fake `chatgpt.com` on an internal
+  network. It compares TLS (JA4), HTTP/2 settings, connections per request,
+  header order and values, and bodies. It covers HTTP, the WebSocket, the native
+  endpoint, a subagent, compaction and a failover between two accounts, plus the
+  pool's own calls and a quota prime. It also reports the custom-provider client
+  gap separately. Output goes to `scripts/conformance/out/` (git-ignored).
 
-In production, the dashboard's Unrecognized failures counter (and `class=unknown` in the log) shows any upstream failure the pool could not classify.
+Moving to a new Codex release is described in AGENTS.md.
 
-## Local Build
+### Committing
 
-Build local images through the repository script so the admin page version comes from git instead of a hand-edited HTML string:
-
-```bash
-sh scripts/build-local-image.sh
-```
-
-The script injects `CODEX_POOL_VERSION` and `CODEX_POOL_COMMIT` as Docker build args. The footer displays a git-derived version such as `v2026.06.25-222b57e`; dirty staged or unstaged changes append `-dirty`.
-
-## Deploy
-
-Deploy with the deploy script rather than a bare `docker compose up -d`:
-
-```bash
-sh scripts/deploy.sh
-```
-
-It builds the image, waits until no provider request is in flight, and only then recreates the container, so a deploy does not cut agents' open streams. If requests never pause it restarts after `CODEX_POOL_DEPLOY_IDLE_WAIT` seconds (default 600) and relies on the pool's shutdown drain, which lets in-flight requests finish for up to `CODEX_POOL_SHUTDOWN_GRACE` (default `120s`). `--force` restarts a running pool that predates in-flight tracking.
-
-## Commit Security
-
-Install the repository hook once:
+Install the hook once with `git config core.hooksPath .githooks`. Before each
+commit run the tests and the staged-change audit, review `git diff --cached`
+for credentials, then commit with the review acknowledgement:
 
 ```bash
-git config core.hooksPath .githooks
-```
-
-Before each commit, run the Docker-only test suite and the staged-change audit:
-
-```bash
-docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm \
-  /usr/local/go/bin/go test -v -p 1 -buildvcs=false ./...
-sh scripts/test/integration-codex-config.sh
-sh scripts/test/integration-cliproxy-sidecar.sh
-sh scripts/test/integration-device-auth-failover.sh
 sh scripts/security/precommit-security-audit.sh --check
-```
-
-The hook blocks credential/runtime-data paths, high-confidence API keys, session tokens, JWTs, and OAuth token values. It also requires an explicit review acknowledgement for every commit:
-
-```bash
 CODEX_ACCOUNT_SECURITY_REVIEWED=yes git commit -m "your message"
 ```
 
-Never stage `.codex/`, `auth.json`, `.env`, `/data`, account data, OAuth responses, provider keys, or generated config files. See [AGENTS.md](AGENTS.md) for the mandatory Codex account security review checklist.
+The hook blocks credential and runtime-data paths, API keys, session tokens, JWTs
+and OAuth values. Never stage `.codex/`, `auth.json`, `.env`, `/data`, account
+data, OAuth responses or provider keys. See AGENTS.md for the full checklist.
