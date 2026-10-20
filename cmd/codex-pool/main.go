@@ -483,6 +483,11 @@ type routingCacheEvent struct {
 	ClientUserAgent   string `json:"clientUserAgent,omitempty"`
 	ClientRequestKind string `json:"clientRequestKind,omitempty"`
 	ClientTurnState   string `json:"clientTurnState,omitempty"`
+	// ClientEntry is how the request reached the pool: "native" (the Codex
+	// backend's own paths, SPEC.md 2.3.3) or "v1", each over "http" or "ws".
+	// It tells a Codex on the native endpoint, which sends the full native
+	// request, from one on a custom provider, which sends a reduced one.
+	ClientEntry string `json:"clientEntry,omitempty"`
 }
 
 // throughputBucket is an in-memory aggregate used for the 48-hour chart and
@@ -6494,6 +6499,7 @@ func (a *app) appendRoutingCacheEventLocked(route routingDecision, model, accoun
 		ClientUserAgent:       route.Client.UserAgent,
 		ClientRequestKind:     route.Client.RequestKind,
 		ClientTurnState:       route.Client.TurnState,
+		ClientEntry:           route.Client.Entry,
 	}
 	a.pruneRoutingCacheEventsLocked(now)
 	a.state.RoutingCacheEvents = append(a.state.RoutingCacheEvents, event)
@@ -6900,6 +6906,8 @@ type clientFingerprint struct {
 	// TurnState is what the final attempt did with the client's
 	// X-Codex-Turn-State; it is set per attempt, not read from the request.
 	TurnState string
+	// Entry is "native/http", "native/ws", "v1/http" or "v1/ws".
+	Entry string
 }
 
 // clientFingerprintFrom keeps only short, low-cardinality labels: the
@@ -6914,10 +6922,20 @@ func clientFingerprintFrom(r *http.Request, payload map[string]any) clientFinger
 		clientMetadata := metadataObject(payload["client_metadata"])
 		requestKind = metadataString(metadataObject(firstMetadataValue(clientMetadata, "x-codex-turn-metadata", "x_codex_turn_metadata")), "request_kind")
 	}
+	entry := "v1"
+	if isNativeCodexRequest(r) {
+		entry = "native"
+	}
+	if isWebSocketUpgrade(r) {
+		entry += "/ws"
+	} else {
+		entry += "/http"
+	}
 	return clientFingerprint{
 		Originator:  telemetryLabel(r.Header.Get("Originator")),
 		UserAgent:   telemetryLabel(userAgent),
 		RequestKind: telemetryLabel(requestKind),
+		Entry:       entry,
 	}
 }
 
@@ -10615,7 +10633,7 @@ func (a *app) routingCacheEventViewsLocked(now time.Time) []map[string]any {
 			"cacheWriteTokens": event.CacheWriteTokens, "uncachedInputTokens": event.UncachedInputTokens,
 			"cacheReadRate": event.CacheReadRate, "cacheWriteRate": event.CacheWriteRate, "cacheReuseBalance": event.CacheReuseBalance,
 			"cacheHit": event.CacheHit, "coldCacheEligible": event.ColdCacheEligible,
-			"clientOriginator": event.ClientOriginator, "clientUserAgent": event.ClientUserAgent, "clientRequestKind": event.ClientRequestKind, "clientTurnState": event.ClientTurnState,
+			"clientOriginator": event.ClientOriginator, "clientUserAgent": event.ClientUserAgent, "clientRequestKind": event.ClientRequestKind, "clientTurnState": event.ClientTurnState, "clientEntry": event.ClientEntry,
 		})
 		// Browser APIs need a compact diagnostic view, not the full persisted
 		// rolling buffer. Keep this server-side limit even though the UI also

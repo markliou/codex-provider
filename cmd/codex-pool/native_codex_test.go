@@ -71,6 +71,10 @@ func TestNativeCodexEndpointSendsTheClientRequestWithThePoolAccount(t *testing.T
 	if recorder.Header().Get("X-Models-Etag") != "catalog-v2" {
 		t.Fatal("a native client refetches its catalog on a new X-Models-Etag, which must reach it")
 	}
+	// Local telemetry says the request came through the native endpoint.
+	if events := a.state.RoutingCacheEvents; len(events) == 0 || events[len(events)-1].ClientEntry != "native/http" {
+		t.Fatalf("routing event entry = %#v", events)
+	}
 	if gotPath != "/backend-api/codex/responses" {
 		t.Fatalf("upstream path = %q", gotPath)
 	}
@@ -151,6 +155,11 @@ func TestNativeCodexEndpointServesTheResponsesWebSocket(t *testing.T) {
 		t.Fatalf("native socket relayed %d events", len(events))
 	}
 	waitInFlightZero(t, a)
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if events := a.state.RoutingCacheEvents; len(events) == 0 || events[len(events)-1].ClientEntry != "native/ws" {
+		t.Fatalf("routing event entry = %#v", events)
+	}
 }
 
 // A native client's header the relay does not carry is reported by name,
