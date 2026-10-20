@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"regexp"
@@ -29,6 +30,16 @@ type codexShapeFixture struct {
 		Name  string          `json:"name"`
 		Event json.RawMessage `json:"event"`
 	} `json:"lifecycle"`
+}
+
+// compactJSON puts a fixture event on one line, as the backend sends an event.
+func compactJSON(t *testing.T, raw json.RawMessage) string {
+	t.Helper()
+	var buffer bytes.Buffer
+	if err := json.Compact(&buffer, raw); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.String()
 }
 
 func loadCodexShapeFixture(t *testing.T) codexShapeFixture {
@@ -64,6 +75,25 @@ func TestCodexShapeFixtureTracksThePinnedCodexRelease(t *testing.T) {
 	}
 }
 
+// One Codex release, named in three places: the crates codex-upstream is built
+// from, the CLI bundled for sign-in and priming, and the version the pool's own
+// calls present. The bundled CLI stayed at 0.141.0 while the rest moved to
+// 0.163.0, so sign-in traffic came from an older Codex than everything else.
+func TestBundledCodexMatchesThePinnedRelease(t *testing.T) {
+	fixture := loadCodexShapeFixture(t)
+	if want := "rust-v" + pinnedCodexVersion; fixture.CodexRelease != want {
+		t.Fatalf("pinnedCodexVersion %s does not match the pinned Codex tag %s", pinnedCodexVersion, fixture.CodexRelease)
+	}
+	dockerfile, err := os.ReadFile("../../Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	match := regexp.MustCompile(`ARG CODEX_CLI_VERSION=(\S+)`).FindSubmatch(dockerfile)
+	if match == nil || string(match[1]) != pinnedCodexVersion {
+		t.Fatalf("the Dockerfile bundles Codex %q, want %s", match, pinnedCodexVersion)
+	}
+}
+
 func TestCodexUpstreamShapesClassifyAsCodexReadsThem(t *testing.T) {
 	fixture := loadCodexShapeFixture(t)
 	if len(fixture.Failures) == 0 || len(fixture.Lifecycle) == 0 {
@@ -74,7 +104,7 @@ func TestCodexUpstreamShapesClassifyAsCodexReadsThem(t *testing.T) {
 			if shape.Source == "" || shape.Marker == "" {
 				t.Fatal("every shape must name the Codex source it was taken from")
 			}
-			info := responseInfoFromSSEBlock("data: " + string(shape.Event) + "\n\n")
+			info := responseInfoFromSSEBlock("data: " + compactJSON(t, shape.Event) + "\n\n")
 			if info.TerminalEvent == "" {
 				t.Fatalf("a failure Codex treats as terminal was not terminal: %s", shape.Event)
 			}
@@ -85,7 +115,7 @@ func TestCodexUpstreamShapesClassifyAsCodexReadsThem(t *testing.T) {
 	}
 	for _, shape := range fixture.Lifecycle {
 		t.Run("lifecycle "+shape.Name, func(t *testing.T) {
-			block := "data: " + string(shape.Event) + "\n\n"
+			block := "data: " + compactJSON(t, shape.Event) + "\n\n"
 			if info := responseInfoFromSSEBlock(block); info.TerminalEvent != "" {
 				t.Fatalf("lifecycle event read as terminal: %#v", info)
 			}
@@ -147,5 +177,20 @@ func TestUnrecognizedUpstreamFailuresAreCounted(t *testing.T) {
 	a.mu.RUnlock()
 	if got := window["unrecognizedFailureCount"].(uint64); got != 1 {
 		t.Fatalf("unrecognized failures = %d, want 1 (the unknown code, not the passthrough one)", got)
+	}
+}
+
+// The bundled CLI's device-auth prompt, recorded from Codex 0.163.0 against a
+// fake issuer (testdata/codex-device-auth-output.txt, ANSI colors included).
+// The pool reads the link and the one-time code out of it; a Codex release
+// that reformats the prompt must fail here, not in a sign-in.
+func TestDeviceAuthPromptOfThePinnedCodexParses(t *testing.T) {
+	raw, err := os.ReadFile("testdata/codex-device-auth-output.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, code := parseDeviceAuthPrompt(stripANSI(string(raw)))
+	if link != "https://auth.openai.com/codex/device" || code != "WXYZ-12345" {
+		t.Fatalf("parsed link %q code %q", link, code)
 	}
 }

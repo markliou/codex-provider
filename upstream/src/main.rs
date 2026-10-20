@@ -63,6 +63,12 @@ const UPSTREAM_URL: &str = "x-codex-upstream-url";
 // request gets a fresh client (see Transports::client).
 const UPSTREAM_IDENTITY: &str = "x-codex-upstream-identity";
 const UPSTREAM_COMPRESSION: &str = "x-codex-upstream-compression";
+// The wire order for a request that is not a Responses request: header names
+// before the body step, `|`, then names after it (for example
+// "user-agent,authorization,chatgpt-account-id|"). The pool's own backend
+// calls and passthrough paths have native orders of their own (captured from
+// a native Codex); the pool's HTTP hop cannot carry an order, so it names it.
+const UPSTREAM_HEADER_ORDER: &str = "x-codex-upstream-header-order";
 /// Set on a response this process generated itself because the upstream could
 /// not be reached, so the pool treats it as a transport failure rather than an
 /// upstream answer.
@@ -111,6 +117,7 @@ const NOT_FORWARDED: &[&str] = &[
     UPSTREAM_URL,
     UPSTREAM_IDENTITY,
     UPSTREAM_COMPRESSION,
+    UPSTREAM_HEADER_ORDER,
 ];
 
 /// Handshake header order of a native Codex 0.163.0 Responses WebSocket,
@@ -209,6 +216,25 @@ impl Transports {
     }
 }
 
+/// Splits the pool's headers by an explicit order (see UPSTREAM_HEADER_ORDER).
+/// Headers the order does not name are dropped: the pool names every header
+/// such a request carries, so anything else is not part of the native request.
+fn named_order_headers(incoming: &HeaderMap, order: &str) -> (HeaderMap, HeaderMap) {
+    let (first, second) = order.split_once('|').unwrap_or((order, ""));
+    let pick = |names: &str| {
+        let mut headers = HeaderMap::new();
+        for name in names.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+            let lower = name.to_ascii_lowercase();
+            if NOT_FORWARDED.contains(&lower.as_str()) {
+                continue;
+            }
+            copy_all(incoming, &lower, &mut headers);
+        }
+        headers
+    };
+    (pick(first), pick(second))
+}
+
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok()).map(str::trim).filter(|value| !value.is_empty())
 }
@@ -294,7 +320,10 @@ async fn forward(transports: Arc<Transports>, request: hyper::Request<Incoming>)
         Ok(collected) => collected.to_bytes(),
         Err(error) => return Ok(plain(StatusCode::BAD_REQUEST, None, format!("request body: {error}"))),
     };
-    let (before, after) = ordered_headers(&parts.headers);
+    let (before, after) = match header_str(&parts.headers, UPSTREAM_HEADER_ORDER) {
+        Some(order) => named_order_headers(&parts.headers, order),
+        None => ordered_headers(&parts.headers),
+    };
 
     let mut codex_request = CodexRequest::new(parts.method.clone(), url);
     codex_request.headers = before;

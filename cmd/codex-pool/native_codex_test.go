@@ -29,6 +29,7 @@ func TestNativeCodexEndpointSendsTheClientRequestWithThePoolAccount(t *testing.T
 		body, _ := io.ReadAll(r.Body)
 		gotBody = string(body)
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Models-Etag", "catalog-v2")
 		_, _ = w.Write([]byte(`{"id":"resp_native","object":"response","output":[]}`))
 	}))
 	defer upstream.Close()
@@ -62,8 +63,12 @@ func TestNativeCodexEndpointSendsTheClientRequestWithThePoolAccount(t *testing.T
 	if recorder := send("wrong-key"); recorder.Code != http.StatusUnauthorized || gotPath != "" {
 		t.Fatalf("a wrong path key must be refused before anything goes upstream: %d, upstream path %q", recorder.Code, gotPath)
 	}
-	if recorder := send("client-key"); recorder.Code != http.StatusOK {
+	recorder := send("client-key")
+	if recorder.Code != http.StatusOK {
 		t.Fatalf("native endpoint returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("X-Models-Etag") != "catalog-v2" {
+		t.Fatal("a native client refetches its catalog on a new X-Models-Etag, which must reach it")
 	}
 	if gotPath != "/backend-api/codex/responses" {
 		t.Fatalf("upstream path = %q", gotPath)

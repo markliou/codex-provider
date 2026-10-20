@@ -452,6 +452,7 @@ func (a *app) dialCodexWebSocket(ctx context.Context, candidate account, clientH
 }
 
 func (a *app) dialCodexWebSocketOnce(candidate account, clientHeaders http.Header, firstMessage []byte, auth codexAuthInfo) (*wsConn, *http.Response, error) {
+	a.noteClientAgent(candidate.ID, clientHeaders)
 	headers := http.Header{}
 	forwardCodexMetadataHeaders(headers, clientHeaders)
 	headers.Del("X-Codex-Turn-State")

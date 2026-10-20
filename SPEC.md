@@ -258,9 +258,11 @@ The service should warn when:
 
 The pool must be indistinguishable from a native Codex of the pinned release (the tag in `upstream/Cargo.toml`) in both directions, because that is what lets the backend serve pool traffic the way it serves Codex:
 
-- **Send.** What reaches upstream equals a native Codex for the same turn: every TLS ClientHello (JA4) and ALPN the pool sends is one Codex sends to that server, and the HTTP/2 SETTINGS, request order and protocol, header names, order and values, body encoding, and WebSocket handshake equal a native Codex's, apart from values minted per run. The body is the one Codex gave the pool, forwarded unchanged. `scripts/conformance/wire-capture.sh` measures all of this against the npm release of the pinned Codex and fails on any difference the pool introduces.
+- **Send.** What reaches upstream equals a native Codex for the same turn: every TLS ClientHello (JA4) and ALPN the pool sends is one Codex sends to that server, and the HTTP/2 SETTINGS, request order and protocol, header names, order and values, body encoding, and WebSocket handshake equal a native Codex's, apart from values minted per run. The body is the one Codex gave the pool, forwarded unchanged. `scripts/conformance/wire-capture.sh` measures all of this against the npm release of the pinned Codex and fails on any difference the pool introduces; it also runs the pool's own calls (a token refresh against a native Codex's refresh, usage, account check and reset credits against Codex's backend client) and a quota prime by the bundled CLI.
 - **Client gap.** Codex itself sends a custom provider — which is how Codex reaches the pool — a smaller body than it sends its own backend, and the capture reports that separately because forwarding cannot repair it. Measured at `rust-v0.163.0`: the custom-provider body lacks the MCP resource tools and `image_gen`, `client_metadata.mcp_attribution` and `client_metadata.guardian_credits_requested`, and `internal_chat_message_metadata_passthrough` on input items. Codex adds internal metadata only for an `https` base URL on `chatgpt.com` or `api.openai.com`, or for its built-in provider (`model-provider/src/provider.rs` `include_internal_metadata`, which cannot be set from configuration), and adds the guardian and Codex-backend fields only for its built-in `OpenAI` provider with ChatGPT auth, no bearer token, and a base URL ending in `/backend-api/codex` (`core/src/client.rs` `uses_codex_backend`, `model-provider-info` `supports_codex_backend_routes`). Closing the gap is a change to how Codex is pointed at the pool, not to forwarding; the native endpoint (2.3.3) is that change.
 - **Receive.** The pool reads upstream's answers as Codex reads them: the same terminal events, the same lifecycle (non-output) events, the same error codes, and an error's `error.type` and wrapped `status` where Codex uses them. The shapes are recorded in `cmd/codex-pool/testdata/codex-upstream-failures.json`, copied from Codex's own source and tests with the file and a verbatim marker for each; the Go tests hold the pool's classification to them, and `scripts/conformance/codex-conformance.sh check` verifies the markers still exist in Codex and that every code Codex's error parsers name has a shape. A fake upstream in a test answers only in shapes that file records.
+- **Own calls.** The pool's own upstream calls are the ones a native Codex makes for the same purpose, made the same way: through `codex-upstream`, to Codex's endpoint, with Codex's header set in Codex's order (captured from a native Codex; `codex-upstream` takes the order from `X-Codex-Upstream-Header-Order`, since the pool's hop cannot carry one). Token refresh is Codex's (`POST auth.openai.com/oauth/token`, sorted JSON body, `originator` and `User-Agent`); usage, reset-credit listing and redemption, and account metadata are Codex's backend client's (`/wham/usage`, `/wham/rate-limit-reset-credits[/consume]`, `/wham/accounts/check`; `User-Agent`, `Authorization`, `ChatGPT-Account-Id`, `X-OpenAI-Fedramp`). Each carries the agent (`User-Agent`, `originator`) of the Codex that last used that account, else the last Codex seen at all (persisted); only before any Codex has ever connected does the pool present an agent of its own making in the bundled CLI's shape. A quota prime is one ephemeral, read-only turn of the bundled Codex CLI against a temporary home holding the account's current access and ID tokens and no refresh token, so it can never rotate the pool's credential; the CLI gets a minimal environment, and without it the prime is skipped rather than composed by the pool. The bundled CLI is the pinned release, like `codex-upstream`.
+- **Known limits.** Two things still differ, and are recorded rather than hidden: a Responses WebSocket that reconnects within a turn on the same account carries no `x-codex-turn-state`, because the pool accepts the client's socket before it has chosen the account and so cannot hand Codex the upstream handshake's turn state; and the realtime (voice) WebSocket is not served on the native endpoint. The `x-oai-attestation` header the Codex Desktop may send is relayed, but its position in the header order has not been measured, because only the Desktop sends it. How often the pool makes its own calls (a quota sweep every five minutes, a prime per unanchored window) is the pool's own schedule; only their shape is Codex's.
 - **Policy.** Where the pool acts on an answer (retry, failover, cooldown, closing a socket), the Codex behavior it stands in for is cited next to the code. The pool may decide differently only where it has something Codex lacks — another account — and must say so there.
 
 The reason this is a contract: every production failure of this kind passed tests built on what the pool assumed instead of what Codex does. A usage limit sent as `error.type` read as unknown; a stream without `Content-Type` skipped the retry window; the backend's informational WebSocket events committed the socket. Each is now a recorded shape.
@@ -283,7 +285,7 @@ openai_base_url = "https://<pool-host>/k/<pool-api-key>/backend-api/codex"
 
 - **Paths.** `POST .../responses`, `POST .../responses/compact` and the Responses WebSocket (`GET .../responses`) run through the same routing as `/v1` (sticky sessions, lineage binding, failover, pre-commit retry). The other Codex-backend paths Codex calls on its provider base URL — `models`, `images/generations`, `images/edits`, `memories/trace_summarize`, `alpha/search`, `realtime/calls` — carry no conversation and are sent upstream with the credential of the account the pool would place a new session on for the default model, and answered as upstream answered (its `ETag`, never its cookies). Any other path under the prefix is `404`.
 - **Authentication.** Codex's built-in provider puts its own ChatGPT login in `Authorization` and its headers cannot be configured, so the pool API key travels in the path; Codex requires only that the base URL end in `/backend-api/codex`. A path key that is not a configured client API key is `401` before anything else happens. The client's own `Authorization` and `ChatGPT-Account-ID` are removed before any handler reads the request: they are never relayed, logged, or taken for a pool key, and upstream receives the selected account's credential and account id. `X-OpenAI-Account-Routing-Override`, which Codex derives from its own login's workspace routing, is never relayed on any path.
-- **Body.** A native Codex zstd-compresses its Responses requests; the pool decodes them (bounded like every request) and `codex-upstream` compresses again on the way out. The request is forwarded exactly as Codex wrote it: no model alias or thinking-tier rewrite, no hosted-tool filtering (a native Codex sends its `image_gen` namespace tool to its own backend), no prompt-cache rewrite, no re-encoding. Routing reads the model and the session from it as on `/v1`.
+- **Body.** A native Codex zstd-compresses its Responses requests; the pool decodes them (bounded like every request) and `codex-upstream` compresses again on the way out. The request is forwarded exactly as Codex wrote it: no model alias or thinking-tier rewrite, no hosted-tool filtering (a native Codex sends its `image_gen` namespace tool to its own backend), no prompt-cache rewrite, no re-encoding. Routing reads the model and the session from it as on `/v1`. Responses on this endpoint also carry upstream's `X-Models-Etag`, because Codex refetches its catalog when it changes and its catalog here is upstream's (on `/v1` the catalog is the pool's own and the header is withheld). The passthrough paths follow the conversation's account when the request names one (its lineage, else its thread's sticky account), so a native Codex's image, memory or search call for a conversation is made with that conversation's account.
 - **What stays with Codex.** Codex still calls `chatgpt.com` with its own login for account and workspace discovery, plugins, settings and analytics, as a native Codex does, without the pool; the local Codex must stay signed in. If the local login's workspace has a routing constraint (data residency), Codex moves its base URL to that backend and bypasses the pool; that is not supported.
 - **The key is in the URL.** The pool logs no request paths and must keep it that way; a reverse proxy in front of the pool must not log `/k/` paths either. `/v1` with the key in a header remains for every other client.
 - **Measured.** `wire-capture.sh` runs the same turn through this endpoint and fails unless what reaches upstream equals a native Codex outright, body included. Doing so first caught the hosted-tool filter and a TLS session resumption a native Codex never performs (codex-upstream now builds a WebSocket connector per connection, as Codex does).
@@ -1299,26 +1301,25 @@ For Codex OAuth accounts, query:
 GET https://chatgpt.com/backend-api/wham/usage
 ```
 
-Headers:
+Headers, in this order, as Codex's backend client sends them (section 2.3.2,
+own calls): `User-Agent` (a Codex agent), `Authorization: Bearer
+<access_token>`, `ChatGPT-Account-Id: <account-id-if-known>`, and
+`X-OpenAI-Fedramp` when the account is FedRAMP.
 
-```text
-Authorization: Bearer <access_token>
-Accept: application/json
-ChatGPT-Account-Id: <account-id-if-known>
-```
-
-Plan and organization metadata may be enriched from
-`/backend-api/accounts/check/v4-2023-04-27`, which returns every workspace the
-login may act as. One login can hold both a personal subscription and one or
-more Team/Business workspaces, so a record may only be applied to a credential
-slot when it is positively identified:
+Plan and organization metadata may be enriched from Codex's own account check,
+`GET /backend-api/wham/accounts/check` with the same headers, which returns
+every workspace the login may act as (a workspace's `name` is its organization
+name; a personal account carries none). The ChatGPT web app's
+`accounts/check/v4-2023-04-27` and `/subscriptions`, once read with a browser's
+headers, are not called: no native Codex calls them. One login can hold both a
+personal subscription and one or more Team/Business workspaces, so a record may
+only be applied to a credential slot when it is positively identified:
 
 - a record matching the slot's known upstream account ID is used;
 - otherwise, a response describing exactly one accessible workspace is used,
   including when it differs from the slot's previous ID, which the device-auth
   identity check treats as an upstream identity change (section 7);
-- otherwise the lookup reports nothing and the workspace-scoped
-  `/backend-api/subscriptions?account_id=<id>` response is used instead.
+- otherwise the lookup reports nothing.
 
 An arbitrary or default-ordered record must never be selected. Labeling a Team
 slot with the login's personal `Pro` entitlement is a visible defect, and the

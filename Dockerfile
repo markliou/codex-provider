@@ -32,7 +32,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM node:22-bookworm-slim AS codex-cli
 
-RUN npm install --global @openai/codex@0.141.0
+# The bundled Codex CLI signs accounts in and primes quota windows, so it is
+# the pinned Codex release, the same one codex-upstream is built from
+# (upstream/Cargo.toml) and pinnedCodexVersion names; a test keeps them equal.
+ARG CODEX_CLI_VERSION=0.163.0
+RUN npm install --global @openai/codex@${CODEX_CLI_VERSION}
 
 FROM eceasy/cli-proxy-api@sha256:b84deb08e59b061f664528deb3061660dda369891c47a3b6e373df7bb541da5d AS cliproxy
 

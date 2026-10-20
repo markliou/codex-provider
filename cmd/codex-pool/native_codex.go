@@ -47,9 +47,11 @@ func isNativeCodexRequest(r *http.Request) bool {
 
 // nativeCodexPassthroughPaths are the other Codex-backend paths Codex calls on
 // its provider base URL (codex-api/src/endpoint: models, images, memories,
-// search, realtime calls). They carry no conversation for the pool to route, so
-// they are sent upstream with one pool account's credential and answered as
-// upstream answered.
+// search, realtime calls). They are not conversation turns the pool routes,
+// but a native Codex makes them with the same login as the conversation they
+// belong to, so one that names its thread or session goes to the account that
+// conversation is on (see nativeCodexPassthroughAccount); only one that names
+// none, like the models catalog, takes the account a new session would.
 var nativeCodexPassthroughPaths = map[string]bool{
 	"models":                   true,
 	"images/generations":       true,
@@ -138,9 +140,7 @@ func (a *app) handleNativeCodexPassthrough(w http.ResponseWriter, r *http.Reques
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "request body is invalid or too large")
 		return
 	}
-	a.mu.RLock()
-	item, ok := a.preferredAccountLocked(a.config.DefaultModel, nil, time.Now().UTC())
-	a.mu.RUnlock()
+	item, ok := a.nativeCodexPassthroughAccount(r)
 	if !ok || !a.usesCodexBackendDirectly(item) {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "no_available_account", "no account can serve this request")
 		return
@@ -154,12 +154,18 @@ func (a *app) handleNativeCodexPassthrough(w http.ResponseWriter, r *http.Reques
 		writeOpenAIError(w, http.StatusServiceUnavailable, "account_auth_failed", "account credential is unavailable")
 		return
 	}
-	response, err := a.sendCodexBackend(r.Context(), item, auth, r.Method, target, body, r.Header)
+	// The catalog request has a native order of its own; the others share
+	// the Responses request's order, which codex-upstream applies by default.
+	order := ""
+	if rest == "models" {
+		order = codexModelsHeaderOrder
+	}
+	response, err := a.sendCodexBackend(r.Context(), item, auth, r.Method, target, order, body, r.Header)
 	// On 401 refresh once and retry the same account, as a native Codex does.
 	if err == nil && response.StatusCode == http.StatusUnauthorized {
 		_ = response.Body.Close()
 		if auth, err = a.refreshCodexAuthAfterRejection(r.Context(), item, auth.AccessToken); err == nil {
-			response, err = a.sendCodexBackend(r.Context(), item, auth, r.Method, target, body, r.Header)
+			response, err = a.sendCodexBackend(r.Context(), item, auth, r.Method, target, order, body, r.Header)
 		}
 	}
 	if err != nil {
@@ -176,10 +182,39 @@ func (a *app) handleNativeCodexPassthrough(w http.ResponseWriter, r *http.Reques
 	_, _ = io.Copy(w, response.Body)
 }
 
+// nativeCodexPassthroughAccount is the account a passthrough request belongs
+// on: the lineage's or the thread's when the request names a conversation and
+// that account can still serve, else the account a new session would take for
+// the default model. It only reads routing state; it never creates a binding
+// or a placement, since these requests are not turns.
+func (a *app) nativeCodexPassthroughAccount(r *http.Request) (account, bool) {
+	a.mu.RLock()
+	model := a.config.DefaultModel
+	a.mu.RUnlock()
+	route := a.routingDecision(r, map[string]any{}, model, requestAPIKey(r))
+	candidates := []string{route.LineageAccountID}
+	if route.Identity.ThreadID != "" || route.Identity.SessionID != "" {
+		candidates = append(candidates, a.stickySessionAccountID(route.StickyKey))
+	}
+	now := time.Now().UTC()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, id := range candidates {
+		if id == "" {
+			continue
+		}
+		if item := a.accountLocked(id); item != nil && a.usableLocked(*item, model, now) {
+			return *item, true
+		}
+	}
+	return a.preferredAccountLocked(model, nil, now)
+}
+
 // sendCodexBackend sends one non-conversation request to the Codex backend
 // with an account's credential, through codex-upstream when it runs, carrying
 // the client's Codex headers as forwardOnce does for a conversation.
-func (a *app) sendCodexBackend(ctx context.Context, item account, auth codexAuthInfo, method, target string, body []byte, inbound http.Header) (*http.Response, error) {
+func (a *app) sendCodexBackend(ctx context.Context, item account, auth codexAuthInfo, method, target, order string, body []byte, inbound http.Header) (*http.Response, error) {
+	a.noteClientAgent(item.ID, inbound)
 	viaTransport := a.codexTransportURL != ""
 	endpoint := target
 	if viaTransport {
@@ -212,6 +247,9 @@ func (a *app) sendCodexBackend(ctx context.Context, item account, auth codexAuth
 	if viaTransport {
 		req.Header.Set("X-Codex-Upstream-Url", target)
 		req.Header.Set("X-Codex-Upstream-Identity", item.ID)
+		if order != "" {
+			req.Header.Set("X-Codex-Upstream-Header-Order", order)
+		}
 	}
 	response, err := a.streamClient.Do(req)
 	if err != nil {

@@ -4,7 +4,8 @@
 // It fails when:
 //   - a watched Codex path no longer exists (follow the rename, update the list);
 //   - a fixture's marker is no longer in the Codex file it names (the shape
-//     moved or changed: re-copy it from Codex);
+//     moved or changed: re-copy it from Codex), including the assumptions the
+//     pool's own requests and the native endpoint rest on;
 //   - Codex's error parsers name a code the fixture does not cover (Codex
 //     learned a failure the pool would read as "unknown": classify it in
 //     terminalFailureClass and add its shape to the fixture).
@@ -26,7 +27,7 @@ for (const entry of watched) {
   if (!fs.existsSync(path.join(root, entry))) problems.push(`watched path is gone: ${entry}`);
 }
 
-for (const shape of [...fixture.failures, ...fixture.lifecycle]) {
+for (const shape of [...fixture.failures, ...fixture.lifecycle, ...(fixture.assumptions || [])]) {
   const file = path.join(root, shape.source);
   if (!fs.existsSync(file)) { problems.push(`${shape.name}: source file is gone: ${shape.source}`); continue; }
   if (!fs.readFileSync(file, "utf8").includes(shape.marker)) problems.push(`${shape.name}: marker no longer in ${shape.source}: ${shape.marker}`);
@@ -61,7 +62,7 @@ for (const [code, parser] of found) {
   if (!known.has(code) && !ignored.has(code)) problems.push(`Codex parses "${code}" (${parser}) but the fixture has no shape for it`);
 }
 
-console.log(`checked ${watched.length} watched paths, ${fixture.failures.length + fixture.lifecycle.length} shapes, ${found.size} codes Codex parses`);
+console.log(`checked ${watched.length} watched paths, ${fixture.failures.length + fixture.lifecycle.length} shapes, ${(fixture.assumptions || []).length} assumptions, ${found.size} codes Codex parses`);
 if (problems.length) {
   for (const problem of problems) console.log(`FAIL ${problem}`);
   process.exit(1);

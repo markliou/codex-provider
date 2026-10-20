@@ -4,6 +4,8 @@
 #   sh run-codex.sh pool-http <model>     Codex pointed at the pool over HTTP
 #   sh run-codex.sh pool-ws <model>       Codex pointed at the pool with
 #                                         supports_websockets = true
+#   sh run-codex.sh native-refresh <model> as native, with an access token about to
+#                                         expire, so Codex refreshes it first
 #   sh run-codex.sh native-pool <model>   Codex's built-in OpenAI provider with
 #                                         ChatGPT auth, its base URL moved to the
 #                                         pool's native endpoint (SPEC.md 2.3.3)
@@ -19,10 +21,14 @@ export CODEX_HOME=/tmp/codex-home PATH=/codex/codex-path:$PATH
 mkdir -p "$CODEX_HOME" /tmp/work
 cd /tmp/work
 case "$target" in
-  native|native-pool)
+  native|native-refresh|native-pool)
     cat /certs/ca.pem >> /etc/ssl/certs/ca-certificates.crt
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt CODEX_CA_CERTIFICATE=/certs/ca.pem
-    cp /harness/auth.json "$CODEX_HOME/auth.json"
+    if [ "$target" = native-refresh ]; then
+      cp /harness/auth-expiring.json "$CODEX_HOME/auth.json"
+    else
+      cp /harness/auth.json "$CODEX_HOME/auth.json"
+    fi
     cat > "$CODEX_HOME/config.toml" <<CFG
 model = "$model"
 model_reasoning_effort = "xhigh"

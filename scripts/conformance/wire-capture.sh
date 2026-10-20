@@ -71,7 +71,10 @@ docker run --rm -v "$work/certs:/c" alpine:3.21 sh -ceu '
   openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=chatgpt.com" 2>/dev/null
   openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out server.pem -days 2 -extfile san.cnf -extensions ext 2>/dev/null
   chmod 644 ./*'
-docker run --rm -v "$repo_root/scripts/conformance/harness:/h:ro" node:22-alpine node /h/mkauth.mjs > "$work/auth.json"
+for mode in current expiring; do
+  docker run --rm -v "$repo_root/scripts/conformance/harness:/h:ro" node:22-alpine node /h/mkauth.mjs "$mode" > "$work/auth-$mode.json"
+done
+cp "$work/auth-current.json" "$work/auth.json"
 cp scripts/conformance/harness/run-codex.sh "$work/run-codex.sh"
 
 echo "Building $image from the working tree"
@@ -82,34 +85,25 @@ docker volume create "$volume" >/dev/null
 docker run --rm -v "$volume:/data" -v "$work:/w:ro" alpine:3.21 sh -ceu "
   mkdir -p /data/accounts/conformance/.codex
   printf '%s' '{\"defaultModel\":\"$model\",\"modelAliases\":{},\"accounts\":[{\"id\":\"conformance\",\"authType\":\"codex_device_auth\",\"enabled\":true,\"inPool\":true,\"priority\":100}]}' > /data/config.json
-  cp /w/auth.json /data/accounts/conformance/.codex/auth.json
+  # About to expire, so the pool's first use of it is a token refresh.
+  cp /w/auth-expiring.json /data/accounts/conformance/.codex/auth.json
   chmod 700 /data/accounts/conformance/.codex
   chmod 600 /data/accounts/conformance/.codex/auth.json
   chown -R 999:999 /data"
-admin_hash=$(docker run --rm -e CODEX_POOL_ADMIN_PASSWORD="$ADMIN_PASSWORD" "$image" hash-password)
-# The prompt-cache passthrough settings mirror the production deployment, so
-# the pool forwards Codex's prompt_cache_key and retention as Codex sent them.
-docker run -d --name "$pool" --network "$net" --network-alias conformance-pool \
-  -v "$volume:/data" -v "$work/certs:/certs:ro" \
-  -e SSL_CERT_FILE=/certs/ca.pem -e CODEX_CA_CERTIFICATE=/certs/ca.pem \
-  -e CODEX_POOL_API_KEY="$CLIENT_KEY" -e CODEX_POOL_ADMIN_PASSWORD_HASH="$admin_hash" \
-  -e CODEX_POOL_ADDR=0.0.0.0:8317 -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
-  -e CODEX_POOL_PROMPT_CACHE_RETENTION="${CONFORMANCE_PROMPT_CACHE_RETENTION:-passthrough}" \
-  -e CODEX_POOL_PROMPT_CACHE_KEY_MODE="${CONFORMANCE_PROMPT_CACHE_KEY_MODE:-passthrough}" \
-  "$image" >/dev/null
-docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$pool" > "$work/pool-ip.txt"
 # The pool only serves once codex-upstream and the account load are up; a
 # Codex started before that spends its turn reconnecting and records nothing.
-if ! docker run --rm --network "$net" alpine:3.21 sh -c '
-  for i in $(seq 1 60); do wget -q -O /dev/null --header "Authorization: Bearer '"$CLIENT_KEY"'" http://conformance-pool:8317/healthz 2>/dev/null && exit 0; sleep 1; done; exit 1'; then
-  docker logs "$pool" 2>&1 | tail -20
-  echo "the pool did not become ready" >&2
-  exit 1
-fi
+wait_for_pool() {
+  if ! docker run --rm --network "$net" alpine:3.21 sh -c '
+    for i in $(seq 1 60); do wget -q -O /dev/null --header "Authorization: Bearer '"$CLIENT_KEY"'" http://conformance-pool:8317/healthz 2>/dev/null && exit 0; sleep 1; done; exit 1'; then
+    docker logs "$pool" 2>&1 | tail -20
+    echo "the pool did not become ready" >&2
+    exit 1
+  fi
+}
 
 start_fake() {
   docker rm -f "$fake" >/dev/null 2>&1 || true
-  docker run -d --name "$fake" --network "$net" -e REJECT_WS="$1" -e CAPTURE_LOG=/logs/capture.jsonl \
+  docker run -d --name "$fake" --network "$net" -e REJECT_WS="$1" -e PRIME_WINDOW="${PRIME_WINDOW:-0}" -e CAPTURE_LOG=/logs/capture.jsonl \
     --network-alias chatgpt.com --network-alias auth.openai.com --network-alias api.openai.com --network-alias ab.chatgpt.com \
     --network-alias conformance-direct \
     -v "$repo_root/scripts/conformance/harness:/srv:ro" -v "$work/certs:/certs:ro" -v "$work/logs:/logs" \
@@ -133,6 +127,40 @@ run_turn() {
     -e CONFORMANCE_CLIENT_KEY="$CLIENT_KEY" alpine:3.21 sh /harness/run-codex.sh "$1" "$model" > "$work/$2.codex.log" 2>&1 || true
   cp "$work/logs/capture.jsonl" "$work/$2.jsonl"
 }
+
+echo "Own calls: the pool starts (token refresh, usage, account check, reset credits), then a native Codex refreshes"
+start_fake 0 own
+: > "$work/logs/capture.jsonl"
+admin_hash=$(docker run --rm -e CODEX_POOL_ADMIN_PASSWORD="$ADMIN_PASSWORD" "$image" hash-password)
+# The prompt-cache passthrough settings mirror the production deployment, so
+# the pool forwards Codex's prompt_cache_key and retention as Codex sent them.
+docker run -d --name "$pool" --network "$net" --network-alias conformance-pool \
+  -v "$volume:/data" -v "$work/certs:/certs:ro" \
+  -e SSL_CERT_FILE=/certs/ca.pem -e CODEX_CA_CERTIFICATE=/certs/ca.pem \
+  -e CODEX_POOL_API_KEY="$CLIENT_KEY" -e CODEX_POOL_ADMIN_PASSWORD_HASH="$admin_hash" \
+  -e CODEX_POOL_ADDR=0.0.0.0:8317 -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
+  -e CODEX_POOL_PROMPT_CACHE_RETENTION="${CONFORMANCE_PROMPT_CACHE_RETENTION:-passthrough}" \
+  -e CODEX_POOL_PROMPT_CACHE_KEY_MODE="${CONFORMANCE_PROMPT_CACHE_KEY_MODE:-passthrough}" \
+  "$image" >/dev/null
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$pool" > "$work/pool-ip.txt"
+wait_for_pool
+# The pool's first quota sweep runs at start; give it time to finish.
+sleep 10
+docker run --rm --network "$net" -v "$work:/harness:ro" -v "$work/certs:/certs:ro" -v "$codex_vendor:/codex:ro" \
+  -e CONFORMANCE_CLIENT_KEY="$CLIENT_KEY" alpine:3.21 sh /harness/run-codex.sh native-refresh "$model" > "$work/native-own.codex.log" 2>&1 || true
+cp "$work/logs/capture.jsonl" "$work/own.jsonl"
+stop_fake own
+
+echo "Prime: the pool primes an unanchored window by running the bundled Codex CLI"
+PRIME_WINDOW=1 start_fake 0 prime
+: > "$work/logs/capture.jsonl"
+docker restart "$pool" >/dev/null
+wait_for_pool
+# The prime is one Codex turn; give it time to start, answer and exit.
+sleep 30
+cp "$work/logs/capture.jsonl" "$work/prime.jsonl"
+docker logs "$pool" 2>&1 | grep -i 'quota window prime' | tail -3 > "$work/prime.log" || true
+stop_fake prime
 
 echo "HTTP: native Codex, then Codex through the pool"
 start_fake 1 http

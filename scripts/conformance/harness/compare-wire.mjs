@@ -16,6 +16,10 @@
 //      custom provider a reduced body (SPEC.md 2.3.2). That is reported as the
 //      client gap, with every differing field, but it is Codex's doing and the
 //      pool cannot repair it by forwarding.
+//   4. The pool's own calls (token refresh, usage, account check, reset
+//      credits) must be the requests a native Codex makes for the same thing:
+//      the same header names in the same order, the same body, a Codex
+//      User-Agent, over a ClientHello Codex sends.
 //   3. The native endpoint (SPEC.md 2.3.3) exists to close that gap: Codex's
 //      built-in provider aimed at the pool. Through it the pool's upstream
 //      traffic must equal a native Codex's outright, body included; any
@@ -176,12 +180,14 @@ function compareWS() {
 // analytics on ab.chatgpt.com, its WebSocket attempts), some from another TLS
 // stack. Every ClientHello the pool sends must be one Codex sends to the same
 // server; the pool need not send every kind Codex does.
-function compareTLS(name) {
+// A phase with no native Codex in it (the prime) is held to the ClientHellos
+// native Codex sent in the other phases.
+function compareTLS(name, referenceNames = [name]) {
   const poolIP = read("pool-ip.txt").trim();
-  const lines = read(name).split("\n").filter(Boolean).map((line) => line.split("\t"));
-  const hello = (fromPool) => [...new Set(lines.filter(([ip]) => (ip === poolIP) === fromPool).map(([, server, ja4, alpn]) => `${server} ${ja4} alpn=${alpn || "-"}`))];
-  const codex = hello(false);
-  const pool = hello(true);
+  const parse = (file) => read(file).split("\n").filter(Boolean).map((line) => line.split("\t"));
+  const describe = (lines) => [...new Set(lines.map(([, server, ja4, alpn]) => `${server} ${ja4} alpn=${alpn || "-"}`))];
+  const codex = describe(referenceNames.flatMap(parse).filter(([ip]) => ip !== poolIP));
+  const pool = describe(parse(name).filter(([ip]) => ip === poolIP));
   if (!codex.length || !pool.length) { fail(`${name}: no ClientHello captured (codex ${codex.length}, pool ${pool.length})`); return; }
   const foreign = pool.filter((entry) => !codex.includes(entry));
   if (foreign.length) fail(`${name}: the pool sent a ClientHello Codex never sends: ${foreign.join(" | ")} (codex: ${codex.join(" | ")})`);
@@ -235,6 +241,77 @@ function compareConnections(nativeFile, poolFile) {
   else notes.push(`${poolFile}: ${shape(pool)}, as a native Codex`);
 }
 
+// The pool's own calls, from own.jsonl: the pool started against the fake
+// (refreshing its expiring credential, then reading usage, account check and
+// reset credits), then a native Codex with an expiring credential refreshed
+// it and ran a turn. Values that differ by design are the credential (the pool uses
+// the token it just refreshed) and the agent before any Codex has used the
+// pool (SPEC.md 2.3.2): only its shape is checked.
+function compareOwn() {
+  const poolIP = read("pool-ip.txt").trim();
+  const entries = load("own.jsonl").filter((entry) => entry.kind === "http-other");
+  const route = (entry) => `${entry.method} ${String(entry.path).split("?")[0]}`;
+  const order = (entry) => (entry.rawHeaderOrder || []).map((name) => name.toLowerCase()).filter((name) => !name.startsWith(":") && name !== "host" && name !== "content-length").join(" ");
+  const codexAgent = (value) => /^codex[a-z_-]*\/\d+\.\d+\.\d+ \(.+\)/i.test(String(value || ""));
+  const native = entries.filter((entry) => entry.from !== poolIP);
+  const pool = entries.filter((entry) => entry.from === poolIP);
+  if (!pool.length) { fail("own calls: the pool made no calls of its own during the capture"); return; }
+  const nativeRefresh = native.find((entry) => route(entry) === "POST /oauth/token");
+  const poolRefresh = pool.find((entry) => route(entry) === "POST /oauth/token");
+  if (!nativeRefresh) fail("own calls: the native Codex did not refresh its expiring credential");
+  if (!poolRefresh) fail("own calls: the pool did not refresh its expiring credential");
+  if (nativeRefresh && poolRefresh) {
+    if (order(nativeRefresh) !== order(poolRefresh)) fail(`own calls: token refresh header order differs\n    native: ${order(nativeRefresh)}\n    pool:   ${order(poolRefresh)}`);
+    for (const name of ["content-type", "accept"]) {
+      if (nativeRefresh.headers[name] !== poolRefresh.headers[name]) fail(`own calls: token refresh ${name} native=${nativeRefresh.headers[name]} pool=${poolRefresh.headers[name]}`);
+    }
+    if (!codexAgent(poolRefresh.headers["user-agent"]) || !poolRefresh.headers.originator) fail(`own calls: token refresh does not present a Codex agent: ${poolRefresh.headers["user-agent"]}`);
+    // Before any Codex has used the pool its agent is the pool's own, in the
+    // bundled CLI's shape; it must still have no conversation suffix.
+    if (/\) [^()]+ \([^()]*\)$/.test(String(poolRefresh.headers["user-agent"]))) fail(`own calls: token refresh carries a conversation User-Agent suffix: ${poolRefresh.headers["user-agent"]}`);
+    if (mask(nativeRefresh.rawBody) !== mask(poolRefresh.rawBody)) fail("own calls: token refresh body differs from a native Codex's");
+    else notes.push("own calls: token refresh equal to a native Codex's");
+  }
+  const reference = native.find((entry) => route(entry) === "GET /backend-api/wham/accounts/check");
+  if (!reference) { fail("own calls: no native account check to compare the pool's backend calls with"); return; }
+  for (const path of ["GET /backend-api/wham/usage", "GET /backend-api/wham/accounts/check", "GET /backend-api/wham/rate-limit-reset-credits"]) {
+    const call = pool.find((entry) => route(entry) === path);
+    if (!call) { fail(`own calls: the pool made no ${path}`); continue; }
+    if (order(call) !== order(reference)) fail(`own calls: ${path} header order differs from Codex's backend client\n    codex: ${order(reference)}\n    pool:  ${order(call)}`);
+    if (!codexAgent(call.headers["user-agent"])) fail(`own calls: ${path} does not present a Codex agent: ${call.headers["user-agent"]}`);
+    if (call.headers["chatgpt-account-id"] !== reference.headers["chatgpt-account-id"]) fail(`own calls: ${path} names another account`);
+    for (const browser of ["origin", "referer", "sec-fetch-mode", "x-openai-target-path", "oai-language"]) {
+      if (call.headers[browser]) fail(`own calls: ${path} carries the browser header ${browser}`);
+    }
+  }
+  const unexpected = pool.filter((entry) => !["POST /oauth/token", "GET /backend-api/wham/usage", "GET /backend-api/wham/accounts/check", "GET /backend-api/wham/rate-limit-reset-credits"].includes(route(entry)));
+  for (const entry of unexpected) fail(`own calls: the pool called ${route(entry)}, which this check does not know`);
+  notes.push(`own calls: ${pool.length} pool calls checked against Codex's`);
+}
+
+// A prime is one turn of the bundled Codex CLI in the pool's container, so its
+// Responses request must be a native Codex's: the pinned Codex's agent and the
+// header set and order a native Codex's socket or request carries.
+function comparePrime() {
+  const poolIP = read("pool-ip.txt").trim();
+  const entries = load("prime.jsonl").filter((entry) => entry.from === poolIP);
+  const turn = entries.find((entry) => entry.kind === "ws-handshake" || entry.kind === "http");
+  if (!turn) { fail(`prime: the pool's Codex sent no Responses request (pool log: ${read("prime.log").trim() || "nothing"})`); return; }
+  const agent = String(turn.headers["user-agent"] || "");
+  if (!/^codex_exec\/\d+\.\d+\.\d+ \(/.test(agent)) fail(`prime: the request does not carry the bundled Codex's agent: ${agent}`);
+  const native = load(turn.kind === "ws-handshake" ? "native-ws.jsonl" : "native-http.jsonl").find((entry) => entry.kind === turn.kind);
+  if (native) {
+    const names = (entry) => (entry.rawHeaderOrder || []).map((name) => name.toLowerCase()).join(" ");
+    if (names(native) !== names(turn)) fail(`prime: header order differs from a native Codex's\n    native: ${names(native)}\n    prime:  ${names(turn)}`);
+  }
+  if (entries.some((entry) => entry.kind === "http-other" && String(entry.path).split("?")[0] === "/oauth/token")) fail("prime: the prime's Codex tried to refresh the account's credential");
+  notes.push(`prime: ${turn.kind} from the bundled Codex (${agent.split(" ")[0]})`);
+}
+
+compareOwn();
+compareTLS("tls-own.txt");
+comparePrime();
+compareTLS("tls-prime.txt", ["tls-own.txt", "tls-http.txt", "tls-ws.txt"]);
 compareHTTP();
 compareWS();
 compareNativeEndpoint("http");

@@ -29,6 +29,11 @@ const connectionOf = (key) => {
 };
 const requestConnection = (req) => connectionOf((req.stream && req.stream.session) || req.socket);
 const record = (entry) => fs.appendFileSync(LOG, JSON.stringify({ t: new Date().toISOString(), ...entry }) + "\n");
+const remote = (req) => String((req.socket && req.socket.remoteAddress) || "").replace(/^::ffff:/, "");
+const b64 = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+// What a token refresh answers: a long-lived unsigned token for the same fake
+// identity mkauth.mjs writes.
+const refreshedToken = `${b64({ alg: "none", typ: "JWT" })}.${b64({ exp: 4102444800, iat: 1700000000, email: "capture@example.invalid", "https://api.openai.com/auth": { chatgpt_account_id: "acct-capture", chatgpt_plan_type: "pro", chatgpt_user_id: "user-capture" } })}.unsigned`;
 
 function pickTool(body) {
   const names = (body.tools || []).map((t) => t.name || t.type);
@@ -78,7 +83,7 @@ function wsSend(socket, text) {
 }
 
 function handleUpgrade(req, socket) {
-  record({ kind: "ws-handshake", conn: connectionOf(socket), method: req.method, path: req.url, headers: req.headers, rawHeaderOrder: req.rawHeaders.filter((_, i) => i % 2 === 0) });
+  record({ kind: "ws-handshake", from: remote(req), conn: connectionOf(socket), method: req.method, path: req.url, headers: req.headers, rawHeaderOrder: req.rawHeaders.filter((_, i) => i % 2 === 0) });
   if (process.env.REJECT_WS === "1") { socket.end("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"); return; }
   const accept = crypto.createHash("sha1").update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\nx-codex-turn-state: ts-ws\r\nopenai-model: fake\r\n\r\n`);
@@ -131,13 +136,21 @@ const server = http2.createSecureServer({ allowHTTP1: true, key: fs.readFileSync
     try { body = raw ? JSON.parse(raw) : null; } catch { body = { raw: raw.slice(0, 2000) }; }
     if (req.method === "POST" && /\/responses$/.test(req.url.split("?")[0])) {
       const { n, out } = events(body || {});
-      record({ kind: "http", conn: requestConnection(req), proto: req.httpVersion, method: req.method, path: req.url, n, headers: req.headers, rawHeaderOrder: req.rawHeaders.filter((_, i) => i % 2 === 0), encoding, wireBytes: Buffer.concat(chunks).length, body });
+      record({ kind: "http", from: remote(req), conn: requestConnection(req), proto: req.httpVersion, method: req.method, path: req.url, n, headers: req.headers, rawHeaderOrder: req.rawHeaders.filter((_, i) => i % 2 === 0), encoding, wireBytes: Buffer.concat(chunks).length, body });
       res.writeHead(200, { "content-type": "text/event-stream", "x-codex-turn-state": `ts-${n}`, "openai-model": (body && body.model) || "fake", "x-reasoning-included": "true" });
       for (const event of out) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
       res.end();
       return;
     }
-    record({ kind: "http-other", method: req.method, path: req.url, headers: req.headers, bodyKeys: body && typeof body === "object" ? Object.keys(body) : null });
+    record({ kind: "http-other", from: remote(req), method: req.method, path: req.url, headers: req.headers, rawHeaderOrder: req.rawHeaders.filter((_, i) => i % 2 === 0), rawBody: raw.length <= 4096 ? raw : null, bodyKeys: body && typeof body === "object" ? Object.keys(body) : null });
+    if (/\/oauth\/token$/.test(req.url.split("?")[0])) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ id_token: refreshedToken, access_token: refreshedToken, refresh_token: "<capture-placeholder>" })); return; }
+    // PRIME_WINDOW=1 reports a five-hour window that has just reset and not
+    // started counting, which the pool primes.
+    if (process.env.PRIME_WINDOW === "1" && /\/wham\/usage$/.test(req.url.split("?")[0])) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ plan_type: "pro", rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 0, limit_window_seconds: 18000, reset_after_seconds: 18000, reset_at: Math.floor(Date.now() / 1000) + 18000 } } })); return; }
+    // Otherwise anchored windows (used and with a reset time), so the pool has
+    // no window to prime while the capture runs.
+    if (/\/wham\/usage$/.test(req.url.split("?")[0])) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ plan_type: "pro", rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 10, limit_window_seconds: 18000, reset_after_seconds: 3600, reset_at: Math.floor(Date.now() / 1000) + 3600 }, secondary_window: { used_percent: 20, limit_window_seconds: 604800, reset_after_seconds: 86400, reset_at: Math.floor(Date.now() / 1000) + 86400 } }, rate_limit_reset_credits: { available_count: 1 } })); return; }
+    if (/\/wham\/rate-limit-reset-credits$/.test(req.url.split("?")[0])) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ credits: [] })); return; }
     if (/accounts\/check/.test(req.url)) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ accounts: [{ id: "acct-capture", plan_type: "pro", workspace_backend_origin: "NO_CONSTRAINT", account_routing_override: "NO_CONSTRAINT", structure: "personal" }], account_ordering: ["acct-capture"], default_account_id: "acct-capture" })); return; }
     if (/\/models/.test(req.url)) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ models: [] })); return; }
     res.writeHead(404, { "content-type": "application/json" });
