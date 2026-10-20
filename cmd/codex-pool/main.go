@@ -37,7 +37,6 @@ import (
 const (
 	listenAddressDefault      = ":8317"
 	codexBaseURLDefault       = "https://chatgpt.com/backend-api"
-	cliproxyBaseURLDefault    = "http://127.0.0.1:8319/v1"
 	codexRefreshURLDefault    = "https://auth.openai.com/oauth/token"
 	codexOAuthClientIDDefault = "app_EMoamEEZ73f0CkXaXp7hrann"
 	codexTokenRefreshWindow   = 5 * time.Minute
@@ -220,7 +219,7 @@ type account struct {
 	// they repeatedly classify missing auth under the global state lock.
 	PendingPoolActivation bool `json:"pendingPoolActivation,omitempty"`
 	// PendingAuthVerification is durable so a restart between auth.json rewrite
-	// and identity/sidecar finalization cannot make the slot routable. It is
+	// and identity finalization cannot make the slot routable. It is
 	// cleared only after the upstream account id has been checked and every
 	// required gateway/state write succeeds.
 	PendingAuthVerification bool `json:"pendingAuthVerification,omitempty"`
@@ -625,10 +624,6 @@ type app struct {
 	listenAddress        string
 	publicDashboard      bool
 	codexBaseURL         string
-	codexGatewayMode     string
-	cliproxyBaseURL      string
-	cliproxyAPIKey       string
-	gatewayModels        gatewayModelCache
 	jobs                 map[string]*loginJob
 	loginCancels         map[string]context.CancelFunc
 	loginFailures        map[string]loginFailure
@@ -732,8 +727,7 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	codexGatewayMode, err := codexGatewayModeFromEnv()
-	if err != nil {
+	if err := rejectRetiredGatewayMode(); err != nil {
 		return nil, err
 	}
 	promptCacheKeyMode, err := promptCacheKeyModeFromEnv()
@@ -800,10 +794,7 @@ func newAppFromEnv() (*app, error) {
 		listenAddress:        listenAddress,
 		publicDashboard:      publicDashboard,
 		codexBaseURL:         strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
-		codexGatewayMode:     codexGatewayMode,
-		cliproxyBaseURL:      strings.TrimRight(envOr("CODEX_POOL_CLIPROXY_BASE_URL", cliproxyBaseURLDefault), "/"),
 		codexTransportURL:    strings.TrimRight(strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_TRANSPORT_URL")), "/"),
-		cliproxyAPIKey:       strings.TrimSpace(os.Getenv("CODEX_POOL_CLIPROXY_API_KEY")),
 		jobs:                 map[string]*loginJob{},
 		loginCancels:         map[string]context.CancelFunc{},
 		loginFailures:        map[string]loginFailure{},
@@ -833,7 +824,7 @@ func defaultHTTPClient() *http.Client {
 		return &http.Client{Timeout: 5 * time.Minute}
 	}
 	transport := base.Clone()
-	// Bound first-byte wait per selected account so one stalled sidecar/upstream
+	// Bound first-byte wait per selected account so one stalled upstream
 	// cannot hold routing for minutes before Pool can fail over or return.
 	transport.ResponseHeaderTimeout = upstreamFirstByteTimeout
 	return &http.Client{Timeout: 5 * time.Minute, Transport: transport}
@@ -955,10 +946,6 @@ func (a *app) load() error {
 		if !isCodexDeviceAuth(account) {
 			continue
 		}
-		a.reconcileCodexCredential(account)
-		if a.codexGatewayMode != "direct" {
-			_ = a.syncCliproxyAuth(account, false)
-		}
 	}
 	if len(a.config.Accounts) == 0 && os.Getenv("CODEX_POOL_UPSTREAM_BASE_URL") != "" {
 		now := time.Now().UTC()
@@ -1018,7 +1005,7 @@ func (a *app) serve() error {
 // stream, and remote Codex clients reported those as error responses. On stop
 // the listener closes, so no new request starts here, and in-flight requests,
 // streams included, run to completion for up to the shutdown grace before the
-// process exits. The supervisor stops the sidecar only after this returns,
+// process exits. The supervisor stops codex-upstream only after this returns,
 // because those streams still flow through it. Do not replace this with a bare
 // Serve: the drain is the point.
 func (a *app) serveUntilStopped(ctx context.Context, listener net.Listener, handler http.Handler) error {
@@ -1227,10 +1214,9 @@ func (a *app) quotaPrimeModelLocked(item account) string {
 //
 // Skipping the handler is not the same as skipping the account's transport. The
 // request still goes out over whatever upstream path that slot normally uses,
-// including the cliproxy sidecar when the gateway mode selects it. Reaching past
-// the sidecar to the direct endpoint would authenticate differently and would
-// not exercise or charge the identity the slot actually routes as, which is the
-// very thing this request exists to spend.
+// the account's own credential. Reaching it some other way would not exercise
+// or charge the identity the slot actually routes as, which is the very thing
+// this request exists to spend.
 func (a *app) primeUnanchoredQuotaWindow(ctx context.Context, accountID string, snapshot quotaSnapshot) {
 	now := time.Now().UTC()
 	a.mu.Lock()
@@ -1294,8 +1280,8 @@ func (a *app) primeUnanchoredQuotaWindow(ctx context.Context, accountID string, 
 func (a *app) sendQuotaPrimeRequest(ctx context.Context, candidate account, model string) error {
 	// A Codex account is primed by Codex itself, so upstream sees a native
 	// Codex request rather than one the pool composed (codex_prime.go). The
-	// composed request below remains only for API-key providers and the
-	// legacy sidecar, neither of which is a Codex backend client.
+	// composed request below remains only for API-key providers, which are
+	// not Codex backend clients.
 	if a.usesCodexBackendDirectly(candidate) {
 		return a.primeWithCodexCLI(ctx, candidate, model)
 	}
@@ -1687,12 +1673,9 @@ func (a *app) codexModelCatalogLocked(models []string) []codexModelInfo {
 }
 
 func (a *app) handleModels(w http.ResponseWriter, r *http.Request) {
-	// Resolved before the state lock: this can reach the gateway over the network,
-	// and no network call belongs under that lock.
-	routable := a.gatewayRoutableModels(r.Context())
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	models := a.modelsLocked(routable)
+	models := a.modelsLocked()
 	if r.URL.Query().Get("client_version") != "" {
 		// Codex decodes this endpoint with its remote-model schema, not the loose
 		// OpenAI model-list shape below. Keep reasoning effort as structured model
@@ -2126,9 +2109,7 @@ func requestOperationalID(r *http.Request) string {
 
 func (a *app) prepareUpstreamRequest(candidate account, body []byte, chat bool) (string, []byte, bool, error) {
 	base := strings.TrimRight(candidate.UpstreamBaseURL, "/")
-	if a.usesCliproxySidecar(candidate) {
-		base = a.cliproxyBaseURL
-	} else if base == "" && isCodexDeviceAuth(candidate) {
+	if base == "" && isCodexDeviceAuth(candidate) {
 		base = a.codexResponsesBaseURL()
 	}
 	if base == "" {
@@ -2172,13 +2153,6 @@ func (a *app) prepareUpstreamRequest(candidate account, body []byte, chat bool) 
 		endpoint = base + "/responses"
 		outbound = converted
 		convertResponse = true
-	}
-	if a.usesCliproxySidecar(candidate) {
-		var err error
-		outbound, err = withCliproxyAccountModel(outbound, candidate.ID)
-		if err != nil {
-			return "", nil, false, err
-		}
 	}
 	return endpoint, outbound, convertResponse, nil
 }
@@ -2251,7 +2225,7 @@ func relayedCodexRequestHeader(name string) bool {
 // usesCodexBackendDirectly reports whether the pool itself talks to the Codex
 // backend with the account's ChatGPT credential, as a native Codex CLI does.
 func (a *app) usesCodexBackendDirectly(candidate account) bool {
-	return isCodexDeviceAuth(candidate) && !a.usesCliproxySidecar(candidate) && candidate.UpstreamAPIKey == ""
+	return isCodexDeviceAuth(candidate) && candidate.UpstreamAPIKey == ""
 }
 
 func (a *app) forward(ctx context.Context, candidate account, endpoint string, body []byte, inbound http.Header) (*http.Response, error) {
@@ -2322,15 +2296,7 @@ func (a *app) forwardOnce(ctx context.Context, candidate account, endpoint strin
 		req.Header.Set("Accept", accept)
 	}
 	forwardCodexMetadataHeaders(req.Header, inbound)
-	if a.usesCliproxySidecar(candidate) {
-		if err := a.syncCliproxyAuth(candidate, false); err != nil {
-			return nil, err
-		}
-		if a.cliproxyAPIKey == "" {
-			return nil, errors.New("cliproxy sidecar API key is unavailable")
-		}
-		req.Header.Set("Authorization", "Bearer "+a.cliproxyAPIKey)
-	} else if candidate.UpstreamAPIKey != "" {
+	if candidate.UpstreamAPIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+candidate.UpstreamAPIKey)
 	} else if a.usesCodexBackendDirectly(candidate) {
 		if auth.AccountID == "" {
@@ -2409,7 +2375,7 @@ var codexBackendUnsupportedFields = []string{
 // the closest one it accepts, and reports whether the client asked for a
 // non-streaming answer that has to be assembled from the stream. The Codex
 // backend only streams, only accepts store=false and list input, and has no
-// system role. The sidecar used to rewrite every request this way; here a
+// system role. The retired sidecar rewrote every request this way; here a
 // request that already has that shape, which is every request a native Codex
 // sends, is returned byte for byte, so only foreign requests are changed and
 // Codex requests stay native. The compact endpoint is not a Responses stream
@@ -2646,113 +2612,12 @@ func markAccountAuthError(err error) error {
 	return fmt.Errorf("%w: %w", errAccountAuthFailed, err)
 }
 
-// gatewayModelCache holds the model names the local gateway can route. It has
-// its own lock because the catalog is read while the state lock is held, and a
-// network call must never happen under that lock.
-type gatewayModelCache struct {
-	mu        sync.Mutex
-	models    map[string]bool
-	refreshed time.Time
-}
-
-const gatewayModelCacheTTL = 5 * time.Minute
-
-// gatewayRoutableModels reports the models the sidecar has a provider for, so
-// the advertised catalog can exclude what it cannot route. The two lists drift:
-// this pool's lineup is compiled in, while the gateway's comes from its own
-// model catalog, and a model in one but not the other is how a client came to
-// pick a model whose every request died at the gateway.
-//
-// A nil result means "do not filter". Losing the gateway must never empty this
-// pool's catalog: a client with no models at all is worse off than one that can
-// still pick something routable.
-func (a *app) gatewayRoutableModels(ctx context.Context) map[string]bool {
-	if a.codexGatewayMode == "direct" || a.cliproxyBaseURL == "" {
-		return nil
-	}
-	a.gatewayModels.mu.Lock()
-	defer a.gatewayModels.mu.Unlock()
-	if a.gatewayModels.models != nil && time.Since(a.gatewayModels.refreshed) < gatewayModelCacheTTL {
-		return a.gatewayModels.models
-	}
-	models := a.fetchGatewayModels(ctx)
-	if len(models) == 0 {
-		return a.gatewayModels.models
-	}
-	a.gatewayModels.models = models
-	a.gatewayModels.refreshed = time.Now()
-	return models
-}
-
-func (a *app) fetchGatewayModels(ctx context.Context) map[string]bool {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cliproxyBaseURL+"/models", nil)
-	if err != nil {
-		return nil
-	}
-	request.Header.Set("Accept", "application/json")
-	if a.cliproxyAPIKey != "" {
-		request.Header.Set("Authorization", "Bearer "+a.cliproxyAPIKey)
-	}
-	response, err := a.client.Do(request)
-	if err != nil {
-		return nil
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil
-	}
-	var decoded struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, maxRequestBody)).Decode(&decoded); err != nil {
-		return nil
-	}
-	models := map[string]bool{}
-	for _, item := range decoded.Data {
-		// The gateway registers one entry per account as "<account prefix>/<model>".
-		// Only the model half is comparable with this pool's catalog.
-		id := item.ID
-		if index := strings.LastIndex(id, "/"); index >= 0 {
-			id = id[index+1:]
-		}
-		if id != "" {
-			models[id] = true
-		}
-	}
-	return models
-}
-
 // codexResponsesBaseURL is where a native Codex CLI signed in with ChatGPT
 // sends Responses requests: the Codex backend under /codex. The bare
 // backend-api root is only for quota, account, and subscription endpoints, and
 // sending inference there instead reaches a different API.
 func (a *app) codexResponsesBaseURL() string {
 	return strings.TrimRight(a.codexBaseURL, "/") + "/codex"
-}
-
-func (a *app) usesCliproxySidecar(item account) bool {
-	return isCodexDeviceAuth(item) && a.codexGatewayMode != "direct"
-}
-
-func cliproxyAccountPrefix(accountID string) string {
-	return "codex-pool-" + accountID
-}
-
-func withCliproxyAccountModel(body []byte, accountID string) ([]byte, error) {
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, err
-	}
-	model, _ := payload["model"].(string)
-	if strings.TrimSpace(model) == "" {
-		return nil, errors.New("request model is required for cliproxy sidecar")
-	}
-	payload["model"] = cliproxyAccountPrefix(accountID) + "/" + model
-	return json.Marshal(payload)
 }
 
 type promptCacheUsage struct {
@@ -4311,7 +4176,7 @@ func (a *app) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		input.CodexHome = a.accountCodexHome(input.ID)
 		if input.Enabled || input.InPool {
 			// A device-auth slot is not routable until Codex CLI has written
-			// auth.json and the sidecar/quota state has been prepared. Stage new
+			// auth.json and the quota state has been prepared. Stage new
 			// slots even when callers request immediate pool membership; otherwise
 			// empty auth directories can stall dashboard and routing lock paths.
 			input.PendingPoolActivation = input.Enabled && input.InPool
@@ -4634,10 +4499,6 @@ func (a *app) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 					writeOpenAIError(w, 500, "storage_error", "unable to purge account credentials")
 					return
 				}
-				if err := os.Remove(a.cliproxyAuthPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
-					writeOpenAIError(w, 500, "storage_error", "unable to purge account gateway credentials")
-					return
-				}
 			}
 			a.config.Accounts = append(a.config.Accounts[:i], a.config.Accounts[i+1:]...)
 			a.clearAccountIdentityScopedStateLocked(id)
@@ -4853,13 +4714,9 @@ func (a *app) validSession(token string) bool {
 	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
 }
 
-// modelsLocked builds the advertised catalog. routable, when non-empty, is what
-// the gateway can actually serve: the compiled-in lineup is filtered against it
-// so a client cannot pick a model whose every request would die at the gateway.
-// Only that lineup is filtered. The configured default model, per-account
-// allowedModels and aliases are operator statements about this deployment, and
-// silently dropping one would hide a misconfiguration instead of reporting it.
-func (a *app) modelsLocked(routable map[string]bool) []string {
+// modelsLocked builds the advertised catalog: the compiled-in lineup, the
+// configured default model, per-account allowedModels and aliases.
+func (a *app) modelsLocked() []string {
 	set := map[string]bool{a.config.DefaultModel: true}
 	if base, _ := parseModel(a.config.DefaultModel); base != "" {
 		set[base] = true
@@ -4868,9 +4725,6 @@ func (a *app) modelsLocked(routable map[string]bool) []string {
 		}
 	}
 	for _, slug := range defaultCodexModelSlugs {
-		if len(routable) > 0 && !routable[slug] {
-			continue
-		}
 		set[slug] = true
 	}
 	for _, account := range a.config.Accounts {
@@ -5641,7 +5495,7 @@ func (a *app) usableLocked(item account, model string, now time.Time) bool {
 	if !item.Enabled || !item.InPool || !allowedModel(item, model) {
 		return false
 	}
-	// Re-authentication rewrites auth.json and the sidecar credential in place.
+	// Re-authentication rewrites auth.json in place.
 	// Keep the slot out of selection for the whole login job without disabling
 	// it: disable/pool-remove clears sticky routes, which would throw away the KV
 	// cache locality this repair flow exists to preserve.
@@ -7651,23 +7505,6 @@ type codexAuthFile struct {
 	} `json:"tokens"`
 }
 
-// cliproxyCodexAuthFile is CLIProxyAPI's file-backed Codex OAuth record. The
-// sidecar owns refreshes of this copy so Pool never races it for a refresh token.
-type cliproxyCodexAuthFile struct {
-	Type             string `json:"type"`
-	Email            string `json:"email,omitempty"`
-	IDToken          string `json:"id_token,omitempty"`
-	AccessToken      string `json:"access_token"`
-	RefreshToken     string `json:"refresh_token,omitempty"`
-	AccountID        string `json:"account_id,omitempty"`
-	OrganizationName string `json:"organization_name,omitempty"`
-	LastRefresh      string `json:"last_refresh,omitempty"`
-	Expire           string `json:"expired,omitempty"`
-	Prefix           string `json:"prefix"`
-	PlanType         string `json:"plan_type,omitempty"`
-	PlanLimit        string `json:"plan_limit,omitempty"`
-}
-
 type codexRefreshResponse struct {
 	IDToken      string `json:"id_token"`
 	AccessToken  string `json:"access_token"`
@@ -7819,7 +7656,7 @@ func (a *app) readCodexAuthFile(item account) (codexAuthFile, error) {
 			return codexAuthFile{}, err
 		}
 		if attempt+1 < codexAuthReadAttempts {
-			// The Codex CLI and the sidecar can rewrite auth.json while requests
+			// The Codex CLI and the pool's own refresh can rewrite auth.json while requests
 			// are selecting accounts. Retry invalid or incomplete content as a
 			// file-write race, but do not retry a file that is simply absent:
 			// empty onboarding slots are expected and must classify quickly.
@@ -7884,227 +7721,6 @@ func codexAuthInfoFromFile(auth codexAuthFile) codexAuthInfo {
 		}
 	}
 	return info
-}
-
-func (a *app) cliproxyAuthPath(accountID string) string {
-	return filepath.Join(a.dataDir, "cliproxy", "auths", accountID+".json")
-}
-
-func (a *app) syncCliproxyAuth(item account, force bool) error {
-	if !a.usesCliproxySidecar(item) {
-		return nil
-	}
-	lock := a.codexAuthLock(item.ID)
-	lock.Lock()
-	defer lock.Unlock()
-	return a.syncCliproxyAuthLocked(item, force)
-}
-
-func (a *app) syncCliproxyAuthLocked(item account, force bool) error {
-	path := a.cliproxyAuthPath(item.ID)
-	if !force {
-		if _, err := os.Stat(path); err == nil {
-			return nil
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("inspect cliproxy auth for account %s: %w", item.ID, err)
-		}
-	}
-	source, err := a.readCodexAuthFile(item)
-	if err != nil {
-		return markAccountAuthError(err)
-	}
-	info := codexAuthInfoFromFile(source)
-	accountID := info.AccountID
-	if accountID == "" {
-		accountID = item.AccountID
-	}
-	record := cliproxyCodexAuthFile{
-		Type:             "codex",
-		Email:            normalizeEmail(chooseString(info.Email, item.Email)),
-		IDToken:          source.Tokens.IDToken,
-		AccessToken:      source.Tokens.AccessToken,
-		RefreshToken:     source.Tokens.RefreshToken,
-		AccountID:        accountID,
-		OrganizationName: cleanOrganizationName(chooseString(info.OrganizationName, item.OrganizationName)),
-		Prefix:           cliproxyAccountPrefix(item.ID),
-		PlanType:         cleanRawPlanType(chooseString(info.PlanType, chooseString(item.RawPlanType, item.PlanType))),
-		PlanLimit:        cleanPlanLimit(chooseString(info.PlanLimit, item.PlanLimit)),
-	}
-	if source.LastRefresh != nil {
-		record.LastRefresh = source.LastRefresh.UTC().Format(time.RFC3339)
-	}
-	if expiry, ok := jwtExpiry(source.Tokens.AccessToken); ok {
-		record.Expire = expiry.UTC().Format(time.RFC3339)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create cliproxy auth directory: %w", err)
-	}
-	if err := writeJSONAtomic(path, record); err != nil {
-		return fmt.Errorf("write cliproxy auth for account %s: %w", item.ID, err)
-	}
-	return nil
-}
-
-// reconcileCodexCredential keeps one current refresh token per account across
-// a gateway-mode switch. Refresh tokens rotate on use, so only the copy that was
-// refreshed last is still valid: the sidecar record after running in sidecar
-// mode, auth.json after running direct. Each mode refreshes only its own copy,
-// so on startup it first adopts the other copy when that one is newer.
-// Skipping this makes the first refresh after a switch spend a revoked token
-// and log the account out.
-func (a *app) reconcileCodexCredential(item account) {
-	data, err := os.ReadFile(a.cliproxyAuthPath(item.ID))
-	if err != nil {
-		return
-	}
-	var record cliproxyCodexAuthFile
-	if err := json.Unmarshal(data, &record); err != nil || strings.TrimSpace(record.AccessToken) == "" {
-		return
-	}
-	sidecarIssued, ok := jwtIssuedAt(record.AccessToken)
-	if !ok {
-		return
-	}
-	lock := a.codexAuthLock(item.ID)
-	lock.Lock()
-	defer lock.Unlock()
-	auth, err := a.readCodexAuthFile(item)
-	if err != nil || auth.Tokens == nil {
-		return
-	}
-	fileIssued, fileOK := jwtIssuedAt(auth.Tokens.AccessToken)
-	if a.codexGatewayMode != "direct" {
-		if fileOK && fileIssued.After(sidecarIssued) {
-			if err := a.syncCliproxyAuthLocked(item, true); err != nil && a.logger != nil {
-				a.logger.Printf("credential reconcile for %s: sidecar copy update failed: %s", item.ID, err)
-			}
-		}
-		return
-	}
-	if fileOK && !sidecarIssued.After(fileIssued) {
-		return
-	}
-	if record.IDToken != "" {
-		auth.Tokens.IDToken = record.IDToken
-	}
-	auth.Tokens.AccessToken = record.AccessToken
-	if record.RefreshToken != "" {
-		auth.Tokens.RefreshToken = record.RefreshToken
-	}
-	if refreshed, err := time.Parse(time.RFC3339, record.LastRefresh); err == nil {
-		refreshed = refreshed.UTC()
-		auth.LastRefresh = &refreshed
-	}
-	if err := writeJSONAtomic(filepath.Join(a.accountCodexHome(item.ID), "auth.json"), auth); err != nil {
-		if a.logger != nil {
-			a.logger.Printf("credential reconcile for %s: adopting the sidecar credential failed: %s", item.ID, err)
-		}
-		return
-	}
-	if a.logger != nil {
-		a.logger.Printf("credential reconcile for %s: adopted the newer sidecar credential", item.ID)
-	}
-}
-
-func (a *app) updateCliproxyAuthMetadata(item account) error {
-	if !a.usesCliproxySidecar(item) {
-		return nil
-	}
-	lock := a.codexAuthLock(item.ID)
-	lock.Lock()
-	defer lock.Unlock()
-	path := a.cliproxyAuthPath(item.ID)
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return a.syncCliproxyAuthLocked(item, false)
-	}
-	if err != nil {
-		return fmt.Errorf("read cliproxy auth for account %s: %w", item.ID, err)
-	}
-	var record cliproxyCodexAuthFile
-	if err := json.Unmarshal(data, &record); err != nil {
-		return fmt.Errorf("decode cliproxy auth for account %s: %w", item.ID, err)
-	}
-	if record.Type == "" {
-		record.Type = "codex"
-	}
-	if item.Email != "" {
-		record.Email = normalizeEmail(item.Email)
-	}
-	if item.AccountID != "" {
-		record.AccountID = item.AccountID
-	}
-	if item.OrganizationName != "" || !organizationScopedPlan(item.PlanType) {
-		record.OrganizationName = cleanOrganizationName(item.OrganizationName)
-	}
-	if item.PlanType != "" {
-		record.PlanType = cleanRawPlanType(chooseString(item.RawPlanType, item.PlanType))
-	}
-	if item.PlanLimit != "" || effectivePlanFamily(item) == "pro" {
-		record.PlanLimit = cleanPlanLimit(item.PlanLimit)
-	}
-	record.Prefix = cliproxyAccountPrefix(item.ID)
-	if err := writeJSONAtomic(path, record); err != nil {
-		return fmt.Errorf("write cliproxy auth metadata for account %s: %w", item.ID, err)
-	}
-	return nil
-}
-
-func (a *app) cliproxyCodexAuth(item account) (codexAuthInfo, error) {
-	if err := a.syncCliproxyAuth(item, false); err != nil {
-		return codexAuthInfo{}, err
-	}
-	path := a.cliproxyAuthPath(item.ID)
-	var record cliproxyCodexAuthFile
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		data, readErr := os.ReadFile(path)
-		if readErr == nil {
-			err = json.Unmarshal(data, &record)
-		} else {
-			err = readErr
-		}
-		if err == nil && strings.TrimSpace(record.AccessToken) != "" {
-			break
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	if err != nil || strings.TrimSpace(record.AccessToken) == "" {
-		return codexAuthInfo{}, fmt.Errorf("cliproxy auth is unavailable for account %s", item.ID)
-	}
-	info := codexAuthInfo{AccessToken: strings.TrimSpace(record.AccessToken), AccountID: strings.TrimSpace(record.AccountID), Email: normalizeEmail(record.Email), PlanType: cleanRawPlanType(record.PlanType), PlanLimit: cleanPlanLimit(record.PlanLimit)}
-	if claims := jwtPayload(record.IDToken); claims != nil {
-		if info.Email == "" {
-			info.Email = normalizeEmail(claimString(claims, "email"))
-		}
-		if organizationName := organizationNameFromMap(claims); organizationName != "" {
-			info.OrganizationName = organizationName
-		}
-		if info.PlanLimit == "" {
-			info.PlanLimit = planLimitFromMap(claims)
-		}
-		if authClaims, _ := claims["https://api.openai.com/auth"].(map[string]any); authClaims != nil {
-			if info.AccountID == "" {
-				info.AccountID = claimString(authClaims, "chatgpt_account_id")
-			}
-			if organizationName := organizationNameFromMap(authClaims); organizationName != "" {
-				info.OrganizationName = organizationName
-			}
-			if info.PlanType == "" || info.PlanType == "unknown" {
-				info.PlanType = cleanRawPlanType(claimString(authClaims, "chatgpt_plan_type"))
-			}
-			if info.PlanLimit == "" {
-				info.PlanLimit = cleanPlanLimit(claimString(authClaims, "chatgpt_plan_type"))
-			}
-			if info.PlanLimit == "" {
-				info.PlanLimit = planLimitFromMap(authClaims)
-			}
-			if fedramp, ok := authClaims["chatgpt_account_is_fedramp"].(bool); ok {
-				info.FedRAMP = fedramp
-			}
-		}
-	}
-	return info, nil
 }
 
 func (a *app) refreshCodexAuthIfNeeded(item account) error {
@@ -8188,12 +7804,6 @@ func (a *app) refreshedCodexAuthContext(ctx context.Context, item account) (code
 }
 
 func (a *app) activeCodexAuthContext(ctx context.Context, item account) (codexAuthInfo, error) {
-	if a.usesCliproxySidecar(item) {
-		// In sidecar mode, inference uses the sidecar-owned auth copy. Pool must
-		// not refresh the original Codex CLI auth file on the request path, or the
-		// two processes can race refresh-token rotation.
-		return a.cliproxyCodexAuth(item)
-	}
 	return a.refreshedCodexAuthContext(ctx, item)
 }
 
@@ -8607,8 +8217,7 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 	plan := planFamilyFromRaw(planRaw)
 	planLimit := planLimitFromMap(usageFields)
 	// auth.PlanLimit is mostly this pool's own earlier output: the multiplier is
-	// written into the sidecar auth record and read back from it on the next
-	// refresh. Using it before the account metadata made a recorded multiplier
+	// stored with the account and read back on the next refresh. Using it before the account metadata made a recorded multiplier
 	// self-perpetuating, so a Pro 200 account kept showing 20x after upstream
 	// cut the tier to 10x. It is therefore only a last resort, used when the
 	// metadata lookup could not run; a metadata answer, including "no
@@ -8756,16 +8365,7 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 		a.mu.Unlock()
 		return quotaSnapshot{}, err
 	}
-	sidecarAccount := *item
-	syncSidecar := a.usesCliproxySidecar(sidecarAccount)
 	a.mu.Unlock()
-	if syncSidecar {
-		if err := a.updateCliproxyAuthMetadata(sidecarAccount); err != nil {
-			if a.logger != nil {
-				a.logger.Printf("cliproxy auth metadata update skipped for %s after quota metadata update: %s", accountID, err)
-			}
-		}
-	}
 	return snapshot, nil
 }
 
@@ -9811,8 +9411,6 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome, expe
 	activateAfterFinalize := false
 	historyReset := false
 	finalizeError := ""
-	sidecarAccount := account{}
-	syncSidecar := false
 	a.mu.Lock()
 	if job := a.jobs[jobID]; job != nil && !loginJobCancellationRequestedStatus(job.Status) {
 		now := time.Now().UTC()
@@ -9828,7 +9426,7 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome, expe
 				activateAfterFinalize = item.PendingPoolActivation
 				if publicRepair && reauthenticationChangedUpstreamIdentity(auth, expectedUpstreamAccountID, reauthentication) {
 					// Public callers may repair only the same upstream identity.
-					// Fail before mutating metadata, history, or the sidecar; the
+					// Fail before mutating metadata or history; the
 					// durable gate remains set so the legitimate user can retry.
 					finalizeError = "Authenticated account did not match this credential"
 				} else {
@@ -9838,10 +9436,6 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome, expe
 						finalizeError = "Unable to persist authenticated account state"
 					} else {
 						refreshQuotaAccountID = accountID
-						if a.usesCliproxySidecar(*item) {
-							sidecarAccount = *item
-							syncSidecar = true
-						}
 					}
 				}
 			} else {
@@ -9863,12 +9457,6 @@ func (a *app) runLoginJob(ctx context.Context, jobID, accountID, codexHome, expe
 			a.finishLoginJob(jobID, "cancelled", verificationURL, userCode, "Codex device auth login cancelled")
 		}
 		return
-	}
-	if syncSidecar {
-		if err := a.syncCliproxyAuth(sidecarAccount, true); err != nil {
-			a.finishLoginJob(jobID, "failed", verificationURL, userCode, "Unable to prepare the account gateway")
-			return
-		}
 	}
 	if refreshQuotaAccountID != "" {
 		var err error
@@ -12187,19 +11775,16 @@ func envOrValue(value, fallback string) string {
 	return fallback
 }
 
-func codexGatewayModeFromEnv() (string, error) {
-	// direct is the default because the pool must send upstream what a native
-	// Codex CLI sends; the sidecar rewrote and dropped Codex headers, dropped the
-	// response turn state, and injected tools. sidecar stays selectable so a
-	// deployment can switch back without losing its credentials (see
-	// reconcileCodexCredential).
-	mode := strings.ToLower(strings.TrimSpace(envOr("CODEX_POOL_CODEX_GATEWAY_MODE", "direct")))
-	switch mode {
-	case "sidecar", "direct":
-		return mode, nil
-	default:
-		return "", errors.New("CODEX_POOL_CODEX_GATEWAY_MODE must be sidecar or direct")
+// rejectRetiredGatewayMode stops startup when a deployment still asks for the
+// CLIProxyAPI sidecar, which was removed (issue #32): it rewrote and dropped
+// Codex headers, dropped the response turn state and injected tools, so the
+// pool now always sends upstream what a native Codex sends. Silently ignoring
+// the setting would leave an operator believing the old gateway was in use.
+func rejectRetiredGatewayMode() error {
+	if mode := strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_GATEWAY_MODE"))); mode != "" && mode != "direct" {
+		return fmt.Errorf("CODEX_POOL_CODEX_GATEWAY_MODE=%s is no longer supported: the CLIProxyAPI sidecar was removed and the pool always talks to the Codex backend directly; remove the setting", mode)
 	}
+	return nil
 }
 
 func promptCacheKeyModeFromEnv() (string, error) {

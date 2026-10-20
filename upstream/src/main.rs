@@ -10,7 +10,7 @@
 //! its permessage-deflate configuration, and messages pass through unchanged,
 //! so prewarm and incremental requests reach upstream exactly as Codex sent
 //! them. Keep it a transport: routing decisions here would split
-//! responsibility with the pool the way the CLIProxyAPI sidecar did.
+//! responsibility with the pool the way the retired CLIProxyAPI sidecar did.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;

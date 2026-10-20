@@ -10,14 +10,7 @@ MOCK=${MOCK:-codex-device-mock-itest-$$}
 VOLUME=${VOLUME:-codex-device-data-itest-$$}
 CLIENT_KEY=${CLIENT_KEY:-test-client-key}
 ADMIN_PASSWORD=${ADMIN_PASSWORD:-test-admin-password}
-# direct (the default) checks the pool's own Codex-backend transport; sidecar
-# checks the CLIProxyAPI fallback. Run both: each must fail over the same way.
-GATEWAY_MODE=${GATEWAY_MODE:-direct}
-case "$GATEWAY_MODE" in
-  direct) EVENT_KIND=device ;;
-  sidecar) EVENT_KIND=sidecar ;;
-  *) echo "GATEWAY_MODE must be direct or sidecar" >&2; exit 2 ;;
-esac
+EVENT_KIND=device
 
 cleanup() {
   docker rm -f "$POOL" "$MOCK" >/dev/null 2>&1 || true
@@ -51,10 +44,7 @@ docker run -d --name "$POOL" --network "$NETWORK" --network-alias codex-pool -v 
   -e CODEX_POOL_API_KEY="$CLIENT_KEY" \
   -e CODEX_POOL_ADMIN_PASSWORD_HASH="$ADMIN_HASH" \
   -e CODEX_POOL_DEFAULT_MODEL=gpt-test \
-  -e CODEX_POOL_CODEX_GATEWAY_MODE="$GATEWAY_MODE" \
   -e CODEX_POOL_CODEX_BASE_URL=http://codex-mock:4010/backend-api \
-  -e CODEX_POOL_CLIPROXY_BASE_URL=http://codex-mock:4010/v1 \
-  -e CODEX_POOL_CLIPROXY_API_KEY=cliproxy-test-key \
   -e CODEX_POOL_ADDR=0.0.0.0:8317 \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
   codex-pool:local >/dev/null

@@ -90,7 +90,7 @@ type wsResponse struct {
 }
 
 // handleResponsesWebSocket serves GET /v1/responses upgrades. Without
-// codex-upstream (sidecar mode, tests) it answers 426, which a native Codex
+// codex-upstream (some tests) it answers 426, which a native Codex
 // treats as "use HTTP" for the session.
 func (a *app) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
 	if a.codexTransportURL == "" || !isWebSocketUpgrade(r) {

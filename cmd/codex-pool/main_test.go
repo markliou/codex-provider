@@ -51,7 +51,7 @@ func testApp(t *testing.T, accounts []account) *app {
 		// never reaches the code paths that log.
 		logger:  log.New(io.Discard, "", 0),
 		dataDir: dir, apiKeys: [][]byte{[]byte("client-key")}, adminUser: "admin", adminHash: []byte(hash),
-		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, routingStrategy: routingStrategyFailover, lineageAffinity: true, promptCacheKeyMode: "auto", publicDashboard: true, codexBaseURL: "https://chatgpt.example.test/backend-api", codexGatewayMode: "direct", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second}, streamClient: &http.Client{Timeout: time.Second},
+		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, routingStrategy: routingStrategyFailover, lineageAffinity: true, promptCacheKeyMode: "auto", publicDashboard: true, codexBaseURL: "https://chatgpt.example.test/backend-api", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second}, streamClient: &http.Client{Timeout: time.Second},
 	}
 }
 
@@ -87,7 +87,7 @@ func TestParseModel(t *testing.T) {
 func TestDefaultModelCatalogIncludesThinkingTiers(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"
-	models := strings.Join(a.modelsLocked(nil), "\n")
+	models := strings.Join(a.modelsLocked(), "\n")
 	for _, expected := range []string{"gpt-5.5", "gpt-5.5(low)", "gpt-5.5(medium)", "gpt-5.5(high)", "gpt-5.5(xhigh)"} {
 		if !strings.Contains(models, expected) {
 			t.Fatalf("modelsLocked missing %q in:\n%s", expected, models)
@@ -201,7 +201,7 @@ func TestCodexModelCatalogAdvertisesReasoningCapabilities(t *testing.T) {
 func TestCodexModelCatalogNormalizesUnsupportedDefaultReasoningTier(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(max)"
-	models := a.codexModelCatalogLocked(a.modelsLocked(nil))
+	models := a.codexModelCatalogLocked(a.modelsLocked())
 	for _, model := range models {
 		if model.Slug == "gpt-5.5" {
 			if model.DefaultReasoningLevel != "medium" {
@@ -216,7 +216,7 @@ func TestCodexModelCatalogNormalizesUnsupportedDefaultReasoningTier(t *testing.T
 func TestCodexModelCatalogIncludesCurrentCodexLineup(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"
-	models := a.codexModelCatalogLocked(a.modelsLocked(nil))
+	models := a.codexModelCatalogLocked(a.modelsLocked())
 	bySlug := map[string]codexModelInfo{}
 	for _, model := range models {
 		bySlug[model.Slug] = model
@@ -1275,7 +1275,7 @@ func TestPoolCapacityOmitsAWindowWithNoDenominator(t *testing.T) {
 func TestCodexModelCatalogAdvertisesGPT6(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.5(xhigh)"
-	models := a.codexModelCatalogLocked(a.modelsLocked(nil))
+	models := a.codexModelCatalogLocked(a.modelsLocked())
 	bySlug := map[string]codexModelInfo{}
 	for _, model := range models {
 		bySlug[model.Slug] = model
@@ -1299,11 +1299,11 @@ func TestCodexModelCatalogAdvertisesGPT6(t *testing.T) {
 func TestCodexModelCatalogKeepsExtendedDefaultReasoningTierOn56(t *testing.T) {
 	a := testApp(t, nil)
 	a.config.DefaultModel = "gpt-5.6-sol(ultra)"
-	models := a.codexModelCatalogLocked(a.modelsLocked(nil))
+	models := a.codexModelCatalogLocked(a.modelsLocked())
 	if models[0].Slug != "gpt-5.6-sol" || models[0].DefaultReasoningLevel != "ultra" {
 		t.Fatalf("gpt-5.6 default reasoning tier was not preserved: %#v", models[0])
 	}
-	aliases := strings.Join(a.modelsLocked(nil), "\n")
+	aliases := strings.Join(a.modelsLocked(), "\n")
 	for _, expected := range []string{"gpt-5.6-sol(max)", "gpt-5.6-sol(ultra)"} {
 		if !strings.Contains(aliases, expected) {
 			t.Fatalf("generic model list missing %q in:\n%s", expected, aliases)
@@ -1692,85 +1692,6 @@ func TestCodexAuthRetriesDuringAuthFileRewrite(t *testing.T) {
 	}
 }
 
-func TestCliproxyCodexAuthUsesJWTAccountNameOverStoredProfileName(t *testing.T) {
-	a := testApp(t, []account{{ID: "acct-auth", AuthType: "codex_device_auth", Enabled: true, InPool: true, OrganizationName: "Yi Fan Liou", PlanType: "team"}})
-	a.codexGatewayMode = "cliproxy"
-	idToken := fakeJWTClaims(map[string]any{
-		"email": "user@example.test",
-		"name":  "Yi Fan Liou",
-		"https://api.openai.com/profile": map[string]any{
-			"email":        "user@example.test",
-			"display_name": "Yi Fan Liou",
-		},
-		"https://api.openai.com/auth": map[string]any{
-			"chatgpt_account_id":   "acct-chatgpt",
-			"chatgpt_account_name": "Example Workspace",
-			"chatgpt_plan_type":    "team",
-		},
-	})
-	path := a.cliproxyAuthPath("acct-auth")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	record := cliproxyCodexAuthFile{
-		Type:             "codex",
-		Email:            "user@example.test",
-		IDToken:          idToken,
-		AccessToken:      "<access-token>",
-		AccountID:        "acct-chatgpt",
-		OrganizationName: "Yi Fan Liou",
-		Prefix:           cliproxyAccountPrefix("acct-auth"),
-		PlanType:         "team",
-	}
-	if err := writeJSONAtomic(path, record); err != nil {
-		t.Fatal(err)
-	}
-	auth, err := a.cliproxyCodexAuth(a.config.Accounts[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if auth.OrganizationName != "Example Workspace" {
-		t.Fatalf("organization name = %q, want Example Workspace", auth.OrganizationName)
-	}
-}
-
-func TestCliproxyCodexAuthIgnoresStoredOrganizationNameWithoutJWTOrganization(t *testing.T) {
-	a := testApp(t, []account{{ID: "acct-auth", AuthType: "codex_device_auth", Enabled: true, InPool: true, OrganizationName: "Yi-Fan Liou", PlanType: "team"}})
-	a.codexGatewayMode = "cliproxy"
-	idToken := fakeJWTClaims(map[string]any{
-		"email": "user@example.test",
-		"name":  "Yi-Fan Liou",
-		"https://api.openai.com/auth": map[string]any{
-			"chatgpt_account_id": "acct-chatgpt",
-			"chatgpt_plan_type":  "team",
-		},
-	})
-	path := a.cliproxyAuthPath("acct-auth")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	record := cliproxyCodexAuthFile{
-		Type:             "codex",
-		Email:            "user@example.test",
-		IDToken:          idToken,
-		AccessToken:      "<access-token>",
-		AccountID:        "acct-chatgpt",
-		OrganizationName: "Yi-Fan Liou",
-		Prefix:           cliproxyAccountPrefix("acct-auth"),
-		PlanType:         "team",
-	}
-	if err := writeJSONAtomic(path, record); err != nil {
-		t.Fatal(err)
-	}
-	auth, err := a.cliproxyCodexAuth(a.config.Accounts[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if auth.OrganizationName != "" {
-		t.Fatalf("stored sidecar organization name was trusted: %q", auth.OrganizationName)
-	}
-}
-
 func TestDeviceAuthLoginJobLifecycle(t *testing.T) {
 	a := testApp(t, []account{{ID: "acct-login", Label: "Login", AuthType: "codex_device_auth", Enabled: false, InPool: false, PendingPoolActivation: true}})
 	a.config.Accounts[0].CodexHome = a.accountCodexHome("acct-login")
@@ -2021,65 +1942,6 @@ rm -f "$CODEX_HOME/auth.json"
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	t.Fatalf("unverifiable login did not fail closed: %#v", a.jobs[job.ID])
-}
-
-func TestDeviceAuthLoginSidecarFailureKeepsAccountBlocked(t *testing.T) {
-	now := time.Now().UTC()
-	a := testApp(t, []account{{
-		ID:          "acct-login",
-		AccountID:   "upstream-one",
-		AuthType:    "codex_device_auth",
-		Enabled:     true,
-		InPool:      true,
-		LastLoginAt: now.Add(-time.Hour),
-	}})
-	a.codexGatewayMode = "cliproxy"
-	seedDeviceAuthIdentityHistory(a, "acct-login", now)
-	if err := os.WriteFile(filepath.Join(a.dataDir, "cliproxy"), []byte("block directory creation"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	bin := t.TempDir()
-	script := `#!/bin/sh
-set -eu
-mkdir -p "$CODEX_HOME"
-printf '%s\n' 'Open https://auth.openai.com/activate' 'ABCD-EFGH'
-cat > "$CODEX_HOME/auth.json" <<EOF
-{"auth_mode":"chatgpt","tokens":{"id_token":"` + fakeJWTClaims(map[string]any{"email": "same@example.test", "https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "upstream-one"}}) + `","access_token":"<access-token>","refresh_token":"<refresh-token>"}}
-EOF
-`
-	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	a.mu.Lock()
-	job, err := a.startLoginJobLocked(a.config.Accounts[0])
-	a.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		a.mu.RLock()
-		current := *a.jobs[job.ID]
-		a.mu.RUnlock()
-		if current.Status == "failed" {
-			if current.HistoryReset || !strings.Contains(current.Error, "gateway") {
-				t.Fatalf("sidecar failure result = %#v", current)
-			}
-			if !a.config.Accounts[0].PendingAuthVerification || a.config.Accounts[0].PendingAuthExpectedAccountID != "upstream-one" {
-				t.Fatalf("sidecar failure released the durable routing gate: %#v", a.config.Accounts[0])
-			}
-			if len(a.state.PromptCache) != 1 || len(a.state.StickySessions) != 1 {
-				t.Fatalf("same-account sidecar failure discarded history: cache=%#v sticky=%#v", a.state.PromptCache, a.state.StickySessions)
-			}
-			return
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	t.Fatalf("sidecar failure did not finish the login job: %#v", a.jobs[job.ID])
 }
 
 func TestDeviceAuthLoginSameIdentityPreservesHistory(t *testing.T) {
@@ -6422,77 +6284,16 @@ func TestDirectCodexGatewayRefreshesOnceOnUnauthorizedAndRetriesTheSameAccount(t
 	}
 }
 
-// Refresh tokens rotate on use, so after a gateway-mode switch only the copy
-// refreshed last is valid; each mode must adopt it before refreshing its own.
-func TestReconcileCodexCredentialAdoptsTheNewerCopyAcrossModeSwitches(t *testing.T) {
-	older := fakeJWTClaims(map[string]any{"iat": 1000, "exp": 4102444800})
-	newer := fakeJWTClaims(map[string]any{"iat": 2000, "exp": 4102444800})
-	setup := func(t *testing.T, mode, fileAccess, sidecarAccess string) (*app, account) {
-		a := testApp(t, []account{{ID: "device", AccountID: "acct-up", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
-		a.codexGatewayMode = mode
-		item := a.config.Accounts[0]
-		home := a.accountCodexHome(item.ID)
-		if err := os.MkdirAll(home, 0o700); err != nil {
-			t.Fatal(err)
+func TestRetiredSidecarGatewayModeStopsStartup(t *testing.T) {
+	for _, mode := range []string{"", "direct", "DIRECT"} {
+		t.Setenv("CODEX_POOL_CODEX_GATEWAY_MODE", mode)
+		if err := rejectRetiredGatewayMode(); err != nil {
+			t.Fatalf("mode %q: %v", mode, err)
 		}
-		if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"refresh_token":"<file-refresh>","account_id":"acct-up"}}`, fileAccess)), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.MkdirAll(filepath.Dir(a.cliproxyAuthPath(item.ID)), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(a.cliproxyAuthPath(item.ID), []byte(fmt.Sprintf(`{"type":"codex","access_token":%q,"refresh_token":"<sidecar-refresh>","account_id":"acct-up","prefix":"codex-pool-device","last_refresh":"2026-10-19T00:00:00Z"}`, sidecarAccess)), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return a, item
-	}
-	fileRefresh := func(t *testing.T, a *app, item account) string {
-		file, err := a.readCodexAuthFile(item)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return file.Tokens.RefreshToken
-	}
-	sidecarRefresh := func(t *testing.T, a *app, item account) string {
-		data, err := os.ReadFile(a.cliproxyAuthPath(item.ID))
-		if err != nil {
-			t.Fatal(err)
-		}
-		var record cliproxyCodexAuthFile
-		if err := json.Unmarshal(data, &record); err != nil {
-			t.Fatal(err)
-		}
-		return record.RefreshToken
-	}
-
-	a, item := setup(t, "direct", older, newer)
-	a.reconcileCodexCredential(item)
-	if got := fileRefresh(t, a, item); got != "<sidecar-refresh>" {
-		t.Fatalf("direct mode must adopt the newer sidecar credential, auth.json refresh = %q", got)
-	}
-
-	a, item = setup(t, "direct", newer, older)
-	a.reconcileCodexCredential(item)
-	if got := fileRefresh(t, a, item); got != "<file-refresh>" {
-		t.Fatalf("direct mode must keep its own newer credential, auth.json refresh = %q", got)
-	}
-
-	a, item = setup(t, "sidecar", newer, older)
-	a.reconcileCodexCredential(item)
-	if got := sidecarRefresh(t, a, item); got != "<file-refresh>" {
-		t.Fatalf("switching back to sidecar must hand it the newer auth.json credential, sidecar refresh = %q", got)
-	}
-}
-
-func TestCodexGatewayModeDefaultsToDirect(t *testing.T) {
-	t.Setenv("CODEX_POOL_CODEX_GATEWAY_MODE", "")
-	mode, err := codexGatewayModeFromEnv()
-	if err != nil || mode != "direct" {
-		t.Fatalf("default gateway mode = %q, %v; want direct", mode, err)
 	}
 	t.Setenv("CODEX_POOL_CODEX_GATEWAY_MODE", "sidecar")
-	if mode, err := codexGatewayModeFromEnv(); err != nil || mode != "sidecar" {
-		t.Fatalf("sidecar must stay selectable: %q, %v", mode, err)
+	if err := rejectRetiredGatewayMode(); err == nil || !strings.Contains(err.Error(), "no longer supported") {
+		t.Fatalf("a deployment still asking for the removed sidecar must not start silently: %v", err)
 	}
 }
 
@@ -6559,230 +6360,6 @@ func TestDeviceAuthFailoverAfterRateLimit(t *testing.T) {
 	}
 	if reason := a.state.Health["device-first"].LastFailureReason; reason != "rate_limited" {
 		t.Fatalf("first device-auth account failure reason = %q, want rate_limited", reason)
-	}
-}
-
-func TestCliproxyAuthAdapterUsesAnIsolatedRefreshOwner(t *testing.T) {
-	a := testApp(t, []account{{ID: "device-one", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
-	a.codexGatewayMode = "sidecar"
-	item := a.config.Accounts[0]
-	home := a.accountCodexHome(item.ID)
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	idToken := fakeJWTClaims(map[string]any{
-		"email":                       "pool-user@example.test",
-		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-one", "chatgpt_plan_type": "team", "chatgpt_account_name": "Acme Workspace"},
-	})
-	authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"id_token":%q,"access_token":"<pool-access-token>","refresh_token":"<pool-refresh-token>"}}`, idToken)
-	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.syncCliproxyAuth(item, true); err != nil {
-		t.Fatal(err)
-	}
-	var sidecar cliproxyCodexAuthFile
-	if err := readJSON(a.cliproxyAuthPath(item.ID), &sidecar); err != nil {
-		t.Fatal(err)
-	}
-	if sidecar.Type != "codex" || sidecar.Prefix != "codex-pool-device-one" || sidecar.AccountID != "acct-one" || sidecar.PlanType != "team" || sidecar.OrganizationName != "Acme Workspace" {
-		t.Fatalf("unexpected cliproxy auth record: %#v", sidecar)
-	}
-	if sidecar.AccessToken != "<pool-access-token>" || sidecar.RefreshToken != "<pool-refresh-token>" {
-		t.Fatalf("cliproxy auth did not preserve token fields")
-	}
-
-	// Sidecar owns refreshes. Pool must use its current copy for quota reads and
-	// never refresh the original Codex CLI auth in parallel.
-	sidecar.AccessToken = "<sidecar-refreshed-access-token>"
-	if err := writeJSONAtomic(a.cliproxyAuthPath(item.ID), sidecar); err != nil {
-		t.Fatal(err)
-	}
-	active, err := a.activeCodexAuthContext(context.Background(), item)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if active.AccessToken != "<sidecar-refreshed-access-token>" {
-		t.Fatalf("active sidecar auth token = %q", active.AccessToken)
-	}
-}
-
-func TestCliproxyMetadataUpdatePreservesSidecarRefreshTokens(t *testing.T) {
-	a := testApp(t, []account{{ID: "device-one", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100}})
-	a.codexGatewayMode = "sidecar"
-	item := a.config.Accounts[0]
-	path := a.cliproxyAuthPath(item.ID)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	original := cliproxyCodexAuthFile{
-		Type:         "codex",
-		AccessToken:  "<sidecar-access-token>",
-		RefreshToken: "<sidecar-refresh-token>",
-		AccountID:    "acct-old",
-		Prefix:       cliproxyAccountPrefix(item.ID),
-		PlanType:     "plus",
-	}
-	if err := writeJSONAtomic(path, original); err != nil {
-		t.Fatal(err)
-	}
-
-	item.Email = "pool-user@example.test"
-	item.AccountID = "acct-new"
-	item.OrganizationName = "Acme Workspace"
-	item.PlanType = "team"
-	item.PlanRank = planRank(item.PlanType)
-	if err := a.updateCliproxyAuthMetadata(item); err != nil {
-		t.Fatal(err)
-	}
-	var updated cliproxyCodexAuthFile
-	if err := readJSON(path, &updated); err != nil {
-		t.Fatal(err)
-	}
-	if updated.AccessToken != original.AccessToken || updated.RefreshToken != original.RefreshToken {
-		t.Fatalf("metadata update changed sidecar-owned tokens: %#v", updated)
-	}
-	if updated.Email != "pool-user@example.test" || updated.AccountID != "acct-new" || updated.OrganizationName != "Acme Workspace" || updated.PlanType != "team" {
-		t.Fatalf("metadata update did not refresh account fields: %#v", updated)
-	}
-}
-
-func TestDeviceAuthFailoverThroughCliproxyAdapter(t *testing.T) {
-	seenModels := make([]string, 0, 2)
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/responses" {
-			t.Fatalf("unexpected sidecar path %s", r.URL.Path)
-		}
-		if r.Header.Get("Authorization") != "Bearer sidecar-test-key" {
-			t.Fatalf("unexpected sidecar authorization %q", r.Header.Get("Authorization"))
-		}
-		var payload map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Fatal(err)
-		}
-		model, _ := payload["model"].(string)
-		seenModels = append(seenModels, model)
-		switch model {
-		case "codex-pool-device-first/gpt-test":
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusTooManyRequests)
-		case "codex-pool-device-second/gpt-test":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"resp_sidecar_failover","object":"response","output":[]}`))
-		default:
-			t.Fatalf("unexpected sidecar model %q", model)
-		}
-	}))
-	defer sidecar.Close()
-
-	a := testApp(t, []account{
-		{ID: "device-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
-		{ID: "device-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10},
-	})
-	a.codexGatewayMode = "sidecar"
-	a.cliproxyBaseURL = sidecar.URL + "/v1"
-	a.cliproxyAPIKey = "sidecar-test-key"
-	for _, item := range a.config.Accounts {
-		home := a.accountCodexHome(item.ID)
-		if err := os.MkdirAll(home, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"<test-access-token>","refresh_token":"<test-refresh-token>"}}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
-	req.Header.Set("Authorization", "Bearer client-key")
-	req.Header.Set("X-Codex-Pool-Session", "cliproxy-failover")
-	recorder := httptest.NewRecorder()
-	a.publicMux().ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("cliproxy failover returned %d: %s", recorder.Code, recorder.Body.String())
-	}
-	if got := strings.Join(seenModels, ","); got != "codex-pool-device-first/gpt-test,codex-pool-device-second/gpt-test" {
-		t.Fatalf("sidecar account sequence = %q", got)
-	}
-	if session := a.state.StickySessions["gpt-test:cliproxy-failover"]; session.AccountID != "device-second" {
-		t.Fatalf("cliproxy sticky failover = %#v", session)
-	}
-	if reason := a.state.Health["device-first"].LastFailureReason; reason != "rate_limited" {
-		t.Fatalf("cliproxy first account reason = %q", reason)
-	}
-}
-
-func TestDeviceAuthFailoverThroughCliproxyAdapterAfterAuthFailure(t *testing.T) {
-	seenModels := make([]string, 0, 2)
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/responses" {
-			t.Fatalf("unexpected sidecar path %s", r.URL.Path)
-		}
-		var payload map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Fatal(err)
-		}
-		model, _ := payload["model"].(string)
-		seenModels = append(seenModels, model)
-		switch model {
-		case "codex-pool-device-first/gpt-test":
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":{"code":"invalid_token","message":"secret-token-body"}}`))
-		case "codex-pool-device-second/gpt-test":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":"resp_sidecar_auth_failover","object":"response","output":[]}`))
-		default:
-			t.Fatalf("unexpected sidecar model %q", model)
-		}
-	}))
-	defer sidecar.Close()
-
-	a := testApp(t, []account{
-		{ID: "device-first", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100},
-		{ID: "device-second", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 10},
-	})
-	a.codexGatewayMode = "sidecar"
-	a.cliproxyBaseURL = sidecar.URL + "/v1"
-	a.cliproxyAPIKey = "sidecar-test-key"
-	for _, item := range a.config.Accounts {
-		home := a.accountCodexHome(item.ID)
-		if err := os.MkdirAll(home, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"<test-access-token>","refresh_token":"<test-refresh-token>"}}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	now := time.Now().UTC()
-	a.state.StickySessions["gpt-test:cliproxy-auth-failover"] = stickySession{Key: "gpt-test:cliproxy-auth-failover", ModelID: "gpt-test", AccountID: "device-first", CreatedAt: now.Add(-time.Minute), LastSuccessAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)}
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
-	req.Header.Set("Authorization", "Bearer client-key")
-	req.Header.Set("X-Codex-Pool-Session", "cliproxy-auth-failover")
-	recorder := httptest.NewRecorder()
-	a.publicMux().ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("cliproxy auth failover returned %d: %s", recorder.Code, recorder.Body.String())
-	}
-	if got := strings.Join(seenModels, ","); got != "codex-pool-device-first/gpt-test,codex-pool-device-second/gpt-test" {
-		t.Fatalf("sidecar account sequence = %q", got)
-	}
-	if session := a.state.StickySessions["gpt-test:cliproxy-auth-failover"]; session.AccountID != "device-second" || session.FailoverFrom != "device-first" {
-		t.Fatalf("cliproxy auth failover sticky session = %#v", session)
-	}
-	snapshot := a.state.Quotas["device-first"]
-	if snapshot.QuotaError == nil || snapshot.QuotaError.Code != "invalid_token" {
-		t.Fatalf("auth failure did not mark first account unavailable: %#v", snapshot)
-	}
-	if strings.Contains(snapshot.QuotaError.Message, "secret-token-body") {
-		t.Fatalf("auth failure persisted upstream body: %#v", snapshot.QuotaError)
-	}
-	selected, err := a.selectAccount("gpt-test:new-session", "gpt-test", map[string]bool{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if selected.ID != "device-second" {
-		t.Fatalf("unavailable auth-failed account was selected: %q", selected.ID)
 	}
 }
 
@@ -9001,38 +8578,6 @@ func TestUnroutableModelIsAClientErrorNotAnAccountFailure(t *testing.T) {
 	}
 }
 
-// Advertising a model the gateway cannot route is how a client comes to pick one
-// whose every request dies at the gateway. The two lists drift, so the catalog
-// is filtered against what the gateway actually serves.
-func TestAdvertisedCatalogExcludesWhatTheGatewayCannotRoute(t *testing.T) {
-	a := testApp(t, nil)
-	a.config.DefaultModel = "gpt-5.5"
-	a.config.ModelAliases = map[string]string{"house-alias": "gpt-5.5"}
-	a.config.Accounts = []account{{ID: "acct", AllowedModels: []string{"operator-declared"}}}
-
-	full := strings.Join(a.modelsLocked(nil), "\n")
-	for _, want := range defaultCodexModelSlugs {
-		if !strings.Contains(full, want) {
-			t.Fatalf("unfiltered catalog dropped %s: %s", want, full)
-		}
-	}
-
-	filtered := a.modelsLocked(map[string]bool{"gpt-5.5": true})
-	joined := strings.Join(filtered, "\n")
-	for _, gone := range []string{"gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
-		if strings.Contains(joined, gone) {
-			t.Fatalf("catalog advertised %s, which the gateway cannot route: %s", gone, joined)
-		}
-	}
-	// What the operator declared for this deployment is never filtered away:
-	// dropping it silently would hide a misconfiguration instead of reporting it.
-	for _, want := range []string{"gpt-5.5", "house-alias", "operator-declared"} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("filtering dropped %s: %s", want, joined)
-		}
-	}
-}
-
 // The retired models are gone from the lineup, and the ones upstream still
 // serves are all present.
 func TestDefaultLineupMatchesWhatUpstreamStillServes(t *testing.T) {
@@ -10781,8 +10326,8 @@ func TestRetiredModelMetersAreDropped(t *testing.T) {
 	}
 }
 
-// The multiplier the pool writes into the sidecar auth record is read back as
-// auth.PlanLimit on the next refresh. It used to win over the account metadata,
+// The multiplier the pool stored for an account is read back on the next
+// refresh. It used to win over the account metadata,
 // so a Pro 200 account kept 20x after upstream cut the tier to 10x. Fresh
 // metadata must now win, and a metadata answer with no multiplier must clear
 // the stale value rather than fall back to it.
@@ -10811,7 +10356,6 @@ func TestQuotaRefreshDoesNotPerpetuateStoredPlanLimit(t *testing.T) {
 
 			a := testApp(t, []account{{ID: "codex-pro", AccountID: "acct-pro", AuthType: "codex_device_auth", PlanType: "pro", PlanFamily: "pro", RawPlanType: "chatgptpro", PlanLimit: "20x", Enabled: true, InPool: true, Priority: 100}})
 			a.codexBaseURL = upstream.URL + "/backend-api"
-			a.codexGatewayMode = "sidecar"
 			home := a.accountCodexHome("codex-pro")
 			if err := os.MkdirAll(home, 0o700); err != nil {
 				t.Fatal(err)
@@ -10819,13 +10363,6 @@ func TestQuotaRefreshDoesNotPerpetuateStoredPlanLimit(t *testing.T) {
 			token := fakeJWT(time.Now().Add(time.Hour))
 			authJSON := fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"access_token":%q,"refresh_token":"<refresh-token>"}}`, token)
 			if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(authJSON), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			path := a.cliproxyAuthPath("codex-pro")
-			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := writeJSONAtomic(path, cliproxyCodexAuthFile{Type: "codex", AccessToken: token, RefreshToken: "<refresh-token>", AccountID: "acct-pro", Prefix: cliproxyAccountPrefix("codex-pro"), PlanType: "chatgptpro", PlanLimit: "20x"}); err != nil {
 				t.Fatal(err)
 			}
 

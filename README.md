@@ -290,8 +290,7 @@ never shows account IDs, keys, sessions or request-level details.
 
 ## How the pool talks upstream
 
-By default (`CODEX_POOL_CODEX_GATEWAY_MODE=direct`) the pool sends each request
-to the Codex backend itself, with the selected account's credential, and adds
+The pool sends each request to the Codex backend itself, with the selected account's credential, and adds
 only what a native Codex adds (`ChatGPT-Account-ID`, `X-Codex-Routing-Hint`). It
 refreshes the account's token five minutes before expiry, and once more on a
 `401` before treating the account as signed out.
@@ -306,10 +305,9 @@ account check and reset-credit reads use Codex's endpoints and header order, wit
 the identity of the Codex that last used the account. A quota-window prime is one
 read-only turn of the bundled Codex CLI that holds no refresh token.
 
-`CODEX_POOL_CODEX_GATEWAY_MODE=sidecar` switches to the bundled CLIProxyAPI
-sidecar, which is kept only for rollback and is due to be removed (issue #32). It
-rewrites what Codex sends, so do not use it normally. Either mode adopts the
-other's newer credential on startup, so switching does not log accounts out.
+A bundled CLIProxyAPI sidecar used to be the gateway; it rewrote what Codex
+sent and was removed (issue #32). Setting `CODEX_POOL_CODEX_GATEWAY_MODE=sidecar`
+now stops startup with an error.
 
 ## Exposure and security
 
@@ -371,10 +369,9 @@ sh scripts/test/render-web-assets.sh
 
 # Integration tests: a real `codex exec` against a mock upstream
 sh scripts/test/integration-codex-config.sh
-GATEWAY_MODE=direct sh scripts/test/integration-device-auth-failover.sh
+sh scripts/test/integration-device-auth-failover.sh
 sh scripts/test/integration-codex-subagent.sh
 sh scripts/test/integration-routing-cache-observability.sh
-sh scripts/test/integration-cliproxy-sidecar.sh   # sidecar mode only
 ```
 
 ### Codex wire conformance

@@ -56,10 +56,6 @@ func (s *mockServer) handleResponse(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": "invalid JSON"}})
 		return
 	}
-	if r.Header.Get("Authorization") == "Bearer cliproxy-test-key" {
-		s.handleCliproxyResponse(w, request)
-		return
-	}
 	if s.subagentIntegration {
 		s.handleSubagentIntegrationResponse(w, r, request)
 		return
@@ -293,44 +289,6 @@ func writeStreamingNamespacedFunctionCall(w http.ResponseWriter, responseID, cal
 	}
 	writeEvent(w, flusher, "response.output_item.done", map[string]any{"type": "response.output_item.done", "item": item})
 	writeEvent(w, flusher, "response.completed", map[string]any{"type": "response.completed", "response": map[string]any{"id": responseID, "output": []any{item}, "usage": map[string]any{"input_tokens": 2048, "input_tokens_details": map[string]any{"cached_tokens": 0}, "output_tokens": 64, "total_tokens": 2112}}})
-}
-
-func (s *mockServer) handleCliproxyResponse(w http.ResponseWriter, request map[string]any) {
-	model, _ := request["model"].(string)
-	account := ""
-	if strings.HasPrefix(model, "codex-pool-device-a/") {
-		account = "test-acct-a"
-	} else if strings.HasPrefix(model, "codex-pool-device-b/") {
-		account = "test-acct-b"
-	}
-	status := http.StatusUnauthorized
-	text := ""
-	switch account {
-	case "test-acct-a":
-		status = http.StatusTooManyRequests
-	case "test-acct-b":
-		status = http.StatusOK
-		text = deviceFailoverText
-	}
-	s.mu.Lock()
-	s.last = request
-	s.events = append(s.events, map[string]any{"kind": "sidecar", "account": account, "status": status})
-	s.mu.Unlock()
-	if status == http.StatusTooManyRequests {
-		w.Header().Set("Retry-After", "1")
-		w.WriteHeader(status)
-		return
-	}
-	if status != http.StatusOK {
-		writeJSON(w, status, map[string]any{"error": map[string]string{"message": "sidecar account rejected"}})
-		return
-	}
-	response := completedResponse(model, text)
-	if stream, _ := request["stream"].(bool); stream {
-		writeStreamingResponse(w, model, response, text)
-		return
-	}
-	writeJSON(w, http.StatusOK, response)
 }
 
 func writeStreamingResponse(w http.ResponseWriter, model string, response map[string]any, text string) {

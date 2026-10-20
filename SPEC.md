@@ -160,7 +160,7 @@ docker run -d \
 | `CODEX_POOL_CODEX_BASE_URL` | no | `https://chatgpt.com/backend-api` | Codex/ChatGPT backend base URL used for quota reads and the legacy direct gateway. |
 | `CODEX_POOL_CODEX_USAGE_URL` | no | `CODEX_POOL_CODEX_BASE_URL + /wham/usage` | Optional quota endpoint override for tests or compatible backends. |
 | `CODEX_POOL_CODEX_RESET_CREDITS_URL` | no | `CODEX_POOL_CODEX_BASE_URL + /wham/rate-limit-reset-credits` | Optional reset-credit details endpoint override for tests or compatible backends. |
-| `CODEX_POOL_CODEX_GATEWAY_MODE` | no | `direct` | `direct` sends device-auth inference from Pool to the Codex backend (`CODEX_POOL_CODEX_BASE_URL` + `/codex/responses`) with the account's credential, as a native Codex CLI does. `sidecar` routes it through the bundled loopback-only CLIProxyAPI executor instead, which rewrites Codex headers and request tools. |
+| `CODEX_POOL_CODEX_GATEWAY_MODE` | no | none | Retired with the CLIProxyAPI sidecar (2.3). Unset or `direct` is accepted; any other value stops startup with an error, so a deployment still asking for the sidecar is told rather than silently served differently. |
 | `CODEX_POOL_ROUTING_STRATEGY` | no | `sticky_balanced` | `sticky_balanced` deterministically distributes new sessions across the highest-priority eligible account tier. `sticky_failover` preserves the legacy behavior that sends new sessions to the first preferred account. |
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | no | `86400000` | Sticky session idle TTL. Successful requests refresh the binding expiry. |
 | `CODEX_POOL_MAX_RETRY_ACCOUNTS` | no | `0` | Max account failover attempts per request. `0` means all configured accounts. |
@@ -190,9 +190,9 @@ The service must refuse to start when:
 4. Admin password hash equals a known example value.
 5. The combined listener binds to `0.0.0.0` or another non-loopback address while `CODEX_POOL_ALLOW_REMOTE_ADMIN` is not `true`.
 
-### 2.3 Codex gateway modes
+### 2.3 Codex gateway
 
-Direct mode is the default. Pool sends each device-auth request to the Codex backend itself, so the upstream request is the one a native Codex CLI sends (see 6.2.2). The sidecar was the default until it was measured rewriting what Codex sent: it dropped `Thread-Id`, `Session-Id` and `X-Codex-Window-ID`, replaced them with its own `session_id`, dropped the upstream `X-Codex-Turn-State` response header, and injected an `image_generation` tool and an empty `instructions` field that a native Codex request does not carry.
+Pool sends each device-auth request to the Codex backend itself, so the upstream request is the one a native Codex CLI sends (see 6.2.2). A bundled CLIProxyAPI sidecar was the gateway until it was measured rewriting what Codex sent: it dropped `Thread-Id`, `Session-Id` and `X-Codex-Window-ID`, replaced them with its own `session_id`, dropped the upstream `X-Codex-Turn-State` response header, and injected an `image_generation` tool and an empty `instructions` field that a native Codex request does not carry. It stayed selectable as a fallback while this direct gateway proved itself, then was removed (issue #32); it remains in the repository history. A sidecar must not be reintroduced: any gateway between the pool and upstream has to forward what Codex sent, which is what `codex-upstream` is for.
 
 In the container the last hop of every direct request goes through `codex-upstream`, a loopback-only Rust process (`127.0.0.1:8320`, started by the supervisor before the pool) built from Codex's own `codex-http-client` crate at the Codex release the pool targets (currently `rust-v0.163.0`), with `Cargo.lock` seeded from that release so reqwest, hyper, h2, native-tls and the vendored OpenSSL resolve to the same versions, compiled for musl with the same Rust toolchain. Its TLS ClientHello (JA4), HTTP/2 SETTINGS, header order, and zstd request compression (level 3, Responses requests only, not compaction) were measured equal to a native Codex CLI of that release. Pool still selects the account, owns its credential, and decides retries and failover; it sends `codex-upstream` the finished request with `X-Codex-Upstream-Url`, `X-Codex-Upstream-Identity` (the account the request is for; nothing is keyed on it, because `codex-upstream` builds a fresh client for every request and a fresh connector for every WebSocket, as Codex does — so every request opens its own connection with a full TLS handshake, never reusing a connection or resuming a TLS session; Cloudflare infrastructure cookies stay process-global, as in Codex itself) and `X-Codex-Upstream-Compression`, which are consumed there and never sent upstream. A response carrying `X-Codex-Upstream-Error` means the hop could not reach upstream and is handled as a transport failure. Pool also sets the `version` header a native Codex sends to the Codex backend, from the client's `codex*/<version>` User-Agent product token. Without `CODEX_POOL_CODEX_TRANSPORT_URL` (tests), Pool sends the same request from Go.
 
@@ -206,25 +206,15 @@ In the container the last hop of every direct request goes through `codex-upstre
 - A turn state goes back only to the account that issued it, as on HTTP (`turnStateForAttempt`): on a socket Codex carries it in `client_metadata["x-codex-turn-state"]`, so after a session moved accounts the field is removed from the message, every other byte unchanged. The issuer is the account whose handshake (or event headers) carried that turn state; one the pool has not seen is taken as the session's sticky account's.
 - When a later request belongs on another account (lineage move, cooled account), or a response that already showed content fails with an account-allowance, transient, or authentication class, Pool closes the client socket instead of switching upstream sockets: incremental requests reference responses that exist only on the old connection. A native Codex reconnects and resends in full, and routing places that request.
 - A running response counts as in flight for the drain and the deploy idle wait; an idle socket between turns does not. Shutdown waits for running socket responses within the grace. Pool pings the client leg every 20 s so NATs and proxies on the internet-facing leg do not drop it.
-- Without `codex-upstream` (sidecar mode, tests) Pool answers the upgrade with `426`, which Codex treats as "use HTTP".
+- Without `codex-upstream` (some tests) Pool answers the upgrade with `426`, which Codex treats as "use HTTP".
 
 Moving to a new Codex release means changing the `codex-http-client` tag in `upstream/Cargo.toml`, reseeding `upstream/Cargo.lock` from that release's `codex-rs/Cargo.lock`, matching its Rust toolchain in the Dockerfile, and re-measuring against that release by the procedure in 2.3.2.
 
-In direct mode Pool is the only process that refreshes an account's credential, in its `auth.json`, under the per-account auth lock. It refreshes before a request when the access token is within five minutes of expiry, and on a `401` it refreshes once and retries the same account, as a native Codex does; only a second `401`, or a refresh that cannot produce a new token, is treated as an account auth failure. A refresh that finds the token already replaced by a concurrent request reuses it instead of spending the rotated refresh token again.
+Pool is the only process that refreshes an account's credential, in its `auth.json`, under the per-account auth lock. It refreshes before a request when the access token is within five minutes of expiry, and on a `401` it refreshes once and retries the same account, as a native Codex does; only a second `401`, or a refresh that cannot produce a new token, is treated as an account auth failure. A refresh that finds the token already replaced by a concurrent request reuses it instead of spending the rotated refresh token again.
 
 The Codex backend sends a Responses stream with no `Content-Type` header (a native Codex reads it regardless), so a successful answer to `/responses` without one is treated as `text/event-stream`; otherwise the pre-commit capacity retry, usage recording, and non-streaming assembly would all be skipped. The Codex backend only streams, only accepts `store: false` and list `input`, has no `system` role, and rejects some Responses parameters. A request already in that shape, which is every request a native Codex sends, is forwarded byte for byte. Only a foreign request (an OpenAI-style app, pool quota priming, chat-completions conversion) is changed, and only as far as needed: string `input` becomes one user message, `stream` becomes `true`, `store` becomes `false`, `system` input roles become `developer`, and `max_output_tokens`, `max_completion_tokens`, `temperature`, `top_p`, `truncation`, `user`, `context_management`, `safety_identifier`, `stream_options`, `previous_response_id` and `prompt_cache_retention` are removed. When the client did not ask to stream, Pool reads the stream to its terminal event and answers with one Responses JSON document, rebuilding `output` from `response.output_item.done` items when the completed event carries none; an in-stream failure is answered as `429` (capacity), `401` (authentication), `400` (request) or `502`, so the non-streaming failover handles it. `POST /v1/responses/compact` goes to the Codex backend's `/responses/compact`, as a native Codex sends it, unchanged.
 
-Refresh tokens rotate on use, so after a mode switch only the copy refreshed last is valid. On startup each mode adopts the other mode's copy when it is newer by access-token `iat` (or `exp`): direct mode copies a newer sidecar record into `auth.json`, and sidecar mode rewrites its record from a newer `auth.json`. Skipping this would make the first refresh after a switch spend a revoked token and log the account out.
-
-The sidecar remains available with `CODEX_POOL_CODEX_GATEWAY_MODE=sidecar`; the rest of this section describes that mode.
-
-The image must bundle a pinned CLIProxyAPI executable and run it in the same container on `127.0.0.1:8319`. Do not expose or publish that port. The pool remains the only public OpenAI-compatible API and the only management UI.
-
-For a device-auth account, Pool writes a separate CLIProxy auth record under `/data/cliproxy/auths/<account-id>.json` with a unique account prefix. Pool must include that prefix when relaying a selected account's request, so all account selection, sticky-session binding, quota exclusion, cooldown, and failover remain in Pool. Configure the sidecar with one retry credential and no independent cooling so a `429` or upstream server error returns to Pool for routing.
-
-The sidecar owns refreshes of its copied OAuth credential. Pool must read the sidecar copy for quota polling and must not concurrently refresh the original Codex CLI auth file. Sidecar auth records, its internal API key, and generated config are runtime `/data` content and must never be committed.
-
-The original Codex `auth.json` is still read for account metadata, routing eligibility, and sidecar sync. Codex CLI or the sidecar may rewrite that file while requests are selecting accounts, so Pool must use bounded retry when a read sees invalid or incomplete auth content. A missing auth file for a staged or unauthenticated slot must classify quickly as unavailable instead of retrying under the global state lock; a transient partial write must not make all device-auth slots look missing and produce a false `503 no eligible account` response.
+Each account's Codex `auth.json` is its only credential, read for the request credential, account metadata and routing eligibility. The Codex CLI (during device auth) or the pool's own refresh may rewrite that file while requests are selecting accounts, so Pool must use bounded retry when a read sees invalid or incomplete auth content. A missing auth file for a staged or unauthenticated slot must classify quickly as unavailable instead of retrying under the global state lock; a transient partial write must not make all device-auth slots look missing and produce a false `503 no eligible account` response.
 
 #### 2.3.1 Shutdown and deploys
 
@@ -236,8 +226,8 @@ remote Codex clients report error responses for each open stream.
   requests (responses, compact, chat completions; streams included) finish for
   up to `CODEX_POOL_SHUTDOWN_GRACE`, saves state, and exits. A request still
   running when the grace expires is cut.
-- The supervisor forwards the signal to the pool and stops the sidecar only
-  after the pool exits, because draining streams still flow through it.
+- The supervisor forwards the signal to the pool and stops `codex-upstream`
+  only after the pool exits, because draining streams still flow through it.
 - `compose.yaml` sets `stop_grace_period` above the grace so Docker does not
   kill the drain.
 - Docker stops the old container before starting the new one, so a drain
@@ -1013,7 +1003,7 @@ Request:
 {}
 ```
 
-The admin UI sends no user-entered account fields. It creates an empty Codex device-auth credential slot, keeps it disabled and out of the pool while login is pending, immediately starts device auth, and shows only the verification URL, user code, local copy controls for those two values, and a 15 minute countdown. The slot is enabled and added to the pool only after device auth succeeds, the sidecar auth record is prepared, and quota/account metadata refresh has run. Failed or cancelled login leaves the slot disabled and out of the pool. `id` and `label` are local slot identifiers and are not derived from email, plan, or upstream account metadata. `email`, `planType`, `planRank`, upstream account ID, organization, and model access are resolved after device auth from the authenticated Codex credential as metadata; routing treats an empty `allowedModels` list as no per-account model restriction.
+The admin UI sends no user-entered account fields. It creates an empty Codex device-auth credential slot, keeps it disabled and out of the pool while login is pending, immediately starts device auth, and shows only the verification URL, user code, local copy controls for those two values, and a 15 minute countdown. The slot is enabled and added to the pool only after device auth succeeds and quota/account metadata refresh has run. Failed or cancelled login leaves the slot disabled and out of the pool. `id` and `label` are local slot identifiers and are not derived from email, plan, or upstream account metadata. `email`, `planType`, `planRank`, upstream account ID, organization, and model access are resolved after device auth from the authenticated Codex credential as metadata; routing treats an empty `allowedModels` list as no per-account model restriction.
 
 Response:
 
@@ -1647,9 +1637,8 @@ Priming is pool bookkeeping, not a client request. It must not create sticky or
 thread affinity, response bindings, prompt-cache statistics, throughput results,
 or routing events, and must not change account health or client request
 counters. It bypasses the proxy handler, not the account's transport: the request
-travels the upstream path that slot normally routes over, including the cliproxy
-sidecar when the gateway mode selects it, because reaching past that transport
-would authenticate differently and would not charge the identity being primed. It applies to any enabled slot that owns its upstream identity, is not awaiting
+travels the upstream path that slot normally routes over, with the slot's own
+credential, because any other path would not charge the identity being primed. It applies to any enabled slot that owns its upstream identity, is not awaiting
 auth verification, is not cooling down for the chosen model, and whose refresh
 succeeded. Pool membership is not a condition: a slot held out of the pool still
 owns a window that must start counting down, or that window is still pinned when
@@ -1885,7 +1874,7 @@ Response:
   "apiKeyId": "default",
   "apiKeyLabel": "Default",
   "modelId": "gpt-5.5",
-  "gatewayMode": "sidecar",
+  "gatewayMode": "direct",
   "requestKind": "text",
   "success": true,
   "httpStatus": 200,
@@ -1945,7 +1934,7 @@ Response:
       "accessScope": "lan",
       "clientBaseUrlHost": "localhost",
       "imageGenerationMode": "enabled",
-      "gatewayMode": "sidecar",
+      "gatewayMode": "direct",
       "upstreamProxyUrl": null,
       "routingStrategy": "sticky_balanced",
       "preserveProQuota": false,
@@ -2743,7 +2732,7 @@ must remain visible:
   becomes a `planLimit`.
   On each quota refresh the multiplier comes from the usage response, then the
   freshly fetched account metadata. The multiplier this pool previously stored
-  (and mirrored into the sidecar auth record) is never evidence while metadata
+  is never evidence while metadata
   answered: it is used only when the metadata lookup could not run, so a tier
   change upstream (Pro 200 going from `20x` to `10x`) replaces it, and a
   metadata answer with no multiplier clears it.
@@ -2980,7 +2969,7 @@ The implementation is acceptable when:
 8. Accounts can be enabled, disabled, added to pool, removed from pool, soft-deleted, and purged.
 9. Sticky sessions keep using the same account across requests.
 10. Quota exhaustion triggers account/model cooldown and failover.
-11. Token expiration is refreshed by the account's sidecar credential on the same account, not treated as quota exhaustion or failover.
+11. Token expiration is refreshed with the account's own credential on the same account, not treated as quota exhaustion or failover.
 12. Admin UI displays account health, cooldown until time, quota windows, token usage stats, and recent errors.
 13. Logs do not expose tokens, API keys, or auth files.
 14. Public `/v1` API is protected by configured API key.
