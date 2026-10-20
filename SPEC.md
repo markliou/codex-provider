@@ -152,6 +152,7 @@ docker run -d \
 | `CODEX_POOL_ADDR` | no | `0.0.0.0:8317` | Combined provider API and control/admin UI bind address. |
 | `CODEX_POOL_PUBLIC_ADDR` | no | none | Compatibility alias for the former provider bind; used only when `CODEX_POOL_ADDR` is unset. |
 | `CODEX_POOL_ALLOW_REMOTE_ADMIN` | no | `false` | Required if the combined address is non-loopback, acknowledging that `/admin` is reachable wherever `/v1` is reachable. |
+| `CODEX_POOL_TRUSTED_PROXIES` | no | none | Comma-separated addresses or CIDRs of reverse proxies in front of the pool. Only a connection from one of them has its `X-Forwarded-For` (last entry) taken as the client address, which the admin login lockout counts by; from anywhere else the header is ignored. Without it, every client behind a proxy shares the proxy's lockout. An invalid value is a startup error. |
 | `CODEX_POOL_PUBLIC_DASHBOARD` | no | `true` | Enable unauthenticated public pool status and join/leave controls on the control page. Set to `false` to hide the public mode. |
 | `CODEX_POOL_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error`. |
 | `CODEX_POOL_REDACT_LOGS` | no | `true` | Redact tokens, auth headers, API keys, refresh tokens. |

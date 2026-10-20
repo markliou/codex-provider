@@ -184,3 +184,34 @@ func TestPoolOwnCallsNameTheirHeaderOrder(t *testing.T) {
 		t.Fatalf("usage hop url %q order %q", gotURL, gotOrder)
 	}
 }
+
+// Behind a reverse proxy the login lockout must count each real client, and a
+// forwarded address must be believed only from the proxy.
+func TestAdminLoginKeyTrustsOnlyTheConfiguredProxy(t *testing.T) {
+	t.Setenv("CODEX_POOL_TRUSTED_PROXIES", "172.18.0.0/16")
+	if err := applyTrustedProxiesEnv(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { trustedProxyNetworks = nil })
+	request := func(remote, forwarded string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/admin/api/login", nil)
+		r.RemoteAddr = remote
+		if forwarded != "" {
+			r.Header.Set("X-Forwarded-For", forwarded)
+		}
+		return r
+	}
+	if got := adminLoginKey(request("172.18.0.5:41000", "203.0.113.9")); got != "203.0.113.9" {
+		t.Fatalf("behind the proxy the key = %q, want the client", got)
+	}
+	if got := adminLoginKey(request("172.18.0.5:41000", "198.51.100.1, 203.0.113.9")); got != "203.0.113.9" {
+		t.Fatalf("a client-supplied hop must not win over the proxy's: %q", got)
+	}
+	if got := adminLoginKey(request("203.0.113.50:5000", "10.0.0.1")); got != "203.0.113.50" {
+		t.Fatalf("a direct client's own forwarded header must be ignored: %q", got)
+	}
+	t.Setenv("CODEX_POOL_TRUSTED_PROXIES", "not-a-network")
+	if err := applyTrustedProxiesEnv(); err == nil {
+		t.Fatal("an invalid trusted proxy must stop startup")
+	}
+}

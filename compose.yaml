@@ -7,6 +7,12 @@ services:
       - .env
     ports:
       - "8317:8317"
+    # edge_proxy is the host's Caddy network: Caddy terminates HTTPS for the
+    # pool's public name and reaches it here as codex-pool:8317. The published
+    # port stays for clients that still connect to it directly.
+    networks:
+      - default
+      - edge_proxy
     volumes:
       - codex-pool-data:/data
     # Docker's default 10s stop timeout would SIGKILL the pool in the middle of
@@ -25,4 +31,8 @@ services:
 
 volumes:
   codex-pool-data:
+    external: true
+
+networks:
+  edge_proxy:
     external: true
