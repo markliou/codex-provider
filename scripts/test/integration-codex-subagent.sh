@@ -130,8 +130,12 @@ if (!parentSpawn.threadId || !child.threadId || child.threadId === parentSpawn.t
 if (child.parentThreadId !== parentSpawn.threadId) {
   throw new Error("child parent thread " + child.parentThreadId + " does not match main " + parentSpawn.threadId);
 }
-if (!parentSpawn.promptCacheKey || !child.promptCacheKey || child.promptCacheKey === parentSpawn.promptCacheKey) {
-  throw new Error("preserve policy did not retain independent native cache keys: " + JSON.stringify(events));
+// Codex 0.163 keys the prompt cache by session (core/src/client.rs
+// prompt_cache_key returns responses_metadata.session_id), and a spawned
+// subagent shares its parent'"'"'s session, so a native Codex sends both the same
+// key. Under the preserve policy the pool must pass that key on unchanged.
+if (!parentSpawn.promptCacheKey || child.promptCacheKey !== parentSpawn.promptCacheKey) {
+  throw new Error("preserve policy did not pass on the native session cache key: " + JSON.stringify(events));
 }
 '
 
