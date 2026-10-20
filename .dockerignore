@@ -19,3 +19,4 @@ note.txt
 coverage.out
 *.log
 upstream/target/
+scripts/conformance/out/

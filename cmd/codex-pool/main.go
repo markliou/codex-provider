@@ -421,12 +421,18 @@ type promptCacheStat struct {
 	// ColdRequestCount counts cache-eligible requests (input >= 1024 tokens)
 	// that returned zero cached tokens, i.e. a cold start. It quantifies why a
 	// hit rate is low: new conversations, failover hand-offs, or 15 RPM overflow.
-	ColdRequestCount            uint64    `json:"coldRequestCount"`
-	ParentAffinityHitCount      uint64    `json:"parentAffinityHitCount,omitempty"`
-	ParentAffinityFallbackCount uint64    `json:"parentAffinityFallbackCount,omitempty"`
-	LineageFailoverCount        uint64    `json:"lineageFailoverCount,omitempty"`
-	RoutingFailoverCount        uint64    `json:"routingFailoverCount,omitempty"`
-	UpdatedAt                   time.Time `json:"updatedAt"`
+	ColdRequestCount            uint64 `json:"coldRequestCount"`
+	ParentAffinityHitCount      uint64 `json:"parentAffinityHitCount,omitempty"`
+	ParentAffinityFallbackCount uint64 `json:"parentAffinityFallbackCount,omitempty"`
+	LineageFailoverCount        uint64 `json:"lineageFailoverCount,omitempty"`
+	RoutingFailoverCount        uint64 `json:"routingFailoverCount,omitempty"`
+	// UnrecognizedFailureCount counts terminal failures whose shape the pool
+	// could not classify ("unknown"). Every one is a format the pool does not
+	// understand the way Codex does: a usage-limit error read by code alone sat
+	// at "unknown" for a session before anyone looked. A nonzero count is the
+	// signal to compare that shape with Codex's source.
+	UnrecognizedFailureCount uint64    `json:"unrecognizedFailureCount,omitempty"`
+	UpdatedAt                time.Time `json:"updatedAt"`
 }
 
 // routingCacheEvent contains only bounded operational metadata. Raw thread,
@@ -3597,6 +3603,16 @@ func responseInfoFromSSEBlock(block string) proxyResponseInfo {
 	if isTerminalResponseEvent(eventType) {
 		info.TerminalEvent = eventType
 		info.TerminalFailureClass = terminalFailureClass(eventType, info.TerminalErrorCode)
+		if info.TerminalFailureClass == "unknown" && eventType == "error" {
+			// A Responses WebSocket wraps an HTTP refusal as {"type":"error",
+			// "status":429,...}; Codex classifies one with no code it knows by
+			// that status, as it would the HTTP answer, so the pool does too.
+			if status, ok := uint64Field(payload, "status"); ok {
+				info.TerminalFailureClass = statusFailureClass(int(status))
+			} else if status, ok := uint64Field(payload, "status_code"); ok {
+				info.TerminalFailureClass = statusFailureClass(int(status))
+			}
+		}
 	}
 	return info
 }
@@ -3643,7 +3659,8 @@ func retryableTerminalCooldown(reason string) time.Duration {
 	switch reason {
 	case "server_is_overloaded", "slow_down", "server_error", "internal_server_error":
 		return upstream5xxCooldown
-	case "usage_limit_reached", "usage_not_included", "insufficient_quota":
+	case "usage_limit_reached", "usage_not_included", "insufficient_quota",
+		"credit_balance_exhausted", "organization_spend_limit_exceeded", "project_spend_limit_exceeded", "organization_usage_limit_exceeded":
 		// A spent allowance does not come back in seconds. Hold the account out
 		// until the next quota refresh has seen the spent window, which then keeps
 		// it out (or lets it back the moment its owner resets it); a short
@@ -3708,8 +3725,15 @@ func terminalFailureClass(eventType, code string) string {
 	if eventType != "error" && eventType != "response.failed" {
 		return ""
 	}
+	// The codes below are the ones Codex itself recognizes (codex-api
+	// sse/responses_error.rs, api_bridge.rs and endpoint/responses_websocket.rs
+	// at the pinned release), each sorted by what another account can do about
+	// it. testdata/codex-upstream-failures.json holds the shapes, copied from
+	// Codex's own tests, that keep this table honest; a code Codex learns in a
+	// later release belongs here and there together.
 	switch sanitizedErrorCode(code) {
-	case "rate_limit_exceeded", "insufficient_quota", "usage_not_included", "usage_limit_reached", "server_is_overloaded", "slow_down":
+	case "rate_limit_exceeded", "insufficient_quota", "usage_not_included", "usage_limit_reached", "server_is_overloaded", "slow_down",
+		"credit_balance_exhausted", "organization_spend_limit_exceeded", "project_spend_limit_exceeded", "organization_usage_limit_exceeded":
 		return "capacity"
 	// A server-side fault upstream chose to deliver inside the stream. These two
 	// codes are documented and unambiguous, so recognizing them is not the
@@ -3721,7 +3745,31 @@ func terminalFailureClass(eventType, code string) string {
 		return "transient"
 	case "account_auth_failed", "authentication_error", "invalid_api_key", "invalid_token", "token_invalidated", "token_revoked", "unauthorized", "forbidden":
 		return "authentication"
-	case "context_length_exceeded", "invalid_prompt", "cyber_policy", "content_policy_violation", "policy_violation":
+	case "context_length_exceeded", "invalid_prompt", "cyber_policy", "bio_policy", "misalignment_policy_violation", "content_policy_violation", "policy_violation", "invalid_request_error":
+		return "request"
+	// Recognized, and Codex's to handle: it reconnects on the WebSocket
+	// connection limit, resends in full when a previous response is gone, and
+	// reports flex unavailability itself. Another account would not do better,
+	// so they pass through untouched, like "unknown", but they are not counted
+	// as shapes the pool failed to understand.
+	case "websocket_connection_limit_reached", "previous_response_not_found", "flex_unavailable":
+		return "passthrough"
+	default:
+		return "unknown"
+	}
+}
+
+// statusFailureClass classifies a wrapped refusal by its HTTP status, the way
+// the pool classifies the same refusal arriving as an HTTP answer.
+func statusFailureClass(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return "capacity"
+	case status == http.StatusUnauthorized:
+		return "authentication"
+	case status >= http.StatusInternalServerError:
+		return "transient"
+	case status >= http.StatusBadRequest:
 		return "request"
 	default:
 		return "unknown"
@@ -6001,6 +6049,9 @@ func (a *app) markTerminalResponseFailure(route routingDecision, model, accountI
 	// account health. Context length, invalid prompt, policy rejection, or a new
 	// unknown code does not prove another credential could serve the request.
 	a.recordPromptCacheResultWithRoutingLocked(accountID, model, route.Identity, info.Usage, false, false, false, "upstream_response_failed", now)
+	if class == "unknown" {
+		a.noteUnrecognizedFailureLocked(accountID, model, route.Identity)
+	}
 	a.appendRoutingCacheEventLocked(route, model, accountID, info.FailoverFromAccountID, "upstream_response_failed", info, now)
 	a.state.RequestCount++
 	a.state.FailureCount++
@@ -6172,6 +6223,20 @@ func (a *app) recordPromptCacheResultWithRoutingLocked(accountID, model string, 
 		stat.RoutingFailoverCount++
 	}
 	stat.UpdatedAt = now
+	a.state.PromptCache[key] = stat
+}
+
+// noteUnrecognizedFailureLocked counts an unclassified terminal failure on the
+// same prompt-cache stat the request was just recorded on, so the dashboard's
+// resettable window carries it with the other observed counters.
+func (a *app) noteUnrecognizedFailureLocked(accountID, model string, identity requestIdentity) {
+	agentKind := "main"
+	if identity.IsSubagent {
+		agentKind = "subagent"
+	}
+	key := accountID + ":" + model + ":" + agentKind
+	stat := a.state.PromptCache[key]
+	stat.UnrecognizedFailureCount++
 	a.state.PromptCache[key] = stat
 }
 
@@ -10902,7 +10967,7 @@ func histogramPercentileMillis(histogram []uint64, percentile uint64) any {
 // accountID aggregates every account.
 func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Time) map[string]any {
 	var input, cached, requests, usageObserved, cacheWrites, cacheWriteInput, cacheWriteObserved, cacheHits, cacheEligible, cold uint64
-	var parentAffinityHits, parentAffinityFallbacks, lineageFailovers, routingFailovers uint64
+	var parentAffinityHits, parentAffinityFallbacks, lineageFailovers, routingFailovers, unrecognizedFailures uint64
 	agents := map[string]map[string]uint64{
 		"main": {
 			"inputTokens": 0, "cachedTokens": 0, "requestCount": 0, "usageObservedRequestCount": 0,
@@ -10946,6 +11011,7 @@ func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Tim
 		parentAffinityFallbacks += subSat(stat.ParentAffinityFallbackCount, base.ParentAffinityFallbackCount)
 		lineageFailovers += subSat(stat.LineageFailoverCount, base.LineageFailoverCount)
 		routingFailovers += subSat(stat.RoutingFailoverCount, base.RoutingFailoverCount)
+		unrecognizedFailures += subSat(stat.UnrecognizedFailureCount, base.UnrecognizedFailureCount)
 		agentKind := stat.AgentKind
 		if agentKind != "subagent" {
 			agentKind = "main"
@@ -10971,7 +11037,8 @@ func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Tim
 		"cacheHitRequestCount": cacheHits, "cacheEligibleRequestCount": cacheEligible, "coldRequestCount": cold,
 		"main": agents["main"], "subagent": agents["subagent"],
 		"parentAffinityHitCount": parentAffinityHits, "parentAffinityFallbackCount": parentAffinityFallbacks,
-		"lineageFailoverCount": lineageFailovers, "routingFailoverCount": routingFailovers, "resetAt": resetAt,
+		"lineageFailoverCount": lineageFailovers, "routingFailoverCount": routingFailovers,
+		"unrecognizedFailureCount": unrecognizedFailures, "resetAt": resetAt,
 	}
 }
 

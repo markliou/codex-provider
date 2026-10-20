@@ -118,6 +118,10 @@
                   <div class="cache-window-stat"><div class="eyebrow">Requests</div><span id="cache-window-reqs" class="cache-window-value">—</span></div>
                   <div class="cache-window-stat"><div class="eyebrow">Cold requests</div><span id="cache-window-cold-count" class="cache-window-value">—</span></div>
                   <div class="cache-window-stat"><div class="eyebrow">Lineage failovers</div><span id="cache-window-lineage-failover" class="cache-window-value">—</span></div>
+                  <!-- Upstream failures the pool could not classify. Nonzero means
+                       upstream sent a shape the pool does not read the way Codex
+                       does; compare it with Codex's source before trusting routing. -->
+                  <div class="cache-window-stat" title="Upstream failures the pool could not classify"><div class="eyebrow">Unrecognized failures</div><span id="cache-window-unrecognized" class="cache-window-value">—</span></div>
                 </div>
               </div>
               <div class="metric-source-group calculated">

@@ -343,6 +343,21 @@ classification; bounded persisted diagnostics; and redaction of raw route and
 account identifiers. It deliberately never retags the live
 `codex-pool:local` image.
 
+### Codex Wire Conformance
+
+The pool must look like a native Codex of the pinned release in both directions (SPEC.md 2.3.2). Two scripts check it, both in Docker:
+
+```bash
+sh scripts/conformance/codex-conformance.sh check        # how the pool reads upstream, against Codex's source
+sh scripts/conformance/wire-capture.sh                   # what the pool sends upstream, against a native Codex
+sh scripts/conformance/codex-conformance.sh releases     # Codex releases newer than the pin
+sh scripts/conformance/codex-conformance.sh diff <tag>   # every change to the watched Codex files up to <tag>
+```
+
+`check` verifies that every upstream shape in `cmd/codex-pool/testdata/codex-upstream-failures.json` still exists in the Codex source it was copied from, and that every error code Codex's parsers name has a shape there (the Go tests hold the pool's classification to those shapes). `wire-capture.sh` runs the same turn from the native Codex CLI and from Codex behind a pool built from the working tree, over HTTP and WebSocket, against a fake `chatgpt.com` on an internal network, and compares TLS ClientHello (JA4), HTTP/2 SETTINGS, header order and values, and bodies. It fails on any difference the pool introduces. It also reports the client gap: Codex sends a custom provider (the pool) a smaller body than its own backend, which forwarding cannot repair (SPEC.md 2.3.2). Output lands in `scripts/conformance/out/` (git-ignored).
+
+In production, the dashboard's Unrecognized failures counter (and `class=unknown` in the log) shows any upstream failure the pool could not classify.
+
 ## Local Build
 
 Build local images through the repository script so the admin page version comes from git instead of a hand-edited HTML string:

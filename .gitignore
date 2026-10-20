@@ -17,3 +17,6 @@ coverage.out
 *.log
 note.txt
 upstream/target/
+
+# Conformance captures and the Codex binaries they download.
+scripts/conformance/out/

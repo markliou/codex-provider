@@ -205,7 +205,7 @@ In the container the last hop of every direct request goes through `codex-upstre
 - A running response counts as in flight for the drain and the deploy idle wait; an idle socket between turns does not. Shutdown waits for running socket responses within the grace. Pool pings the client leg every 20 s so NATs and proxies on the internet-facing leg do not drop it.
 - Without `codex-upstream` (sidecar mode, tests) Pool answers the upgrade with `426`, which Codex treats as "use HTTP".
 
-Moving to a new Codex release means changing the `codex-http-client` tag in `upstream/Cargo.toml`, reseeding `upstream/Cargo.lock` from that release's `codex-rs/Cargo.lock`, matching its Rust toolchain in the Dockerfile, and re-measuring against that release.
+Moving to a new Codex release means changing the `codex-http-client` tag in `upstream/Cargo.toml`, reseeding `upstream/Cargo.lock` from that release's `codex-rs/Cargo.lock`, matching its Rust toolchain in the Dockerfile, and re-measuring against that release by the procedure in 2.3.2.
 
 In direct mode Pool is the only process that refreshes an account's credential, in its `auth.json`, under the per-account auth lock. It refreshes before a request when the access token is within five minutes of expiry, and on a `401` it refreshes once and retries the same account, as a native Codex does; only a second `401`, or a refresh that cannot produce a new token, is treated as an account auth failure. A refresh that finds the token already replaced by a concurrent request reuses it instead of spending the rotated refresh token again.
 
@@ -253,6 +253,23 @@ The service should warn when:
 2. Debug logs are enabled.
 3. Remote admin is explicitly enabled.
 4. HTTP is used on a public bind address without TLS/reverse proxy.
+
+#### 2.3.2 Codex wire conformance
+
+The pool must be indistinguishable from a native Codex of the pinned release (the tag in `upstream/Cargo.toml`) in both directions, because that is what lets the backend serve pool traffic the way it serves Codex:
+
+- **Send.** What reaches upstream equals a native Codex for the same turn: every TLS ClientHello (JA4) and ALPN the pool sends is one Codex sends to that server, and the HTTP/2 SETTINGS, request order and protocol, header names, order and values, body encoding, and WebSocket handshake equal a native Codex's, apart from values minted per run. The body is the one Codex gave the pool, forwarded unchanged. `scripts/conformance/wire-capture.sh` measures all of this against the npm release of the pinned Codex and fails on any difference the pool introduces.
+- **Client gap.** Codex itself sends a custom provider — which is how Codex reaches the pool — a smaller body than it sends its own backend, and the capture reports that separately because forwarding cannot repair it. Measured at `rust-v0.163.0`: the custom-provider body lacks the MCP resource tools and `image_gen`, `client_metadata.mcp_attribution` and `client_metadata.guardian_credits_requested`, and `internal_chat_message_metadata_passthrough` on input items. Codex adds internal metadata only for an `https` base URL on `chatgpt.com` or `api.openai.com`, or for its built-in provider (`model-provider/src/provider.rs` `include_internal_metadata`, which cannot be set from configuration), and adds the guardian and Codex-backend fields only for its built-in `OpenAI` provider with ChatGPT auth, no bearer token, and a base URL ending in `/backend-api/codex` (`core/src/client.rs` `uses_codex_backend`, `model-provider-info` `supports_codex_backend_routes`). Closing the gap is a change to how Codex is pointed at the pool, not to forwarding.
+- **Receive.** The pool reads upstream's answers as Codex reads them: the same terminal events, the same lifecycle (non-output) events, the same error codes, and an error's `error.type` and wrapped `status` where Codex uses them. The shapes are recorded in `cmd/codex-pool/testdata/codex-upstream-failures.json`, copied from Codex's own source and tests with the file and a verbatim marker for each; the Go tests hold the pool's classification to them, and `scripts/conformance/codex-conformance.sh check` verifies the markers still exist in Codex and that every code Codex's error parsers name has a shape. A fake upstream in a test answers only in shapes that file records.
+- **Policy.** Where the pool acts on an answer (retry, failover, cooldown, closing a socket), the Codex behavior it stands in for is cited next to the code. The pool may decide differently only where it has something Codex lacks — another account — and must say so there.
+
+The reason this is a contract: every production failure of this kind passed tests built on what the pool assumed instead of what Codex does. A usage limit sent as `error.type` read as unknown; a stream without `Content-Type` skipped the retry window; the backend's informational WebSocket events committed the socket. Each is now a recorded shape.
+
+A failure the pool cannot classify is counted (`unrecognizedFailureCount` in the cache window, shown as Unrecognized failures) as well as logged with `class=unknown`. It is passed through untouched, as before, but a nonzero count means upstream sent something the pool does not read the way Codex does, and the shape must be found, compared with Codex's source, and recorded. Codes Codex recognizes and handles itself (`websocket_connection_limit_reached`, `previous_response_not_found`, `flex_unavailable`) are class `passthrough`: passed through, no effect on account health, and not counted.
+
+Account semantics are the pool's own and cannot be checked against Codex, which only ever has one account. Each such concept must have one definition shared by routing and the dashboard: routing's upstream identity and the dashboard's quota allowance draw the same line between accounts, and a test holds them together. They once diverged for a month — the dashboard counted each Business workspace member as an allowance while routing collapsed the workspace into one account — and live account data had shown the difference the whole time.
+
+Moving to a new Codex release: `codex-conformance.sh diff <tag>` prints every change to the watched Codex files (`scripts/conformance/codex-watchlist.txt`); each change is matched in the pool or noted as not applying; then the tag, lock, fixture release and shapes are updated together (a test fails if the fixture's release differs from the pinned tag), and `check` and `wire-capture.sh` must pass before deploying.
 
 ---
 
@@ -2056,6 +2073,15 @@ For streaming responses:
   failures may quarantine the credential. Context length, invalid prompt, and
   policy failures do not penalize account health. Unknown codes remain a
   sanitized generic failure instead of being guessed as quota/auth.
+- The classes follow Codex's own parsers (2.3.2). Codex's quota codes
+  (`credit_balance_exhausted`, `organization_spend_limit_exceeded`,
+  `project_spend_limit_exceeded`, `organization_usage_limit_exceeded`) are
+  `capacity` like `insufficient_quota`; `bio_policy`,
+  `misalignment_policy_violation` and `invalid_request_error` are `request`;
+  `websocket_connection_limit_reached`, `previous_response_not_found` and
+  `flex_unavailable` are `passthrough`. A wrapped WebSocket error whose code is
+  not recognized is classified by its `status` as the same HTTP answer would be
+  (`429` capacity, `401` authentication, `5xx` transient, other `4xx` request).
 - Two classes of terminal failure are retryable: `capacity`
   (`rate_limit_exceeded`, `insufficient_quota`, `usage_not_included`,
   `usage_limit_reached`, `server_is_overloaded`, `slow_down`) and `transient` (`server_error`,
@@ -2712,8 +2738,9 @@ The pool-wide cache window must show the total request count since reset and
 must group and visibly label Pool-observed counters separately from calculated
 read, request-hit, and cold rates. It must not show an upstream raw-token group
 or a cache-write rate. The Pool group must not duplicate the per-account
-parent-affinity hit/fallback metric; it shows Requests, Cold requests, and
-Lineage failovers. The cold count is Pool-observed; its rate is calculated and
+parent-affinity hit/fallback metric; it shows Requests, Cold requests,
+Lineage failovers, and Unrecognized failures (terminal failures the pool could
+not classify, highlighted when nonzero; see 2.3.2). The cold count is Pool-observed; its rate is calculated and
 must not share one mixed-source value. Main/subagent rates in this top summary
 must not append per-kind request counts; the request total is the single
 pool-wide Requests metric.
