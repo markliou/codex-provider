@@ -2168,10 +2168,8 @@ func TestDeviceAuthLoginRechecksIdentityAfterQuotaMetadata(t *testing.T) {
 		switch r.URL.Path {
 		case "/backend-api/wham/usage":
 			_, _ = w.Write([]byte(`{"plan_type":"team","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":60}}}`))
-		case "/backend-api/accounts/check/v4-2023-04-27":
-			_, _ = w.Write([]byte(`{"accounts":{"upstream-two":{"account":{"account_id":"upstream-two","workspace_name":"Different Workspace","plan_type":"team"},"entitlement":{"subscription_plan":"chatgptteamplan"}}},"account_ordering":["upstream-two"]}`))
-		case "/backend-api/subscriptions":
-			_, _ = w.Write([]byte(`{"subscription_plan":"chatgptteamplan"}`))
+		case "/backend-api/wham/accounts/check":
+			_, _ = w.Write([]byte(`{"accounts":[{"id":"upstream-two","name":"Different Workspace","plan_type":"team","structure":"workspace"}],"account_ordering":["upstream-two"]}`))
 		default:
 			t.Fatalf("unexpected quota metadata path %s", r.URL.Path)
 		}
@@ -7232,12 +7230,9 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 					{"status":"available","expires_at":%q}
 				]
 			}`, resetCreditExpires.Add(-time.Hour).Format(time.RFC3339), resetCreditExpires.Format(time.RFC3339))
-		case "/backend-api/accounts/check/v4-2023-04-27":
+		case "/backend-api/wham/accounts/check":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"accounts":{"acct-chatgpt":{"account":{"account_id":"acct-chatgpt","name":"Acme Workspace","plan_type":"team"},"entitlement":{"subscription_plan":"chatgptteamplan"}}},"account_ordering":["acct-chatgpt"]}`))
-		case "/backend-api/subscriptions":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"subscription_plan":"chatgptteamplan"}`))
+			_, _ = w.Write([]byte(`{"accounts":[{"id":"acct-chatgpt","name":"Acme Workspace","plan_type":"team","structure":"workspace"}],"account_ordering":["acct-chatgpt"]}`))
 		default:
 			t.Fatalf("unexpected usage path %s", r.URL.Path)
 		}
@@ -7262,7 +7257,9 @@ func TestCodexQuotaRefreshUpdatesDashboardState(t *testing.T) {
 	if !sawAccountHeader {
 		t.Fatal("quota refresh did not send ChatGPT-Account-Id")
 	}
-	if snapshot.RawPlanType != "chatgptteamplan" || snapshot.PlanFamily != "business" || snapshot.PlanType != "business" || snapshot.OrganizationName != "Acme Workspace" || snapshot.Quota == nil {
+	// Codex's account check names the plan "team"; the web app's entitlement
+	// said "chatgptteamplan". Both are the Business family.
+	if snapshot.RawPlanType != "team" || snapshot.PlanFamily != "business" || snapshot.PlanType != "business" || snapshot.OrganizationName != "Acme Workspace" || snapshot.Quota == nil {
 		t.Fatalf("unexpected quota snapshot: %#v", snapshot)
 	}
 	if a.config.Accounts[0].OrganizationName != "Acme Workspace" || a.config.Accounts[0].Label != "codex-quota" {
@@ -7337,12 +7334,9 @@ func TestCodexQuotaRefreshClearsStoredPersonalOrganizationName(t *testing.T) {
 					"secondary_window":{"used_percent":40,"limit_window_seconds":604800,"reset_at":%d}
 				}
 			}`, resetAt)
-		case "/backend-api/accounts/check/v4-2023-04-27":
+		case "/backend-api/wham/accounts/check":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"accounts":{"acct-chatgpt":{"account":{"account_id":"acct-chatgpt","name":"Yi-Fan Liou","plan_type":"team"},"entitlement":{"subscription_plan":"chatgptteamplan"}}},"account_ordering":["acct-chatgpt"]}`))
-		case "/backend-api/subscriptions":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"subscription_plan":"chatgptteamplan"}`))
+			_, _ = w.Write([]byte(`{"accounts":[{"id":"acct-chatgpt","name":"Yi-Fan Liou","plan_type":"team","structure":"personal"}],"account_ordering":["acct-chatgpt"]}`))
 		default:
 			t.Fatalf("unexpected usage path %s", r.URL.Path)
 		}
@@ -7808,8 +7802,7 @@ func TestRoutingStrategyFromEnv(t *testing.T) {
 }
 
 func TestCodexQuotaRefreshDoesNotInferProPlanLimit(t *testing.T) {
-	var sawAccountCheckRequest bool
-	var sawSubscriptionRequest bool
+	var accountCheckHeaders http.Header
 	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/backend-api/wham/usage":
@@ -7823,18 +7816,12 @@ func TestCodexQuotaRefreshDoesNotInferProPlanLimit(t *testing.T) {
 					"secondary_window":{"used_percent":20,"limit_window_seconds":604800}
 				}
 			}`))
-		case "/backend-api/accounts/check/v4-2023-04-27":
-			if r.URL.Query().Get("timezone_offset_min") != "" && r.Header.Get("X-OpenAI-Target-Path") == "/backend-api/accounts/check/v4-2023-04-27" {
-				sawAccountCheckRequest = true
+		case "/backend-api/wham/accounts/check":
+			if r.URL.RawQuery == "" {
+				accountCheckHeaders = r.Header.Clone()
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"accounts":{"primary":{"account":{"account_id":"acct-pro","account_name":"Personal Pro","plan_type":"pro"},"entitlement":{"expires_at":"2020-01-01T00:00:00Z"}}}}`))
-		case "/backend-api/subscriptions":
-			if r.URL.Query().Get("account_id") == "acct-pro" && r.Header.Get("X-OpenAI-Target-Path") == "/backend-api/subscriptions" {
-				sawSubscriptionRequest = true
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"subscription_plan":"chatgptpro"}`))
+			_, _ = w.Write([]byte(`{"accounts":[{"id":"acct-pro","name":"Personal Pro","plan_type":"pro","structure":"personal"}]}`))
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -7856,11 +7843,18 @@ func TestCodexQuotaRefreshDoesNotInferProPlanLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sawAccountCheckRequest {
-		t.Fatal("quota refresh did not fetch account metadata for Pro plan limit")
+	// Codex's own account check, as a native Codex sends it: no query, no
+	// browser headers, a Codex User-Agent and the account's credential.
+	if accountCheckHeaders == nil {
+		t.Fatal("quota refresh did not read Codex's account check")
 	}
-	if !sawSubscriptionRequest {
-		t.Fatal("quota refresh did not fetch subscription metadata for Pro plan limit")
+	if !strings.HasPrefix(accountCheckHeaders.Get("User-Agent"), "codex") || accountCheckHeaders.Get("ChatGPT-Account-Id") != "acct-pro" || !strings.HasPrefix(accountCheckHeaders.Get("Authorization"), "Bearer ") {
+		t.Fatalf("account check headers are not Codex's: %v", accountCheckHeaders)
+	}
+	for _, browser := range []string{"Origin", "Referer", "Sec-Fetch-Mode", "X-OpenAI-Target-Path", "OAI-Language"} {
+		if accountCheckHeaders.Get(browser) != "" {
+			t.Fatalf("account check carried the browser header %s", browser)
+		}
 	}
 	if snapshot.PlanType != "pro" || snapshot.PlanLimit != "" || snapshot.OrganizationName != "" {
 		t.Fatalf("unexpected Pro quota metadata: %#v", snapshot)
@@ -8228,7 +8222,7 @@ func TestResetCreditDetailsFailureRetainsKnownDateWithoutBlockingQuota(t *testin
 		DetailsObservedAt: now.Add(-resetCreditDetailsRefreshInterval),
 	}
 
-	a.enrichResetCreditExpiration(context.Background(), codexAuthInfo{AccessToken: "<access-token>"}, &current, prior, now)
+	a.enrichResetCreditExpiration(context.Background(), "", codexAuthInfo{AccessToken: "<access-token>"}, &current, prior, now)
 	if hits != 1 {
 		t.Fatalf("reset-credit details hits = %d, want 1", hits)
 	}
@@ -10754,11 +10748,11 @@ func TestRetiredModelMetersAreDropped(t *testing.T) {
 func TestQuotaRefreshDoesNotPerpetuateStoredPlanLimit(t *testing.T) {
 	for _, testCase := range []struct {
 		name         string
-		subscription string
+		accountCheck string
 		want         string
 	}{
-		{"metadata reports the new multiplier", `{"subscription_plan":"chatgptpro","plan_limit":"10x"}`, "10x"},
-		{"metadata reports no multiplier", `{"subscription_plan":"chatgptpro"}`, ""},
+		{"metadata reports the new multiplier", `{"accounts":[{"id":"acct-pro","plan_type":"pro","plan_limit":"10x","structure":"personal"}]}`, "10x"},
+		{"metadata reports no multiplier", `{"accounts":[{"id":"acct-pro","plan_type":"pro","structure":"personal"}]}`, ""},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -10766,10 +10760,8 @@ func TestQuotaRefreshDoesNotPerpetuateStoredPlanLimit(t *testing.T) {
 				switch r.URL.Path {
 				case "/backend-api/wham/usage":
 					_, _ = w.Write([]byte(`{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":10,"limit_window_seconds":604800}}}`))
-				case "/backend-api/accounts/check/v4-2023-04-27":
-					_, _ = w.Write([]byte(`{"accounts":{"primary":{"account":{"account_id":"acct-pro","account_name":"Personal Pro","plan_type":"pro"}}}}`))
-				case "/backend-api/subscriptions":
-					_, _ = w.Write([]byte(testCase.subscription))
+				case "/backend-api/wham/accounts/check":
+					_, _ = w.Write([]byte(testCase.accountCheck))
 				default:
 					t.Fatalf("unexpected path %s", r.URL.Path)
 				}

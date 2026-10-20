@@ -1,0 +1,604 @@
+{
+  "_comment": "Upstream event shapes as Codex itself parses them, at codexRelease. Every entry names the Codex file it comes from and a marker string that appears in that file verbatim; scripts/conformance/codex-conformance.sh check verifies the markers against the Codex source, and TestCodexUpstreamShapesClassifyAsCodexReadsThem verifies the pool's reading. Payloads are copied from Codex's own tests where one exists; entries with a note are built from Codex's parser where it has no test fixture. When codexRelease changes (it must equal the tag in upstream/Cargo.toml), re-run the check and add the shapes the new release parses.",
+  "codexRelease": "rust-v0.163.0",
+  "_ignoredComment": "Snake-case literals the conformance check finds in Codex's error parsers that are not error codes. Anything else it finds must appear as a failure code above.",
+  "ignoredCodexLiterals": {
+    "safety_buffering": "a response.metadata payload type, not an error; response.metadata is held before the commit point (see lifecycle)"
+  },
+  "failures": [
+    {
+      "name": "stream rate limit",
+      "source": "codex-rs/codex-api/src/sse/responses.rs",
+      "marker": "resp_689bcf18d7f08194bf3440ba62fe05d803fee0cdac429894",
+      "codex": "RateLimitExceeded",
+      "event": {
+        "type": "response.failed",
+        "sequence_number": 3,
+        "response": {
+          "id": "resp_689bcf18d7f08194bf3440ba62fe05d803fee0cdac429894",
+          "object": "response",
+          "created_at": 1755041560,
+          "status": "failed",
+          "background": false,
+          "error": {
+            "code": "rate_limit_exceeded",
+            "message": "Rate limit reached for gpt-5.1 in organization org-AAA on tokens per min (TPM): Limit 30000, Used 22999, Requested 12528. Please try again in 11.054s. Visit https://platform.openai.com/account/rate-limits to learn more."
+          },
+          "usage": null,
+          "user": null,
+          "metadata": {}
+        }
+      },
+      "class": "capacity",
+      "code": "rate_limit_exceeded"
+    },
+    {
+      "name": "stream overload",
+      "source": "codex-rs/codex-api/src/sse/responses.rs",
+      "marker": "{\"code\": \"server_is_overloaded\", \"plan_type\": 42}",
+      "codex": "ServerOverloaded",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "server_is_overloaded",
+            "plan_type": 42
+          }
+        }
+      },
+      "class": "capacity",
+      "code": "server_is_overloaded"
+    },
+    {
+      "name": "stream slow down",
+      "source": "codex-rs/codex-api/src/sse/responses_error.rs",
+      "marker": "Some(\"rate_limit_exceeded\" | \"slow_down\")",
+      "codex": "RateLimitExceeded",
+      "note": "built from the parser; Codex has no slow_down stream fixture",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "slow_down",
+            "message": "Slow down."
+          }
+        }
+      },
+      "class": "capacity",
+      "code": "slow_down"
+    },
+    {
+      "name": "stream quota",
+      "source": "codex-rs/codex-api/src/sse/responses.rs",
+      "marker": "resp_fatal_quota",
+      "codex": "QuotaExceeded",
+      "event": {
+        "type": "response.failed",
+        "sequence_number": 3,
+        "response": {
+          "id": "resp_fatal_quota",
+          "object": "response",
+          "created_at": 1759771626,
+          "status": "failed",
+          "background": false,
+          "error": {
+            "code": "insufficient_quota",
+            "message": "You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors."
+          },
+          "incomplete_details": null
+        }
+      },
+      "class": "capacity",
+      "code": "insufficient_quota"
+    },
+    {
+      "name": "stream credit balance",
+      "source": "codex-rs/codex-api/src/sse/responses_error.rs",
+      "marker": "| \"credit_balance_exhausted\"",
+      "codex": "QuotaExceeded",
+      "note": "built from the parser; Codex has no fixture for this code",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "credit_balance_exhausted",
+            "message": "Credit balance exhausted."
+          }
+        }
+      },
+      "class": "capacity",
+      "code": "credit_balance_exhausted"
+    },
+    {
+      "name": "stream organization spend limit",
+      "source": "codex-rs/codex-api/src/sse/responses_error.rs",
+      "marker": "| \"organization_spend_limit_exceeded\"",
+      "codex": "QuotaExceeded",
+      "note": "built from the parser; Codex has no fixture for this code",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "organization_spend_limit_exceeded",
+            "message": "Spend limit reached."
+          }
+        }
+      },
+      "class": "capacity",
+      "code": "organization_spend_limit_exceeded"
+    },
+    {
+      "name": "stream project spend limit",
+      "source": "codex-rs/codex-api/src/sse/responses_error.rs",
+      "marker": "| \"project_spend_limit_exceeded\"",
+      "codex": "QuotaExceeded",
+      "note": "built from the parser; Codex has no fixture for this code",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "project_spend_limit_exceeded",
+            "message": "Spend limit reached."
+          }
+        }
+      },
+      "class": "capacity",
+      "code": "project_spend_limit_exceeded"
+    },
+    {
+      "name": "organization usage limit",
+      "source": "codex-rs/codex-api/src/api_bridge.rs",
+      "marker": "| \"organization_usage_limit_exceeded\"",
+      "codex": "QuotaExceeded",
+      "note": "Codex reads this code from an HTTP 429 body; the in-stream shape is built from that body",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "organization_usage_limit_exceeded",
+            "message": "Usage limit reached."
+          }
+        }
+      },
+      "class": "capacity",
+      "code": "organization_usage_limit_exceeded"
+    },
+    {
+      "name": "stream usage not included",
+      "source": "codex-rs/codex-api/src/sse/responses_error.rs",
+      "marker": "Some(\"usage_not_included\") => ApiError::UsageNotIncluded",
+      "codex": "UsageNotIncluded",
+      "note": "built from the parser; Codex has no stream fixture for this code",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "usage_not_included",
+            "message": "Usage not included."
+          }
+        }
+      },
+      "class": "capacity",
+      "code": "usage_not_included"
+    },
+    {
+      "name": "stream context window",
+      "source": "codex-rs/codex-api/src/sse/responses.rs",
+      "marker": "resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b",
+      "codex": "ContextWindowExceeded",
+      "event": {
+        "type": "response.failed",
+        "sequence_number": 3,
+        "response": {
+          "id": "resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b",
+          "object": "response",
+          "created_at": 1759510079,
+          "status": "failed",
+          "background": false,
+          "error": {
+            "code": "context_length_exceeded",
+            "message": "Your input exceeds the context window of this model. Please adjust your input and try again."
+          },
+          "usage": null,
+          "user": null,
+          "metadata": {}
+        }
+      },
+      "class": "request",
+      "code": "context_length_exceeded"
+    },
+    {
+      "name": "stream cyber policy",
+      "source": "codex-rs/codex-api/src/sse/responses.rs",
+      "marker": "resp_fatal_cyber",
+      "codex": "CyberPolicy",
+      "event": {
+        "type": "response.failed",
+        "sequence_number": 3,
+        "response": {
+          "id": "resp_fatal_cyber",
+          "object": "response",
+          "created_at": 1759771626,
+          "status": "failed",
+          "background": false,
+          "error": {
+            "code": "cyber_policy",
+            "message": "This request was flagged for cyber policy."
+          },
+          "incomplete_details": null
+        }
+      },
+      "class": "request",
+      "code": "cyber_policy"
+    },
+    {
+      "name": "stream bio policy",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "[\"insufficient_quota\", \"cyber_policy\", \"bio_policy\"]",
+      "codex": "BioPolicy",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "bio_policy",
+            "headers": {
+              "retry-after": "1"
+            }
+          }
+        }
+      },
+      "class": "request",
+      "code": "bio_policy"
+    },
+    {
+      "name": "stream misalignment policy",
+      "source": "codex-rs/codex-api/src/sse/responses_error.rs",
+      "marker": "Some(\"misalignment_policy_violation\")",
+      "codex": "MisalignmentPolicyViolation",
+      "note": "built from the parser; Codex has no stream fixture for this code",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "misalignment_policy_violation",
+            "message": "This request was blocked due to a misalignment policy violation."
+          }
+        }
+      },
+      "class": "request",
+      "code": "misalignment_policy_violation"
+    },
+    {
+      "name": "stream invalid prompt",
+      "source": "codex-rs/codex-api/src/sse/responses_error.rs",
+      "marker": "Some(\"invalid_prompt\") => ApiError::InvalidPrompt",
+      "codex": "InvalidPrompt",
+      "note": "built from the parser",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "invalid_prompt",
+            "message": "Invalid request."
+          }
+        }
+      },
+      "class": "request",
+      "code": "invalid_prompt"
+    },
+    {
+      "name": "flex unavailable error event",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "\"code\": \"flex_unavailable\"",
+      "codex": "FlexUnavailable",
+      "event": {
+        "type": "error",
+        "error": {
+          "code": "flex_unavailable",
+          "plan_type": 42,
+          "headers": {
+            "retry-after": "300"
+          }
+        }
+      },
+      "class": "passthrough",
+      "code": "flex_unavailable"
+    },
+    {
+      "name": "stream failure Codex does not name",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "(\"unknown_failure\", CodexErrorInfo::Other)",
+      "codex": "Retryable (Codex retries it itself)",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "unknown_failure",
+            "headers": {
+              "retry-after": "7"
+            }
+          }
+        }
+      },
+      "class": "unknown",
+      "code": "unknown_failure"
+    },
+    {
+      "name": "websocket usage limit",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "parse_wrapped_websocket_error_event_maps_to_transport_http",
+      "codex": "UsageLimitReached",
+      "event": {
+        "type": "error",
+        "status": 429,
+        "error": {
+          "type": "usage_limit_reached",
+          "message": "The usage limit has been reached",
+          "plan_type": "pro",
+          "resets_at": 1738888888
+        },
+        "headers": {
+          "x-codex-primary-used-percent": "100.0",
+          "x-codex-primary-window-minutes": 15
+        }
+      },
+      "class": "capacity",
+      "code": "usage_limit_reached"
+    },
+    {
+      "name": "websocket usage limit with window",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "wrapped_websocket_usage_limit_preserves_optional_window",
+      "codex": "UsageLimitReached",
+      "event": {
+        "type": "error",
+        "status": 429,
+        "error": {
+          "type": "usage_limit_reached",
+          "plan_type": "pro",
+          "limit_window_minutes": 10080
+        }
+      },
+      "class": "capacity",
+      "code": "usage_limit_reached"
+    },
+    {
+      "name": "websocket rate limit",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "\"error\": {\"code\": \"rate_limit_exceeded\", \"headers\": error_headers}",
+      "codex": "Transport(Http 429)",
+      "event": {
+        "type": "error",
+        "status": 429,
+        "error": {
+          "code": "rate_limit_exceeded",
+          "headers": {
+            "retry-after": "5"
+          }
+        },
+        "headers": {
+          "retry-after": "12"
+        }
+      },
+      "class": "capacity",
+      "code": "rate_limit_exceeded"
+    },
+    {
+      "name": "websocket invalid request",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "parse_wrapped_websocket_error_event_with_status_maps_invalid_request",
+      "codex": "Transport(Http 400)",
+      "event": {
+        "type": "error",
+        "status": 400,
+        "error": {
+          "type": "invalid_request_error",
+          "message": "Model does not support image inputs"
+        }
+      },
+      "class": "request",
+      "code": "invalid_request_error"
+    },
+    {
+      "name": "websocket connection limit",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "parse_wrapped_websocket_error_event_with_connection_limit_maps_retryable",
+      "codex": "Retryable (Codex reconnects)",
+      "event": {
+        "type": "error",
+        "status": 400,
+        "error": {
+          "type": "invalid_request_error",
+          "code": "websocket_connection_limit_reached",
+          "message": "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue."
+        }
+      },
+      "class": "passthrough",
+      "code": "websocket_connection_limit_reached"
+    },
+    {
+      "name": "websocket previous response gone",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "const PREVIOUS_RESPONSE_NOT_FOUND_CODE: &str = \"previous_response_not_found\";",
+      "codex": "Retryable (Codex resends in full)",
+      "note": "built from the parser and the connection-limit fixture's shape; Codex has no fixture for this code",
+      "event": {
+        "type": "error",
+        "status": 400,
+        "error": {
+          "type": "invalid_request_error",
+          "code": "previous_response_not_found",
+          "message": "Previous response not found."
+        }
+      },
+      "class": "passthrough",
+      "code": "previous_response_not_found"
+    },
+    {
+      "name": "websocket server fault by status",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "let status = StatusCode::from_u16(status?).ok()?;",
+      "codex": "Transport(Http 5xx)",
+      "note": "built from the parser: a wrapped error Codex cannot name is classified by its status",
+      "event": {
+        "type": "error",
+        "status": 500,
+        "error": {
+          "message": "An error occurred while processing your request."
+        }
+      },
+      "class": "transient",
+      "code": ""
+    }
+  ],
+  "lifecycle": [
+    {
+      "name": "rate limits",
+      "source": "codex-rs/codex-api/src/rate_limits.rs",
+      "marker": "event.kind != \"codex.rate_limits\"",
+      "event": {
+        "type": "codex.rate_limits"
+      }
+    },
+    {
+      "name": "websocket response metadata",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "event.kind() == \"codex.response.metadata\"",
+      "event": {
+        "type": "codex.response.metadata"
+      }
+    },
+    {
+      "name": "websocket timing",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "const RESPONSES_WEBSOCKET_TIMING_KIND: &str = \"responsesapi.websocket_timing\";",
+      "event": {
+        "type": "responsesapi.websocket_timing"
+      }
+    },
+    {
+      "name": "stream response metadata",
+      "source": "codex-rs/codex-api/src/sse/responses.rs",
+      "marker": "self.kind() != \"response.metadata\"",
+      "event": {
+        "type": "response.metadata"
+      }
+    },
+    {
+      "name": "response created",
+      "source": "codex-rs/codex-api/src/sse/responses.rs",
+      "marker": "\"response.created\" => {",
+      "event": {
+        "type": "response.created",
+        "response": {
+          "id": "resp_lifecycle"
+        }
+      }
+    }
+  ],
+  "_assumptionsComment": "Codex behaviors the pool's own requests and the native endpoint are built on (SPEC.md 2.3.2, 2.3.3). codex-conformance.sh check fails when a marker disappears: re-read that Codex code and adjust the pool before moving the pin.",
+  "assumptions": [
+    {
+      "name": "backend-client headers",
+      "source": "codex-rs/backend-client/src/client.rs",
+      "marker": "h.insert(USER_AGENT, ua.clone());",
+      "pool": "codexBackendHeaders: User-Agent, Authorization, ChatGPT-Account-Id, X-OpenAI-Fedramp, nothing else"
+    },
+    {
+      "name": "account check endpoint",
+      "source": "codex-rs/backend-client/src/client.rs",
+      "marker": "PathStyle::ChatGptApi => format!(\"{}/wham/accounts/check\", self.base_url),",
+      "pool": "account metadata comes from Codex's account check"
+    },
+    {
+      "name": "usage endpoint",
+      "source": "codex-rs/backend-client/src/client/rate_limit_resets.rs",
+      "marker": "PathStyle::ChatGptApi => format!(\"{}/wham/usage\", self.base_url),",
+      "pool": "quota reads"
+    },
+    {
+      "name": "reset credit redemption endpoint",
+      "source": "codex-rs/backend-client/src/client/rate_limit_resets.rs",
+      "marker": "format!(\"{}/wham/rate-limit-reset-credits/consume\", self.base_url)",
+      "pool": "reset-credit redemption"
+    },
+    {
+      "name": "reset credit redemption body",
+      "source": "codex-rs/backend-client/src/client/rate_limit_resets.rs",
+      "marker": "redeem_request_id: &'a str,",
+      "pool": "the redemption body's one required field"
+    },
+    {
+      "name": "token refresh body",
+      "source": "codex-rs/login/src/oauth/client.rs",
+      "marker": ".json(&parameters.iter().copied().collect::<BTreeMap<_, _>>()),",
+      "pool": "refresh JSON with sorted keys"
+    },
+    {
+      "name": "token refresh endpoint",
+      "source": "codex-rs/login/src/auth/manager.rs",
+      "marker": "const REFRESH_TOKEN_URL: &str = \"https://auth.openai.com/oauth/token\";",
+      "pool": "refresh endpoint"
+    },
+    {
+      "name": "default client headers",
+      "source": "codex-rs/login/src/auth/default_client.rs",
+      "marker": "headers.insert(\"originator\", originator().header_value);",
+      "pool": "the refresh carries the default client's originator and user-agent"
+    },
+    {
+      "name": "internal metadata destination check",
+      "source": "codex-rs/model-provider/src/provider.rs",
+      "marker": "host == \"api.openai.com\" || codex_http_client::is_allowed_chatgpt_host(host)",
+      "pool": "why a custom provider gets a reduced body (SPEC.md 2.3.2 client gap)"
+    },
+    {
+      "name": "codex backend routes suffix",
+      "source": "codex-rs/model-provider-info/src/lib.rs",
+      "marker": ".ends_with(\"/backend-api/codex\")",
+      "pool": "the native endpoint's base URL must end in /backend-api/codex"
+    },
+    {
+      "name": "workspace routing header",
+      "source": "codex-rs/model-provider/src/workspace_routing.rs",
+      "marker": "pub const ACCOUNT_ROUTING_HEADER: &str = \"x-openai-account-routing-override\";",
+      "pool": "never relayed to a pool account"
+    },
+    {
+      "name": "client per request",
+      "source": "codex-rs/core/src/client.rs",
+      "marker": "let transport = self.client.build_api_transport(",
+      "pool": "codex-upstream builds a fresh client per request"
+    },
+    {
+      "name": "websocket connector per connection",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "let connector = WebSocketConnector::new(http_client_factory)",
+      "pool": "codex-upstream builds a fresh connector per socket"
+    },
+    {
+      "name": "attestation header",
+      "source": "codex-rs/core/src/attestation.rs",
+      "marker": "return the upstream `x-oai-attestation` header value when one should be sent.",
+      "pool": "x-oai-attestation is relayed"
+    },
+    {
+      "name": "device auth link",
+      "source": "codex-rs/login/src/device_code_auth.rs",
+      "marker": "verification_url: format!(\"{base_url}/codex/device\"),",
+      "pool": "the sign-in prompt the pool parses"
+    },
+    {
+      "name": "models etag refresh",
+      "source": "codex-rs/core/src/session/turn.rs",
+      "marker": ".refresh_if_new_etag(etag, turn_context.config.http_client_factory())",
+      "pool": "X-Models-Etag is relayed"
+    },
+    {
+      "name": "access token refresh window",
+      "source": "codex-rs/login/src/auth/manager.rs",
+      "marker": "const CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;",
+      "pool": "codexTokenRefreshWindow is the same five minutes, so a prime's Codex never finds its token due for refresh"
+    }
+  ]
+}

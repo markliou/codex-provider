@@ -12,11 +12,9 @@
 //! them. Keep it a transport: routing decisions here would split
 //! responsibility with the pool the way the CLIProxyAPI sidecar did.
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use bytes::Bytes;
 use codex_http_client::HttpClientFactory;
@@ -61,8 +59,16 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 /// Control headers the pool sets for this hop. They are consumed here and are
 /// never sent upstream.
 const UPSTREAM_URL: &str = "x-codex-upstream-url";
+// Names the pool account a request is for. Nothing is keyed on it: every
+// request gets a fresh client (see Transports::client).
 const UPSTREAM_IDENTITY: &str = "x-codex-upstream-identity";
 const UPSTREAM_COMPRESSION: &str = "x-codex-upstream-compression";
+// The wire order for a request that is not a Responses request: header names
+// before the body step, `|`, then names after it (for example
+// "user-agent,authorization,chatgpt-account-id|"). The pool's own backend
+// calls and passthrough paths have native orders of their own (captured from
+// a native Codex); the pool's HTTP hop cannot carry an order, so it names it.
+const UPSTREAM_HEADER_ORDER: &str = "x-codex-upstream-header-order";
 /// Set on a response this process generated itself because the upstream could
 /// not be reached, so the pool treats it as a transport failure rather than an
 /// upstream answer.
@@ -111,6 +117,7 @@ const NOT_FORWARDED: &[&str] = &[
     UPSTREAM_URL,
     UPSTREAM_IDENTITY,
     UPSTREAM_COMPRESSION,
+    UPSTREAM_HEADER_ORDER,
 ];
 
 /// Handshake header order of a native Codex 0.163.0 Responses WebSocket,
@@ -162,42 +169,70 @@ const WS_UPGRADE_HEADERS: &[&str] = &[
 type ResponseBody = UnsyncBoxBody<Bytes, std::io::Error>;
 
 struct Transports {
-    // One client per upstream identity, as each native Codex process has its
-    // own connection pool for its one account, so one account's requests never
-    // ride another account's connection. Cloudflare infrastructure cookies are
-    // process-global in Codex itself (codex-http-client keeps only those and
-    // the __oailb routing cookie, never account cookies), so they stay shared.
-    by_identity: Mutex<HashMap<String, ReqwestTransport>>,
-    // Codex's WebSocket connector for its default factory (transport default
-    // proxy, no PSP cookie): explicit Codex TLS from native roots and any
-    // configured custom CA.
-    websocket: WebSocketConnector,
+    // Codex's default factory (transport default proxy, no PSP cookie), from
+    // which each WebSocket connection gets its own connector.
+    factory: HttpClientFactory,
 }
 
 impl Transports {
     fn new() -> std::io::Result<Self> {
         let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
-        let websocket = WebSocketConnector::new(&factory).map_err(std::io::Error::other)?;
-        Ok(Self { by_identity: Mutex::new(HashMap::new()), websocket })
+        // Fail at startup, not on the first socket, if Codex's TLS setup
+        // (native roots, custom CA) cannot be built.
+        WebSocketConnector::new(&factory).map_err(std::io::Error::other)?;
+        Ok(Self { factory })
     }
 
-    fn for_identity(&self, identity: &str) -> ReqwestTransport {
-        let mut clients = self.by_identity.lock().unwrap_or_else(|e| e.into_inner());
-        clients
-            .entry(identity.to_string())
-            .or_insert_with(|| {
-                // Codex's default client: Cloudflare cookie store, transport
-                // default proxy and TLS, custom-CA fallback. Request logging is
-                // off because these requests carry account credentials.
-                #[allow(deprecated)]
-                let client = HttpClientBuilder::new()
-                    .with_chatgpt_cloudflare_cookie_store()
-                    .without_request_logging()
-                    .build_with_transport_default_proxy_and_custom_ca_fallback();
-                ReqwestTransport::from_http_client(client)
-            })
-            .clone()
+    // A new connector per connection, as Codex builds one in every
+    // ResponsesWebsocketClient::connect (codex-api endpoint/
+    // responses_websocket.rs). A connector shared across connections keeps
+    // OpenSSL's session cache, so a later socket resumed the earlier TLS
+    // session and sent a pre_shared_key ClientHello no native Codex sends;
+    // wire-capture.sh caught it once the pool opened a second socket.
+    fn websocket(&self) -> std::io::Result<WebSocketConnector> {
+        WebSocketConnector::new(&self.factory).map_err(std::io::Error::other)
     }
+
+    // A new client per request, as Codex builds one for every Responses,
+    // compaction, memories and realtime call (core/src/client.rs
+    // build_api_transport -> login default_client create_client_for_route).
+    // So each request opens its own connection with a full TLS handshake.
+    // A client kept per account reused connections and resumed TLS sessions
+    // (a pre_shared_key ClientHello), neither of which a native Codex does;
+    // wire-capture.sh caught the resumption. No account's request can ride
+    // another's connection either way. Cloudflare infrastructure cookies are
+    // process-global in Codex itself (codex-http-client keeps only those and
+    // the __oailb routing cookie, never account cookies), so they stay shared.
+    fn client(&self) -> ReqwestTransport {
+        // Codex's default client: Cloudflare cookie store, transport default
+        // proxy and TLS, custom-CA fallback. Request logging is off because
+        // these requests carry account credentials.
+        #[allow(deprecated)]
+        let client = HttpClientBuilder::new()
+            .with_chatgpt_cloudflare_cookie_store()
+            .without_request_logging()
+            .build_with_transport_default_proxy_and_custom_ca_fallback();
+        ReqwestTransport::from_http_client(client)
+    }
+}
+
+/// Splits the pool's headers by an explicit order (see UPSTREAM_HEADER_ORDER).
+/// Headers the order does not name are dropped: the pool names every header
+/// such a request carries, so anything else is not part of the native request.
+fn named_order_headers(incoming: &HeaderMap, order: &str) -> (HeaderMap, HeaderMap) {
+    let (first, second) = order.split_once('|').unwrap_or((order, ""));
+    let pick = |names: &str| {
+        let mut headers = HeaderMap::new();
+        for name in names.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+            let lower = name.to_ascii_lowercase();
+            if NOT_FORWARDED.contains(&lower.as_str()) {
+                continue;
+            }
+            copy_all(incoming, &lower, &mut headers);
+        }
+        headers
+    };
+    (pick(first), pick(second))
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -277,7 +312,6 @@ async fn forward(transports: Arc<Transports>, request: hyper::Request<Incoming>)
     let Some(url) = header_str(&parts.headers, UPSTREAM_URL).map(str::to_string) else {
         return Ok(plain(StatusCode::BAD_REQUEST, None, "missing x-codex-upstream-url"));
     };
-    let identity = header_str(&parts.headers, UPSTREAM_IDENTITY).unwrap_or("default").to_string();
     let compression = match header_str(&parts.headers, UPSTREAM_COMPRESSION) {
         Some("zstd") => RequestCompression::Zstd,
         _ => RequestCompression::None,
@@ -286,7 +320,10 @@ async fn forward(transports: Arc<Transports>, request: hyper::Request<Incoming>)
         Ok(collected) => collected.to_bytes(),
         Err(error) => return Ok(plain(StatusCode::BAD_REQUEST, None, format!("request body: {error}"))),
     };
-    let (before, after) = ordered_headers(&parts.headers);
+    let (before, after) = match header_str(&parts.headers, UPSTREAM_HEADER_ORDER) {
+        Some(order) => named_order_headers(&parts.headers, order),
+        None => ordered_headers(&parts.headers),
+    };
 
     let mut codex_request = CodexRequest::new(parts.method.clone(), url);
     codex_request.headers = before;
@@ -317,7 +354,7 @@ async fn forward(transports: Arc<Transports>, request: hyper::Request<Incoming>)
         prepared.headers.append(name.clone(), value.clone());
     }
 
-    match transports.for_identity(&identity).stream(prepared).await {
+    match transports.client().stream(prepared).await {
         Ok(streamed) => {
             let frames = streamed.bytes.map(|chunk| match chunk {
                 Ok(bytes) => Ok(Frame::data(bytes)),
@@ -401,7 +438,11 @@ async fn websocket(transports: Arc<Transports>, mut request: hyper::Request<Inco
         Err(error) => return plain(StatusCode::BAD_REQUEST, None, format!("upstream url: {error}")),
     };
     upstream_request.headers_mut().extend(ordered_websocket_headers(request.headers()));
-    let (upstream, handshake) = match transports.websocket.connect(upstream_request, websocket_config()).await {
+    let connector = match transports.websocket() {
+        Ok(connector) => connector,
+        Err(error) => return transport_failure("connection", error.to_string()),
+    };
+    let (upstream, handshake) = match connector.connect(upstream_request, websocket_config()).await {
         Ok(connected) => connected,
         Err(WsError::Http(refused)) => {
             let (parts, body) = refused.into_parts();

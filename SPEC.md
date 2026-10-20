@@ -193,19 +193,21 @@ The service must refuse to start when:
 
 Direct mode is the default. Pool sends each device-auth request to the Codex backend itself, so the upstream request is the one a native Codex CLI sends (see 6.2.2). The sidecar was the default until it was measured rewriting what Codex sent: it dropped `Thread-Id`, `Session-Id` and `X-Codex-Window-ID`, replaced them with its own `session_id`, dropped the upstream `X-Codex-Turn-State` response header, and injected an `image_generation` tool and an empty `instructions` field that a native Codex request does not carry.
 
-In the container the last hop of every direct request goes through `codex-upstream`, a loopback-only Rust process (`127.0.0.1:8320`, started by the supervisor before the pool) built from Codex's own `codex-http-client` crate at the Codex release the pool targets (currently `rust-v0.163.0`), with `Cargo.lock` seeded from that release so reqwest, hyper, h2, native-tls and the vendored OpenSSL resolve to the same versions, compiled for musl with the same Rust toolchain. Its TLS ClientHello (JA4), HTTP/2 SETTINGS, header order, and zstd request compression (level 3, Responses requests only, not compaction) were measured equal to a native Codex CLI of that release. Pool still selects the account, owns its credential, and decides retries and failover; it sends `codex-upstream` the finished request with `X-Codex-Upstream-Url`, `X-Codex-Upstream-Identity` (one Codex client per account, as each native Codex process has its own connections; Cloudflare infrastructure cookies stay process-global, as in Codex itself) and `X-Codex-Upstream-Compression`, which are consumed there and never sent upstream. A response carrying `X-Codex-Upstream-Error` means the hop could not reach upstream and is handled as a transport failure. Pool also sets the `version` header a native Codex sends to the Codex backend, from the client's `codex*/<version>` User-Agent product token. Without `CODEX_POOL_CODEX_TRANSPORT_URL` (tests), Pool sends the same request from Go.
+In the container the last hop of every direct request goes through `codex-upstream`, a loopback-only Rust process (`127.0.0.1:8320`, started by the supervisor before the pool) built from Codex's own `codex-http-client` crate at the Codex release the pool targets (currently `rust-v0.163.0`), with `Cargo.lock` seeded from that release so reqwest, hyper, h2, native-tls and the vendored OpenSSL resolve to the same versions, compiled for musl with the same Rust toolchain. Its TLS ClientHello (JA4), HTTP/2 SETTINGS, header order, and zstd request compression (level 3, Responses requests only, not compaction) were measured equal to a native Codex CLI of that release. Pool still selects the account, owns its credential, and decides retries and failover; it sends `codex-upstream` the finished request with `X-Codex-Upstream-Url`, `X-Codex-Upstream-Identity` (the account the request is for; nothing is keyed on it, because `codex-upstream` builds a fresh client for every request and a fresh connector for every WebSocket, as Codex does — so every request opens its own connection with a full TLS handshake, never reusing a connection or resuming a TLS session; Cloudflare infrastructure cookies stay process-global, as in Codex itself) and `X-Codex-Upstream-Compression`, which are consumed there and never sent upstream. A response carrying `X-Codex-Upstream-Error` means the hop could not reach upstream and is handled as a transport failure. Pool also sets the `version` header a native Codex sends to the Codex backend, from the client's `codex*/<version>` User-Agent product token. Without `CODEX_POOL_CODEX_TRANSPORT_URL` (tests), Pool sends the same request from Go.
 
 `GET /v1/responses` with a WebSocket upgrade serves the Responses WebSocket a native Codex uses with the Codex backend (set `supports_websockets = true` on the Codex provider). It matters to upstream load: Codex uploads tools and instructions once in a `generate: false` prewarm and then sends only new input with `previous_response_id`, and that state lives on the upstream connection. Pool relays the socket rather than rebuilding requests:
 
 - One client socket is bound to one account's upstream socket, opened by `codex-upstream` with Codex's own `codex-websocket-client` connector, the OpenAI tungstenite forks Codex patches in, and its permessage-deflate offer. The handshake (header set and order, TLS ClientHello) was measured equal to a native Codex; it carries the client's Codex headers, the account's credential and `ChatGPT-Account-ID`, the routing hint and `version`, and no turn state.
 - Messages pass through byte for byte both ways. Pool reads them only to record each response (usage, terminal event) like an HTTP request; a `generate: false` prewarm is not recorded.
 - Upstream events get the same pre-commit rule as the HTTP stream: lifecycle events are held until the first event carrying content. The Codex backend opens every socket response with `codex.rate_limits` and `codex.response.metadata` before `response.created` and sends `responsesapi.websocket_timing` near the end; all `codex.*` and `responsesapi.*` events are informational, never model output, and count as lifecycle on both transports. An overload before that point is retried by resending the identical request on the same socket (same account, same connection state, which is what a Codex retry would send) up to three times after 1 s, 2 s and 4 s. When that is spent, or the account's allowance or credential failed before content, the account is cooled and the socket closed without showing the failure; Codex treats a dropped socket as a retryable stream error, reconnects, and resends in full, and routing moves the whole lineage. A failure after content reached Codex is relayed unchanged.
-- The account is chosen at the first `response.create`, since the handshake has no model, with the same failover as HTTP before anything reaches upstream (a refused handshake is marked and the next account tried). If no account can serve it, Pool sends the backend's wrapped `{"type":"error","status":...}` event and closes.
+- The account is chosen at the handshake, from the session and thread it names and its model (the `X-Codex-Routing-Hint` a native Codex sends, else the model in `X-Codex-Turn-Metadata`, else the default), with the same failover as HTTP, and the upstream socket is opened before the client's socket is accepted. Codex then receives the upstream handshake's `X-Codex-Turn-State`, `X-Reasoning-Included` and `OpenAI-Model` (and `X-Models-Etag` on the native endpoint), as a native Codex does: on a socket Codex reads its turn state from the handshake alone and returns it in every later message's `client_metadata`, and `x-reasoning-included` changes its token accounting and so when it compacts. When the pool accepted first and dialed at the first message, Codex had neither, so its later messages differed from a native Codex's. If no account can take the socket, the handshake itself is answered with the status (`426` means HTTP to Codex; `429` and `5xx` are retried).
+- The first request on a socket may settle the account differently from the handshake's guess (a model the guessed account cannot serve, a response chain bound elsewhere). Nothing has gone out on that upstream socket, so it is replaced before the request is sent; closing Codex's socket instead would only make it reconnect into the same guess. If no account can serve it, Pool sends the backend's wrapped `{"type":"error","status":...}` event and closes.
+- A turn state goes back only to the account that issued it, as on HTTP (`turnStateForAttempt`): on a socket Codex carries it in `client_metadata["x-codex-turn-state"]`, so after a session moved accounts the field is removed from the message, every other byte unchanged. The issuer is the account whose handshake (or event headers) carried that turn state; one the pool has not seen is taken as the session's sticky account's.
 - When a later request belongs on another account (lineage move, cooled account), or a response that already showed content fails with an account-allowance, transient, or authentication class, Pool closes the client socket instead of switching upstream sockets: incremental requests reference responses that exist only on the old connection. A native Codex reconnects and resends in full, and routing places that request.
 - A running response counts as in flight for the drain and the deploy idle wait; an idle socket between turns does not. Shutdown waits for running socket responses within the grace. Pool pings the client leg every 20 s so NATs and proxies on the internet-facing leg do not drop it.
 - Without `codex-upstream` (sidecar mode, tests) Pool answers the upgrade with `426`, which Codex treats as "use HTTP".
 
-Moving to a new Codex release means changing the `codex-http-client` tag in `upstream/Cargo.toml`, reseeding `upstream/Cargo.lock` from that release's `codex-rs/Cargo.lock`, matching its Rust toolchain in the Dockerfile, and re-measuring against that release.
+Moving to a new Codex release means changing the `codex-http-client` tag in `upstream/Cargo.toml`, reseeding `upstream/Cargo.lock` from that release's `codex-rs/Cargo.lock`, matching its Rust toolchain in the Dockerfile, and re-measuring against that release by the procedure in 2.3.2.
 
 In direct mode Pool is the only process that refreshes an account's credential, in its `auth.json`, under the per-account auth lock. It refreshes before a request when the access token is within five minutes of expiry, and on a `401` it refreshes once and retries the same account, as a native Codex does; only a second `401`, or a refresh that cannot produce a new token, is treated as an account auth failure. A refresh that finds the token already replaced by a concurrent request reuses it instead of spending the rotated refresh token again.
 
@@ -254,6 +256,41 @@ The service should warn when:
 3. Remote admin is explicitly enabled.
 4. HTTP is used on a public bind address without TLS/reverse proxy.
 
+#### 2.3.2 Codex wire conformance
+
+The pool must be indistinguishable from a native Codex of the pinned release (the tag in `upstream/Cargo.toml`) in both directions, because that is what lets the backend serve pool traffic the way it serves Codex:
+
+- **Send.** What reaches upstream equals a native Codex for the same turn: every TLS ClientHello (JA4) and ALPN the pool sends is one Codex sends to that server, and the HTTP/2 SETTINGS, request order and protocol, header names, order and values, body encoding, and WebSocket handshake equal a native Codex's, apart from values minted per run. The body is the one Codex gave the pool, forwarded unchanged. `scripts/conformance/wire-capture.sh` measures all of this against the npm release of the pinned Codex and fails on any difference the pool introduces; it also runs the pool's own calls (a token refresh against a native Codex's refresh, usage, account check and reset credits against Codex's backend client) and a quota prime by the bundled CLI.
+- **Client gap.** Codex itself sends a custom provider — which is how Codex reaches the pool — a smaller body than it sends its own backend, and the capture reports that separately because forwarding cannot repair it. Measured at `rust-v0.163.0`: the custom-provider body lacks the MCP resource tools and `image_gen`, `client_metadata.mcp_attribution` and `client_metadata.guardian_credits_requested`, and `internal_chat_message_metadata_passthrough` on input items. Codex adds internal metadata only for an `https` base URL on `chatgpt.com` or `api.openai.com`, or for its built-in provider (`model-provider/src/provider.rs` `include_internal_metadata`, which cannot be set from configuration), and adds the guardian and Codex-backend fields only for its built-in `OpenAI` provider with ChatGPT auth, no bearer token, and a base URL ending in `/backend-api/codex` (`core/src/client.rs` `uses_codex_backend`, `model-provider-info` `supports_codex_backend_routes`). Closing the gap is a change to how Codex is pointed at the pool, not to forwarding; the native endpoint (2.3.3) is that change.
+- **Receive.** The pool reads upstream's answers as Codex reads them: the same terminal events, the same lifecycle (non-output) events, the same error codes, and an error's `error.type` and wrapped `status` where Codex uses them. The shapes are recorded in `cmd/codex-pool/testdata/codex-upstream-failures.json`, copied from Codex's own source and tests with the file and a verbatim marker for each; the Go tests hold the pool's classification to them, and `scripts/conformance/codex-conformance.sh check` verifies the markers still exist in Codex and that every code Codex's error parsers name has a shape. A fake upstream in a test answers only in shapes that file records.
+- **Own calls.** The pool's own upstream calls are the ones a native Codex makes for the same purpose, made the same way: through `codex-upstream`, to Codex's endpoint, with Codex's header set in Codex's order (captured from a native Codex; `codex-upstream` takes the order from `X-Codex-Upstream-Header-Order`, since the pool's hop cannot carry one). Token refresh is Codex's (`POST auth.openai.com/oauth/token`, sorted JSON body, `originator` and `User-Agent`); usage, reset-credit listing and redemption, and account metadata are Codex's backend client's (`/wham/usage`, `/wham/rate-limit-reset-credits[/consume]`, `/wham/accounts/check`; `User-Agent`, `Authorization`, `ChatGPT-Account-Id`, `X-OpenAI-Fedramp`). Each carries the agent (`User-Agent`, `originator`) of the Codex that last used that account, else the last Codex seen at all (persisted); only before any Codex has ever connected does the pool present an agent of its own making in the bundled CLI's shape. A quota prime is one ephemeral, read-only turn of the bundled Codex CLI against a temporary home holding the account's current access and ID tokens and no refresh token, so it can never rotate the pool's credential; the CLI gets a minimal environment, and without it the prime is skipped rather than composed by the pool. The bundled CLI is the pinned release, like `codex-upstream`.
+- **Known limits.** The realtime (voice) WebSocket is not served on the native endpoint. A client that sends no routing hint (a custom provider) gets one built from the handshake's model, without a service tier, because the tier is only in the request body. The `x-oai-attestation` header the Codex Desktop may send is relayed, but its position in the header order has not been measured, because only the Desktop sends it. How often the pool makes its own calls (a quota sweep every five minutes, a prime per unanchored window) is the pool's own schedule; only their shape is Codex's.
+- **Policy.** Where the pool acts on an answer (retry, failover, cooldown, closing a socket), the Codex behavior it stands in for is cited next to the code. The pool may decide differently only where it has something Codex lacks — another account — and must say so there.
+
+The reason this is a contract: every production failure of this kind passed tests built on what the pool assumed instead of what Codex does. A usage limit sent as `error.type` read as unknown; a stream without `Content-Type` skipped the retry window; the backend's informational WebSocket events committed the socket. Each is now a recorded shape.
+
+A failure the pool cannot classify is counted (`unrecognizedFailureCount` in the cache window, shown as Unrecognized failures) as well as logged with `class=unknown`. It is passed through untouched, as before, but a nonzero count means upstream sent something the pool does not read the way Codex does, and the shape must be found, compared with Codex's source, and recorded. Codes Codex recognizes and handles itself (`websocket_connection_limit_reached`, `previous_response_not_found`, `flex_unavailable`) are class `passthrough`: passed through, no effect on account health, and not counted.
+
+Account semantics are the pool's own and cannot be checked against Codex, which only ever has one account. Each such concept must have one definition shared by routing and the dashboard: routing's upstream identity and the dashboard's quota allowance draw the same line between accounts, and a test holds them together. They once diverged for a month — the dashboard counted each Business workspace member as an allowance while routing collapsed the workspace into one account — and live account data had shown the difference the whole time.
+
+Moving to a new Codex release: `codex-conformance.sh diff <tag>` prints every change to the watched Codex files (`scripts/conformance/codex-watchlist.txt`); each change is matched in the pool or noted as not applying; then the tag, lock, fixture release and shapes are updated together (a test fails if the fixture's release differs from the pinned tag), and `check` and `wire-capture.sh` must pass before deploying.
+
+
+#### 2.3.3 Native Codex endpoint
+
+The client gap in 2.3.2 exists because Codex treats the pool as a custom provider. The native endpoint removes it: Codex keeps its built-in OpenAI provider and ChatGPT login and only moves the provider's base URL to the pool, so it sends the pool exactly the request it sends OpenAI.
+
+```toml
+# ~/.codex/config.toml — shared by the Codex CLI, Desktop and IDE extension
+openai_base_url = "https://<pool-host>/k/<pool-api-key>/backend-api/codex"
+```
+
+- **Paths.** `POST .../responses`, `POST .../responses/compact` and the Responses WebSocket (`GET .../responses`) run through the same routing as `/v1` (sticky sessions, lineage binding, failover, pre-commit retry). The other Codex-backend paths Codex calls on its provider base URL — `models`, `images/generations`, `images/edits`, `memories/trace_summarize`, `alpha/search`, `realtime/calls` — carry no conversation and are sent upstream with the credential of the account the pool would place a new session on for the default model, and answered as upstream answered (its `ETag`, never its cookies). Any other path under the prefix is `404`.
+- **Authentication.** Codex's built-in provider puts its own ChatGPT login in `Authorization` and its headers cannot be configured, so the pool API key travels in the path; Codex requires only that the base URL end in `/backend-api/codex`. A path key that is not a configured client API key is `401` before anything else happens. The client's own `Authorization` and `ChatGPT-Account-ID` are removed before any handler reads the request: they are never relayed, logged, or taken for a pool key, and upstream receives the selected account's credential and account id. `X-OpenAI-Account-Routing-Override`, which Codex derives from its own login's workspace routing, is never relayed on any path.
+- **Body.** A native Codex zstd-compresses its Responses requests; the pool decodes them (bounded like every request) and `codex-upstream` compresses again on the way out. The request is forwarded exactly as Codex wrote it: no model alias or thinking-tier rewrite, no hosted-tool filtering (a native Codex sends its `image_gen` namespace tool to its own backend), no prompt-cache rewrite, no re-encoding. Routing reads the model and the session from it as on `/v1`. Responses on this endpoint also carry upstream's `X-Models-Etag`, because Codex refetches its catalog when it changes and its catalog here is upstream's (on `/v1` the catalog is the pool's own and the header is withheld). The passthrough paths follow the conversation's account when the request names one (its lineage, else its thread's sticky account), so a native Codex's image, memory or search call for a conversation is made with that conversation's account.
+- **What stays with Codex.** Codex still calls `chatgpt.com` with its own login for account and workspace discovery, plugins, settings and analytics, as a native Codex does, without the pool; the local Codex must stay signed in. If the local login's workspace has a routing constraint (data residency), Codex moves its base URL to that backend and bypasses the pool; that is not supported.
+- **The key is in the URL.** The pool logs no request paths and must keep it that way; a reverse proxy in front of the pool must not log `/k/` paths either. `/v1` with the key in a header remains for every other client.
+- **Measured.** `wire-capture.sh` runs the same turn through this endpoint and fails unless what reaches upstream equals a native Codex outright, body included. Doing so first caught the hosted-tool filter and a TLS session resumption a native Codex never performs (codex-upstream now builds a WebSocket connector per connection, as Codex does).
 ---
 
 ## 3. Persistent Data Layout
@@ -1266,26 +1303,25 @@ For Codex OAuth accounts, query:
 GET https://chatgpt.com/backend-api/wham/usage
 ```
 
-Headers:
+Headers, in this order, as Codex's backend client sends them (section 2.3.2,
+own calls): `User-Agent` (a Codex agent), `Authorization: Bearer
+<access_token>`, `ChatGPT-Account-Id: <account-id-if-known>`, and
+`X-OpenAI-Fedramp` when the account is FedRAMP.
 
-```text
-Authorization: Bearer <access_token>
-Accept: application/json
-ChatGPT-Account-Id: <account-id-if-known>
-```
-
-Plan and organization metadata may be enriched from
-`/backend-api/accounts/check/v4-2023-04-27`, which returns every workspace the
-login may act as. One login can hold both a personal subscription and one or
-more Team/Business workspaces, so a record may only be applied to a credential
-slot when it is positively identified:
+Plan and organization metadata may be enriched from Codex's own account check,
+`GET /backend-api/wham/accounts/check` with the same headers, which returns
+every workspace the login may act as (a workspace's `name` is its organization
+name; a personal account carries none). The ChatGPT web app's
+`accounts/check/v4-2023-04-27` and `/subscriptions`, once read with a browser's
+headers, are not called: no native Codex calls them. One login can hold both a
+personal subscription and one or more Team/Business workspaces, so a record may
+only be applied to a credential slot when it is positively identified:
 
 - a record matching the slot's known upstream account ID is used;
 - otherwise, a response describing exactly one accessible workspace is used,
   including when it differs from the slot's previous ID, which the device-auth
   identity check treats as an upstream identity change (section 7);
-- otherwise the lookup reports nothing and the workspace-scoped
-  `/backend-api/subscriptions?account_id=<id>` response is used instead.
+- otherwise the lookup reports nothing.
 
 An arbitrary or default-ordered record must never be selected. Labeling a Team
 slot with the login's personal `Pro` entitlement is a visible defect, and the
@@ -1303,8 +1339,9 @@ Account metadata keeps these concepts separate:
 - `planLimit`: exact reported `5x`, `10x`, `20x`, or `25x` multiplier only;
 - `quotaPolicy`: explicit policy such as `no_five_hour_cap`.
 
-Plan names follow OpenAI's September 2026 naming: raw `prolite` displays as
-`Pro 100`, and a Pro account with a reported multiplier displays its tier with
+Plan names follow OpenAI's September 2026 naming and Codex's own labels: raw
+`prolite` displays as `Pro 100`, raw `pro` as `Pro 200`, raw `promax` as
+`Pro 500`, and a Pro account with a reported multiplier displays its tier with
 the multiplier beside it (`5x` → `Pro 100`, `10x`/`20x` → `Pro 200`, `25x` →
 `Pro 500`). The multiplier stays visible because the mapping is not one-to-one:
 existing Pro 200 subscribers keep `20x` until 2026-10-29, new ones get `10x`.
@@ -2056,6 +2093,15 @@ For streaming responses:
   failures may quarantine the credential. Context length, invalid prompt, and
   policy failures do not penalize account health. Unknown codes remain a
   sanitized generic failure instead of being guessed as quota/auth.
+- The classes follow Codex's own parsers (2.3.2). Codex's quota codes
+  (`credit_balance_exhausted`, `organization_spend_limit_exceeded`,
+  `project_spend_limit_exceeded`, `organization_usage_limit_exceeded`) are
+  `capacity` like `insufficient_quota`; `bio_policy`,
+  `misalignment_policy_violation` and `invalid_request_error` are `request`;
+  `websocket_connection_limit_reached`, `previous_response_not_found` and
+  `flex_unavailable` are `passthrough`. A wrapped WebSocket error whose code is
+  not recognized is classified by its `status` as the same HTTP answer would be
+  (`429` capacity, `401` authentication, `5xx` transient, other `4xx` request).
 - Two classes of terminal failure are retryable: `capacity`
   (`rate_limit_exceeded`, `insufficient_quota`, `usage_not_included`,
   `usage_limit_reached`, `server_is_overloaded`, `slow_down`) and `transient` (`server_error`,
@@ -2682,10 +2728,13 @@ must remain visible:
 
 - A Pro slot reports its own multiplier through `planLimit`, so `5x`, `10x`,
   `20x` and `25x` are authoritative. A Pro account with no reported multiplier
-  weighs the published Pro 200 ratio (`10x`), marked as assumed, and displays
-  as `Pro 200` without a multiplier: Pro 100 has its own raw plan (`prolite`),
-  so a plain Pro is taken as Pro 200, and if it is really Pro 500 the reading
-  errs low. The assumption never becomes a `planLimit`.
+  weighs its tier's published ratio, marked as assumed. The raw plan names the
+  tier, exactly as Codex labels it (`tui/src/subscription.rs`): `prolite` is
+  Pro 100 (`5x`), `pro` is Pro 200 (`10x`; Pro 200 subscribers from before
+  2026-09-29 keep `20x` until 2026-10-29, which the plan cannot tell apart, so
+  until then such an account reads low), and `promax` is Pro 500 (`25x`). An
+  unmapped `promax` once weighed one base allowance. The assumption never
+  becomes a `planLimit`.
   On each quota refresh the multiplier comes from the usage response, then the
   freshly fetched account metadata. The multiplier this pool previously stored
   (and mirrored into the sidecar auth record) is never evidence while metadata
@@ -2712,8 +2761,9 @@ The pool-wide cache window must show the total request count since reset and
 must group and visibly label Pool-observed counters separately from calculated
 read, request-hit, and cold rates. It must not show an upstream raw-token group
 or a cache-write rate. The Pool group must not duplicate the per-account
-parent-affinity hit/fallback metric; it shows Requests, Cold requests, and
-Lineage failovers. The cold count is Pool-observed; its rate is calculated and
+parent-affinity hit/fallback metric; it shows Requests, Cold requests,
+Lineage failovers, and Unrecognized failures (terminal failures the pool could
+not classify, highlighted when nonzero; see 2.3.2). The cold count is Pool-observed; its rate is calculated and
 must not share one mixed-source value. Main/subagent rates in this top summary
 must not append per-kind request counts; the request total is the single
 pool-wide Requests metric.

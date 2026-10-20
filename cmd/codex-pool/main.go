@@ -18,7 +18,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -41,8 +40,6 @@ const (
 	cliproxyBaseURLDefault    = "http://127.0.0.1:8319/v1"
 	codexRefreshURLDefault    = "https://auth.openai.com/oauth/token"
 	codexOAuthClientIDDefault = "app_EMoamEEZ73f0CkXaXp7hrann"
-	chatGPTWebReferer         = "https://chatgpt.com/"
-	chatGPTWebUserAgent       = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 	codexTokenRefreshWindow   = 5 * time.Minute
 	adminLoginMaxFailures     = 5
 	adminLoginLockout         = 15 * time.Minute
@@ -421,12 +418,18 @@ type promptCacheStat struct {
 	// ColdRequestCount counts cache-eligible requests (input >= 1024 tokens)
 	// that returned zero cached tokens, i.e. a cold start. It quantifies why a
 	// hit rate is low: new conversations, failover hand-offs, or 15 RPM overflow.
-	ColdRequestCount            uint64    `json:"coldRequestCount"`
-	ParentAffinityHitCount      uint64    `json:"parentAffinityHitCount,omitempty"`
-	ParentAffinityFallbackCount uint64    `json:"parentAffinityFallbackCount,omitempty"`
-	LineageFailoverCount        uint64    `json:"lineageFailoverCount,omitempty"`
-	RoutingFailoverCount        uint64    `json:"routingFailoverCount,omitempty"`
-	UpdatedAt                   time.Time `json:"updatedAt"`
+	ColdRequestCount            uint64 `json:"coldRequestCount"`
+	ParentAffinityHitCount      uint64 `json:"parentAffinityHitCount,omitempty"`
+	ParentAffinityFallbackCount uint64 `json:"parentAffinityFallbackCount,omitempty"`
+	LineageFailoverCount        uint64 `json:"lineageFailoverCount,omitempty"`
+	RoutingFailoverCount        uint64 `json:"routingFailoverCount,omitempty"`
+	// UnrecognizedFailureCount counts terminal failures whose shape the pool
+	// could not classify ("unknown"). Every one is a format the pool does not
+	// understand the way Codex does: a usage-limit error read by code alone sat
+	// at "unknown" for a session before anyone looked. A nonzero count is the
+	// signal to compare that shape with Codex's source.
+	UnrecognizedFailureCount uint64    `json:"unrecognizedFailureCount,omitempty"`
+	UpdatedAt                time.Time `json:"updatedAt"`
 }
 
 // routingCacheEvent contains only bounded operational metadata. Raw thread,
@@ -571,6 +574,10 @@ type state struct {
 	// prime cannot turn into a retry loop against upstream.
 	QuotaWindowPrimes  map[string]time.Time `json:"quotaWindowPrimes,omitempty"`
 	RoutingCacheEvents []routingCacheEvent  `json:"routingCacheEvents,omitempty"`
+	// ClientAgents is the Codex User-Agent and originator last seen per account
+	// (and, under "", pool-wide), the identity the pool's own upstream calls for
+	// that account carry (see codex_own.go).
+	ClientAgents map[string]clientAgent `json:"clientAgents,omitempty"`
 	// LegacyThroughputBuckets is read once when upgrading from the persisted
 	// 30-minute implementation, then migrated into app memory and cleared before
 	// the next runtime save. New throughput history must never be written here.
@@ -631,6 +638,14 @@ type app struct {
 	// Codex-backend requests with Codex's own HTTP client. Empty sends them from
 	// Go, which tests use; the container supervisor always sets it.
 	codexTransportURL string
+	// codexPrimeRunner runs the bundled Codex CLI for a quota prime (see
+	// codex_prime.go); tests replace it.
+	codexPrimeRunner func(ctx context.Context, home, workdir, model string) error
+	// turnStateIssuers maps a turn state an upstream socket issued to the
+	// account that issued it (see wsSession.gateTurnState). Guarded by
+	// turnStateMu, not mu, because it is read on every socket message.
+	turnStateMu      sync.Mutex
+	turnStateIssuers map[string]turnStateIssuer
 
 	// sessionPlacements is in-memory placement load, guarded by mu: which
 	// account each recently active session is on (see noteSessionPlacement).
@@ -1257,6 +1272,13 @@ func (a *app) primeUnanchoredQuotaWindow(ctx context.Context, accountID string, 
 }
 
 func (a *app) sendQuotaPrimeRequest(ctx context.Context, candidate account, model string) error {
+	// A Codex account is primed by Codex itself, so upstream sees a native
+	// Codex request rather than one the pool composed (codex_prime.go). The
+	// composed request below remains only for API-key providers and the
+	// legacy sidecar, neither of which is a Codex backend client.
+	if a.usesCodexBackendDirectly(candidate) {
+		return a.primeWithCodexCLI(ctx, candidate, model)
+	}
 	body, err := json.Marshal(map[string]any{
 		"model":  model,
 		"input":  quotaPrimePrompt,
@@ -1302,6 +1324,7 @@ func (a *app) mux() http.Handler {
 	mux.HandleFunc("GET /v1/responses", a.requireAPIKey(a.handleResponsesWebSocket))
 	mux.HandleFunc("POST /v1/responses/compact", a.trackInFlight(a.requireAPIKey(a.handleResponses)))
 	mux.HandleFunc("POST /v1/chat/completions", a.trackInFlight(a.requireAPIKey(a.handleChatCompletions)))
+	a.registerNativeCodexRoutes(mux)
 	mux.HandleFunc("GET /internal/inflight", a.handleInFlight)
 	// The combined-port root is the public control page. It is intentionally
 	// visible without a password; owner-only actions are protected by
@@ -1708,13 +1731,24 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		model = alias
 	}
 	a.mu.RUnlock()
-	payload["model"] = model
-	if !chat && tier != "" && tier != "none" {
-		payload["reasoning"] = map[string]any{"effort": tier}
+	// A request from the native endpoint is already the one Codex sends OpenAI
+	// and must reach upstream as Codex wrote it (SPEC.md 2.3.3). The rewrites
+	// below adapt custom-provider and foreign requests; applied to a native
+	// request, dropHostedToolConflicts removed the image_gen tool a native
+	// Codex sends its own backend and re-encoding sorted every key. Routing
+	// still reads the model; nothing is written back.
+	native := isNativeCodexRequest(r)
+	if !native {
+		payload["model"] = model
+		if !chat && tier != "" && tier != "none" {
+			payload["reasoning"] = map[string]any{"effort": tier}
+		}
+		dropHostedToolConflicts(payload)
 	}
-	dropHostedToolConflicts(payload)
 	route := a.routingDecision(r, payload, model, requestAPIKey(r))
-	a.applyPromptCacheControls(payload, route)
+	if !native {
+		a.applyPromptCacheControls(payload, route)
+	}
 	streaming, _ := payload["stream"].(bool)
 	if streaming && !chat {
 		early := newEarlyStreamWriter(w, streamingPrecommitMaxHold)
@@ -1732,7 +1766,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	// arrived. Re-encoding a decoded map sorts every object's keys, tool
 	// parameter schemas included, and rewrites number formatting, so even an
 	// untouched request reached upstream in a byte layout no native Codex sends.
-	if payloadUnchanged(body, payload) {
+	if native || payloadUnchanged(body, payload) {
 		updatedBody = body
 	}
 	requestID := requestOperationalID(r)
@@ -1917,6 +1951,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		if !convertResponse && isStreamingProxyResponse(response) {
 			result := copyStreamingProxyResponseWithPrecommit(w, response.Body, precommitByteLimit(len(body)), func() {
 				a.addCurrentAccountResponseHeaders(w, candidate.ID)
+				relayNativeCodexResponseHeaders(w, response, native)
 				commitProxyResponseHeaders(w, response)
 			})
 			info = result.Info
@@ -2001,6 +2036,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 					continue
 				}
 				a.addCurrentAccountResponseHeaders(w, candidate.ID)
+				relayNativeCodexResponseHeaders(w, response, native)
 				commitProxyResponseHeaders(w, response)
 				writeStreamingBytes(w, result.Buffered)
 			}
@@ -2009,6 +2045,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			info, ok = a.writeChatFromResponse(w, response, model)
 		} else {
 			a.addCurrentAccountResponseHeaders(w, candidate.ID)
+			relayNativeCodexResponseHeaders(w, response, native)
 			info, ok = copyProxyResponse(w, response)
 		}
 		_ = response.Body.Close()
@@ -2133,6 +2170,10 @@ var codexRequestHeaderNames = map[string]bool{
 	"version":             true,
 	"traceparent":         true,
 	"tracestate":          true,
+	// The Codex Desktop's device attestation (core/src/attestation.rs,
+	// app-server attestation.rs): generated by the app for the thread, with no
+	// account in it, so it travels with the request like any Codex header.
+	"x-oai-attestation": true,
 }
 
 var codexRequestHeaderPrefixes = []string{"x-codex-", "x-openai-", "x-responsesapi-"}
@@ -2151,6 +2192,11 @@ var poolOnlyRequestHeaders = map[string]bool{
 	"x-codex-thread-source":         true,
 	"x-codex-forked-from-thread-id": true,
 	"x-openai-fedramp":              true,
+	// Codex sets this from its own login's workspace routing (data residency,
+	// model-provider/src/workspace_routing.rs). It describes the client's
+	// account, not the one the pool selects, so it must not follow the request
+	// to another account.
+	"x-openai-account-routing-override": true,
 }
 
 func relayedCodexRequestHeader(name string) bool {
@@ -2228,6 +2274,7 @@ func (a *app) retryCodexBackendAfterRejection(ctx context.Context, candidate acc
 }
 
 func (a *app) forwardOnce(ctx context.Context, candidate account, endpoint string, body []byte, inbound http.Header, auth codexAuthInfo) (*http.Response, error) {
+	a.noteClientAgent(candidate.ID, inbound)
 	viaTransport := a.codexTransportURL != "" && a.usesCodexBackendDirectly(candidate)
 	target := endpoint
 	if viaTransport {
@@ -2274,8 +2321,9 @@ func (a *app) forwardOnce(ctx context.Context, candidate account, endpoint strin
 		return a.streamClient.Do(req)
 	}
 	req.Header.Set("X-Codex-Upstream-Url", endpoint)
-	// One client per account in codex-upstream, as each native Codex process
-	// keeps its own connections for its one account.
+	// Names the account on the hop. codex-upstream opens a fresh client per
+	// request, as Codex does, so this keys nothing there; it stays so the hop
+	// (and the tests' fake transport) can tell which account a request is for.
 	req.Header.Set("X-Codex-Upstream-Identity", candidate.ID)
 	// A native Codex zstd-compresses its Responses requests to the Codex
 	// backend; compaction requests are sent uncompressed.
@@ -2833,6 +2881,22 @@ func safeHeaderValue(value string) string {
 // early SSE headers have gone out these cannot be added any more; upstream's
 // response.metadata event carries the same values in the stream.
 var proxyResponseHeaderAllowlist = []string{"Content-Type", "Cache-Control", "X-Request-Id", "X-Codex-Turn-State", "OpenAI-Model", "X-Reasoning-Included"}
+
+// relayNativeCodexResponseHeaders adds what only a native-endpoint client is
+// owed. X-Models-Etag names upstream's catalog, and Codex refetches its
+// catalog when it changes (core session/turn.rs refresh_if_new_etag): through
+// the native endpoint the catalog is upstream's, so withholding it made Codex
+// send fewer catalog requests than a native Codex. A /v1 client's catalog is
+// the pool's own, which carries no ETag, so there it would only make Codex
+// refetch the pool's catalog on every turn.
+func relayNativeCodexResponseHeaders(w http.ResponseWriter, response *http.Response, native bool) {
+	if !native {
+		return
+	}
+	if value := response.Header.Get("X-Models-Etag"); value != "" {
+		w.Header().Set("X-Models-Etag", value)
+	}
+}
 
 func copyProxyResponseHeaders(w http.ResponseWriter, response *http.Response) {
 	for _, header := range proxyResponseHeaderAllowlist {
@@ -3597,6 +3661,16 @@ func responseInfoFromSSEBlock(block string) proxyResponseInfo {
 	if isTerminalResponseEvent(eventType) {
 		info.TerminalEvent = eventType
 		info.TerminalFailureClass = terminalFailureClass(eventType, info.TerminalErrorCode)
+		if info.TerminalFailureClass == "unknown" && eventType == "error" {
+			// A Responses WebSocket wraps an HTTP refusal as {"type":"error",
+			// "status":429,...}; Codex classifies one with no code it knows by
+			// that status, as it would the HTTP answer, so the pool does too.
+			if status, ok := uint64Field(payload, "status"); ok {
+				info.TerminalFailureClass = statusFailureClass(int(status))
+			} else if status, ok := uint64Field(payload, "status_code"); ok {
+				info.TerminalFailureClass = statusFailureClass(int(status))
+			}
+		}
 	}
 	return info
 }
@@ -3643,7 +3717,8 @@ func retryableTerminalCooldown(reason string) time.Duration {
 	switch reason {
 	case "server_is_overloaded", "slow_down", "server_error", "internal_server_error":
 		return upstream5xxCooldown
-	case "usage_limit_reached", "usage_not_included", "insufficient_quota":
+	case "usage_limit_reached", "usage_not_included", "insufficient_quota",
+		"credit_balance_exhausted", "organization_spend_limit_exceeded", "project_spend_limit_exceeded", "organization_usage_limit_exceeded":
 		// A spent allowance does not come back in seconds. Hold the account out
 		// until the next quota refresh has seen the spent window, which then keeps
 		// it out (or lets it back the moment its owner resets it); a short
@@ -3708,8 +3783,15 @@ func terminalFailureClass(eventType, code string) string {
 	if eventType != "error" && eventType != "response.failed" {
 		return ""
 	}
+	// The codes below are the ones Codex itself recognizes (codex-api
+	// sse/responses_error.rs, api_bridge.rs and endpoint/responses_websocket.rs
+	// at the pinned release), each sorted by what another account can do about
+	// it. testdata/codex-upstream-failures.json holds the shapes, copied from
+	// Codex's own tests, that keep this table honest; a code Codex learns in a
+	// later release belongs here and there together.
 	switch sanitizedErrorCode(code) {
-	case "rate_limit_exceeded", "insufficient_quota", "usage_not_included", "usage_limit_reached", "server_is_overloaded", "slow_down":
+	case "rate_limit_exceeded", "insufficient_quota", "usage_not_included", "usage_limit_reached", "server_is_overloaded", "slow_down",
+		"credit_balance_exhausted", "organization_spend_limit_exceeded", "project_spend_limit_exceeded", "organization_usage_limit_exceeded":
 		return "capacity"
 	// A server-side fault upstream chose to deliver inside the stream. These two
 	// codes are documented and unambiguous, so recognizing them is not the
@@ -3721,7 +3803,31 @@ func terminalFailureClass(eventType, code string) string {
 		return "transient"
 	case "account_auth_failed", "authentication_error", "invalid_api_key", "invalid_token", "token_invalidated", "token_revoked", "unauthorized", "forbidden":
 		return "authentication"
-	case "context_length_exceeded", "invalid_prompt", "cyber_policy", "content_policy_violation", "policy_violation":
+	case "context_length_exceeded", "invalid_prompt", "cyber_policy", "bio_policy", "misalignment_policy_violation", "content_policy_violation", "policy_violation", "invalid_request_error":
+		return "request"
+	// Recognized, and Codex's to handle: it reconnects on the WebSocket
+	// connection limit, resends in full when a previous response is gone, and
+	// reports flex unavailability itself. Another account would not do better,
+	// so they pass through untouched, like "unknown", but they are not counted
+	// as shapes the pool failed to understand.
+	case "websocket_connection_limit_reached", "previous_response_not_found", "flex_unavailable":
+		return "passthrough"
+	default:
+		return "unknown"
+	}
+}
+
+// statusFailureClass classifies a wrapped refusal by its HTTP status, the way
+// the pool classifies the same refusal arriving as an HTTP answer.
+func statusFailureClass(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return "capacity"
+	case status == http.StatusUnauthorized:
+		return "authentication"
+	case status >= http.StatusInternalServerError:
+		return "transient"
+	case status >= http.StatusBadRequest:
 		return "request"
 	default:
 		return "unknown"
@@ -4331,7 +4437,7 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusBadGateway, "account_auth_failed", "unable to authenticate this account with upstream")
 			return
 		}
-		outcome, err := a.consumeCodexResetCredit(ctx, auth, randomUUID())
+		outcome, err := a.consumeCodexResetCredit(ctx, accountCopy.ID, auth, randomUUID())
 		if err != nil {
 			a.logger.Printf("reset credit consume failed for %s: %s", accountCopy.ID, err)
 			writeOpenAIError(w, http.StatusBadGateway, "reset_credit_failed", err.Error())
@@ -5642,7 +5748,9 @@ func (a *app) proAccountLocked(item account) bool {
 	if snapshot := a.state.Quotas[item.ID]; snapshot.PlanType != "" {
 		plan = snapshot.PlanType
 	}
-	return normalizePlanType(plan) == "pro"
+	// Pro 500 is Pro too, and the costliest tier to spend first.
+	family := normalizePlanType(plan)
+	return family == "pro" || family == "pro_max"
 }
 
 func (a *app) beginThroughputMeasurement(streaming bool) *throughputMeasurement {
@@ -6001,6 +6109,9 @@ func (a *app) markTerminalResponseFailure(route routingDecision, model, accountI
 	// account health. Context length, invalid prompt, policy rejection, or a new
 	// unknown code does not prove another credential could serve the request.
 	a.recordPromptCacheResultWithRoutingLocked(accountID, model, route.Identity, info.Usage, false, false, false, "upstream_response_failed", now)
+	if class == "unknown" {
+		a.noteUnrecognizedFailureLocked(accountID, model, route.Identity)
+	}
 	a.appendRoutingCacheEventLocked(route, model, accountID, info.FailoverFromAccountID, "upstream_response_failed", info, now)
 	a.state.RequestCount++
 	a.state.FailureCount++
@@ -6172,6 +6283,20 @@ func (a *app) recordPromptCacheResultWithRoutingLocked(accountID, model string, 
 		stat.RoutingFailoverCount++
 	}
 	stat.UpdatedAt = now
+	a.state.PromptCache[key] = stat
+}
+
+// noteUnrecognizedFailureLocked counts an unclassified terminal failure on the
+// same prompt-cache stat the request was just recorded on, so the dashboard's
+// resettable window carries it with the other observed counters.
+func (a *app) noteUnrecognizedFailureLocked(accountID, model string, identity requestIdentity) {
+	agentKind := "main"
+	if identity.IsSubagent {
+		agentKind = "subagent"
+	}
+	key := accountID + ":" + model + ":" + agentKind
+	stat := a.state.PromptCache[key]
+	stat.UnrecognizedFailureCount++
 	a.state.PromptCache[key] = stat
 }
 
@@ -7896,7 +8021,7 @@ func (a *app) refreshCodexAuthContext(ctx context.Context, item account, force b
 			return nil
 		}
 	}
-	refreshed, err := a.requestCodexTokenRefreshContext(ctx, auth.Tokens.RefreshToken)
+	refreshed, err := a.requestCodexTokenRefreshContext(ctx, item.ID, auth.Tokens.RefreshToken)
 	if err != nil {
 		return err
 	}
@@ -7956,26 +8081,30 @@ func (a *app) codexAuthLock(accountID string) *sync.Mutex {
 }
 
 func (a *app) requestCodexTokenRefresh(refreshToken string) (codexRefreshResponse, error) {
-	return a.requestCodexTokenRefreshContext(context.Background(), refreshToken)
+	return a.requestCodexTokenRefreshContext(context.Background(), "", refreshToken)
 }
 
-func (a *app) requestCodexTokenRefreshContext(ctx context.Context, refreshToken string) (codexRefreshResponse, error) {
+// requestCodexTokenRefreshContext is Codex's ChatGPT token refresh (login
+// auth/manager.rs request_chatgpt_token_refresh): a JSON body with sorted keys
+// (Codex serializes a BTreeMap, Go a map, both sorted) sent by Codex's HTTP
+// client with its default originator and user-agent, nothing else.
+func (a *app) requestCodexTokenRefreshContext(ctx context.Context, accountID, refreshToken string) (codexRefreshResponse, error) {
 	request := map[string]string{
 		"client_id":     envOr("CODEX_APP_SERVER_LOGIN_CLIENT_ID", codexOAuthClientIDDefault),
 		"grant_type":    "refresh_token",
 		"refresh_token": refreshToken,
 	}
-	body, err := json.Marshal(request)
+	body, err := codexJSON(request)
 	if err != nil {
 		return codexRefreshResponse{}, err
 	}
 	endpoint := envOr("CODEX_REFRESH_TOKEN_URL_OVERRIDE", codexRefreshURLDefault)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
-	if err != nil {
-		return codexRefreshResponse{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	response, err := a.client.Do(req)
+	agent := a.clientAgentFor(accountID)
+	header := http.Header{}
+	header.Set("Content-Type", "application/json")
+	header.Set("Originator", agent.Originator)
+	header.Set("User-Agent", codexDefaultClientUserAgent(agent.UserAgent))
+	response, err := a.sendCodexOwnRequest(ctx, accountID, http.MethodPost, endpoint, codexTokenRefreshHeaderOrder, header, body)
 	if err != nil {
 		return codexRefreshResponse{}, fmt.Errorf("refresh codex token: %w", err)
 	}
@@ -8017,206 +8146,43 @@ func (a *app) codexResetCreditsURL() string {
 	return strings.TrimRight(a.codexBaseURL, "/") + "/wham/rate-limit-reset-credits"
 }
 
-func (a *app) codexSubscriptionsURL() string {
-	if value := strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_SUBSCRIPTIONS_URL")); value != "" {
-		return value
-	}
-	return strings.TrimRight(a.codexBaseURL, "/") + "/subscriptions"
-}
-
 func (a *app) codexAccountsCheckURL() string {
 	if value := strings.TrimSpace(os.Getenv("CODEX_POOL_CODEX_ACCOUNTS_CHECK_URL")); value != "" {
 		return value
 	}
-	return strings.TrimRight(a.codexBaseURL, "/") + "/accounts/check/v4-2023-04-27"
+	return strings.TrimRight(a.codexBaseURL, "/") + "/wham/accounts/check"
 }
 
-func (a *app) fetchCodexSubscriptionMetadata(ctx context.Context, auth codexAuthInfo) (codexSubscriptionMetadata, error) {
-	metadata, err := a.fetchCodexAccountCheckMetadata(ctx, auth)
+// fetchCodexSubscriptionMetadata reads the account's plan and workspace name
+// from Codex's own account check (backend-client client.rs, GET
+// /wham/accounts/check), which a native Codex calls at every start. The pool
+// once read the ChatGPT web app's accounts/check and /subscriptions with a
+// Chrome browser's headers, through Node when Go was refused: requests no
+// native Codex sends. /subscriptions was the only source of a Pro multiplier,
+// and it reported none for any account in this pool; a Pro account without one
+// is weighed as SPEC.md's assumed default.
+func (a *app) fetchCodexSubscriptionMetadata(ctx context.Context, accountID string, auth codexAuthInfo) (codexSubscriptionMetadata, error) {
+	if strings.TrimSpace(auth.AccessToken) == "" {
+		return codexSubscriptionMetadata{}, errors.New("codex access token is missing")
+	}
+	response, err := a.sendCodexOwnRequest(ctx, accountID, http.MethodGet, a.codexAccountsCheckURL(), codexBackendHeaderOrder,
+		codexBackendHeaders(a.clientAgentFor(accountID), auth, auth.AccountID), nil)
 	if err != nil {
-		if auth.AccountID == "" {
-			return codexSubscriptionMetadata{}, err
-		}
-		return a.fetchCodexSubscriptionsMetadata(ctx, auth, auth.AccountID)
+		return codexSubscriptionMetadata{}, err
 	}
-	accountID := chooseString(metadata.AccountID, auth.AccountID)
-	if accountID == "" {
-		return metadata, nil
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return codexSubscriptionMetadata{}, fmt.Errorf("accounts/check returned status %d", response.StatusCode)
 	}
-	if metadata.RawPlanType == "" || metadata.PlanLimit == "" {
-		if subscriptions, err := a.fetchCodexSubscriptionsMetadata(ctx, auth, accountID); err == nil {
-			metadata.AccountID = chooseString(metadata.AccountID, subscriptions.AccountID)
-			metadata.OrganizationName = cleanOrganizationName(chooseString(metadata.OrganizationName, subscriptions.OrganizationName))
-			if subscriptions.RawPlanType != "" {
-				metadata.RawPlanType = subscriptions.RawPlanType
-				metadata.PlanFamily = subscriptions.PlanFamily
-				metadata.PlanType = subscriptions.PlanFamily
-			}
-			if subscriptions.PlanLimit != "" {
-				metadata.PlanLimit = subscriptions.PlanLimit
-			}
-		}
-	}
-	return metadata, nil
-}
-
-func (a *app) fetchCodexAccountCheckMetadata(ctx context.Context, auth codexAuthInfo) (codexSubscriptionMetadata, error) {
-	endpoint := a.codexAccountsCheckURL()
-	parsed, err := url.Parse(endpoint)
-	if err == nil {
-		query := parsed.Query()
-		query.Set("timezone_offset_min", strconv.Itoa(chatGPTTimezoneOffsetMinutes()))
-		parsed.RawQuery = query.Encode()
-		endpoint = parsed.String()
-	}
-	payload, err := a.fetchCodexMetadataPayload(ctx, auth, endpoint, "/backend-api/accounts/check/v4-2023-04-27", "")
-	if err != nil {
-		payload, err = a.fetchCodexMetadataPayloadWithNode(ctx, auth, endpoint, "/backend-api/accounts/check/v4-2023-04-27", "")
-		if err != nil {
-			return codexSubscriptionMetadata{}, err
-		}
+	var payload any
+	if err := json.NewDecoder(io.LimitReader(response.Body, maxRequestBody)).Decode(&payload); err != nil {
+		return codexSubscriptionMetadata{}, err
 	}
 	metadata, ok := subscriptionMetadataFromValue(payload, auth.AccountID)
 	if !ok {
 		return codexSubscriptionMetadata{}, errors.New("accounts/check did not include account metadata")
 	}
 	return metadata, nil
-}
-
-func (a *app) fetchCodexSubscriptionsMetadata(ctx context.Context, auth codexAuthInfo, accountID string) (codexSubscriptionMetadata, error) {
-	endpoint := a.codexSubscriptionsURL()
-	parsed, err := url.Parse(endpoint)
-	if err == nil {
-		query := parsed.Query()
-		query.Set("account_id", accountID)
-		parsed.RawQuery = query.Encode()
-		endpoint = parsed.String()
-	}
-	payload, err := a.fetchCodexMetadataPayload(ctx, auth, endpoint, "/backend-api/subscriptions", "")
-	if err != nil {
-		return codexSubscriptionMetadata{}, err
-	}
-	metadata := subscriptionMetadataFromMap(payload)
-	metadata.AccountID = accountID
-	return metadata, nil
-}
-
-func (a *app) fetchCodexMetadataPayload(ctx context.Context, auth codexAuthInfo, endpoint, targetPath, chatGPTAccountID string) (map[string]any, error) {
-	if strings.TrimSpace(auth.AccessToken) == "" {
-		return nil, errors.New("codex access token is missing")
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	applyCodexWebMetadataHeaders(request, auth, targetPath, chatGPTAccountID)
-	response, err := a.client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode > 299 {
-		return nil, fmt.Errorf("subscription metadata returned status %d", response.StatusCode)
-	}
-	var payload map[string]any
-	if err := json.NewDecoder(io.LimitReader(response.Body, maxRequestBody)).Decode(&payload); err != nil {
-		return nil, err
-	}
-	return payload, nil
-}
-
-const codexMetadataNodeFetchScript = `
-const chunks = [];
-process.stdin.on("data", (chunk) => chunks.push(chunk));
-process.stdin.on("end", async () => {
-  try {
-    const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const headers = {
-      "Authorization": "Bearer " + input.accessToken,
-      "Accept": "application/json",
-      "Accept-Language": "en-US,en;q=0.9",
-      "OAI-Language": "en-US",
-      "Origin": "https://chatgpt.com",
-      "Referer": "https://chatgpt.com/",
-      "Sec-Fetch-Dest": "empty",
-      "Sec-Fetch-Mode": "cors",
-      "Sec-Fetch-Site": "same-origin",
-      "User-Agent": input.userAgent
-    };
-    if (input.targetPath) {
-      headers["X-OpenAI-Target-Path"] = input.targetPath;
-      headers["X-OpenAI-Target-Route"] = input.targetPath;
-    }
-    if (input.chatGPTAccountID) headers["ChatGPT-Account-Id"] = input.chatGPTAccountID;
-    if (input.fedramp) headers["X-OpenAI-Fedramp"] = "true";
-    const response = await fetch(input.endpoint, { headers });
-    const body = await response.text();
-    if (!response.ok) {
-      console.error("metadata fetch returned status " + response.status);
-      process.exit(2);
-    }
-    process.stdout.write(body);
-  } catch (error) {
-    console.error(error && error.message ? error.message : String(error));
-    process.exit(1);
-  }
-});
-`
-
-func (a *app) fetchCodexMetadataPayloadWithNode(ctx context.Context, auth codexAuthInfo, endpoint, targetPath, chatGPTAccountID string) (map[string]any, error) {
-	if strings.TrimSpace(auth.AccessToken) == "" {
-		return nil, errors.New("codex access token is missing")
-	}
-	input, err := json.Marshal(map[string]any{
-		"accessToken":      auth.AccessToken,
-		"endpoint":         endpoint,
-		"targetPath":       targetPath,
-		"chatGPTAccountID": chatGPTAccountID,
-		"fedramp":          auth.FedRAMP,
-		"userAgent":        chatGPTWebUserAgent,
-	})
-	if err != nil {
-		return nil, err
-	}
-	cmd := exec.CommandContext(ctx, "node", "-e", codexMetadataNodeFetchScript)
-	cmd.Stdin = strings.NewReader(string(input))
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("node metadata fetch failed: %w", err)
-	}
-	var payload map[string]any
-	if err := json.NewDecoder(io.LimitReader(bytes.NewReader(output), maxRequestBody)).Decode(&payload); err != nil {
-		return nil, err
-	}
-	return payload, nil
-}
-
-func applyCodexWebMetadataHeaders(request *http.Request, auth codexAuthInfo, targetPath, chatGPTAccountID string) {
-	request.Header.Set("Authorization", "Bearer "+auth.AccessToken)
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	request.Header.Set("OAI-Language", "en-US")
-	request.Header.Set("Origin", "https://chatgpt.com")
-	request.Header.Set("Referer", chatGPTWebReferer)
-	request.Header.Set("Sec-Fetch-Dest", "empty")
-	request.Header.Set("Sec-Fetch-Mode", "cors")
-	request.Header.Set("Sec-Fetch-Site", "same-origin")
-	request.Header.Set("User-Agent", chatGPTWebUserAgent)
-	if targetPath != "" {
-		request.Header.Set("X-OpenAI-Target-Path", targetPath)
-		request.Header.Set("X-OpenAI-Target-Route", targetPath)
-	}
-	if chatGPTAccountID != "" {
-		request.Header.Set("ChatGPT-Account-Id", chatGPTAccountID)
-	}
-	if auth.FedRAMP {
-		request.Header.Set("X-OpenAI-Fedramp", "true")
-	}
-}
-
-func chatGPTTimezoneOffsetMinutes() int {
-	_, offsetSeconds := time.Now().Zone()
-	return -offsetSeconds / 60
 }
 
 func subscriptionMetadataFromMap(values map[string]any) codexSubscriptionMetadata {
@@ -8464,20 +8430,10 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 		auth.AccountID = accountCopy.AccountID
 	}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, a.codexUsageURL(), nil)
-	if err != nil {
-		a.saveQuotaError(accountID, "request_invalid", "quota request could not be created")
-		return quotaSnapshot{}, errors.New("quota request could not be created")
-	}
-	request.Header.Set("Authorization", "Bearer "+auth.AccessToken)
-	request.Header.Set("Accept", "application/json")
-	if auth.AccountID != "" {
-		request.Header.Set("ChatGPT-Account-Id", auth.AccountID)
-	}
-	if auth.FedRAMP {
-		request.Header.Set("X-OpenAI-Fedramp", "true")
-	}
-	response, err := a.client.Do(request)
+	// Codex's own rate-limit read (backend-client rate_limit_resets.rs
+	// get_rate_limit_status): GET /wham/usage with the backend-client headers.
+	response, err := a.sendCodexOwnRequest(ctx, accountID, http.MethodGet, a.codexUsageURL(), codexBackendHeaderOrder,
+		codexBackendHeaders(a.clientAgentFor(accountID), auth, auth.AccountID), nil)
 	if err != nil {
 		if ctx.Err() != nil {
 			return quotaSnapshot{}, errors.New("quota refresh cancelled")
@@ -8515,7 +8471,7 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 	_ = json.Unmarshal(body, &usageFields)
 	now := time.Now().UTC()
 	quota := quotaFromUsage(usage, now)
-	a.enrichResetCreditExpiration(ctx, auth, &quota, priorResetCredits, now)
+	a.enrichResetCreditExpiration(ctx, accountID, auth, &quota, priorResetCredits, now)
 	planRaw := cleanRawPlanType(chooseString(usage.PlanType, usage.SubscriptionPlan))
 	plan := planFamilyFromRaw(planRaw)
 	planLimit := planLimitFromMap(usageFields)
@@ -8533,7 +8489,7 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 	}
 	metadataResolved := false
 	if planRaw == "" || organizationName == "" || organizationScopedPlan(plan) {
-		if metadata, err := a.fetchCodexSubscriptionMetadata(ctx, auth); err == nil {
+		if metadata, err := a.fetchCodexSubscriptionMetadata(ctx, accountID, auth); err == nil {
 			metadataResolved = true
 			if metadata.AccountID != "" {
 				auth.AccountID = metadata.AccountID
@@ -8880,7 +8836,7 @@ func cloneQuotaResetCredits(value *quotaResetCredits) *quotaResetCredits {
 	return &cloned
 }
 
-func (a *app) enrichResetCreditExpiration(ctx context.Context, auth codexAuthInfo, quota *accountQuota, prior *quotaResetCredits, now time.Time) {
+func (a *app) enrichResetCreditExpiration(ctx context.Context, accountID string, auth codexAuthInfo, quota *accountQuota, prior *quotaResetCredits, now time.Time) {
 	if quota == nil || quota.ResetCredits == nil || quota.ResetCredits.AvailableCount == nil || *quota.ResetCredits.AvailableCount <= 0 {
 		return
 	}
@@ -8897,7 +8853,7 @@ func (a *app) enrichResetCreditExpiration(ctx context.Context, auth codexAuthInf
 		return
 	}
 
-	expiresAt, err := a.fetchCodexResetCreditExpiration(ctx, auth, now)
+	expiresAt, err := a.fetchCodexResetCreditExpiration(ctx, accountID, auth, now)
 	if err == nil {
 		current.ExpiresAt = expiresAt
 		current.DetailsObservedAt = now
@@ -8945,31 +8901,23 @@ func resetCreditOutcomeMessage(outcome string) (string, bool) {
 // retry of the same logical attempt must carry the same id or upstream would
 // spend a second credit, so the caller owns it rather than this function
 // minting a fresh one on every network retry.
-func (a *app) consumeCodexResetCredit(ctx context.Context, auth codexAuthInfo, redeemRequestID string) (string, error) {
+func (a *app) consumeCodexResetCredit(ctx context.Context, accountID string, auth codexAuthInfo, redeemRequestID string) (string, error) {
 	// Upstream reads this key as redeem_request_id and requires it. The Codex
 	// client calls the same value an idempotency key on its own JSON-RPC surface
 	// and renames it here, so both idempotency_key and idempotencyKey leave the
 	// required field absent and earn a 400: that is how every real attempt
 	// failed. The optional credit_id picks one specific credit; omitting it lets
 	// upstream choose, which is what this pool wants.
-	body, err := json.Marshal(map[string]any{"redeem_request_id": redeemRequestID})
+	body, err := codexJSON(map[string]any{"redeem_request_id": redeemRequestID})
 	if err != nil {
 		return "", fmt.Errorf("encode reset-credit consume request: %w", err)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, a.codexResetCreditConsumeURL(), bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("create reset-credit consume request: %w", err)
-	}
-	request.Header.Set("Authorization", "Bearer "+auth.AccessToken)
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "application/json")
-	if auth.AccountID != "" {
-		request.Header.Set("ChatGPT-Account-Id", auth.AccountID)
-	}
-	if auth.FedRAMP {
-		request.Header.Set("X-OpenAI-Fedramp", "true")
-	}
-	response, err := a.client.Do(request)
+	// Codex's own redemption (backend-client rate_limit_resets.rs
+	// consume_rate_limit_reset_credit_request): the backend-client headers,
+	// then the JSON body step.
+	header := codexBackendHeaders(a.clientAgentFor(accountID), auth, auth.AccountID)
+	header.Set("Content-Type", "application/json")
+	response, err := a.sendCodexOwnRequest(ctx, accountID, http.MethodPost, a.codexResetCreditConsumeURL(), codexBackendHeaderOrder, header, body)
 	if err != nil {
 		return "", fmt.Errorf("consume reset credit: %w", err)
 	}
@@ -9004,20 +8952,11 @@ func (a *app) consumeCodexResetCredit(ctx context.Context, auth codexAuthInfo, r
 	return cleanMetadataToken(decoded.Code), nil
 }
 
-func (a *app) fetchCodexResetCreditExpiration(ctx context.Context, auth codexAuthInfo, now time.Time) (*int64, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, a.codexResetCreditsURL(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("create reset-credit details request: %w", err)
-	}
-	request.Header.Set("Authorization", "Bearer "+auth.AccessToken)
-	request.Header.Set("Accept", "application/json")
-	if auth.AccountID != "" {
-		request.Header.Set("ChatGPT-Account-Id", auth.AccountID)
-	}
-	if auth.FedRAMP {
-		request.Header.Set("X-OpenAI-Fedramp", "true")
-	}
-	response, err := a.client.Do(request)
+func (a *app) fetchCodexResetCreditExpiration(ctx context.Context, accountID string, auth codexAuthInfo, now time.Time) (*int64, error) {
+	// Codex's own listing (backend-client rate_limit_resets.rs
+	// list_rate_limit_reset_credits) with the backend-client headers.
+	response, err := a.sendCodexOwnRequest(ctx, accountID, http.MethodGet, a.codexResetCreditsURL(), codexBackendHeaderOrder,
+		codexBackendHeaders(a.clientAgentFor(accountID), auth, auth.AccountID), nil)
 	if err != nil {
 		return nil, fmt.Errorf("fetch reset-credit details: %w", err)
 	}
@@ -10902,7 +10841,7 @@ func histogramPercentileMillis(histogram []uint64, percentile uint64) any {
 // accountID aggregates every account.
 func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Time) map[string]any {
 	var input, cached, requests, usageObserved, cacheWrites, cacheWriteInput, cacheWriteObserved, cacheHits, cacheEligible, cold uint64
-	var parentAffinityHits, parentAffinityFallbacks, lineageFailovers, routingFailovers uint64
+	var parentAffinityHits, parentAffinityFallbacks, lineageFailovers, routingFailovers, unrecognizedFailures uint64
 	agents := map[string]map[string]uint64{
 		"main": {
 			"inputTokens": 0, "cachedTokens": 0, "requestCount": 0, "usageObservedRequestCount": 0,
@@ -10946,6 +10885,7 @@ func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Tim
 		parentAffinityFallbacks += subSat(stat.ParentAffinityFallbackCount, base.ParentAffinityFallbackCount)
 		lineageFailovers += subSat(stat.LineageFailoverCount, base.LineageFailoverCount)
 		routingFailovers += subSat(stat.RoutingFailoverCount, base.RoutingFailoverCount)
+		unrecognizedFailures += subSat(stat.UnrecognizedFailureCount, base.UnrecognizedFailureCount)
 		agentKind := stat.AgentKind
 		if agentKind != "subagent" {
 			agentKind = "main"
@@ -10971,7 +10911,8 @@ func (a *app) promptCacheWindowFilteredLocked(accountID string, resetAt time.Tim
 		"cacheHitRequestCount": cacheHits, "cacheEligibleRequestCount": cacheEligible, "coldRequestCount": cold,
 		"main": agents["main"], "subagent": agents["subagent"],
 		"parentAffinityHitCount": parentAffinityHits, "parentAffinityFallbackCount": parentAffinityFallbacks,
-		"lineageFailoverCount": lineageFailovers, "routingFailoverCount": routingFailovers, "resetAt": resetAt,
+		"lineageFailoverCount": lineageFailovers, "routingFailoverCount": routingFailovers,
+		"unrecognizedFailureCount": unrecognizedFailures, "resetAt": resetAt,
 	}
 }
 
@@ -11629,8 +11570,12 @@ const defaultPremiumSeatWeight = 5.0
 const proLiteWeight = 5.0
 
 // proDefaultWeight is the published Pro 200 allowance (10x Plus since
-// 2026-09-29), assumed for a Pro account that reports no multiplier.
+// 2026-09-29), assumed for a Pro account that reports no multiplier. Codex
+// itself labels raw plan "pro" as Pro 200 (tui subscription.rs).
 const proDefaultWeight = 10.0
+
+// proMaxWeight is the published Pro 500 (raw plan promax) allowance.
+const proMaxWeight = 25.0
 
 var premiumSeatWeight = defaultPremiumSeatWeight
 
@@ -11683,6 +11628,11 @@ func accountWeeklyWeight(planFamily, planLimit, seatType string) (float64, bool)
 		// guess: the raw plan names the tier exactly, and weighing it as one
 		// understated a 5x account as a single base allowance.
 		return proLiteWeight, true
+	case "pro_max":
+		// The Pro 500 tier, which OpenAI prices at 25x Plus. The raw plan names
+		// the tier exactly, as prolite does for Pro 100; the multiplier is read
+		// off the pricing page, so it is flagged as assumed.
+		return proMaxWeight, true
 	case "business":
 		if cleanMetadataToken(seatType) == "premium" {
 			return premiumSeatWeight, true
@@ -11783,7 +11733,7 @@ func normalizePlanType(value string) string {
 	value = strings.ReplaceAll(value, "-", "_")
 	value = strings.ReplaceAll(value, " ", "_")
 	switch value {
-	case "free", "go", "plus", "pro", "pro_lite", "team", "business", "enterprise", "edu":
+	case "free", "go", "plus", "pro", "pro_lite", "pro_max", "team", "business", "enterprise", "edu":
 		return value
 	case "chatgpt_plus":
 		return "plus"
@@ -11856,8 +11806,15 @@ func planFamilyFromRaw(value string) string {
 		return "plus"
 	case "pro", "chatgptpro", "chatgpt_pro", "chatgptproplan":
 		return "pro"
-	case "prolite":
+	// chatgptprolite is the web app's name for it, still stored on slots
+	// whose plan was last read from the web app's account metadata.
+	case "prolite", "chatgptprolite", "pro_lite":
 		return "pro_lite"
+	// promax is the Pro 500 tier: Codex names it so (protocol auth.rs KnownPlan
+	// ProMax, tui subscription.rs "Pro 500"). Unmapped, a Pro 500 account was
+	// "unknown" and weighed as one base allowance instead of 25.
+	case "promax", "chatgptpromax", "pro_max":
+		return "pro_max"
 	// self_serve_business_prolite appeared in ID-token claims in September 2026
 	// on the Business seats inferred as Premium (Premium is priced like Pro
 	// 100, hence "prolite"). It is mapped to the Business family only; it is
@@ -11920,6 +11877,8 @@ func planRank(plan string) int {
 		return 500
 	case "team", "business":
 		return 400
+	case "pro_max":
+		return 320
 	case "pro":
 		return 300
 	case "pro_lite":
@@ -11966,6 +11925,8 @@ func planDisplayName(plan string) string {
 		// OpenAI now sells Pro as Pro 100 / 200 / 500; the prolite plan is the
 		// $100 tier.
 		return "Pro 100"
+	case "pro_max":
+		return "Pro 500"
 	case "go":
 		return "Go"
 	case "team":

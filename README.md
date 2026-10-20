@@ -279,7 +279,18 @@ env_key = "CODEX_POOL_API_KEY"
 wire_api = "responses"
 ```
 
-Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key passed to the service container. The checked-in [test config](test/codex-config.toml) uses the same provider contract and was verified with Codex CLI `0.141.0`.
+Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key passed to the service container. The checked-in [test config](test/codex-config.toml) uses the same provider contract and was verified with Codex CLI `0.163.0`.
+
+### Native Codex endpoint (recommended for Codex)
+
+A custom provider makes Codex send a reduced request (no MCP resource tools or `image_gen`, no internal metadata or guardian fields). To have Codex send the pool exactly what it sends OpenAI, keep the built-in OpenAI provider and your ChatGPT login (`codex login`) and move only its base URL, with the pool's client key in the path:
+
+```toml
+# ~/.codex/config.toml — used by the Codex CLI, Desktop and IDE extension alike
+openai_base_url = "https://<pool-host>/k/<pool-api-key>/backend-api/codex"
+```
+
+Do not set `model_provider`. The pool replaces your login's credential with the selected account's before anything goes upstream; your login is still used, directly with `chatgpt.com`, for the account, plugin and analytics calls a native Codex makes. Because the key is in the URL, make sure no reverse proxy in front of the pool logs `/k/` paths. Details: SPEC.md 2.3.3.
 
 ## Implemented Surface
 
@@ -342,6 +353,21 @@ rate-limit-failover correlation; read/write token observations; cold-eligible
 classification; bounded persisted diagnostics; and redaction of raw route and
 account identifiers. It deliberately never retags the live
 `codex-pool:local` image.
+
+### Codex Wire Conformance
+
+The pool must look like a native Codex of the pinned release in both directions (SPEC.md 2.3.2). Two scripts check it, both in Docker:
+
+```bash
+sh scripts/conformance/codex-conformance.sh check        # how the pool reads upstream, against Codex's source
+sh scripts/conformance/wire-capture.sh                   # what the pool sends upstream, against a native Codex
+sh scripts/conformance/codex-conformance.sh releases     # Codex releases newer than the pin
+sh scripts/conformance/codex-conformance.sh diff <tag>   # every change to the watched Codex files up to <tag>
+```
+
+`check` verifies that every upstream shape in `cmd/codex-pool/testdata/codex-upstream-failures.json` still exists in the Codex source it was copied from, and that every error code Codex's parsers name has a shape there (the Go tests hold the pool's classification to those shapes). `wire-capture.sh` runs the same turn from the native Codex CLI and from Codex behind a pool built from the working tree, over HTTP and WebSocket and through the native endpoint, against a fake `chatgpt.com` on an internal network, and compares TLS ClientHello (JA4), HTTP/2 SETTINGS, connections per request, header order and values, and bodies. It also checks the pool's own calls (token refresh, usage, account check, reset credits) and a quota prime by the bundled Codex CLI. It fails on any difference the pool introduces. It also reports the client gap: Codex sends a custom provider (the pool) a smaller body than its own backend, which forwarding cannot repair (SPEC.md 2.3.2). Output lands in `scripts/conformance/out/` (git-ignored).
+
+In production, the dashboard's Unrecognized failures counter (and `class=unknown` in the log) shows any upstream failure the pool could not classify.
 
 ## Local Build
 

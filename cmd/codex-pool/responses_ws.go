@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -20,14 +21,32 @@ import (
 //
 // One client socket is bound to one account's upstream socket, opened by
 // codex-upstream with Codex's own connector. Messages pass through byte for
-// byte in both directions. The account is chosen at the first response.create
-// (the handshake carries no model) and kept for the connection. When the next
-// request belongs on another account (a lineage move, a cooled-down account)
-// or the account fails mid-connection, the pool closes the client socket
-// instead of switching upstream sockets underneath it: incremental requests
-// reference responses that exist only on the old connection, and a native
-// Codex answers a closed socket by reconnecting and resending the request in
-// full, which the pool then routes like any new request.
+// byte in both directions.
+//
+// The account is chosen at the handshake, from the session, thread and model
+// the handshake names (X-Codex-Routing-Hint, else X-Codex-Turn-Metadata), and
+// the upstream socket is opened before the client's is accepted. That order is
+// what lets the client receive the upstream handshake's own headers, as a
+// native Codex does: Codex reads its turn state from the handshake response
+// alone on a socket (codex-api endpoint/responses_websocket.rs; its event
+// parser takes turn state only from response.metadata, which a socket does not
+// carry) and sends it back in every later message's client_metadata, and it
+// reads x-reasoning-included there, which changes its token accounting and so
+// when it compacts. Accepting first and dialing at the first message, as the
+// pool once did, left Codex with neither, so its later messages differed from
+// a native Codex's.
+//
+// When the next request belongs on another account (a lineage move, a
+// cooled-down account) or the account fails mid-connection, the pool closes
+// the client socket instead of switching upstream sockets underneath it:
+// incremental requests reference responses that exist only on the old
+// connection, and a native Codex answers a closed socket by reconnecting and
+// resending the request in full, which the pool then routes like any new
+// request. The one exception is the first request on a socket, which may
+// settle the account differently from the handshake's guess (a model the
+// guessed account cannot serve, a response chain bound elsewhere): nothing
+// has gone out on that upstream socket yet, so it is replaced before the
+// request is sent, rather than sending Codex to reconnect into the same guess.
 
 type wsSession struct {
 	a         *app
@@ -40,6 +59,16 @@ type wsSession struct {
 	account  account
 	active   *wsResponse
 	closed   chan struct{}
+	// upstreamHeaders is the current upstream socket's handshake response.
+	upstreamHeaders http.Header
+	// sent is true once a request has gone out on the current upstream socket.
+	sent bool
+}
+
+// wsRefusal is why no upstream socket could be opened for a handshake.
+type wsRefusal struct {
+	status       int
+	code, detail string
 }
 
 type wsResponse struct {
@@ -68,13 +97,74 @@ func (a *app) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusUpgradeRequired, "websocket_unavailable", "this pool serves Responses over HTTP")
 		return
 	}
-	client, err := acceptWebSocket(w, r, nil)
-	if err != nil {
+	if strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key")) == "" || r.Header.Get("Sec-WebSocket-Version") != "13" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid websocket handshake")
 		return
 	}
-	session := &wsSession{a: a, client: client, handshake: r, apiKey: requestAPIKey(r), closed: make(chan struct{})}
+	session := &wsSession{a: a, handshake: r, apiKey: requestAPIKey(r), closed: make(chan struct{})}
+	model := a.wsHandshakeModel(r)
+	route := a.routingDecision(r, map[string]any{}, model, session.apiKey)
+	// No account could take the socket: answer the handshake itself, as the
+	// Codex backend does when it refuses one, so Codex maps the status (426
+	// means HTTP, 429 and 5xx are retried) before any socket exists.
+	if refusal := session.dial(&route, model); refusal != nil {
+		writeOpenAIError(w, refusal.status, refusal.code, refusal.detail)
+		return
+	}
+	client, err := acceptWebSocket(w, r, session.clientHandshakeHeaders())
+	if err != nil {
+		session.upstream.Close()
+		return
+	}
+	session.client = client
+	go session.relayUpstream(session.upstream)
 	session.run()
+}
+
+// wsHandshakeHeaders are the upstream handshake response headers a native
+// Codex reads (codex-api endpoint/responses_websocket.rs): turn state, whether
+// reasoning is included, and the serving model. X-Models-Etag joins them only
+// on the native endpoint, where the catalog is upstream's (see
+// relayNativeCodexResponseHeaders).
+var wsHandshakeHeaders = []string{"X-Codex-Turn-State", "X-Reasoning-Included", "OpenAI-Model"}
+
+func (s *wsSession) clientHandshakeHeaders() http.Header {
+	headers := http.Header{}
+	names := wsHandshakeHeaders
+	if isNativeCodexRequest(s.handshake) {
+		names = append(append([]string(nil), names...), "X-Models-Etag")
+	}
+	for _, name := range names {
+		if value := s.upstreamHeaders.Get(name); value != "" {
+			headers.Set(name, value)
+		}
+	}
+	return headers
+}
+
+// wsHandshakeModel is the model a handshake names: the routing hint a native
+// Codex sends the Codex backend, else the turn metadata every Codex sends,
+// else the pool's default, with the pool's alias applied for routing only.
+func (a *app) wsHandshakeModel(r *http.Request) string {
+	model := ""
+	for _, part := range strings.Split(r.Header.Get("X-Codex-Routing-Hint"), ";") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(part), "model="); ok {
+			model = strings.TrimSpace(value)
+		}
+	}
+	if model == "" {
+		model = metadataString(metadataObject(r.Header.Get("X-Codex-Turn-Metadata")), "model")
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if model == "" {
+		model = a.config.DefaultModel
+	}
+	model, _ = parseModel(model)
+	if alias, ok := a.config.ModelAliases[model]; ok {
+		model = alias
+	}
+	return model
 }
 
 // wsClientPingInterval keeps the client leg alive between messages. That leg
@@ -157,21 +247,28 @@ func (s *wsSession) startResponse(message []byte, payload map[string]any) bool {
 	warmup := payload["generate"] == false
 
 	s.mu.Lock()
-	upstream := s.upstream
 	bound := s.account
+	sent := s.sent
 	s.mu.Unlock()
-	if upstream != nil {
-		candidate, err := a.selectAccountForRoute(&route, model, map[string]bool{})
-		if err != nil || candidate.ID != bound.ID {
+	candidate, err := a.selectAccountForRoute(&route, model, map[string]bool{})
+	if err != nil || candidate.ID != bound.ID {
+		if sent {
 			// Nothing of this request reached upstream; Codex resends it in full
 			// after reconnecting, and routing places it then.
 			s.client.CloseWith(1012, "account changed")
 			return false
 		}
-	} else if !s.dial(&route, model, message) {
-		return false
+		// The first request settled the account differently from the
+		// handshake's guess, and nothing has gone out on this socket: move it.
+		if !s.redial(&route, model) {
+			return false
+		}
 	}
+	s.mu.Lock()
+	bound = s.account
+	s.mu.Unlock()
 	a.noteSessionPlacement(route.BalanceKey, bound.ID)
+	message = s.gateTurnState(message, payload, route)
 
 	s.mu.Lock()
 	response := &wsResponse{route: route, model: model, accountID: s.account.ID, warmup: warmup, message: message}
@@ -180,7 +277,8 @@ func (s *wsSession) startResponse(message []byte, payload map[string]any) bool {
 		response.throughput.AccountID = s.account.ID
 	}
 	s.active = response
-	upstream = s.upstream
+	s.sent = true
+	upstream := s.upstream
 	s.mu.Unlock()
 	// A running response holds the drain and the deploy idle wait like an
 	// HTTP request; an idle socket between turns does not.
@@ -193,8 +291,9 @@ func (s *wsSession) startResponse(message []byte, payload map[string]any) bool {
 }
 
 // dial binds the session to an account's upstream socket, failing over the
-// same way an HTTP request does before anything reaches upstream.
-func (s *wsSession) dial(route *routingDecision, model string, firstMessage []byte) bool {
+// same way an HTTP request does before anything reaches upstream. It does not
+// start the relay; the caller does once the client's socket exists.
+func (s *wsSession) dial(route *routingDecision, model string) *wsRefusal {
 	a := s.a
 	excluded := map[string]bool{}
 	status, code, detail := http.StatusServiceUnavailable, "all_accounts_cooling_down", "no eligible upstream account"
@@ -209,7 +308,7 @@ func (s *wsSession) dial(route *routingDecision, model string, firstMessage []by
 			// API-key providers have no Codex WebSocket; their sessions use HTTP.
 			continue
 		}
-		conn, refusal, err := s.a.dialCodexWebSocket(s.handshake.Context(), candidate, s.handshake.Header, firstMessage)
+		conn, handshake, refusal, err := s.a.dialCodexWebSocket(s.handshake.Context(), candidate, s.handshake.Header, model)
 		if err != nil {
 			a.markFailure(candidate.ID, model, "upstream_transport_error", 30*time.Second)
 			status, code, detail = http.StatusBadGateway, "bad_gateway", "upstream websocket unreachable"
@@ -233,20 +332,102 @@ func (s *wsSession) dial(route *routingDecision, model string, firstMessage []by
 			}
 			continue
 		}
+		if turnState := handshake.Get("X-Codex-Turn-State"); turnState != "" {
+			a.noteTurnStateIssuer(turnState, candidate.ID)
+		}
 		s.mu.Lock()
 		s.upstream = conn
 		s.account = candidate
+		s.upstreamHeaders = handshake
+		s.sent = false
 		s.mu.Unlock()
-		go s.relayUpstream(conn)
-		return true
+		return nil
 	}
-	// The wrapped error event is what the Codex backend itself sends on a
-	// socket; Codex maps its status the way it maps an HTTP status, so a 426
-	// still means "fall back to HTTP" and a 429 or 5xx is retried.
-	event, _ := json.Marshal(map[string]any{"type": "error", "status": status, "error": map[string]any{"code": code, "message": detail}})
-	_ = s.client.WriteMessage(wsOpText, event)
-	s.client.CloseWith(1011, "no upstream")
-	return false
+	return &wsRefusal{status: status, code: code, detail: detail}
+}
+
+// redial replaces the upstream socket for the first request on a client
+// socket (see the comment at the top of this file). The old socket's relay
+// sees it close and, no longer current, exits without touching the client.
+func (s *wsSession) redial(route *routingDecision, model string) bool {
+	s.mu.Lock()
+	old := s.upstream
+	s.upstream = nil
+	s.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+	if refusal := s.dial(route, model); refusal != nil {
+		// The wrapped error event is what the Codex backend itself sends on a
+		// socket; Codex maps its status the way it maps an HTTP status, so a
+		// 426 still means "fall back to HTTP" and a 429 or 5xx is retried.
+		event, _ := json.Marshal(map[string]any{"type": "error", "status": refusal.status, "error": map[string]any{"code": refusal.code, "message": refusal.detail}})
+		_ = s.client.WriteMessage(wsOpText, event)
+		s.client.CloseWith(1011, "no upstream")
+		return false
+	}
+	s.mu.Lock()
+	upstream := s.upstream
+	s.mu.Unlock()
+	go s.relayUpstream(upstream)
+	return true
+}
+
+// gateTurnState applies the HTTP turn-state rule (turnStateForAttempt) to a
+// socket, where Codex carries the turn state in the message's client_metadata
+// rather than a header: only the account that issued it may receive it. After
+// the session moved accounts, Codex still holds the old account's token for
+// the turn, and a native Codex never presents one account's turn token to
+// another, so it is removed from the message, leaving every other byte as
+// Codex wrote it.
+func (s *wsSession) gateTurnState(message []byte, payload map[string]any, route routingDecision) []byte {
+	metadata, _ := payload["client_metadata"].(map[string]any)
+	value, _ := metadata["x-codex-turn-state"].(string)
+	if value == "" {
+		return message
+	}
+	s.mu.Lock()
+	bound := s.account.ID
+	s.mu.Unlock()
+	issuer := s.a.turnStateIssuer(value)
+	if issuer == "" {
+		issuer = s.a.stickySessionAccountID(route.StickyKey)
+	}
+	if issuer == bound {
+		return message
+	}
+	return withoutClientMetadataField(message, payload, "x-codex-turn-state", value)
+}
+
+// withoutClientMetadataField removes one client_metadata field from a message
+// without re-encoding the rest. Codex writes compact JSON, so the field is a
+// literal "key":"value" pair; only if that pair cannot be found is the message
+// re-encoded.
+func withoutClientMetadataField(message []byte, payload map[string]any, key, value string) []byte {
+	pair, err := codexJSON(map[string]string{key: value})
+	if err == nil {
+		pair = pair[1 : len(pair)-1]
+		for _, candidate := range [][]byte{append([]byte(","), pair...), append(append([]byte(nil), pair...), ','), pair} {
+			if index := bytes.Index(message, candidate); index >= 0 {
+				edited := append(append([]byte(nil), message[:index]...), message[index+len(candidate):]...)
+				var check map[string]any
+				if json.Unmarshal(edited, &check) == nil {
+					if metadata, _ := check["client_metadata"].(map[string]any); metadata != nil {
+						if _, still := metadata[key]; !still {
+							return edited
+						}
+					}
+				}
+			}
+		}
+	}
+	if metadata, _ := payload["client_metadata"].(map[string]any); metadata != nil {
+		delete(metadata, key)
+	}
+	if encoded, err := codexJSON(payload); err == nil {
+		return encoded
+	}
+	return message
 }
 
 // wsPrecommitMaxBlocks bounds the lifecycle preamble held back from Codex.
@@ -265,6 +446,11 @@ const wsPrecommitMaxBlocks = 64
 // retryable, reconnects and resends in full, and routing moves the whole
 // lineage. A failure after content has reached Codex is relayed as it is.
 func (s *wsSession) relayUpstream(upstream *wsConn) {
+	// The account this socket belongs to, fixed for the socket's life even if
+	// the session later redials elsewhere.
+	s.mu.Lock()
+	accountID := s.account.ID
+	s.mu.Unlock()
 	for {
 		opcode, message, err := upstream.ReadMessage()
 		if err != nil {
@@ -274,6 +460,9 @@ func (s *wsSession) relayUpstream(upstream *wsConn) {
 		s.mu.Lock()
 		response := s.active
 		s.mu.Unlock()
+		if opcode == wsOpText {
+			s.a.noteEventTurnState(message, accountID)
+		}
 		if opcode != wsOpText || response == nil || response.committed {
 			if s.client.WriteMessage(opcode, message) != nil {
 				upstream.Close()
@@ -401,6 +590,12 @@ func (s *wsSession) finishResponse(response *wsResponse, delivered, coolDown boo
 
 func (s *wsSession) upstreamGone(upstream *wsConn) {
 	s.mu.Lock()
+	if s.upstream != upstream {
+		// A socket replaced by redial: the session has already moved on.
+		s.mu.Unlock()
+		upstream.Close()
+		return
+	}
 	response := s.active
 	s.active = nil
 	accountID := s.account.ID
@@ -433,25 +628,27 @@ func (s *wsSession) shutdown() {
 // codex-upstream with the handshake a native Codex sends: the client's own
 // Codex headers, the account's credential and ChatGPT-Account-ID, and the
 // routing hint and version a native Codex adds for the Codex backend. A native
-// handshake carries no turn state. A 401 is answered like on HTTP: refresh
-// once and redial the same account.
-func (a *app) dialCodexWebSocket(ctx context.Context, candidate account, clientHeaders http.Header, firstMessage []byte) (*wsConn, *http.Response, error) {
+// handshake carries no turn state (core client.rs build_websocket_headers).
+// It returns the upstream handshake's response headers. A 401 is answered like
+// on HTTP: refresh once and redial the same account.
+func (a *app) dialCodexWebSocket(ctx context.Context, candidate account, clientHeaders http.Header, model string) (*wsConn, http.Header, *http.Response, error) {
 	auth, err := a.refreshedCodexAuthContext(ctx, candidate)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	conn, refusal, err := a.dialCodexWebSocketOnce(candidate, clientHeaders, firstMessage, auth)
+	conn, handshake, refusal, err := a.dialCodexWebSocketOnce(candidate, clientHeaders, model, auth)
 	if err != nil || refusal == nil || refusal.StatusCode != http.StatusUnauthorized {
-		return conn, refusal, err
+		return conn, handshake, refusal, err
 	}
 	refreshed, refreshErr := a.refreshCodexAuthAfterRejection(ctx, candidate, auth.AccessToken)
 	if refreshErr != nil || refreshed.AccessToken == "" || refreshed.AccessToken == auth.AccessToken {
-		return nil, refusal, nil
+		return nil, nil, refusal, nil
 	}
-	return a.dialCodexWebSocketOnce(candidate, clientHeaders, firstMessage, refreshed)
+	return a.dialCodexWebSocketOnce(candidate, clientHeaders, model, refreshed)
 }
 
-func (a *app) dialCodexWebSocketOnce(candidate account, clientHeaders http.Header, firstMessage []byte, auth codexAuthInfo) (*wsConn, *http.Response, error) {
+func (a *app) dialCodexWebSocketOnce(candidate account, clientHeaders http.Header, model string, auth codexAuthInfo) (*wsConn, http.Header, *http.Response, error) {
+	a.noteClientAgent(candidate.ID, clientHeaders)
 	headers := http.Header{}
 	forwardCodexMetadataHeaders(headers, clientHeaders)
 	headers.Del("X-Codex-Turn-State")
@@ -465,8 +662,11 @@ func (a *app) dialCodexWebSocketOnce(candidate account, clientHeaders http.Heade
 	if auth.FedRAMP {
 		headers.Set("X-OpenAI-Fedramp", "true")
 	}
-	if hint := codexRoutingHint(firstMessage, clientHeaders); hint != "" {
-		headers.Set("X-Codex-Routing-Hint", hint)
+	// A native Codex names the model in its handshake's routing hint; a
+	// client that sent none gets the handshake's model. The service tier is
+	// only in the request body, so such a client's hint carries no tier.
+	if strings.TrimSpace(clientHeaders.Get("X-Codex-Routing-Hint")) == "" && !strings.EqualFold(strings.TrimSpace(clientHeaders.Get("X-Codex-Guardian")), "reviewer") && model != "" {
+		headers.Set("X-Codex-Routing-Hint", "model="+model)
 	}
 	if version := codexClientVersion(clientHeaders); version != "" && headers.Get("Version") == "" {
 		headers.Set("Version", version)
@@ -478,14 +678,76 @@ func (a *app) dialCodexWebSocketOnce(candidate account, clientHeaders http.Heade
 	transport := "ws" + strings.TrimPrefix(a.codexTransportURL, "http") + "/ws"
 	conn, response, err := dialWebSocket(transport, headers)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if response != nil && conn == nil && response.Header.Get("X-Codex-Upstream-Error") != "" {
 		_ = response.Body.Close()
-		return nil, nil, io.ErrUnexpectedEOF
+		return nil, nil, nil, io.ErrUnexpectedEOF
 	}
 	if conn == nil {
-		return nil, response, nil
+		return nil, nil, response, nil
 	}
-	return conn, nil, nil
+	return conn, response.Header, nil, nil
+}
+
+// turnStateIssuer records which account issued a turn state, and when.
+type turnStateIssuer struct {
+	accountID string
+	at        time.Time
+}
+
+// A turn state lives for one Codex turn; a day is far longer, and the bound
+// keeps the map small however many sockets come and go.
+const (
+	turnStateIssuerTTL = 24 * time.Hour
+	turnStateIssuerMax = 4096
+)
+
+func (a *app) noteTurnStateIssuer(value, accountID string) {
+	if value == "" || accountID == "" {
+		return
+	}
+	now := time.Now()
+	a.turnStateMu.Lock()
+	defer a.turnStateMu.Unlock()
+	if a.turnStateIssuers == nil {
+		a.turnStateIssuers = map[string]turnStateIssuer{}
+	}
+	if len(a.turnStateIssuers) >= turnStateIssuerMax {
+		for key, issuer := range a.turnStateIssuers {
+			if now.Sub(issuer.at) > turnStateIssuerTTL || len(a.turnStateIssuers) >= turnStateIssuerMax {
+				delete(a.turnStateIssuers, key)
+			}
+		}
+	}
+	a.turnStateIssuers[value] = turnStateIssuer{accountID: accountID, at: now}
+}
+
+func (a *app) turnStateIssuer(value string) string {
+	a.turnStateMu.Lock()
+	defer a.turnStateMu.Unlock()
+	issuer, ok := a.turnStateIssuers[value]
+	if !ok || time.Since(issuer.at) > turnStateIssuerTTL {
+		return ""
+	}
+	return issuer.accountID
+}
+
+// noteEventTurnState records a turn state an upstream event carries in its
+// headers, so a later message presenting it is known to be this account's.
+func (a *app) noteEventTurnState(message []byte, accountID string) {
+	if !bytes.Contains(message, []byte("x-codex-turn-state")) {
+		return
+	}
+	var event struct {
+		Headers map[string]any `json:"headers"`
+	}
+	if json.Unmarshal(message, &event) != nil {
+		return
+	}
+	for name, value := range event.Headers {
+		if text, ok := value.(string); ok && strings.EqualFold(name, "x-codex-turn-state") {
+			a.noteTurnStateIssuer(text, accountID)
+		}
+	}
 }

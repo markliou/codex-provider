@@ -650,6 +650,10 @@
     $("#cache-window-main").textContent = agentCacheText(win.main);
     $("#cache-window-subagent").textContent = agentCacheText(win.subagent);
     $("#cache-window-lineage-failover").textContent = String(Number(win.lineageFailoverCount) || 0);
+    const unrecognized = Number(win.unrecognizedFailureCount) || 0;
+    const unrecognizedValue = $("#cache-window-unrecognized");
+    unrecognizedValue.textContent = String(unrecognized);
+    unrecognizedValue.classList.toggle("alert", unrecognized > 0);
     const resetAt = win.resetAt && win.resetAt !== "0001-01-01T00:00:00Z" ? win.resetAt : null;
     $("#cache-window-since").textContent = resetAt ? `since ${displayTime(resetAt)}` : "since service start (never reset)";
     $("#cache-window-reset").hidden = state.mode !== "management";
