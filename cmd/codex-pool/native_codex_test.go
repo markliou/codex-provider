@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -150,4 +151,29 @@ func TestNativeCodexEndpointServesTheResponsesWebSocket(t *testing.T) {
 		t.Fatalf("native socket relayed %d events", len(events))
 	}
 	waitInFlightZero(t, a)
+}
+
+// A native client's header the relay does not carry is reported by name,
+// once, so a Codex header the allowlist misses cannot vanish silently.
+func TestNativeEndpointReportsHeadersItDoesNotRelay(t *testing.T) {
+	var logged bytes.Buffer
+	a := testApp(t, nil)
+	a.logger = log.New(&logged, "", 0)
+	header := http.Header{}
+	header.Set("Authorization", "Bearer <client-login>")
+	header.Set("X-Codex-Turn-Metadata", "{}")
+	header.Set("X-Oai-Attestation", "<attestation>")
+	header.Set("X-Some-Future-Header", "<value>")
+	header.Set("Originator", "Codex_Desktop")
+	a.noteUnrelayedNativeHeaders(header)
+	a.noteUnrelayedNativeHeaders(header)
+	out := logged.String()
+	if strings.Count(out, "not relayed") != 1 || !strings.Contains(out, "x-some-future-header") {
+		t.Fatalf("log = %q", out)
+	}
+	for _, leaked := range []string{"<value>", "<client-login>", "<attestation>", "x-oai-attestation", "x-codex-turn-metadata", "authorization"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("the report must name only unrelayed headers and never a value: %q", out)
+		}
+	}
 }
