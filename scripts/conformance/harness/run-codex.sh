@@ -4,6 +4,9 @@
 #   sh run-codex.sh pool-http <model>     Codex pointed at the pool over HTTP
 #   sh run-codex.sh pool-ws <model>       Codex pointed at the pool with
 #                                         supports_websockets = true
+#   sh run-codex.sh native-pool <model>   Codex's built-in OpenAI provider with
+#                                         ChatGPT auth, its base URL moved to the
+#                                         pool's native endpoint (SPEC.md 2.3.3)
 #   sh run-codex.sh client-http <model>   the pool's provider config, pointed
 #   sh run-codex.sh client-ws <model>     straight at the fake: what Codex sends
 #                                         the pool before the pool touches it
@@ -16,7 +19,7 @@ export CODEX_HOME=/tmp/codex-home PATH=/codex/codex-path:$PATH
 mkdir -p "$CODEX_HOME" /tmp/work
 cd /tmp/work
 case "$target" in
-  native)
+  native|native-pool)
     cat /certs/ca.pem >> /etc/ssl/certs/ca-certificates.crt
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt CODEX_CA_CERTIFICATE=/certs/ca.pem
     cp /harness/auth.json "$CODEX_HOME/auth.json"
@@ -24,6 +27,9 @@ case "$target" in
 model = "$model"
 model_reasoning_effort = "xhigh"
 CFG
+    if [ "$target" = native-pool ]; then
+      echo "openai_base_url = \"http://conformance-pool:8317/k/$CONFORMANCE_CLIENT_KEY/backend-api/codex\"" >> "$CODEX_HOME/config.toml"
+    fi
     ;;
   pool-http|pool-ws|client-http|client-ws)
     websockets=false

@@ -281,6 +281,17 @@ wire_api = "responses"
 
 Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key passed to the service container. The checked-in [test config](test/codex-config.toml) uses the same provider contract and was verified with Codex CLI `0.141.0`.
 
+### Native Codex endpoint (recommended for Codex)
+
+A custom provider makes Codex send a reduced request (no MCP resource tools or `image_gen`, no internal metadata or guardian fields). To have Codex send the pool exactly what it sends OpenAI, keep the built-in OpenAI provider and your ChatGPT login (`codex login`) and move only its base URL, with the pool's client key in the path:
+
+```toml
+# ~/.codex/config.toml — used by the Codex CLI, Desktop and IDE extension alike
+openai_base_url = "https://<pool-host>/k/<pool-api-key>/backend-api/codex"
+```
+
+Do not set `model_provider`. The pool replaces your login's credential with the selected account's before anything goes upstream; your login is still used, directly with `chatgpt.com`, for the account, plugin and analytics calls a native Codex makes. Because the key is in the URL, make sure no reverse proxy in front of the pool logs `/k/` paths. Details: SPEC.md 2.3.3.
+
 ## Implemented Surface
 
 - API-key authentication from Bearer, raw Authorization, `X-Goog-Api-Key`, `X-Api-Key`, `key`, and `auth_token`.

@@ -16,6 +16,10 @@
 //      custom provider a reduced body (SPEC.md 2.3.2). That is reported as the
 //      client gap, with every differing field, but it is Codex's doing and the
 //      pool cannot repair it by forwarding.
+//   3. The native endpoint (SPEC.md 2.3.3) exists to close that gap: Codex's
+//      built-in provider aimed at the pool. Through it the pool's upstream
+//      traffic must equal a native Codex's outright, body included; any
+//      difference fails the run.
 // Values minted per run (UUIDs, the fake's own response ids and turn states,
 // timestamps) are masked before comparing, and nothing else is: a difference
 // that has to be masked to pass is a difference.
@@ -34,7 +38,9 @@ const mask = (value) => String(value)
   .replace(/\b(resp_fake|fc|call|msg)_\d+\b/g, "$1_<n>")
   .replace(/\bts-\d+\b/g, "ts-<n>")
   .replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z\b/g, "<time>")
-  .replace(/\b1\d{9}(\d{3})?\b/g, "<epoch>")
+  // Epoch seconds or milliseconds, with the fraction Codex writes in
+  // internal_chat_message_metadata_passthrough.create_time.
+  .replace(/\b1\d{9}(\d{3})?(\.\d+)?\b/g, "<epoch>")
   // exec_command output carries a random chunk id per call.
   .replace(/Chunk ID: [0-9a-f]+/g, "Chunk ID: <chunk>");
 
@@ -182,8 +188,61 @@ function compareTLS(name) {
   else notes.push(`${name}: ${pool.join(" | ")}`);
 }
 
+// Native endpoint: what reached upstream through the pool must be what a
+// native Codex sent, header for header and body for body.
+function compareNativeEndpoint(mode) {
+  const kind = mode === "http" ? "http" : "ws-message";
+  const native = load(`native-${mode}.jsonl`);
+  const pool = load(`native-pool-${mode}.jsonl`);
+  if (mode === "ws" && pool.some((entry) => entry.kind === "http")) fail("native endpoint ws: the pool fell back to HTTP");
+  const left = native.filter((entry) => entry.kind === kind);
+  const right = pool.filter((entry) => entry.kind === kind);
+  if (!right.length) { fail(`native endpoint ${mode}: nothing reached upstream through the pool`); return; }
+  if (left.length !== right.length) fail(`native endpoint ${mode}: native sent ${left.length}, the pool ${right.length}`);
+  for (let i = 0; i < Math.min(left.length, right.length); i++) {
+    const label = `native endpoint ${mode} ${kind === "http" ? "request" : "message"} ${i + 1}`;
+    if (kind === "http") {
+      if (left[i].proto !== right[i].proto) fail(`${label}: protocol native=${left[i].proto} pool=${right[i].proto}`);
+      if (left[i].path !== right[i].path) fail(`${label}: path native=${left[i].path} pool=${right[i].path}`);
+      if (left[i].encoding !== right[i].encoding) fail(`${label}: content-encoding native=${left[i].encoding || "none"} pool=${right[i].encoding || "none"}`);
+      compareHeaders(label, left[i], right[i]);
+    }
+    const difference = bodyDifference(left[i].body, right[i].body);
+    if (difference) fail(`${label}: body differs from a native Codex${difference}`);
+  }
+  if (mode === "ws") {
+    const handshakes = [native, pool].map((entries) => entries.filter((entry) => entry.kind === "ws-handshake"));
+    if (handshakes[0].length !== handshakes[1].length) fail(`native endpoint ws: native opened ${handshakes[0].length} sockets, the pool ${handshakes[1].length}`);
+    for (let i = 0; i < Math.min(handshakes[0].length, handshakes[1].length); i++) compareHeaders(`native endpoint ws handshake ${i + 1}`, handshakes[0][i], handshakes[1][i]);
+  }
+  notes.push(`native endpoint ${mode}: ${right.length} ${kind === "http" ? "requests" : "messages"} equal to a native Codex`);
+}
+
+// Codex builds a fresh client for every request (core/src/client.rs
+// build_api_transport), so each Responses request and each socket arrives on
+// its own connection. Whatever pattern the native Codex shows, the pool's
+// must show too.
+function compareConnections(nativeFile, poolFile) {
+  const pattern = (file) => {
+    const requests = load(file).filter((entry) => (entry.kind === "http" || entry.kind === "ws-handshake") && entry.conn != null);
+    const distinct = new Set(requests.map((entry) => entry.conn)).size;
+    return { requests: requests.length, distinct };
+  };
+  const native = pattern(nativeFile);
+  const pool = pattern(poolFile);
+  const shape = (p) => (p.requests && p.distinct === p.requests ? "one connection per request" : `${p.distinct} connections for ${p.requests} requests`);
+  if (shape(native) !== shape(pool)) fail(`${poolFile}: ${shape(pool)}, but a native Codex opens ${shape(native)}`);
+  else notes.push(`${poolFile}: ${shape(pool)}, as a native Codex`);
+}
+
 compareHTTP();
 compareWS();
+compareNativeEndpoint("http");
+compareNativeEndpoint("ws");
+compareConnections("native-http.jsonl", "pool-http.jsonl");
+compareConnections("native-ws.jsonl", "pool-ws.jsonl");
+compareConnections("native-http.jsonl", "native-pool-http.jsonl");
+compareConnections("native-ws.jsonl", "native-pool-ws.jsonl");
 compareTLS("tls-http.txt");
 compareTLS("tls-ws.txt");
 for (const note of notes) console.log(`ok   ${note}`);

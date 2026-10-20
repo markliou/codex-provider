@@ -1308,6 +1308,7 @@ func (a *app) mux() http.Handler {
 	mux.HandleFunc("GET /v1/responses", a.requireAPIKey(a.handleResponsesWebSocket))
 	mux.HandleFunc("POST /v1/responses/compact", a.trackInFlight(a.requireAPIKey(a.handleResponses)))
 	mux.HandleFunc("POST /v1/chat/completions", a.trackInFlight(a.requireAPIKey(a.handleChatCompletions)))
+	a.registerNativeCodexRoutes(mux)
 	mux.HandleFunc("GET /internal/inflight", a.handleInFlight)
 	// The combined-port root is the public control page. It is intentionally
 	// visible without a password; owner-only actions are protected by
@@ -1714,13 +1715,24 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 		model = alias
 	}
 	a.mu.RUnlock()
-	payload["model"] = model
-	if !chat && tier != "" && tier != "none" {
-		payload["reasoning"] = map[string]any{"effort": tier}
+	// A request from the native endpoint is already the one Codex sends OpenAI
+	// and must reach upstream as Codex wrote it (SPEC.md 2.3.3). The rewrites
+	// below adapt custom-provider and foreign requests; applied to a native
+	// request, dropHostedToolConflicts removed the image_gen tool a native
+	// Codex sends its own backend and re-encoding sorted every key. Routing
+	// still reads the model; nothing is written back.
+	native := isNativeCodexRequest(r)
+	if !native {
+		payload["model"] = model
+		if !chat && tier != "" && tier != "none" {
+			payload["reasoning"] = map[string]any{"effort": tier}
+		}
+		dropHostedToolConflicts(payload)
 	}
-	dropHostedToolConflicts(payload)
 	route := a.routingDecision(r, payload, model, requestAPIKey(r))
-	a.applyPromptCacheControls(payload, route)
+	if !native {
+		a.applyPromptCacheControls(payload, route)
+	}
 	streaming, _ := payload["stream"].(bool)
 	if streaming && !chat {
 		early := newEarlyStreamWriter(w, streamingPrecommitMaxHold)
@@ -1738,7 +1750,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	// arrived. Re-encoding a decoded map sorts every object's keys, tool
 	// parameter schemas included, and rewrites number formatting, so even an
 	// untouched request reached upstream in a byte layout no native Codex sends.
-	if payloadUnchanged(body, payload) {
+	if native || payloadUnchanged(body, payload) {
 		updatedBody = body
 	}
 	requestID := requestOperationalID(r)
@@ -2157,6 +2169,11 @@ var poolOnlyRequestHeaders = map[string]bool{
 	"x-codex-thread-source":         true,
 	"x-codex-forked-from-thread-id": true,
 	"x-openai-fedramp":              true,
+	// Codex sets this from its own login's workspace routing (data residency,
+	// model-provider/src/workspace_routing.rs). It describes the client's
+	// account, not the one the pool selects, so it must not follow the request
+	// to another account.
+	"x-openai-account-routing-override": true,
 }
 
 func relayedCodexRequestHeader(name string) bool {
@@ -2280,8 +2297,9 @@ func (a *app) forwardOnce(ctx context.Context, candidate account, endpoint strin
 		return a.streamClient.Do(req)
 	}
 	req.Header.Set("X-Codex-Upstream-Url", endpoint)
-	// One client per account in codex-upstream, as each native Codex process
-	// keeps its own connections for its one account.
+	// Names the account on the hop. codex-upstream opens a fresh client per
+	// request, as Codex does, so this keys nothing there; it stays so the hop
+	// (and the tests' fake transport) can tell which account a request is for.
 	req.Header.Set("X-Codex-Upstream-Identity", candidate.ID)
 	// A native Codex zstd-compresses its Responses requests to the Codex
 	// backend; compaction requests are sent uncompressed.

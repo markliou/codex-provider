@@ -17,6 +17,17 @@ import zlib from "node:zlib";
 const LOG = process.env.CAPTURE_LOG || "/logs/capture.jsonl";
 const SEND_METADATA = process.env.SEND_METADATA !== "0";
 let seq = 0;
+// Which connection each request arrived on, so the comparison can tell a
+// client that opens one connection per request (as Codex does) from one that
+// reuses connections.
+const connections = new WeakMap();
+let connectionSeq = 0;
+const connectionOf = (key) => {
+  if (!key) return null;
+  if (!connections.has(key)) connections.set(key, ++connectionSeq);
+  return connections.get(key);
+};
+const requestConnection = (req) => connectionOf((req.stream && req.stream.session) || req.socket);
 const record = (entry) => fs.appendFileSync(LOG, JSON.stringify({ t: new Date().toISOString(), ...entry }) + "\n");
 
 function pickTool(body) {
@@ -67,7 +78,7 @@ function wsSend(socket, text) {
 }
 
 function handleUpgrade(req, socket) {
-  record({ kind: "ws-handshake", method: req.method, path: req.url, headers: req.headers, rawHeaderOrder: req.rawHeaders.filter((_, i) => i % 2 === 0) });
+  record({ kind: "ws-handshake", conn: connectionOf(socket), method: req.method, path: req.url, headers: req.headers, rawHeaderOrder: req.rawHeaders.filter((_, i) => i % 2 === 0) });
   if (process.env.REJECT_WS === "1") { socket.end("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"); return; }
   const accept = crypto.createHash("sha1").update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\nx-codex-turn-state: ts-ws\r\nopenai-model: fake\r\n\r\n`);
@@ -120,7 +131,7 @@ const server = http2.createSecureServer({ allowHTTP1: true, key: fs.readFileSync
     try { body = raw ? JSON.parse(raw) : null; } catch { body = { raw: raw.slice(0, 2000) }; }
     if (req.method === "POST" && /\/responses$/.test(req.url.split("?")[0])) {
       const { n, out } = events(body || {});
-      record({ kind: "http", proto: req.httpVersion, method: req.method, path: req.url, n, headers: req.headers, rawHeaderOrder: req.rawHeaders.filter((_, i) => i % 2 === 0), encoding, wireBytes: Buffer.concat(chunks).length, body });
+      record({ kind: "http", conn: requestConnection(req), proto: req.httpVersion, method: req.method, path: req.url, n, headers: req.headers, rawHeaderOrder: req.rawHeaders.filter((_, i) => i % 2 === 0), encoding, wireBytes: Buffer.concat(chunks).length, body });
       res.writeHead(200, { "content-type": "text/event-stream", "x-codex-turn-state": `ts-${n}`, "openai-model": (body && body.model) || "fake", "x-reasoning-included": "true" });
       for (const event of out) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
       res.end();

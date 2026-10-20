@@ -139,6 +139,7 @@ start_fake 1 http
 run_turn native native-http
 run_turn client-http client-http
 run_turn pool-http pool-http
+run_turn native-pool native-pool-http
 stop_fake http
 
 echo "WebSocket: native Codex, then Codex through the pool"
@@ -146,6 +147,7 @@ start_fake 0 ws
 run_turn native native-ws
 run_turn client-ws client-ws
 run_turn pool-ws pool-ws
+run_turn native-pool native-pool-ws
 stop_fake ws
 
 docker logs "$pool" > "$work/pool.log" 2>&1 || true
