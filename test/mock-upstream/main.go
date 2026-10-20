@@ -56,10 +56,6 @@ func (s *mockServer) handleResponse(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": "invalid JSON"}})
 		return
 	}
-	if r.Header.Get("Authorization") == "Bearer cliproxy-test-key" {
-		s.handleCliproxyResponse(w, request)
-		return
-	}
 	if s.subagentIntegration {
 		s.handleSubagentIntegrationResponse(w, r, request)
 		return
@@ -189,13 +185,14 @@ func (s *mockServer) handleSubagentIntegrationResponse(w http.ResponseWriter, r 
 	if !spawnIssued {
 		event["role"] = "parent"
 		event["status"] = http.StatusOK
-		event["spawnSchemaHasForkTurns"] = spawnAgentSchemaHasForkTurns(request["tools"])
+		namespace, hasForkTurns := spawnAgentTool(request["tools"])
+		event["spawnSchemaHasForkTurns"] = hasForkTurns
 		s.events = append(s.events, event)
 		s.last = request
 		s.spawnIssued = true
 		s.mu.Unlock()
 		time.Sleep(1500 * time.Millisecond)
-		writeStreamingFunctionCall(w, "resp_spawn", "call_spawn", "spawn_agent", `{"message":"Reply with the exact token SUBAGENT_CHILD_OK and nothing else.","task_name":"child_probe","fork_turns":"none"}`)
+		writeStreamingNamespacedFunctionCall(w, "resp_spawn", "call_spawn", namespace, "spawn_agent", `{"message":"Reply with the exact token SUBAGENT_CHILD_OK and nothing else.","task_name":"child_probe","fork_turns":"none"}`)
 		return
 	}
 	event["role"] = "parent"
@@ -228,7 +225,29 @@ func metadataString(metadata map[string]any, key string) string {
 	return strings.TrimSpace(value)
 }
 
-func spawnAgentSchemaHasForkTurns(raw any) bool {
+// spawnAgentTool finds spawn_agent in the request's tools and reports the
+// namespace it sits in and whether its schema offers fork_turns. Codex 0.163
+// offers it inside the "collaboration" namespace tool; a call to it must name
+// that namespace, or Codex rejects it as an unsupported call.
+func spawnAgentTool(raw any) (string, bool) {
+	tools, _ := raw.([]any)
+	for _, value := range tools {
+		tool, _ := value.(map[string]any)
+		if tool["type"] == "namespace" {
+			namespace, _ := tool["name"].(string)
+			if _, hasForkTurns, ok := findSpawnAgent(tool["tools"]); ok {
+				return namespace, hasForkTurns
+			}
+			continue
+		}
+		if _, hasForkTurns, ok := findSpawnAgent([]any{tool}); ok {
+			return "", hasForkTurns
+		}
+	}
+	return "", false
+}
+
+func findSpawnAgent(raw any) (map[string]any, bool, bool) {
 	tools, _ := raw.([]any)
 	for _, value := range tools {
 		tool, _ := value.(map[string]any)
@@ -237,10 +256,10 @@ func spawnAgentSchemaHasForkTurns(raw any) bool {
 		}
 		parameters, _ := tool["parameters"].(map[string]any)
 		properties, _ := parameters["properties"].(map[string]any)
-		_, ok := properties["fork_turns"]
-		return ok
+		_, hasForkTurns := properties["fork_turns"]
+		return tool, hasForkTurns, true
 	}
-	return false
+	return nil, false, false
 }
 
 func requestFunctionOutput(request map[string]any, callID string) (string, bool) {
@@ -256,51 +275,20 @@ func requestFunctionOutput(request map[string]any, callID string) (string, bool)
 }
 
 func writeStreamingFunctionCall(w http.ResponseWriter, responseID, callID, name, arguments string) {
+	writeStreamingNamespacedFunctionCall(w, responseID, callID, "", name, arguments)
+}
+
+func writeStreamingNamespacedFunctionCall(w http.ResponseWriter, responseID, callID, namespace, name, arguments string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
 	writeEvent(w, flusher, "response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": responseID}})
 	item := map[string]any{"type": "function_call", "call_id": callID, "name": name, "arguments": arguments}
+	if namespace != "" {
+		item["namespace"] = namespace
+	}
 	writeEvent(w, flusher, "response.output_item.done", map[string]any{"type": "response.output_item.done", "item": item})
 	writeEvent(w, flusher, "response.completed", map[string]any{"type": "response.completed", "response": map[string]any{"id": responseID, "output": []any{item}, "usage": map[string]any{"input_tokens": 2048, "input_tokens_details": map[string]any{"cached_tokens": 0}, "output_tokens": 64, "total_tokens": 2112}}})
-}
-
-func (s *mockServer) handleCliproxyResponse(w http.ResponseWriter, request map[string]any) {
-	model, _ := request["model"].(string)
-	account := ""
-	if strings.HasPrefix(model, "codex-pool-device-a/") {
-		account = "test-acct-a"
-	} else if strings.HasPrefix(model, "codex-pool-device-b/") {
-		account = "test-acct-b"
-	}
-	status := http.StatusUnauthorized
-	text := ""
-	switch account {
-	case "test-acct-a":
-		status = http.StatusTooManyRequests
-	case "test-acct-b":
-		status = http.StatusOK
-		text = deviceFailoverText
-	}
-	s.mu.Lock()
-	s.last = request
-	s.events = append(s.events, map[string]any{"kind": "sidecar", "account": account, "status": status})
-	s.mu.Unlock()
-	if status == http.StatusTooManyRequests {
-		w.Header().Set("Retry-After", "1")
-		w.WriteHeader(status)
-		return
-	}
-	if status != http.StatusOK {
-		writeJSON(w, status, map[string]any{"error": map[string]string{"message": "sidecar account rejected"}})
-		return
-	}
-	response := completedResponse(model, text)
-	if stream, _ := request["stream"].(bool); stream {
-		writeStreamingResponse(w, model, response, text)
-		return
-	}
-	writeJSON(w, http.StatusOK, response)
 }
 
 func writeStreamingResponse(w http.ResponseWriter, model string, response map[string]any, text string) {
