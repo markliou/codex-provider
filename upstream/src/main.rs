@@ -80,12 +80,26 @@ const UPSTREAM_ERROR: &str = "x-codex-upstream-error";
 /// auth adds `authorization` and `chatgpt-account-id`; the client's default
 /// headers add `originator` and `user-agent` last. Codex headers not listed
 /// here keep their relative order after `thread-id`.
+///
+/// The subagent, memgen, attestation and responses-lite headers never appear
+/// in a CLI capture (a subagent, a memory job, the Desktop app, a lite model
+/// send them). Their places come from Codex's own assembly instead: core
+/// client.rs build_responses_options extends the compatibility headers
+/// (responses_metadata.rs: window id, turn metadata, parent thread, subagent;
+/// then memgen), then inserts attestation and responses-lite, and the routing
+/// hint is inserted after the options are built. Unlisted, they were written
+/// after thread-id, where no native Codex puts them.
 const LEADING: &[&str] = &[
     "version",
     "x-codex-beta-features",
     "x-codex-turn-state",
     "x-codex-window-id",
     "x-codex-turn-metadata",
+    "x-codex-parent-thread-id",
+    "x-openai-subagent",
+    "x-openai-memgen-request",
+    "x-oai-attestation",
+    "x-openai-internal-codex-responses-lite",
     "x-codex-routing-hint",
     "x-client-request-id",
     "session-id",
@@ -138,7 +152,15 @@ const WS_ORDER: &[&str] = &[
     "thread-id",
     "x-codex-window-id",
     "x-codex-turn-metadata",
+    // Not in any capture; placed from core client.rs build_websocket_headers,
+    // which adds the compatibility headers, then the routing hint, then
+    // attestation and the timing opt-in.
+    "x-codex-parent-thread-id",
+    "x-openai-subagent",
+    "x-openai-memgen-request",
     "x-codex-routing-hint",
+    "x-oai-attestation",
+    "x-responsesapi-include-timing-metrics",
 ];
 const WS_NOT_FORWARDED: &[&str] = &[
     "host",

@@ -646,6 +646,9 @@ type app struct {
 	// turnStateMu, not mu, because it is read on every socket message.
 	turnStateMu      sync.Mutex
 	turnStateIssuers map[string]turnStateIssuer
+	// unrelayedHeaderSets are the header-name sets already logged by
+	// noteUnrelayedNativeHeaders (also under turnStateMu).
+	unrelayedHeaderSets map[string]bool
 
 	// sessionPlacements is in-memory placement load, guarded by mu: which
 	// account each recently active session is on (see noteSessionPlacement).

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -85,6 +86,7 @@ func (a *app) nativeCodexClient(path string, next http.HandlerFunc) http.Handler
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "invalid or missing API key")
 			return
 		}
+		a.noteUnrelayedNativeHeaders(r.Header)
 		inner := r.Clone(context.WithValue(r.Context(), nativeCodexRequestKey{}, true))
 		inner.Header.Del("Authorization")
 		inner.Header.Del("ChatGPT-Account-ID")
@@ -260,4 +262,48 @@ func (a *app) sendCodexBackend(ctx context.Context, item account, auth codexAuth
 		return nil, errors.New("codex-upstream could not reach upstream")
 	}
 	return response, nil
+}
+
+// nativeCodexHandledHeaders are the client headers the pool consumes or
+// replaces on purpose rather than relaying: framing and transport, the
+// client's own credential, and the WebSocket handshake.
+var nativeCodexHandledHeaders = map[string]bool{
+	"authorization": true, "chatgpt-account-id": true, "content-type": true, "content-length": true,
+	"content-encoding": true, "accept": true, "accept-encoding": true, "connection": true, "upgrade": true,
+	"host": true, "te": true, "keep-alive": true, "via": true, "x-forwarded-for": true, "x-forwarded-host": true,
+	"x-forwarded-proto": true, "sec-websocket-key": true, "sec-websocket-version": true,
+	"sec-websocket-extensions": true, "sec-websocket-protocol": true, "cookie": true,
+}
+
+// noteUnrelayedNativeHeaders logs, by name only and once per distinct set,
+// the headers a native-endpoint client sent that the pool does not relay
+// upstream. A native Codex's request must reach upstream whole, and the relay
+// is an allowlist: x-oai-attestation, which only the Desktop sends, was once
+// dropped this way without a trace. Values are never logged.
+func (a *app) noteUnrelayedNativeHeaders(header http.Header) {
+	var names []string
+	for name := range header {
+		lower := strings.ToLower(name)
+		if nativeCodexHandledHeaders[lower] || relayedCodexRequestHeader(name) {
+			continue
+		}
+		names = append(names, lower)
+	}
+	if len(names) == 0 || a.logger == nil {
+		return
+	}
+	sort.Strings(names)
+	key := strings.Join(names, ",")
+	a.turnStateMu.Lock()
+	if a.unrelayedHeaderSets == nil {
+		a.unrelayedHeaderSets = map[string]bool{}
+	}
+	seen := a.unrelayedHeaderSets[key]
+	if !seen && len(a.unrelayedHeaderSets) < 256 {
+		a.unrelayedHeaderSets[key] = true
+	}
+	a.turnStateMu.Unlock()
+	if !seen {
+		a.logger.Printf("native endpoint client headers not relayed upstream: %s (originator %s)", key, telemetryLabel(header.Get("Originator")))
+	}
 }
