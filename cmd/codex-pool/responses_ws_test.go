@@ -214,29 +214,39 @@ func TestResponsesWebSocketFailsOverARefusedHandshake(t *testing.T) {
 // nothing: the socket closes, Codex reconnects and resends in full, and the
 // cooled account is not chosen again.
 func TestResponsesWebSocketClosesAfterACapacityFailure(t *testing.T) {
-	upstream := &fakeCodexUpstream{script: func(string) []string {
-		return append(append([]string(nil), nativePreamble...),
-			`{"type":"response.created","response":{"id":"resp_busy"}}`,
-			`{"type":"response.failed","response":{"id":"resp_busy","error":{"code":"rate_limit_exceeded","message":"limit"}}}`,
-		)
-	}}
-	a, url := wsTestPool(t, upstream)
-	conn := dialPool(t, url)
-	if err := conn.WriteMessage(wsOpText, []byte(`{"type":"response.create","model":"gpt-test","input":[]}`)); err != nil {
-		t.Fatal(err)
-	}
-	if events := readUntilTerminal(t, conn); len(events) != 0 {
-		t.Fatalf("nothing of a failure before output may reach Codex, which would stop the turn: %q", events)
-	}
-	waitInFlightZero(t, a)
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	cooled := false
-	for _, entry := range a.state.Cooldowns["first"] {
-		cooled = cooled || entry.NextRetryAt.After(time.Now())
-	}
-	if !cooled {
-		t.Fatal("the spent account must cool down so the reconnect goes elsewhere")
+	for _, tc := range []struct{ name, failure string }{
+		{"rate limit", `{"type":"response.failed","response":{"id":"resp_busy","error":{"code":"rate_limit_exceeded","message":"limit"}}}`},
+		// The shape the Codex backend sends for a spent allowance: the kind is
+		// in error.type and there is no code. Read by code only, it went to
+		// Codex as a final error and the lineage stayed on the spent account.
+		{"usage limit", `{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"team","resets_at":1738888888}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := &fakeCodexUpstream{script: func(string) []string {
+				return append(append([]string(nil), nativePreamble...),
+					`{"type":"response.created","response":{"id":"resp_busy"}}`,
+					tc.failure,
+				)
+			}}
+			a, url := wsTestPool(t, upstream)
+			conn := dialPool(t, url)
+			if err := conn.WriteMessage(wsOpText, []byte(`{"type":"response.create","model":"gpt-test","input":[]}`)); err != nil {
+				t.Fatal(err)
+			}
+			if events := readUntilTerminal(t, conn); len(events) != 0 {
+				t.Fatalf("nothing of a failure before output may reach Codex, which would stop the turn: %q", events)
+			}
+			waitInFlightZero(t, a)
+			a.mu.RLock()
+			defer a.mu.RUnlock()
+			cooled := false
+			for _, entry := range a.state.Cooldowns["first"] {
+				cooled = cooled || entry.NextRetryAt.After(time.Now())
+			}
+			if !cooled {
+				t.Fatal("the spent account must cool down so the reconnect goes elsewhere")
+			}
+		})
 	}
 }
 

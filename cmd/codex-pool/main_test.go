@@ -1143,9 +1143,11 @@ func TestPoolCapacityIgnoresAnAccountThatReportedNoWindow(t *testing.T) {
 // A duplicate-blocked slot is in the pool but routing will not select it, so its
 // capacity is real yet unspendable. It belongs to the recoverable run, counted
 // apart from capacity an operator parked on purpose.
-func TestPoolCapacityCountsDuplicateBlockedCapacityAsRecoverable(t *testing.T) {
+func TestPoolCapacityCountsWorkspaceMembersAsSpendable(t *testing.T) {
 	// One workspace, two members with their own allowances, both in the pool.
-	// Routing selects one and holds the other back as a duplicate.
+	// Routing once held one back as a duplicate of the other, which hid half the
+	// workspace's capacity behind its sibling; both are routable now, so both
+	// are spendable and nothing is blocked.
 	a := testApp(t, []account{
 		{ID: "member-a", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "a@example.test"},
 		{ID: "member-b", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 100, AccountID: "workspace-1", Email: "b@example.test"},
@@ -1156,15 +1158,12 @@ func TestPoolCapacityCountsDuplicateBlockedCapacityAsRecoverable(t *testing.T) {
 	}
 
 	bar := capacityBar(t, a, weeklyWindowMinutes)
-	if bar.SpendableAccounts != 1 || bar.RecoverableAccounts != 1 {
-		t.Fatalf("counts = %d spendable, %d recoverable, want 1 and 1", bar.SpendableAccounts, bar.RecoverableAccounts)
-	}
-	if bar.BlockedAccounts != 1 {
-		t.Fatalf("blocked count = %d, want 1: routing-held capacity must be distinguishable from parked capacity", bar.BlockedAccounts)
+	if bar.SpendableAccounts != 2 || bar.RecoverableAccounts != 0 || bar.BlockedAccounts != 0 {
+		t.Fatalf("counts = %d spendable, %d recoverable, %d blocked, want 2, 0 and 0", bar.SpendableAccounts, bar.RecoverableAccounts, bar.BlockedAccounts)
 	}
 	// Neither allowance is dropped: each is half of one of two equal units.
-	if bar.SpendablePercent != 25 || bar.RecoverablePercent != 25 {
-		t.Fatalf("bar = %v spendable, %v recoverable, want 25 and 25", bar.SpendablePercent, bar.RecoverablePercent)
+	if bar.SpendablePercent != 50 || bar.RecoverablePercent != 0 {
+		t.Fatalf("bar = %v spendable, %v recoverable, want 50 and 0", bar.SpendablePercent, bar.RecoverablePercent)
 	}
 }
 
@@ -1480,7 +1479,8 @@ func TestDashboardSummariesPartitionVisibleAccountStates(t *testing.T) {
 		{ID: "invalid-duplicate", AccountID: "shared-upstream", AuthType: "codex_device_auth", Enabled: true, InPool: true, Priority: 80},
 	})
 	for _, id := range []string{"primary", "healthy-duplicate", "invalid-duplicate"} {
-		writeCodexDeviceAuth(t, a, id, "shared-upstream", id+"@example.test")
+		// Copies of one login: one account id and one email.
+		writeCodexDeviceAuth(t, a, id, "shared-upstream", "shared@example.test")
 	}
 	a.state.Cooldowns["cooldown"] = []cooldown{{ModelID: "gpt-test", NextRetryAt: now.Add(time.Minute), Reason: "rate_limited"}}
 	a.state.Quotas["invalid-duplicate"] = quotaSnapshot{
@@ -6866,6 +6866,69 @@ func TestDuplicateUpstreamAccountsAreNotFailoverCapacity(t *testing.T) {
 	}
 }
 
+// Members of one Business or Team workspace share its upstream account id but
+// each hold their own allowance. Regression guard: keyed on the workspace, the
+// pool let one member serve at a time and excluded every member after one
+// member's 429, so the request went to another workspace (or Pro) while a
+// sibling member sat idle with its own allowance.
+func TestWorkspaceMembersAreSeparateRoutingIdentities(t *testing.T) {
+	spentHits := 0
+	spent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		spentHits++
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer spent.Close()
+	memberHits := 0
+	member := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		memberHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_member","object":"response","output":[]}`))
+	}))
+	defer member.Close()
+	otherHits := 0
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		otherHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_other","object":"response","output":[]}`))
+	}))
+	defer other.Close()
+
+	a := testApp(t, []account{
+		{ID: "slot-spent", AuthType: "codex_device_auth", AccountID: "workspace-shared", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: spent.URL},
+		{ID: "slot-member", AuthType: "codex_device_auth", AccountID: "workspace-shared", Enabled: true, InPool: true, Priority: 90, UpstreamBaseURL: member.URL},
+		{ID: "slot-other", AuthType: "codex_device_auth", AccountID: "workspace-other", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: other.URL},
+	})
+	a.routingStrategy = routingStrategyFailover
+	writeCodexDeviceAuth(t, a, "slot-spent", "workspace-shared", "first-member@example.test")
+	writeCodexDeviceAuth(t, a, "slot-member", "workspace-shared", "second-member@example.test")
+	writeCodexDeviceAuth(t, a, "slot-other", "workspace-other", "other@example.test")
+
+	a.mu.RLock()
+	spentIdentity := a.upstreamIdentityKeyLocked(a.config.Accounts[0])
+	memberIdentity := a.upstreamIdentityKeyLocked(a.config.Accounts[1])
+	memberReady, _ := a.accountStatusLocked(a.config.Accounts[1], time.Now().UTC())
+	a.mu.RUnlock()
+	if spentIdentity == memberIdentity {
+		t.Fatalf("two members of one workspace share a routing identity: %q", spentIdentity)
+	}
+	if memberReady != "ready" {
+		t.Fatalf("a second workspace member must be routable, not a standby duplicate: %q", memberReady)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("X-Codex-Pool-Session", "workspace-members")
+	recorder := httptest.NewRecorder()
+	a.publicMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("workspace member failover returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if spentHits != 1 || memberHits != 1 || otherHits != 0 {
+		t.Fatalf("routing hits = spent:%d member:%d other:%d", spentHits, memberHits, otherHits)
+	}
+}
+
 func TestDuplicateUpstreamPositiveQuotaCredentialRepresentsIdentityBeforePro(t *testing.T) {
 	primaryHits := 0
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -8376,6 +8439,11 @@ func TestResponseInfoFromSSEBlockClassifiesTerminalEvents(t *testing.T) {
 	if malformed.TerminalEvent != "response.failed" || malformed.TerminalFailureClass != "unknown" {
 		t.Fatalf("malformed terminal event was treated as success: %#v", malformed)
 	}
+	// The Codex backend names a spent allowance by error.type, with no code.
+	usageLimit := responseInfoFromSSEBlock(`data: {"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}` + "\n\n")
+	if usageLimit.TerminalEvent != "error" || usageLimit.TerminalErrorCode != "usage_limit_reached" || usageLimit.TerminalFailureClass != "capacity" {
+		t.Fatalf("usage limit by type was not classified as capacity: %#v", usageLimit)
+	}
 	standalone := responseInfoFromSSEBlock("event: error\ndata: {\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"not persisted\"}\n\n")
 	if standalone.TerminalEvent != "error" || standalone.TerminalErrorCode != "server_is_overloaded" || standalone.TerminalFailureClass != "capacity" {
 		t.Fatalf("standalone error event was not classified: %#v", standalone)
@@ -8580,6 +8648,7 @@ func TestTerminalFailureClassesAndCooldownPricing(t *testing.T) {
 		"internal_server_error": "transient",
 		"server_is_overloaded":  "capacity",
 		"rate_limit_exceeded":   "capacity",
+		"usage_limit_reached":   "capacity",
 		"invalid_prompt":        "request",
 		"unauthorized":          "authentication",
 		"some_new_condition":    "unknown",
@@ -8607,6 +8676,12 @@ func TestTerminalFailureClassesAndCooldownPricing(t *testing.T) {
 	}
 	if got := retryableTerminalCooldown("rate_limit_exceeded"); got != 30*time.Second {
 		t.Fatalf("retryableTerminalCooldown(rate_limit_exceeded) = %s, want 30s", got)
+	}
+	// A spent allowance stays out until the quota refresh has seen it.
+	for _, reason := range []string{"usage_limit_reached", "usage_not_included", "insufficient_quota"} {
+		if got := retryableTerminalCooldown(reason); got != quotaRefreshInterval {
+			t.Fatalf("retryableTerminalCooldown(%q) = %s, want %s", reason, got, quotaRefreshInterval)
+		}
 	}
 	// The outcome must name the cause an operator has to act on.
 	if got := streamRetryFailoverOutcome("transient"); got != "stream_transient_failover" {
