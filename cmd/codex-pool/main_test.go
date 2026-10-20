@@ -6114,12 +6114,15 @@ func TestSessionPlacementPrefersIdleAccountsAndAvoidsAHerd(t *testing.T) {
 	}
 }
 
-// An account holding a reset credit about to expire takes a larger share of new
-// sessions, but only among accounts free to take one.
-func TestExpiringResetCreditRaisesPlacementShareAmongIdleAccounts(t *testing.T) {
+// Accounts holding a reset credit about to expire (the red outline) are a tier
+// of their own: every new session goes to one of them while one can take it,
+// even a busy one over an idle ordinary account. Among several, the credit
+// lost soonest draws the most. Use Pro last still comes first.
+func TestExpiringResetCreditAccountsAreTheirOwnTier(t *testing.T) {
 	a := testApp(t, []account{
 		{ID: "a", Enabled: true, InPool: true, Priority: 100},
 		{ID: "b", Enabled: true, InPool: true, Priority: 100},
+		{ID: "c", Enabled: true, InPool: true, Priority: 100},
 	})
 	a.routingStrategy = routingStrategyBalanced
 	week := int64(10080)
@@ -6133,38 +6136,65 @@ func TestExpiringResetCreditRaisesPlacementShareAmongIdleAccounts(t *testing.T) 
 		}
 		return quotaSnapshot{AccountID: id, Quota: quota}
 	}
-	share := func() float64 {
+	shares := func() map[string]int {
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		toA := 0
+		counts := map[string]int{}
 		for i := 0; i < 400; i++ {
-			picked, _ := a.pickBalancedAccountLocked(fmt.Sprintf("lineage:s-%d", i), []account{a.config.Accounts[0], a.config.Accounts[1]})
-			if picked.ID == "a" {
-				toA++
-			}
+			picked, _ := a.pickBalancedAccountLocked(fmt.Sprintf("lineage:s-%d", i), append([]account(nil), a.config.Accounts...))
+			counts[picked.ID]++
 		}
-		return float64(toA) / 400
+		return counts
 	}
 
 	a.state.Quotas["a"] = snapshot("a", 24*time.Hour)
 	a.state.Quotas["b"] = snapshot("b", 0)
-	if got := share(); got < .78 || got > .94 {
-		t.Fatalf("a credit expiring in a day: a took %.2f of new sessions, want about 0.86", got)
+	a.state.Quotas["c"] = snapshot("c", 0)
+	if got := shares(); got["a"] != 400 {
+		t.Fatalf("with one red-outlined account every new session goes there: %v", got)
 	}
-	a.state.Quotas["a"] = snapshot("a", 10*24*time.Hour)
-	if got := share(); got < .4 || got > .6 {
-		t.Fatalf("a credit outside the seven-day window must not tilt placement: %.2f", got)
-	}
-	a.state.Quotas["a"] = snapshot("a", 24*time.Hour)
 	a.noteSessionPlacement("lineage:running", "a")
 	a.mu.Lock()
-	picked, _ := a.pickBalancedAccountLocked("lineage:new", []account{a.config.Accounts[0], a.config.Accounts[1]})
+	picked, _ := a.pickBalancedAccountLocked("lineage:new", append([]account(nil), a.config.Accounts...))
 	a.mu.Unlock()
-	if picked.ID != "b" {
-		t.Fatal("an expiring credit must not make a busy account take new sessions while another is idle")
+	if picked.ID != "a" {
+		t.Fatalf("a busy red-outlined account still comes before idle ordinary ones, got %q", picked.ID)
+	}
+
+	a = testApp(t, a.config.Accounts)
+	a.routingStrategy = routingStrategyBalanced
+	a.state.Quotas["a"] = snapshot("a", 12*time.Hour)
+	a.state.Quotas["b"] = snapshot("b", 6*24*time.Hour)
+	a.state.Quotas["c"] = snapshot("c", 0)
+	got := shares()
+	if got["c"] != 0 || got["a"] <= got["b"] {
+		t.Fatalf("two red-outlined accounts share new sessions, the sooner credit more: %v", got)
+	}
+
+	a.state.Quotas["a"] = snapshot("a", 10*24*time.Hour)
+	a.state.Quotas["b"] = snapshot("b", 0)
+	if got := shares(); got["a"] < 90 || got["b"] < 90 || got["c"] < 90 {
+		t.Fatalf("a credit outside the seven-day window must not tilt placement: %v", got)
 	}
 	if boost := resetCreditExpiryBoost(snapshot("x", time.Minute).Quota, time.Now()); boost < 6.9 || boost > 7 {
 		t.Fatalf("boost at expiry = %.2f, want about 7", boost)
+	}
+
+	// Use Pro last outranks the red outline: a red-outlined Pro account is not
+	// spent while an ordinary account can serve.
+	a = testApp(t, []account{
+		{ID: "pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 100},
+		{ID: "plain", PlanType: "business", Enabled: true, InPool: true, Priority: 100},
+	})
+	a.routingStrategy = routingStrategyBalanced
+	a.preserveProQuota = true
+	a.state.Quotas["pro"] = snapshot("pro", 24*time.Hour)
+	a.state.Quotas["plain"] = snapshot("plain", 0)
+	a.mu.Lock()
+	picked, _ = a.pickBalancedAccountLocked("lineage:pro-check", append([]account(nil), a.config.Accounts...))
+	a.mu.Unlock()
+	if picked.ID != "plain" {
+		t.Fatalf("Use Pro last must still keep the Pro account back, got %q", picked.ID)
 	}
 }
 

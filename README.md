@@ -193,14 +193,22 @@ healthy copy can stand in when the current one has failed.
 
 ### Placing a new conversation
 
-A new conversation goes to an **idle** account when there is one, chosen by a
-weighted rendezvous hash, so concurrent first requests for the same conversation
-agree. The weight is the remaining allowance (the tighter quota window) times the
-plan's multiplier. Only when every account is busy does it share one, with the
-weight divided by (1 + sessions on it)². An account with a reset credit that
-expires within seven days (the red outline on the dashboard) weighs 2× at seven
-days out, rising to 7× at expiry, so it is used first. The pool never spends a
-reset credit; that stays the account owner's decision.
+A new conversation is placed in steps:
+
+1. **Plan tier** (with **Use Pro last** on): ordinary accounts, then Pro 100,
+   then Pro 200/500.
+2. **Red outline**: accounts holding a reset credit that expires within seven
+   days come first. While one of them can take the conversation it goes to one
+   of them, even a busy one.
+3. **Idle first**: an account no conversation is using is preferred; only when
+   all are busy is one shared, with the weight divided by (1 + sessions on it)².
+4. **Weighted choice**: remaining allowance (the tighter window) × plan
+   multiplier, and among red-outlined accounts × 2 at seven days out rising to
+   × 7 at expiry. A weighted rendezvous hash makes the choice, so concurrent
+   first requests for one conversation agree.
+
+Placement applies only to new conversations; one already bound stays where it is.
+The pool never spends a reset credit; that stays the account owner's decision.
 
 | Plan (as Codex names it) | Shown as | Multiplier |
 |---|---|---|

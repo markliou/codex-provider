@@ -617,14 +617,19 @@ balancing, not mutable request round-robin:
    account carries. A session counts against its account from the request that
    placed it (not its first success) until 30 minutes after its last request,
    and follows it across a failover, so an account whose window just reset
-   takes one new session and the next goes elsewhere. An account holding an
+   takes one new session and the next goes elsewhere. Accounts holding an
    available reset credit that expires within seven days (the dashboard's red
-   outline) has that weight multiplied by 2 at seven days out rising to 7 at
-   expiry, so it is drawn on first and its owner can spend the credit before
-   it is lost; the boost never lets a busy account take a new session while
-   another is idle, and spending the credit stays the owner's decision. The
-   score is a weighted rendezvous hash of the balance key and the upstream
-   identity.
+   outline) form a tier of their own, applied before the idle-first rule:
+   while one of them can take the session it goes to one of them, even a busy
+   one over an idle ordinary account, so their owners can spend the credit
+   before it is lost. Among them the weight is multiplied by 2 at seven days
+   out rising to 7 at expiry, so the credit lost soonest draws the most. As a
+   weight alone (the earlier rule) red-outlined accounts still lost about one
+   new session in six, which strict binding then kept elsewhere. The tier sits
+   inside the Use Pro last tiers, only places new sessions (a bound lineage is
+   never moved for it), and spending the credit stays the owner's decision.
+   The score is a weighted rendezvous hash of the balance key and the
+   upstream identity.
 3. Existing TTL-live sticky bindings remain authoritative and are never
    rebalanced merely because another account becomes available.
 4. Selection balances only within the highest-priority eligible tier, preserving
