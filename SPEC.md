@@ -200,7 +200,7 @@ In the container the last hop of every direct request goes through `codex-upstre
 
 - One client socket is bound to one account's upstream socket, opened by `codex-upstream` with Codex's own `codex-websocket-client` connector, the OpenAI tungstenite forks Codex patches in, and its permessage-deflate offer. The handshake (header set and order, TLS ClientHello) was measured equal to a native Codex; it carries the client's Codex headers, the account's credential and `ChatGPT-Account-ID`, the routing hint and `version`, and no turn state.
 - Messages pass through byte for byte both ways. Pool reads them only to record each response (usage, terminal event) like an HTTP request; a `generate: false` prewarm is not recorded.
-- Upstream events get the same pre-commit rule as the HTTP stream: lifecycle events are held until the first event carrying content. The Codex backend opens every socket response with `codex.rate_limits` and `codex.response.metadata` before `response.created` and sends `responsesapi.websocket_timing` near the end; all `codex.*` and `responsesapi.*` events are informational, never model output, and count as lifecycle on both transports. An overload before that point is retried by resending the identical request on the same socket (same account, same connection state, which is what a Codex retry would send) up to three times after 1 s, 2 s and 4 s. When that is spent, or the account's allowance or credential failed before content, the account is cooled and the socket closed without showing the failure; Codex treats a dropped socket as a retryable stream error, reconnects, and resends in full, and routing moves the whole lineage. A failure after content reached Codex is relayed unchanged.
+- Upstream events get the same pre-commit rule as the HTTP stream: lifecycle events are held until the first event carrying content. The Codex backend opens every socket response with `codex.rate_limits` and `codex.response.metadata` before `response.created` and sends `responsesapi.websocket_timing` near the end; all `codex.*` and `responsesapi.*` events are informational, never model output, and count as lifecycle on both transports. An overload or server fault before that point is retried by resending the identical request on the same socket (same account, same connection state, which is what a Codex retry would send) up to three times after 1 s, 2 s and 4 s. When that is spent, or the account's allowance or credential failed before content, the account is cooled and the socket closed without showing the failure; Codex treats a dropped socket as a retryable stream error, reconnects, and resends in full, and routing moves the whole lineage. A failure after content reached Codex is relayed unchanged.
 - The account is chosen at the handshake, from the session and thread it names and its model (the `X-Codex-Routing-Hint` a native Codex sends, else the model in `X-Codex-Turn-Metadata`, else the default), with the same failover as HTTP, and the upstream socket is opened before the client's socket is accepted. Codex then receives the upstream handshake's `X-Codex-Turn-State`, `X-Reasoning-Included` and `OpenAI-Model` (and `X-Models-Etag` on the native endpoint), as a native Codex does: on a socket Codex reads its turn state from the handshake alone and returns it in every later message's `client_metadata`, and `x-reasoning-included` changes its token accounting and so when it compacts. When the pool accepted first and dialed at the first message, Codex had neither, so its later messages differed from a native Codex's. If no account can take the socket, the handshake itself is answered with the status (`426` means HTTP to Codex; `429` and `5xx` are retried).
 - The first request on a socket may settle the account differently from the handshake's guess (a model the guessed account cannot serve, a response chain bound elsewhere). Nothing has gone out on that upstream socket, so it is replaced before the request is sent; closing Codex's socket instead would only make it reconnect into the same guess. If no account can serve it, Pool sends the backend's wrapped `{"type":"error","status":...}` event and closes.
 - A turn state goes back only to the account that issued it, as on HTTP (`turnStateForAttempt`): on a socket Codex carries it in `client_metadata["x-codex-turn-state"]`, so after a session moved accounts the field is removed from the message, every other byte unchanged. The issuer is the account whose handshake (or event headers) carried that turn state; one the pool has not seen is taken as the session's sticky account's.
@@ -2143,15 +2143,17 @@ For streaming responses:
   binding, response binding, or request-level throughput result. The eventual
   successful response is classified as `stream_capacity_failover`, or
   `stream_transient_failover` when the discarded failure was a server fault.
-- An upstream overload (`server_is_overloaded`, `slow_down`) is the server's
-  condition, not the account's allowance, so it is first retried on the same
-  account, as a native Codex with its one account does: up to three times per
-  request, after 1 s, 2 s and 4 s, with no cooldown, so the main agent and its
-  subagents stay on one account and keep its KV cache. Only an overload that
-  outlasts that schedule, or any account-allowance failure
-  (`rate_limit_exceeded`, `usage_not_included`, `usage_limit_reached`,
-  `insufficient_quota`) or server
-  fault, proceeds to the sweep below, and a success there moves the whole
+- An upstream overload (`server_is_overloaded`, `slow_down`) or server fault
+  (`server_error`, `internal_server_error`) is the server's condition, not the
+  account's allowance, so it is first retried on the same account, as a native
+  Codex with its one account does (a server fault falls to Codex's default
+  `ApiError::Retryable`, `codex-api/src/sse/responses_error.rs`): up to three
+  times per request, after 1 s, 2 s and 4 s, with no cooldown, so the main
+  agent and its subagents stay on one account and keep its KV cache. Moving on
+  the first `server_error` once carried a session off the expiring-credit
+  accounts it had been placed on. Only a fault that outlasts that schedule, or
+  any account-allowance failure (`rate_limit_exceeded`, `usage_not_included`,
+  `usage_limit_reached`, `insufficient_quota`), proceeds to the sweep below, and a success there moves the whole
   lineage. On a Responses WebSocket the same schedule runs inside the pool,
   because a native Codex does not retry an overload that carries no retry
   advice: it shows "Selected model is at capacity" and stops the turn.
