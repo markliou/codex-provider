@@ -290,6 +290,12 @@ A custom provider makes Codex send a reduced request (no MCP resource tools or `
 openai_base_url = "https://<pool-host>/k/<pool-api-key>/backend-api/codex"
 ```
 
+Over the internet, put the pool behind HTTPS before using this: Codex sends your own ChatGPT login to the pool in `Authorization` (the pool drops it), and the key is in the URL. With a TLS reverse proxy such as Caddy (`compose.yaml` joins the pool to the `edge_proxy` network, so Caddy reaches it as `codex-pool:8317`; set `CODEX_POOL_TRUSTED_PROXIES` to the proxy's network):
+
+```toml
+openai_base_url = "https://codex-api.example.com/k/<pool-api-key>/backend-api/codex"
+```
+
 Do not set `model_provider`. The pool replaces your login's credential with the selected account's before anything goes upstream; your login is still used, directly with `chatgpt.com`, for the account, plugin and analytics calls a native Codex makes. Because the key is in the URL, make sure no reverse proxy in front of the pool logs `/k/` paths. Details: SPEC.md 2.3.3.
 
 ## Implemented Surface

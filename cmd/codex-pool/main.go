@@ -710,6 +710,9 @@ func newAppFromEnv() (*app, error) {
 	if err := applyCapacityWeightEnv(); err != nil {
 		return nil, err
 	}
+	if err := applyTrustedProxiesEnv(); err != nil {
+		return nil, err
+	}
 	if err := applyQuotaFloorEnv(); err != nil {
 		return nil, err
 	}
@@ -4692,9 +4695,62 @@ func (a *app) clearAdminLoginFailures(key string) {
 	delete(a.loginFailures, key)
 }
 
+// trustedProxyNetworks are the networks of reverse proxies whose
+// X-Forwarded-For names the real client (CODEX_POOL_TRUSTED_PROXIES). Behind
+// a proxy every connection comes from the proxy's address, so the login lockout
+// keyed on it would make everyone share one failure count: a stranger guessing
+// passwords would lock the owner out. A forwarded address is believed only
+// from these networks; from anywhere else it is the client's own claim and is
+// ignored, or it would let anyone step around the lockout.
+var trustedProxyNetworks []*net.IPNet
+
+func applyTrustedProxiesEnv() error {
+	trustedProxyNetworks = nil
+	for _, part := range strings.Split(os.Getenv("CODEX_POOL_TRUSTED_PROXIES"), ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !strings.Contains(part, "/") {
+			if ip := net.ParseIP(part); ip != nil && ip.To4() != nil {
+				part += "/32"
+			} else {
+				part += "/128"
+			}
+		}
+		_, network, err := net.ParseCIDR(part)
+		if err != nil {
+			return fmt.Errorf("CODEX_POOL_TRUSTED_PROXIES: %q is not an address or CIDR", part)
+		}
+		trustedProxyNetworks = append(trustedProxyNetworks, network)
+	}
+	return nil
+}
+
+func trustedProxy(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, network := range trustedProxyNetworks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 func adminLoginKey(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil && host != "" {
+		// The proxy appends the address it received the connection from, so
+		// the last entry is the one the trusted proxy vouches for.
+		if trustedProxy(host) {
+			forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+			if client := strings.TrimSpace(forwarded[len(forwarded)-1]); net.ParseIP(client) != nil {
+				return client
+			}
+		}
 		return host
 	}
 	if r.RemoteAddr != "" {
