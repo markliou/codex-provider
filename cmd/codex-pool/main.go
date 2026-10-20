@@ -5069,6 +5069,7 @@ func (a *app) pickBalancedAccountLocked(stickyKey string, eligible []account) (a
 		return eligible[0], true
 	}
 
+	now := time.Now().UTC()
 	// Preserve the existing priority contract as capacity tiers, then balance
 	// sessions only across the best eligible tier. Newly-created accounts all use
 	// the same priority, so normal pools distribute evenly; operators who
@@ -5100,6 +5101,25 @@ func (a *app) pickBalancedAccountLocked(stickyKey string, eligible []account) (a
 			tier = append(tier, item)
 		}
 	}
+	// Accounts holding a reset credit that expires within seven days (the
+	// dashboard's red outline) form a tier of their own: while one can take
+	// the session, the session goes to one of them, even a busy one over an
+	// idle ordinary account. The owner asked for these to be spent first
+	// because the credit is lost at expiry; as a weight alone they still lost
+	// about one new session in six to ordinary accounts, which strict binding
+	// then kept there. It sits inside the Use Pro last tiers, so it never
+	// spends a Pro allowance early, and it only places new sessions: a bound
+	// lineage is never moved for it. Spending the credit stays the owner's
+	// decision.
+	expiring := make([]account, 0, len(tier))
+	for _, item := range tier {
+		if a.expiringResetCreditLocked(item, now) {
+			expiring = append(expiring, item)
+		}
+	}
+	if len(expiring) > 0 {
+		tier = expiring
+	}
 
 	// Session placement. Separate sessions spread their consumption so no
 	// single allowance drains early and every account's remote KV cache stays
@@ -5114,7 +5134,6 @@ func (a *app) pickBalancedAccountLocked(stickyKey string, eligible []account) (a
 	// instead of the whole queue sticking to it. The hash keeps the choice
 	// deterministic for one balance key, so lineage members placed together
 	// converge, and a bound lineage never reaches here.
-	now := time.Now().UTC()
 	active := a.activeSessionCountsLocked(now, stickyKey)
 	idle := make([]account, 0, len(tier))
 	for _, item := range tier {
@@ -5209,13 +5228,18 @@ func (a *app) placementWeightLocked(item account, active map[string]int) float64
 // reset credit expiring within seven days.
 const resetCreditExpiryWindow = 7 * 24 * time.Hour
 
-// resetCreditExpiryBoost raises an account's share of new sessions while it
-// holds a reset credit about to expire, from x2 at seven days out to x7 at
-// expiry. A credit only resets a window that has been spent, so drawing on the
-// account first gives its owner the chance to spend the credit before it is
-// lost. It only weighs placement among accounts that are free to take a new
-// session: a busy account still keeps its allowance for its own sessions, and
-// spending the credit stays the owner's decision.
+// expiringResetCreditLocked reports the dashboard's red outline: an available
+// reset credit that expires within seven days.
+func (a *app) expiringResetCreditLocked(item account, now time.Time) bool {
+	return resetCreditExpiryBoost(a.state.Quotas[item.ID].Quota, now) > 1
+}
+
+// resetCreditExpiryBoost weighs the expiring-credit tier (see
+// pickBalancedAccountLocked) by urgency, from x2 at seven days out to x7 at
+// expiry, so among several red-outlined accounts the one whose credit is lost
+// soonest draws the most new sessions. A credit only resets a window that has
+// been spent, so drawing on the account first gives its owner the chance to
+// spend the credit before it is lost; spending it stays the owner's decision.
 func resetCreditExpiryBoost(quota *accountQuota, now time.Time) float64 {
 	if quota == nil || quota.ResetCredits == nil || quota.ResetCredits.AvailableCount == nil || *quota.ResetCredits.AvailableCount <= 0 || quota.ResetCredits.ExpiresAt == nil {
 		return 1
@@ -5262,6 +5286,10 @@ func (a *app) preferredBeforeLocked(left, right account) bool {
 		if leftTier, rightTier := a.proTierLocked(left), a.proTierLocked(right); leftTier != rightTier {
 			return leftTier < rightTier
 		}
+	}
+	now := time.Now()
+	if leftRed, rightRed := a.expiringResetCreditLocked(left, now), a.expiringResetCreditLocked(right, now); leftRed != rightRed {
+		return leftRed
 	}
 	if left.Priority == right.Priority {
 		return left.ID < right.ID
