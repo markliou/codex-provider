@@ -272,6 +272,12 @@ func TestResponsesWebSocketClosesAfterACapacityFailure(t *testing.T) {
 // on the same account, keeping the lineage and its cache, and the account is
 // not cooled down while it is inside the same-account schedule.
 func TestResponsesWebSocketKeepsTheSocketThroughAnOverload(t *testing.T) {
+	for _, code := range []string{"server_is_overloaded", "server_error"} {
+		t.Run(code, func(t *testing.T) { testWebSocketKeepsTheSocketThrough(t, code) })
+	}
+}
+
+func testWebSocketKeepsTheSocketThrough(t *testing.T, code string) {
 	var mu sync.Mutex
 	calls := 0
 	upstream := &fakeCodexUpstream{script: func(string) []string {
@@ -280,7 +286,7 @@ func TestResponsesWebSocketKeepsTheSocketThroughAnOverload(t *testing.T) {
 		n := calls
 		mu.Unlock()
 		if n == 1 {
-			return append(append([]string(nil), nativePreamble...), `{"type":"response.created","response":{"id":"resp_busy"}}`, `{"type":"error","status":503,"error":{"code":"server_is_overloaded","message":"busy"}}`)
+			return append(append([]string(nil), nativePreamble...), `{"type":"response.created","response":{"id":"resp_busy"}}`, `{"type":"error","status":503,"error":{"code":"`+code+`","message":"busy"}}`)
 		}
 		return completedEvents("resp_ok")
 	}}
@@ -292,8 +298,8 @@ func TestResponsesWebSocketKeepsTheSocketThroughAnOverload(t *testing.T) {
 			t.Fatalf("round %d: socket closed: %v", round, err)
 		}
 		events := readUntilTerminal(t, conn)
-		if len(events) != len(completedEvents("x")) || strings.Contains(strings.Join(events, ""), "server_is_overloaded") {
-			t.Fatalf("round %d: the overload must be retried before Codex sees it: %q", round, events)
+		if len(events) != len(completedEvents("x")) || strings.Contains(strings.Join(events, ""), code) {
+			t.Fatalf("round %d: the %s must be retried before Codex sees it: %q", round, code, events)
 		}
 	}
 	waitInFlightZero(t, a)

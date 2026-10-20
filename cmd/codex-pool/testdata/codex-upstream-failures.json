@@ -50,6 +50,23 @@
       "code": "server_is_overloaded"
     },
     {
+      "name": "stream server error",
+      "source": "codex-rs/app-server/tests/suite/v2/guardian_v2.rs",
+      "marker": "\"error\":{\"code\":\"server_error\", \"message\":\"stream failed after score\"}",
+      "codex": "Retryable (the default branch of parse_failed_response: Codex retries it on its one account)",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "server_error",
+            "message": "stream failed after score"
+          }
+        }
+      },
+      "class": "transient",
+      "code": "server_error"
+    },
+    {
       "name": "stream slow down",
       "source": "codex-rs/codex-api/src/sse/responses_error.rs",
       "marker": "Some(\"rate_limit_exceeded\" | \"slow_down\")",

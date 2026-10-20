@@ -3316,12 +3316,17 @@ const transportSameAccountRetryLimit = 2
 // retry doubles it. A variable only so tests can shorten it.
 var transportRetryBackoff = 500 * time.Millisecond
 
-// transientOverloadCode reports an upstream overload, as opposed to an
-// account's own allowance being spent: retrying the same account is the
-// native answer to the former, moving to another account to the latter.
+// transientOverloadCode reports an upstream condition that is the server's,
+// not the account's: an overload, or a server fault. Retrying the same account
+// is the native answer to these, moving to another account the answer to an
+// account's own allowance being spent. A native Codex retries server_error on
+// its one account (codex-api/src/sse/responses_error.rs parse_failed_response:
+// it falls to the default ApiError::Retryable branch). Moving on the first
+// server_error once carried a session off the expiring-credit accounts it had
+// been placed on, two faults in four minutes, under strict lineage binding.
 func transientOverloadCode(code string) bool {
 	switch sanitizedErrorCode(code) {
-	case "server_is_overloaded", "slow_down":
+	case "server_is_overloaded", "slow_down", "server_error", "internal_server_error":
 		return true
 	default:
 		return false

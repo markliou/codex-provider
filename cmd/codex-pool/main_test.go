@@ -5955,6 +5955,13 @@ func TestCodexBackendStreamWithoutContentTypeIsStillAStream(t *testing.T) {
 // account is retried behind a backoff, as a native Codex does, so the lineage
 // and its cache stay put. Only an overload that outlasts the schedule moves on.
 func TestOverloadRetriesTheSameAccountBeforeMovingTheLineage(t *testing.T) {
+	// server_error is the server's fault too; a native Codex retries it.
+	for _, code := range []string{"server_is_overloaded", "server_error"} {
+		t.Run(code, func(t *testing.T) { testSameAccountRetryBeforeMoving(t, code) })
+	}
+}
+
+func testSameAccountRetryBeforeMoving(t *testing.T, code string) {
 	run := func(t *testing.T, failures int) (map[string]int, *app) {
 		hits := map[string]int{}
 		var mu sync.Mutex
@@ -5967,7 +5974,7 @@ func TestOverloadRetriesTheSameAccountBeforeMovingTheLineage(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_x\"}}\n\n")
 			if account == "acct-first" && n <= failures {
-				_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n")
+				_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_x\",\"error\":{\"code\":\""+code+"\"}}}\n\n")
 				return
 			}
 			_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n")
@@ -5986,8 +5993,8 @@ func TestOverloadRetriesTheSameAccountBeforeMovingTheLineage(t *testing.T) {
 		req.Header.Set("X-Codex-Turn-Metadata", `{"thread_id":"thread-main"}`)
 		recorder := httptest.NewRecorder()
 		a.publicMux().ServeHTTP(recorder, req)
-		if strings.Contains(recorder.Body.String(), "server_is_overloaded") || !strings.Contains(recorder.Body.String(), "response.completed") {
-			t.Fatalf("the overload must be retried before output: %s", recorder.Body.String())
+		if strings.Contains(recorder.Body.String(), code) || !strings.Contains(recorder.Body.String(), "response.completed") {
+			t.Fatalf("the %s must be retried before output: %s", code, recorder.Body.String())
 		}
 		return hits, a
 	}
@@ -8130,9 +8137,11 @@ func TestEarlyCapacityStreamingFailureRetriesBeforeCommit(t *testing.T) {
 }
 
 // An upstream server fault delivered inside the stream is a server-side
-// condition like any other, and it must move to another identity instead of
-// being handed to the caller. Unclassified, this failed the caller outright
-// while the identical fault reported as an HTTP 5xx got a fallback.
+// condition like any other, and it must not be handed to the caller.
+// Unclassified, this failed the caller outright while the identical fault
+// reported as an HTTP 5xx got a fallback. It is retried on the same account
+// first, as a native Codex does, and moves to another identity only once that
+// schedule is spent.
 func TestServerErrorStreamFailsOverToAnotherIdentity(t *testing.T) {
 	firstHits, secondHits := 0, 0
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -8166,8 +8175,8 @@ func TestServerErrorStreamFailsOverToAnotherIdentity(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), "server_error") || strings.Contains(recorder.Body.String(), "secret upstream detail") {
 		t.Fatalf("the abandoned failure leaked downstream: %s", recorder.Body.String())
 	}
-	if firstHits != 1 || secondHits != 1 {
-		t.Fatalf("failover did not happen exactly once: first=%d second=%d", firstHits, secondHits)
+	if firstHits != overloadSameAccountRetryLimit+1 || secondHits != 1 {
+		t.Fatalf("the fault must be retried on its account, then fail over once: first=%d second=%d", firstHits, secondHits)
 	}
 	// The outcome must name the cause. Reporting this as a capacity failover
 	// would send an operator looking at quota for a server fault.
