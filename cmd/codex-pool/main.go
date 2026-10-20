@@ -812,6 +812,15 @@ func newAppFromEnv() (*app, error) {
 		streamClient:         streamingHTTPClient(),
 		logger:               log.New(os.Stdout, "codex-pool ", log.LstdFlags|log.LUTC),
 	}
+	// Each deploy recreates the container, and Docker's log goes with it, so
+	// the log is also kept under /data, which outlives the container. A
+	// session that moved accounts a minute after a deploy could not be traced
+	// once the next deploy had discarded that container's log.
+	if file, err := newRotatingLogFile(filepath.Join(a.dataDir, "logs", "service.log"), 20<<20, 3); err == nil {
+		a.logger.SetOutput(io.MultiWriter(os.Stdout, file))
+	} else {
+		a.logger.Printf("persistent log unavailable: %v", err)
+	}
 	if err := a.load(); err != nil {
 		return nil, err
 	}
@@ -1790,6 +1799,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 	capacityExcluded := map[string]bool{}
 	capacityRetries := 0
 	overloadRetries := 0
+	transportRetries := 0
 	turnStateIssuer := a.stickySessionAccountID(route.StickyKey)
 	attemptLimit := a.proxyAttemptLimit()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
@@ -1832,6 +1842,18 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 				// confirmed, and persisting one makes later unrelated requests slower.
 				throughput.Cancelled = true
 				return
+			}
+			if !errors.Is(err, errAccountAuthFailed) && transportRetries < transportSameAccountRetryLimit {
+				transportRetries++
+				a.logger.Printf("upstream unreachable for %s (try %d of %d on this account)", candidate.ID, transportRetries, transportSameAccountRetryLimit+1)
+				select {
+				case <-r.Context().Done():
+					throughput.Cancelled = true
+					return
+				case <-time.After(transportRetryBackoff << (transportRetries - 1)):
+				}
+				attempt--
+				continue
 			}
 			excluded[candidate.ID] = true
 			// A revoked or invalid device-auth credential must not end the user
@@ -3413,6 +3435,22 @@ const overloadSameAccountRetryLimit = 3
 // doubles it. A variable only so tests can shorten it.
 var overloadRetryBackoff = time.Second
 
+// transportSameAccountRetryLimit is how many times a request that could not
+// reach upstream at all (a connection that failed or dropped before an
+// answer) is retried on the same account before the pool moves the lineage.
+// A failed connection says nothing against the account, and moving at once
+// is costly under strict binding: the whole lineage leaves its account for
+// good and pays a full prefill. Once, two connection failures right after a
+// restart moved a session off the expiring-credit accounts it had been placed
+// on and left it on Pro Lite. The owner's rule is to keep trying before
+// switching; this is that rule for connections, as overloadSameAccountRetryLimit
+// is for overload.
+const transportSameAccountRetryLimit = 2
+
+// transportRetryBackoff is the first same-account transport retry wait; each
+// retry doubles it. A variable only so tests can shorten it.
+var transportRetryBackoff = 500 * time.Millisecond
+
 // transientOverloadCode reports an upstream overload, as opposed to an
 // account's own allowance being spent: retrying the same account is the
 // native answer to the former, moving to another account to the latter.
@@ -4967,7 +5005,7 @@ func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string
 		return account{}, false, nil
 	}
 	if a.selectableAccountLocked(*lineage, model, excluded, now) {
-		if !a.preserveProQuota || !a.proAccountLocked(*lineage) {
+		if !a.preserveProQuota || a.proTierLocked(*lineage) == proTierOrdinary {
 			return *lineage, true, nil
 		}
 		var replacement account
@@ -4977,7 +5015,7 @@ func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string
 		} else {
 			replacement, ok = a.preferredAccountForStickyLocked(balanceKey, model, excluded, now)
 		}
-		if ok && !a.proAccountLocked(replacement) {
+		if ok && a.proTierLocked(replacement) < a.proTierLocked(*lineage) {
 			return replacement, true, nil
 		}
 		return *lineage, true, nil
@@ -5000,8 +5038,8 @@ func (a *app) selectAccountWithPreference(stickyKey, balanceKey, model, parentAc
 			delete(a.state.StickySessions, stickyKey)
 			stickyChanged = true
 		} else if item := a.accountLocked(existing.AccountID); item != nil && a.usableLocked(*item, model, now) {
-			if a.preserveProQuota && a.proAccountLocked(*item) {
-				if replacement, ok := a.preferredAccountForStickyLocked(balanceKey, model, excluded, now); ok && replacement.ID != item.ID && !a.proAccountLocked(replacement) {
+			if a.preserveProQuota && a.proTierLocked(*item) > proTierOrdinary {
+				if replacement, ok := a.preferredAccountForStickyLocked(balanceKey, model, excluded, now); ok && replacement.ID != item.ID && a.proTierLocked(replacement) < a.proTierLocked(*item) {
 					return replacement, nil
 				}
 			}
@@ -5177,22 +5215,19 @@ func (a *app) pickBalancedAccountLocked(stickyKey string, eligible []account) (a
 	// the same priority, so normal pools distribute evenly; operators who
 	// intentionally configured a lower priority still retain a standby tier.
 	if a.preserveProQuota {
-		hasNonPro := false
+		lowest := proTierPro
 		for _, item := range eligible {
-			if !a.proAccountLocked(item) {
-				hasNonPro = true
-				break
+			if tier := a.proTierLocked(item); tier < lowest {
+				lowest = tier
 			}
 		}
-		if hasNonPro {
-			filtered := eligible[:0]
-			for _, item := range eligible {
-				if !a.proAccountLocked(item) {
-					filtered = append(filtered, item)
-				}
+		filtered := eligible[:0]
+		for _, item := range eligible {
+			if a.proTierLocked(item) == lowest {
+				filtered = append(filtered, item)
 			}
-			eligible = filtered
 		}
+		eligible = filtered
 	}
 	highestPriority := eligible[0].Priority
 	for _, item := range eligible[1:] {
@@ -5365,10 +5400,8 @@ func (a *app) hasPreferredAccount(model string, excluded map[string]bool) bool {
 
 func (a *app) preferredBeforeLocked(left, right account) bool {
 	if a.preserveProQuota {
-		leftPro := a.proAccountLocked(left)
-		rightPro := a.proAccountLocked(right)
-		if leftPro != rightPro {
-			return !leftPro
+		if leftTier, rightTier := a.proTierLocked(left), a.proTierLocked(right); leftTier != rightTier {
+			return leftTier < rightTier
 		}
 	}
 	if left.Priority == right.Priority {
@@ -5808,13 +5841,34 @@ func (a *app) sameIdentityQuotaHintAvailableLocked(item account, model string, n
 }
 
 func (a *app) proAccountLocked(item account) bool {
+	return a.proTierLocked(item) == proTierPro
+}
+
+// Use Pro last spends accounts in three tiers: ordinary accounts first, then
+// Pro 100 (Pro Lite), then Pro 200 and Pro 500. Pro Lite was once an
+// ordinary account here, and its 5x weight drew new sessions about as often
+// as a Business seat whose reset credit was about to expire, which is the
+// opposite of using the paid Pro allowance last; the owner asked for it to
+// rank between the two.
+const (
+	proTierOrdinary = 0
+	proTierLite     = 1
+	proTierPro      = 2
+)
+
+func (a *app) proTierLocked(item account) int {
 	plan := item.PlanType
 	if snapshot := a.state.Quotas[item.ID]; snapshot.PlanType != "" {
 		plan = snapshot.PlanType
 	}
-	// Pro 500 is Pro too, and the costliest tier to spend first.
-	family := normalizePlanType(plan)
-	return family == "pro" || family == "pro_max"
+	switch normalizePlanType(plan) {
+	case "pro", "pro_max":
+		return proTierPro
+	case "pro_lite":
+		return proTierLite
+	default:
+		return proTierOrdinary
+	}
 }
 
 func (a *app) beginThroughputMeasurement(streaming bool) *throughputMeasurement {

@@ -215,3 +215,26 @@ func TestAdminLoginKeyTrustsOnlyTheConfiguredProxy(t *testing.T) {
 		t.Fatal("an invalid trusted proxy must stop startup")
 	}
 }
+
+func TestRotatingLogFileStaysBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "logs", "pool.log")
+	logFile, err := newRotatingLogFile(path, 100, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := []byte(strings.Repeat("x", 39) + "\n")
+	for i := 0; i < 20; i++ {
+		if _, err := logFile.Write(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{path, path + ".1", path + ".2"} {
+		info, err := os.Stat(name)
+		if err != nil || info.Size() > 100 {
+			t.Fatalf("%s: %v size %v", name, err, info)
+		}
+	}
+	if _, err := os.Stat(path + ".3"); !os.IsNotExist(err) {
+		t.Fatal("only the configured number of rotated logs may be kept")
+	}
+}

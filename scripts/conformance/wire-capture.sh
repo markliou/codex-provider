@@ -103,7 +103,8 @@ wait_for_pool() {
 
 start_fake() {
   docker rm -f "$fake" >/dev/null 2>&1 || true
-  docker run -d --name "$fake" --network "$net" -e REJECT_WS="$1" -e PRIME_WINDOW="${PRIME_WINDOW:-0}" -e CAPTURE_LOG=/logs/capture.jsonl \
+  docker run -d --name "$fake" --network "$net" -e REJECT_WS="$1" -e PRIME_WINDOW="${PRIME_WINDOW:-0}" \
+    -e SCENARIO="${SCENARIO:-}" -e FAIL_FROM="${FAIL_FROM:-}" -e CAPTURE_LOG=/logs/capture.jsonl \
     --network-alias chatgpt.com --network-alias auth.openai.com --network-alias api.openai.com --network-alias ab.chatgpt.com \
     --network-alias conformance-direct \
     -v "$repo_root/scripts/conformance/harness:/srv:ro" -v "$work/certs:/certs:ro" -v "$work/logs:/logs" \
@@ -124,8 +125,33 @@ stop_fake() {
 run_turn() {
   : > "$work/logs/capture.jsonl"
   docker run --rm --network "$net" -v "$work:/harness:ro" -v "$work/certs:/certs:ro" -v "$codex_vendor:/codex:ro" \
-    -e CONFORMANCE_CLIENT_KEY="$CLIENT_KEY" alpine:3.21 sh /harness/run-codex.sh "$1" "$model" > "$work/$2.codex.log" 2>&1 || true
+    -e CONFORMANCE_CLIENT_KEY="$CLIENT_KEY" -e CONFORMANCE_PROMPT="${CONFORMANCE_PROMPT:-}" -e CONFORMANCE_EXTRA="${CONFORMANCE_EXTRA:-}" \
+    alpine:3.21 sh /harness/run-codex.sh "$1" "$model" > "$work/$2.codex.log" 2>&1 || true
   cp "$work/logs/capture.jsonl" "$work/$2.jsonl"
+}
+
+# A scenario phase: the same turn from a native Codex and from Codex on the
+# pool's native endpoint, against a fake answering in that scenario.
+#   scenario_phase <label> <scenario> <reject-ws>
+scenario_phase() {
+  SCENARIO=$2 start_fake "$3" "$1"
+  SCENARIO=$2 run_turn native "native-$1"
+  docker run --rm --network "$net" alpine:3.21 wget -q --no-check-certificate -O /dev/null https://chatgpt.com/__conformance/reset || true
+  SCENARIO=$2 run_turn native-pool "native-pool-$1"
+  stop_fake "$1"
+}
+
+# Each failover phase starts with both pool accounts usable: the account an
+# earlier phase refused as spent is rightly still cooling down, and would
+# leave the next phase with only the account it refuses.
+clear_pool_cooldowns() {
+  docker stop "$pool" >/dev/null
+  docker run --rm -v "$volume:/data" node:22-alpine node -e '
+    const fs = require("fs"); const file = "/data/state/runtime.json";
+    if (fs.existsSync(file)) { const s = JSON.parse(fs.readFileSync(file, "utf8")); s.cooldowns = {}; s.health = {}; fs.writeFileSync(file, JSON.stringify(s)); }'
+  docker start "$pool" >/dev/null
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$pool" > "$work/pool-ip.txt"
+  wait_for_pool
 }
 
 echo "Own calls: the pool starts (token refresh, usage, account check, reset credits), then a native Codex refreshes"
@@ -177,6 +203,39 @@ run_turn client-ws client-ws
 run_turn pool-ws pool-ws
 run_turn native-pool native-pool-ws
 stop_fake ws
+
+echo "Subagent: a parent spawns one child, over HTTP and over the WebSocket"
+subagent_config='[features.multi_agent_v2]
+enabled = true
+max_concurrent_threads_per_session = 3
+non_code_mode_only = false'
+CONFORMANCE_EXTRA="$subagent_config" CONFORMANCE_PROMPT="Use the spawn_agent tool exactly once, wait for the child, then reply with PARENT_OK." \
+  scenario_phase subagent-http subagent 1
+CONFORMANCE_EXTRA="$subagent_config" CONFORMANCE_PROMPT="Use the spawn_agent tool exactly once, wait for the child, then reply with PARENT_OK." \
+  scenario_phase subagent-ws subagent 0
+
+echo "Compaction: a low auto-compact limit makes Codex compact mid-turn"
+CONFORMANCE_EXTRA='model_auto_compact_token_limit = 20000' scenario_phase compact compact 1
+
+echo "Failover: the pool's first account is refused as spent and the request moves to its second"
+docker stop "$pool" >/dev/null
+docker run --rm -v "$repo_root/scripts/conformance/harness:/h:ro" node:22-alpine node /h/mkauth.mjs current acct-second > "$work/auth-second.json"
+docker run --rm -v "$volume:/data" -v "$work:/w:ro" node:22-alpine sh -ceu '
+  mkdir -p /data/accounts/conformance-second/.codex
+  cp /w/auth-second.json /data/accounts/conformance-second/.codex/auth.json
+  chmod 700 /data/accounts/conformance-second/.codex
+  chmod 600 /data/accounts/conformance-second/.codex/auth.json
+  node -e "const fs=require(\"fs\");const c=JSON.parse(fs.readFileSync(\"/data/config.json\",\"utf8\"));c.accounts.push({id:\"conformance-second\",authType:\"codex_device_auth\",enabled:true,inPool:true,priority:100});fs.writeFileSync(\"/data/config.json\",JSON.stringify(c))"
+  chown -R 999:999 /data'
+docker start "$pool" >/dev/null
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$pool" > "$work/pool-ip.txt"
+wait_for_pool
+for transport in http ws; do
+  reject=1
+  [ "$transport" = ws ] && reject=0
+  clear_pool_cooldowns
+  FAIL_FROM=$(cat "$work/pool-ip.txt") scenario_phase "failover-$transport" failover "$reject"
+done
 
 docker logs "$pool" > "$work/pool.log" 2>&1 || true
 status=0
