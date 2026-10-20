@@ -194,3 +194,39 @@ func TestDeviceAuthPromptOfThePinnedCodexParses(t *testing.T) {
 		t.Fatalf("parsed link %q code %q", link, code)
 	}
 }
+
+// Codex names the three Pro tiers by raw plan (tui subscription.rs): prolite
+// is Pro 100, pro is Pro 200, promax is Pro 500. The pool must read the tier
+// and its published multiplier from the plan the same way; promax was once
+// unmapped and weighed as a single base allowance.
+func TestProTiersFollowCodexPlanNames(t *testing.T) {
+	for _, tc := range []struct {
+		raw, family, display string
+		weight               float64
+		pro                  bool
+	}{
+		{"chatgptprolite", "pro_lite", "Pro 100", proLiteWeight, false},
+		{"chatgptpro", "pro", "Pro 200", proDefaultWeight, true},
+		{"promax", "pro_max", "Pro 500", proMaxWeight, true},
+	} {
+		family := planFamilyFromRaw(tc.raw)
+		if family != tc.family {
+			t.Fatalf("%s: family %q, want %q", tc.raw, family, tc.family)
+		}
+		item := account{ID: "slot", RawPlanType: tc.raw, PlanFamily: family, PlanType: family}
+		if got := accountPlanDisplayName(item, false); got != tc.display {
+			t.Fatalf("%s: shown as %q, want %q", tc.raw, got, tc.display)
+		}
+		weight, assumed := accountWeeklyWeight(family, "", "")
+		if weight != tc.weight || !assumed {
+			t.Fatalf("%s: weight %v assumed %v, want %v assumed", tc.raw, weight, assumed, tc.weight)
+		}
+		a := testApp(t, nil)
+		if got := a.proAccountLocked(item); got != tc.pro {
+			t.Fatalf("%s: counted as Pro for Use Pro last = %v", tc.raw, got)
+		}
+	}
+	if weight, _ := accountWeeklyWeight("pro", "20x", ""); weight != 20 {
+		t.Fatalf("a reported multiplier must still win over the assumed tier, got %v", weight)
+	}
+}

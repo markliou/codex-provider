@@ -1337,8 +1337,9 @@ Account metadata keeps these concepts separate:
 - `planLimit`: exact reported `5x`, `10x`, `20x`, or `25x` multiplier only;
 - `quotaPolicy`: explicit policy such as `no_five_hour_cap`.
 
-Plan names follow OpenAI's September 2026 naming: raw `prolite` displays as
-`Pro 100`, and a Pro account with a reported multiplier displays its tier with
+Plan names follow OpenAI's September 2026 naming and Codex's own labels: raw
+`prolite` displays as `Pro 100`, raw `pro` as `Pro 200`, raw `promax` as
+`Pro 500`, and a Pro account with a reported multiplier displays its tier with
 the multiplier beside it (`5x` → `Pro 100`, `10x`/`20x` → `Pro 200`, `25x` →
 `Pro 500`). The multiplier stays visible because the mapping is not one-to-one:
 existing Pro 200 subscribers keep `20x` until 2026-10-29, new ones get `10x`.
@@ -2725,10 +2726,13 @@ must remain visible:
 
 - A Pro slot reports its own multiplier through `planLimit`, so `5x`, `10x`,
   `20x` and `25x` are authoritative. A Pro account with no reported multiplier
-  weighs the published Pro 200 ratio (`10x`), marked as assumed, and displays
-  as `Pro 200` without a multiplier: Pro 100 has its own raw plan (`prolite`),
-  so a plain Pro is taken as Pro 200, and if it is really Pro 500 the reading
-  errs low. The assumption never becomes a `planLimit`.
+  weighs its tier's published ratio, marked as assumed. The raw plan names the
+  tier, exactly as Codex labels it (`tui/src/subscription.rs`): `prolite` is
+  Pro 100 (`5x`), `pro` is Pro 200 (`10x`; Pro 200 subscribers from before
+  2026-09-29 keep `20x` until 2026-10-29, which the plan cannot tell apart, so
+  until then such an account reads low), and `promax` is Pro 500 (`25x`). An
+  unmapped `promax` once weighed one base allowance. The assumption never
+  becomes a `planLimit`.
   On each quota refresh the multiplier comes from the usage response, then the
   freshly fetched account metadata. The multiplier this pool previously stored
   (and mirrored into the sidecar auth record) is never evidence while metadata

@@ -5743,7 +5743,9 @@ func (a *app) proAccountLocked(item account) bool {
 	if snapshot := a.state.Quotas[item.ID]; snapshot.PlanType != "" {
 		plan = snapshot.PlanType
 	}
-	return normalizePlanType(plan) == "pro"
+	// Pro 500 is Pro too, and the costliest tier to spend first.
+	family := normalizePlanType(plan)
+	return family == "pro" || family == "pro_max"
 }
 
 func (a *app) beginThroughputMeasurement(streaming bool) *throughputMeasurement {
@@ -11563,8 +11565,12 @@ const defaultPremiumSeatWeight = 5.0
 const proLiteWeight = 5.0
 
 // proDefaultWeight is the published Pro 200 allowance (10x Plus since
-// 2026-09-29), assumed for a Pro account that reports no multiplier.
+// 2026-09-29), assumed for a Pro account that reports no multiplier. Codex
+// itself labels raw plan "pro" as Pro 200 (tui subscription.rs).
 const proDefaultWeight = 10.0
+
+// proMaxWeight is the published Pro 500 (raw plan promax) allowance.
+const proMaxWeight = 25.0
 
 var premiumSeatWeight = defaultPremiumSeatWeight
 
@@ -11617,6 +11623,11 @@ func accountWeeklyWeight(planFamily, planLimit, seatType string) (float64, bool)
 		// guess: the raw plan names the tier exactly, and weighing it as one
 		// understated a 5x account as a single base allowance.
 		return proLiteWeight, true
+	case "pro_max":
+		// The Pro 500 tier, which OpenAI prices at 25x Plus. The raw plan names
+		// the tier exactly, as prolite does for Pro 100; the multiplier is read
+		// off the pricing page, so it is flagged as assumed.
+		return proMaxWeight, true
 	case "business":
 		if cleanMetadataToken(seatType) == "premium" {
 			return premiumSeatWeight, true
@@ -11717,7 +11728,7 @@ func normalizePlanType(value string) string {
 	value = strings.ReplaceAll(value, "-", "_")
 	value = strings.ReplaceAll(value, " ", "_")
 	switch value {
-	case "free", "go", "plus", "pro", "pro_lite", "team", "business", "enterprise", "edu":
+	case "free", "go", "plus", "pro", "pro_lite", "pro_max", "team", "business", "enterprise", "edu":
 		return value
 	case "chatgpt_plus":
 		return "plus"
@@ -11790,8 +11801,15 @@ func planFamilyFromRaw(value string) string {
 		return "plus"
 	case "pro", "chatgptpro", "chatgpt_pro", "chatgptproplan":
 		return "pro"
-	case "prolite":
+	// chatgptprolite is the web app's name for it, still stored on slots
+	// whose plan was last read from the web app's account metadata.
+	case "prolite", "chatgptprolite", "pro_lite":
 		return "pro_lite"
+	// promax is the Pro 500 tier: Codex names it so (protocol auth.rs KnownPlan
+	// ProMax, tui subscription.rs "Pro 500"). Unmapped, a Pro 500 account was
+	// "unknown" and weighed as one base allowance instead of 25.
+	case "promax", "chatgptpromax", "pro_max":
+		return "pro_max"
 	// self_serve_business_prolite appeared in ID-token claims in September 2026
 	// on the Business seats inferred as Premium (Premium is priced like Pro
 	// 100, hence "prolite"). It is mapped to the Business family only; it is
@@ -11854,6 +11872,8 @@ func planRank(plan string) int {
 		return 500
 	case "team", "business":
 		return 400
+	case "pro_max":
+		return 320
 	case "pro":
 		return 300
 	case "pro_lite":
@@ -11900,6 +11920,8 @@ func planDisplayName(plan string) string {
 		// OpenAI now sells Pro as Pro 100 / 200 / 500; the prolite plan is the
 		// $100 tier.
 		return "Pro 100"
+	case "pro_max":
+		return "Pro 500"
 	case "go":
 		return "Go"
 	case "team":
