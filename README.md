@@ -279,7 +279,7 @@ env_key = "CODEX_POOL_API_KEY"
 wire_api = "responses"
 ```
 
-Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key passed to the service container. The checked-in [test config](test/codex-config.toml) uses the same provider contract and was verified with Codex CLI `0.141.0`.
+Set `CODEX_POOL_API_KEY` in the Codex process environment to the same client key passed to the service container. The checked-in [test config](test/codex-config.toml) uses the same provider contract and was verified with Codex CLI `0.163.0`.
 
 ### Native Codex endpoint (recommended for Codex)
 

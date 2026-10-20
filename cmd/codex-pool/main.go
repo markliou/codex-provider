@@ -641,6 +641,11 @@ type app struct {
 	// codexPrimeRunner runs the bundled Codex CLI for a quota prime (see
 	// codex_prime.go); tests replace it.
 	codexPrimeRunner func(ctx context.Context, home, workdir, model string) error
+	// turnStateIssuers maps a turn state an upstream socket issued to the
+	// account that issued it (see wsSession.gateTurnState). Guarded by
+	// turnStateMu, not mu, because it is read on every socket message.
+	turnStateMu      sync.Mutex
+	turnStateIssuers map[string]turnStateIssuer
 
 	// sessionPlacements is in-memory placement load, guarded by mu: which
 	// account each recently active session is on (see noteSessionPlacement).

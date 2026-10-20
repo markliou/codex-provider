@@ -19,6 +19,8 @@ type fakeCodexUpstream struct {
 	messages   []string
 	refuse     map[string]int                 // identity -> handshake status
 	script     func(identity string) []string // events per response.create
+	// handshake overrides the 101's extra headers (default: a turn state).
+	handshake http.Header
 }
 
 func (f *fakeCodexUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -31,7 +33,11 @@ func (f *fakeCodexUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		return
 	}
-	conn, err := acceptWebSocket(w, r, http.Header{"X-Codex-Turn-State": {"ts-ws"}})
+	extra := f.handshake
+	if extra == nil {
+		extra = http.Header{"X-Codex-Turn-State": {"ts-ws-" + identity}}
+	}
+	conn, err := acceptWebSocket(w, r, extra)
 	if err != nil {
 		return
 	}
@@ -345,4 +351,104 @@ func TestResponsesWebSocketWithoutTransportAsksForHTTP(t *testing.T) {
 func TestMain(m *testing.M) {
 	overloadRetryBackoff = time.Millisecond
 	os.Exit(m.Run())
+}
+
+// The upstream handshake's headers reach Codex, as they reach a native Codex:
+// Codex takes its socket turn state from the handshake alone and sends it back
+// in client_metadata, and reads x-reasoning-included there. The account is
+// chosen, and its socket opened, before the client's socket is accepted.
+func TestResponsesWebSocketRelaysTheUpstreamHandshake(t *testing.T) {
+	upstream := &fakeCodexUpstream{
+		handshake: http.Header{"X-Codex-Turn-State": {"ts-native"}, "X-Reasoning-Included": {"true"}, "Openai-Model": {"gpt-test"}, "X-Models-Etag": {"catalog"}},
+		script:    func(string) []string { return completedEvents("resp_hs") },
+	}
+	_, url := wsTestPool(t, upstream)
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer client-key")
+	headers.Set("Session-Id", "session-hs")
+	conn, response, err := dialWebSocket(url, headers)
+	if err != nil || conn == nil {
+		t.Fatalf("dial: %v %v", err, response)
+	}
+	defer conn.Close()
+	for name, want := range map[string]string{"X-Codex-Turn-State": "ts-native", "X-Reasoning-Included": "true", "OpenAI-Model": "gpt-test"} {
+		if got := response.Header.Get(name); got != want {
+			t.Fatalf("client handshake %s = %q, want %q", name, got, want)
+		}
+	}
+	// On /v1 the catalog is the pool's own, so upstream's ETag is withheld.
+	if got := response.Header.Get("X-Models-Etag"); got != "" {
+		t.Fatalf("a /v1 socket must not carry upstream's catalog ETag: %q", got)
+	}
+	upstream.mu.Lock()
+	opened := len(upstream.handshakes)
+	upstream.mu.Unlock()
+	if opened != 1 {
+		t.Fatalf("the upstream socket must be open before the client's is accepted: %d handshakes", opened)
+	}
+}
+
+func TestResponsesWebSocketRefusesTheHandshakeWhenNoAccountCan(t *testing.T) {
+	upstream := &fakeCodexUpstream{refuse: map[string]int{"first": http.StatusTooManyRequests, "second": http.StatusTooManyRequests}, script: func(string) []string { return nil }}
+	_, url := wsTestPool(t, upstream)
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer client-key")
+	conn, response, err := dialWebSocket(url, headers)
+	if err != nil || conn != nil || response == nil || response.StatusCode == http.StatusSwitchingProtocols {
+		t.Fatalf("the handshake must be refused before a socket exists: conn=%v response=%v err=%v", conn, response, err)
+	}
+}
+
+// The handshake can only guess the account; the first request may settle it
+// elsewhere. Nothing has gone out on that upstream socket, so it is replaced
+// without closing Codex's socket, which would only reconnect into the guess.
+func TestResponsesWebSocketMovesTheSocketForItsFirstRequest(t *testing.T) {
+	upstream := &fakeCodexUpstream{script: func(identity string) []string { return completedEvents("resp_" + identity) }}
+	a, url := wsTestPool(t, upstream)
+	a.config.Accounts[0].AllowedModels = []string{"gpt-test"}
+	conn := dialPool(t, url)
+	if err := conn.WriteMessage(wsOpText, []byte(`{"type":"response.create","model":"gpt-other","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	events := readUntilTerminal(t, conn)
+	if len(events) != len(completedEvents("x")) || !strings.Contains(strings.Join(events, ""), "resp_second") {
+		t.Fatalf("the first request must be served by the account that can serve it: %q", events)
+	}
+	waitInFlightZero(t, a)
+	upstream.mu.Lock()
+	defer upstream.mu.Unlock()
+	if len(upstream.handshakes) != 2 || upstream.handshakes[0].Get("X-Codex-Upstream-Identity") != "first" || upstream.handshakes[1].Get("X-Codex-Upstream-Identity") != "second" || len(upstream.messages) != 1 {
+		t.Fatalf("handshakes %d, messages %d", len(upstream.handshakes), len(upstream.messages))
+	}
+}
+
+// A turn state goes back only to the account that issued it, as on HTTP; on a
+// socket Codex carries it in client_metadata. Removing it leaves every other
+// byte of the message as Codex wrote it.
+func TestResponsesWebSocketWithholdsAnotherAccountsTurnState(t *testing.T) {
+	upstream := &fakeCodexUpstream{script: func(string) []string { return completedEvents("resp_ts") }}
+	a, url := wsTestPool(t, upstream)
+	// The second account issued this one, on a socket the session left.
+	a.noteTurnStateIssuer("ts-from-another-account", "second")
+	conn := dialPool(t, url)
+	own := `{"type":"response.create","model":"gpt-test","client_metadata":{"session_id":"s","x-codex-turn-state":"ts-ws-first","thread_id":"t"},"input":[]}`
+	foreign := `{"type":"response.create","model":"gpt-test","client_metadata":{"session_id":"s","x-codex-turn-state":"ts-from-another-account","thread_id":"t"},"input":[]}`
+	for _, message := range []string{own, foreign} {
+		if err := conn.WriteMessage(wsOpText, []byte(message)); err != nil {
+			t.Fatal(err)
+		}
+		readUntilTerminal(t, conn)
+	}
+	waitInFlightZero(t, a)
+	upstream.mu.Lock()
+	defer upstream.mu.Unlock()
+	if len(upstream.messages) != 2 {
+		t.Fatalf("messages = %q", upstream.messages)
+	}
+	if upstream.messages[0] != own {
+		t.Fatalf("the issuing account's turn state must pass byte for byte:\n got %s\nwant %s", upstream.messages[0], own)
+	}
+	if want := `{"type":"response.create","model":"gpt-test","client_metadata":{"session_id":"s","thread_id":"t"},"input":[]}`; upstream.messages[1] != want {
+		t.Fatalf("another account's turn state must be removed and nothing else:\n got %s\nwant %s", upstream.messages[1], want)
+	}
 }
