@@ -203,11 +203,11 @@ func TestProTiersFollowCodexPlanNames(t *testing.T) {
 	for _, tc := range []struct {
 		raw, family, display string
 		weight               float64
-		pro                  bool
+		tier                 int
 	}{
-		{"chatgptprolite", "pro_lite", "Pro 100", proLiteWeight, false},
-		{"chatgptpro", "pro", "Pro 200", proDefaultWeight, true},
-		{"promax", "pro_max", "Pro 500", proMaxWeight, true},
+		{"chatgptprolite", "pro_lite", "Pro 100", proLiteWeight, proTierLite},
+		{"chatgptpro", "pro", "Pro 200", proDefaultWeight, proTierPro},
+		{"promax", "pro_max", "Pro 500", proMaxWeight, proTierPro},
 	} {
 		family := planFamilyFromRaw(tc.raw)
 		if family != tc.family {
@@ -222,8 +222,8 @@ func TestProTiersFollowCodexPlanNames(t *testing.T) {
 			t.Fatalf("%s: weight %v assumed %v, want %v assumed", tc.raw, weight, assumed, tc.weight)
 		}
 		a := testApp(t, nil)
-		if got := a.proAccountLocked(item); got != tc.pro {
-			t.Fatalf("%s: counted as Pro for Use Pro last = %v", tc.raw, got)
+		if got := a.proTierLocked(item); got != tc.tier {
+			t.Fatalf("%s: Use Pro last tier = %v, want %v", tc.raw, got, tc.tier)
 		}
 	}
 	if weight, _ := accountWeeklyWeight("pro", "20x", ""); weight != 20 {

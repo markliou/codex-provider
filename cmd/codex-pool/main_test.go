@@ -4847,6 +4847,39 @@ func TestPreserveProQuotaModeMovesStickySessionBackToNonPro(t *testing.T) {
 	}
 }
 
+// Use Pro last spends ordinary accounts first, then Pro 100 (Pro Lite), then
+// Pro 200/500: Pro Lite takes a session only when no ordinary account can, a
+// Pro account only when neither can, and a session that had to use a higher
+// tier moves back down as soon as a lower one can serve it.
+func TestPreserveProQuotaSpendsProLiteBetweenOrdinaryAndPro(t *testing.T) {
+	a := testApp(t, []account{
+		{ID: "business", PlanType: "business", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://b.example.test", UpstreamAPIKey: "b"},
+		{ID: "pro-lite", PlanType: "pro_lite", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://l.example.test", UpstreamAPIKey: "l"},
+		{ID: "pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://p.example.test", UpstreamAPIKey: "p"},
+	})
+	a.routingStrategy = routingStrategyBalanced
+	a.preserveProQuota = true
+	for index := 0; index < 200; index++ {
+		selected, err := a.selectAccount(fmt.Sprintf("gpt-test:tier-%d", index), "gpt-test", map[string]bool{})
+		if err != nil || selected.ID != "business" {
+			t.Fatalf("with an ordinary account eligible, session %d went to %q (%v)", index, selected.ID, err)
+		}
+	}
+	selected, err := a.selectAccount("gpt-test:tier-lite", "gpt-test", map[string]bool{"business": true})
+	if err != nil || selected.ID != "pro-lite" {
+		t.Fatalf("without an ordinary account, Pro Lite comes before Pro: got %q (%v)", selected.ID, err)
+	}
+	selected, err = a.selectAccount("gpt-test:tier-pro", "gpt-test", map[string]bool{"business": true, "pro-lite": true})
+	if err != nil || selected.ID != "pro" {
+		t.Fatalf("Pro is the last resort: got %q (%v)", selected.ID, err)
+	}
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:on-lite"] = stickySession{Key: "gpt-test:on-lite", ModelID: "gpt-test", AccountID: "pro-lite", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+	if selected, err = a.selectAccount("gpt-test:on-lite", "gpt-test", map[string]bool{}); err != nil || selected.ID != "business" {
+		t.Fatalf("a session on Pro Lite must move back to an ordinary account: got %q (%v)", selected.ID, err)
+	}
+}
+
 func TestPreserveProQuotaModeUsesProWhenNonProCoolingDown(t *testing.T) {
 	a := testApp(t, []account{
 		{ID: "plus", PlanType: "plus", Enabled: true, InPool: true, Priority: 10, UpstreamBaseURL: "https://plus.example.test", UpstreamAPIKey: "plus"},
@@ -5999,12 +6032,20 @@ func TestDirectCodexGatewaySendsThroughCodexUpstream(t *testing.T) {
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "resp_via_transport") {
 		t.Fatalf("proxy returned %d: %s", recorder.Code, recorder.Body.String())
 	}
-	if len(hops) != 2 || hops[0].identity != "first" || hops[1].identity != "second" {
-		t.Fatalf("a transport failure must fail over to the next account: %+v", hops)
+	// A transport failure is retried on the same account first
+	// (transportSameAccountRetryLimit), and only then fails over.
+	last := len(hops) - 1
+	if len(hops) != transportSameAccountRetryLimit+2 || hops[last].identity != "second" {
+		t.Fatalf("a transport failure must be retried on its account, then fail over: %+v", hops)
+	}
+	for _, retried := range hops[:last] {
+		if retried.identity != "first" {
+			t.Fatalf("the retries must stay on the first account: %+v", hops)
+		}
 	}
 	want := hop{"https://chatgpt.example.test/backend-api/codex/responses", "second", "zstd", "0.163.0", "model=gpt-test", "Bearer " + second.AccessToken}
-	if hops[1] != want {
-		t.Fatalf("transport hop = %+v, want %+v", hops[1], want)
+	if hops[last] != want {
+		t.Fatalf("transport hop = %+v, want %+v", hops[last], want)
 	}
 }
 

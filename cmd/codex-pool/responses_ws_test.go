@@ -21,6 +21,9 @@ type fakeCodexUpstream struct {
 	script     func(identity string) []string // events per response.create
 	// handshake overrides the 101's extra headers (default: a turn state).
 	handshake http.Header
+	// unreachable makes the next N handshakes for an identity fail as
+	// codex-upstream does when it cannot reach upstream at all.
+	unreachable map[string]int
 }
 
 func (f *fakeCodexUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -28,7 +31,16 @@ func (f *fakeCodexUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.handshakes = append(f.handshakes, r.Header.Clone())
 	status := f.refuse[identity]
+	unreachable := f.unreachable[identity] > 0
+	if unreachable {
+		f.unreachable[identity]--
+	}
 	f.mu.Unlock()
+	if unreachable {
+		w.Header().Set("X-Codex-Upstream-Error", "connection")
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
 	if status != 0 {
 		w.WriteHeader(status)
 		return
@@ -350,6 +362,7 @@ func TestResponsesWebSocketWithoutTransportAsksForHTTP(t *testing.T) {
 // overload retries do not each wait the production 1s, 2s and 4s.
 func TestMain(m *testing.M) {
 	overloadRetryBackoff = time.Millisecond
+	transportRetryBackoff = time.Millisecond
 	os.Exit(m.Run())
 }
 
@@ -450,5 +463,66 @@ func TestResponsesWebSocketWithholdsAnotherAccountsTurnState(t *testing.T) {
 	}
 	if want := `{"type":"response.create","model":"gpt-test","client_metadata":{"session_id":"s","thread_id":"t"},"input":[]}`; upstream.messages[1] != want {
 		t.Fatalf("another account's turn state must be removed and nothing else:\n got %s\nwant %s", upstream.messages[1], want)
+	}
+}
+
+// A socket that cannot be opened is retried on its account before the
+// session moves: a connection failure says nothing against the account, and
+// under strict binding a move is for good and costs a full prefill.
+func TestResponsesWebSocketRetriesAnUnreachableAccountBeforeMoving(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		failures int
+		want     []string
+	}{
+		{"recovers on its account", transportSameAccountRetryLimit, []string{"first", "first", "first"}},
+		{"moves once the retries are spent", transportSameAccountRetryLimit + 1, []string{"first", "first", "first", "second"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := &fakeCodexUpstream{unreachable: map[string]int{"first": tc.failures}, script: func(string) []string { return completedEvents("resp_retry") }}
+			a, url := wsTestPool(t, upstream)
+			conn := dialPool(t, url)
+			if err := conn.WriteMessage(wsOpText, []byte(`{"type":"response.create","model":"gpt-test","input":[]}`)); err != nil {
+				t.Fatal(err)
+			}
+			if events := readUntilTerminal(t, conn); len(events) != len(completedEvents("x")) {
+				t.Fatalf("events = %q", events)
+			}
+			waitInFlightZero(t, a)
+			upstream.mu.Lock()
+			defer upstream.mu.Unlock()
+			var got []string
+			for _, handshake := range upstream.handshakes {
+				got = append(got, handshake.Get("X-Codex-Upstream-Identity"))
+			}
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("handshakes went to %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A 426 is the backend asking for HTTP, the same for every account: the pool
+// passes it on after the one handshake a native Codex would make, and cools
+// nothing.
+func TestResponsesWebSocketPassesUpgradeRequiredOnAtOnce(t *testing.T) {
+	upstream := &fakeCodexUpstream{refuse: map[string]int{"first": http.StatusUpgradeRequired, "second": http.StatusUpgradeRequired}, script: func(string) []string { return nil }}
+	a, url := wsTestPool(t, upstream)
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer client-key")
+	_, response, _ := dialWebSocket(url, headers)
+	if response == nil || response.StatusCode != http.StatusUpgradeRequired {
+		t.Fatalf("handshake answer = %v, want 426", response)
+	}
+	upstream.mu.Lock()
+	opened := len(upstream.handshakes)
+	upstream.mu.Unlock()
+	if opened != 1 {
+		t.Fatalf("upstream saw %d handshakes, want the one a native Codex makes", opened)
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.state.Cooldowns["first"]) != 0 {
+		t.Fatalf("a 426 must not cool the account: %+v", a.state.Cooldowns["first"])
 	}
 }

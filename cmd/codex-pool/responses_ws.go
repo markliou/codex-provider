@@ -309,6 +309,16 @@ func (s *wsSession) dial(route *routingDecision, model string) *wsRefusal {
 			continue
 		}
 		conn, handshake, refusal, err := s.a.dialCodexWebSocket(s.handshake.Context(), candidate, s.handshake.Header, model)
+		// A socket that could not be opened at all is retried on the same
+		// account before the lineage moves (transportSameAccountRetryLimit).
+		for retry := 1; err != nil && retry <= transportSameAccountRetryLimit && s.handshake.Context().Err() == nil; retry++ {
+			a.logger.Printf("upstream socket unreachable for %s (try %d of %d on this account)", candidate.ID, retry, transportSameAccountRetryLimit+1)
+			select {
+			case <-s.handshake.Context().Done():
+			case <-time.After(transportRetryBackoff << (retry - 1)):
+			}
+			conn, handshake, refusal, err = s.a.dialCodexWebSocket(s.handshake.Context(), candidate, s.handshake.Header, model)
+		}
 		if err != nil {
 			a.markFailure(candidate.ID, model, "upstream_transport_error", 30*time.Second)
 			status, code, detail = http.StatusBadGateway, "bad_gateway", "upstream websocket unreachable"
@@ -326,7 +336,10 @@ func (s *wsSession) dial(route *routingDecision, model string) *wsRefusal {
 			case status == http.StatusTooManyRequests:
 				a.markFailure(candidate.ID, model, "rate_limited", retryAfter(refusal.Header.Get("Retry-After")))
 			case status == http.StatusUpgradeRequired:
-				// Upstream wants HTTP; the client is told the same below.
+				// Upstream wants HTTP, which is the backend's answer, not this
+				// account's: tell the client at once, as a native Codex hears it
+				// on its one handshake, rather than knocking with every account.
+				return &wsRefusal{status: status, code: code, detail: detail}
 			default:
 				a.markFailure(candidate.ID, model, "upstream_5xx", 30*time.Second)
 			}
@@ -601,7 +614,12 @@ func (s *wsSession) upstreamGone(upstream *wsConn) {
 	accountID := s.account.ID
 	s.mu.Unlock()
 	if response != nil {
-		s.a.markFailure(accountID, response.model, "upstream_transport_error", 30*time.Second)
+		// Recorded, but without a cooldown: a dropped socket is no evidence
+		// against the account, and a native Codex reconnects to the same one.
+		// A cooldown here sent Codex's immediate reconnect, and so the whole
+		// lineage, to another account; a reconnect that cannot open a socket
+		// is retried on this account and only then moves (see dial).
+		s.a.markFailure(accountID, response.model, "upstream_transport_error", 0)
 		s.finish(response, false)
 	}
 	upstream.Close()

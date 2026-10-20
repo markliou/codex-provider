@@ -31,9 +31,10 @@ const requestConnection = (req) => connectionOf((req.stream && req.stream.sessio
 const record = (entry) => fs.appendFileSync(LOG, JSON.stringify({ t: new Date().toISOString(), ...entry }) + "\n");
 const remote = (req) => String((req.socket && req.socket.remoteAddress) || "").replace(/^::ffff:/, "");
 const b64 = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
-// What a token refresh answers: a long-lived unsigned token for the same fake
-// identity mkauth.mjs writes.
-const refreshedToken = `${b64({ alg: "none", typ: "JWT" })}.${b64({ exp: 4102444800, iat: 1700000000, email: "capture@example.invalid", "https://api.openai.com/auth": { chatgpt_account_id: "acct-capture", chatgpt_plan_type: "pro", chatgpt_user_id: "user-capture" } })}.unsigned`;
+// What a token refresh answers: the long-lived token mkauth.mjs writes for the
+// same fake identity, byte for byte, so a refreshed pool and a native Codex
+// present the same credential.
+const refreshedToken = `${b64({ alg: "none", typ: "JWT" })}.${b64({ exp: 4102444800, iat: 1700000000, email: "acct-capture@example.invalid", "https://api.openai.com/auth": { chatgpt_account_id: "acct-capture", chatgpt_plan_type: "pro", chatgpt_user_id: "user-acct-capture" } })}.unsigned`;
 
 function pickTool(body) {
   const names = (body.tools || []).map((t) => t.name || t.type);
@@ -49,7 +50,58 @@ function hasToolOutput(body) {
   return (body.input || []).some((item) => item && /_output$/.test(item.type || ""));
 }
 
-function events(body) {
+// SCENARIO selects how the fake answers, for wire-capture.sh's scenario
+// phases:
+//   subagent  the parent is told to spawn one child (spawn_agent), the child
+//             answers, and the parent then finishes
+//   compact   every answer reports a large usage, so Codex compacts mid-turn;
+//             a compaction request is answered with a compaction item
+//   failover  the first account the pool (FAIL_FROM, its address) sends a
+//             Responses request or socket for is refused as spent, so the
+//             pool moves the request to its other account
+const SCENARIO = process.env.SCENARIO || "";
+const FAIL_FROM = process.env.FAIL_FROM || "";
+let failedAccount = "";
+
+// A subagent's requests name their parent thread (x-codex-parent-thread-id,
+// the turn metadata's parent_thread_id) or carry x-openai-subagent.
+function isSubagent(body, headers) {
+  if (headers && (headers["x-openai-subagent"] || headers["x-codex-parent-thread-id"])) return true;
+  let metadata = {};
+  try { metadata = JSON.parse((body.client_metadata || {})["x-codex-turn-metadata"] || "{}"); } catch {}
+  return Boolean(metadata.parent_thread_id || metadata.subagent_kind);
+}
+function isCompaction(body) {
+  if ((body.input || []).some((item) => item && item.type === "compaction_trigger")) return true;
+  let metadata = {};
+  try { metadata = JSON.parse((body.client_metadata || {})["x-codex-turn-metadata"] || "{}"); } catch {}
+  return metadata.request_kind === "compaction";
+}
+// Codex 0.163 offers spawn_agent inside the collaboration namespace tool.
+function offersSpawnAgent(body) {
+  return (body.tools || []).some((tool) => tool && (tool.name === "spawn_agent" || (tool.type === "namespace" && (tool.tools || []).some((inner) => inner && inner.name === "spawn_agent"))));
+}
+function hasCompacted(body) {
+  return (body.input || []).some((item) => item && (item.type === "compaction" || item.type === "compaction_summary"));
+}
+// The spawn_agent calls this fake has issued. Over the WebSocket Codex sends
+// only the new items after previous_response_id, so the call's output arrives
+// without the call itself; without this record the parent was told to spawn
+// again after every answer and never finished.
+const spawnCalls = new Set();
+function hasCallOutput(body, name) {
+  const calls = new Set((body.input || []).filter((item) => item && item.type === "function_call" && item.name === name).map((item) => item.call_id));
+  if (name === "spawn_agent") for (const id of spawnCalls) calls.add(id);
+  return (body.input || []).some((item) => item && /_output$/.test(item.type || "") && calls.has(item.call_id));
+}
+// Whether the pool's request for this account must be refused (failover).
+function refuseForFailover(remoteAddress, account) {
+  if (SCENARIO !== "failover" || !FAIL_FROM || remoteAddress !== FAIL_FROM || !account) return false;
+  if (!failedAccount) failedAccount = account;
+  return account === failedAccount;
+}
+
+function events(body, headers) {
   const n = ++seq;
   const id = `resp_fake_${n}`;
   const model = body.model || "unknown";
@@ -57,8 +109,19 @@ function events(body) {
   out.push({ type: "response.created", response: { id, object: "response", status: "in_progress", model } });
   if (SEND_METADATA) out.push({ type: "response.metadata", response_id: id, metadata: { "x-codex-turn-state": `ts-${n}`, "openai-model": model } });
   let item;
+  const tools = (body.tools || []).map((tool) => tool.name || tool.type);
   if (body.generate === false) {
     item = null;
+  } else if (SCENARIO === "compact" && isCompaction(body)) {
+    item = { type: "compaction", id: `cmp_${n}`, encrypted_content: "capture-compaction" };
+  } else if (SCENARIO === "subagent" && isSubagent(body, headers)) {
+    item = { type: "message", id: `msg_${n}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "CHILD_OK", annotations: [] }] };
+  } else if (SCENARIO === "subagent" && offersSpawnAgent(body) && !hasCallOutput(body, "spawn_agent")) {
+    const namespaced = !tools.includes("spawn_agent");
+    spawnCalls.add(`call_${n}`);
+    item = { type: "function_call", id: `fc_${n}`, call_id: `call_${n}`, name: "spawn_agent", ...(namespaced ? { namespace: "collaboration" } : {}), arguments: JSON.stringify({ message: "Reply with CHILD_OK.", task_name: "child_probe", fork_turns: "none" }), status: "completed" };
+  } else if (SCENARIO === "subagent") {
+    item = { type: "message", id: `msg_${n}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "PARENT_OK", annotations: [] }] };
   } else if (!hasToolOutput(body) && pickTool(body)) {
     const name = pickTool(body);
     item = { type: "function_call", id: `fc_${n}`, call_id: `call_${n}`, name, arguments: JSON.stringify(toolArgs(name)), status: "completed" };
@@ -69,7 +132,10 @@ function events(body) {
     out.push({ type: "response.output_item.added", output_index: 0, item });
     out.push({ type: "response.output_item.done", output_index: 0, item });
   }
-  out.push({ type: "response.completed", response: { id, object: "response", status: "completed", model, output: item ? [item] : [], usage: { input_tokens: 10, input_tokens_details: { cached_tokens: 0 }, output_tokens: 5, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 15 } } });
+  // Large only until the conversation has been compacted once, so Codex
+  // compacts one time rather than after every answer.
+  const input = SCENARIO === "compact" && !hasCompacted(body) && !isCompaction(body) ? 50000 : 10;
+  out.push({ type: "response.completed", response: { id, object: "response", status: "completed", model, output: item ? [item] : [], usage: { input_tokens: input, input_tokens_details: { cached_tokens: 0 }, output_tokens: 5, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: input + 5 } } });
   return { n, out };
 }
 
@@ -83,8 +149,16 @@ function wsSend(socket, text) {
 }
 
 function handleUpgrade(req, socket) {
+  if (refuseForFailover(remote(req), req.headers["chatgpt-account-id"])) {
+    record({ kind: "ws-refused", from: remote(req), account: req.headers["chatgpt-account-id"], path: req.url });
+    socket.end("HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}");
+    return;
+  }
   record({ kind: "ws-handshake", from: remote(req), conn: connectionOf(socket), method: req.method, path: req.url, headers: req.headers, rawHeaderOrder: req.rawHeaders.filter((_, i) => i % 2 === 0) });
-  if (process.env.REJECT_WS === "1") { socket.end("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"); return; }
+  // 426 is the backend's "use HTTP": Codex falls back on it, and the pool
+  // passes it on without holding it against the account. A 404 here once
+  // cooled the pool's account and spoiled the phases after it.
+  if (process.env.REJECT_WS === "1") { socket.end("HTTP/1.1 426 Upgrade Required\r\ncontent-length: 0\r\n\r\n"); return; }
   const accept = crypto.createHash("sha1").update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\nx-codex-turn-state: ts-ws\r\nopenai-model: fake\r\n\r\n`);
   let buffer = Buffer.alloc(0);
@@ -115,8 +189,8 @@ function handleUpgrade(req, socket) {
         fragments = [];
         let body = null;
         try { body = JSON.parse(text); } catch { body = { raw: text.slice(0, 2000) }; }
-        const { n, out } = events(body);
-        record({ kind: "ws-message", path: req.url, n, body });
+        const { n, out } = events(body, req.headers);
+        record({ kind: "ws-message", from: remote(req), conn: connectionOf(socket), path: req.url, n, body });
         for (const event of out) wsSend(socket, JSON.stringify(event));
       }
     }
@@ -125,6 +199,16 @@ function handleUpgrade(req, socket) {
 }
 
 const server = http2.createSecureServer({ allowHTTP1: true, key: fs.readFileSync("/certs/server.key"), cert: fs.readFileSync("/certs/server.pem") }, (req, res) => {
+  // Between a scenario's native run and its pool run, so both see the same
+  // ids (resp_fake_1, call_1, ...) and the same first refused account.
+  if (req.url === "/__conformance/reset") {
+    seq = 0;
+    failedAccount = "";
+    spawnCalls.clear();
+    res.writeHead(204);
+    res.end();
+    return;
+  }
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
@@ -134,8 +218,14 @@ const server = http2.createSecureServer({ allowHTTP1: true, key: fs.readFileSync
     const raw = buffer.toString("utf8");
     let body = null;
     try { body = raw ? JSON.parse(raw) : null; } catch { body = { raw: raw.slice(0, 2000) }; }
+    if (req.method === "POST" && /\/responses$/.test(req.url.split("?")[0]) && refuseForFailover(remote(req), req.headers["chatgpt-account-id"])) {
+      record({ kind: "http-refused", from: remote(req), account: req.headers["chatgpt-account-id"], path: req.url });
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "usage_limit_reached", message: "The usage limit has been reached", plan_type: "pro" } }));
+      return;
+    }
     if (req.method === "POST" && /\/responses$/.test(req.url.split("?")[0])) {
-      const { n, out } = events(body || {});
+      const { n, out } = events(body || {}, req.headers);
       record({ kind: "http", from: remote(req), conn: requestConnection(req), proto: req.httpVersion, method: req.method, path: req.url, n, headers: req.headers, rawHeaderOrder: req.rawHeaders.filter((_, i) => i % 2 === 0), encoding, wireBytes: Buffer.concat(chunks).length, body });
       res.writeHead(200, { "content-type": "text/event-stream", "x-codex-turn-state": `ts-${n}`, "openai-model": (body && body.model) || "fake", "x-reasoning-included": "true" });
       for (const event of out) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);

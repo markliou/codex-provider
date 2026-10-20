@@ -13,7 +13,9 @@
 #   sh run-codex.sh client-ws <model>     straight at the fake: what Codex sends
 #                                         the pool before the pool touches it
 # The Codex binary is mounted at /codex, the capture CA at /certs and the
-# fake auth.json at /harness/auth.json.
+# fake auth.json at /harness/auth.json. CONFORMANCE_PROMPT replaces the prompt
+# and CONFORMANCE_EXTRA is TOML appended to config.toml (a scenario's own
+# settings, such as multi-agent).
 set -eu
 target=$1
 model=$2
@@ -36,6 +38,7 @@ CFG
     if [ "$target" = native-pool ]; then
       echo "openai_base_url = \"http://conformance-pool:8317/k/$CONFORMANCE_CLIENT_KEY/backend-api/codex\"" >> "$CODEX_HOME/config.toml"
     fi
+    printf '%s\n' "${CONFORMANCE_EXTRA:-}" >> "$CODEX_HOME/config.toml"
     ;;
   pool-http|pool-ws|client-http|client-ws)
     websockets=false
@@ -69,4 +72,4 @@ CFG
     exit 2
     ;;
 esac
-timeout 180 /codex/bin/codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "run echo hi" 2>&1 | tail -5
+timeout 180 /codex/bin/codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "${CONFORMANCE_PROMPT:-run echo hi}" 2>&1 | tail -5

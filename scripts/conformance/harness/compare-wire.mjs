@@ -64,7 +64,7 @@ const notes = [];
 const gaps = [];
 const fail = (message) => problems.push(message);
 
-function compareHeaders(label, native, pool) {
+function compareHeaders(label, native, pool, alsoIgnored = new Set()) {
   const nativeOrder = (native.rawHeaderOrder || []).map((name) => name.toLowerCase());
   const poolOrder = (pool.rawHeaderOrder || []).map((name) => name.toLowerCase());
   if (nativeOrder.join(" ") !== poolOrder.join(" ")) {
@@ -72,7 +72,7 @@ function compareHeaders(label, native, pool) {
   }
   const names = new Set([...Object.keys(native.headers || {}), ...Object.keys(pool.headers || {})]);
   for (const name of names) {
-    if (ignoredHeaders.has(name)) continue;
+    if (ignoredHeaders.has(name) || alsoIgnored.has(name)) continue;
     const left = native.headers[name];
     const right = pool.headers[name];
     if (left === undefined || right === undefined || mask(left) !== mask(right)) {
@@ -308,6 +308,55 @@ function comparePrime() {
   notes.push(`prime: ${turn.kind} from the bundled Codex (${agent.split(" ")[0]})`);
 }
 
+// Scenario phases (subagent, compaction, failover): the requests that reached
+// upstream through the pool's native endpoint must be a native Codex's, role
+// by role (parent and child threads interleave differently from run to run,
+// so each role is compared in its own order).
+function compareScenario(label, { requireChild = false, requireCompaction = false, failover = false } = {}) {
+  const native = load(`native-${label}.jsonl`);
+  const pool = load(`native-pool-${label}.jsonl`);
+  const childHeaders = (headers) => Boolean(headers && (headers["x-openai-subagent"] || headers["x-codex-parent-thread-id"]));
+  const roleOf = (entries) => {
+    const sockets = new Map(entries.filter((entry) => entry.kind === "ws-handshake").map((entry) => [entry.conn, childHeaders(entry.headers) ? "child" : "parent"]));
+    return (entry) => entry.kind === "ws-message" ? (sockets.get(entry.conn) || "parent") : (childHeaders(entry.headers) ? "child" : "parent");
+  };
+  const requests = (entries) => entries.filter((entry) => ["http", "ws-handshake", "ws-message"].includes(entry.kind));
+  const nativeRequests = requests(native);
+  const poolRequests = requests(pool);
+  const nativeRole = roleOf(native);
+  const poolRole = roleOf(pool);
+  if (!nativeRequests.length) { fail(`${label}: the native Codex sent nothing; the scenario did not run`); return; }
+  if (requireChild && !nativeRequests.some((entry) => nativeRole(entry) === "child")) fail(`${label}: the native Codex spawned no subagent; the scenario did not run`);
+  if (requireCompaction && !nativeRequests.some((entry) => entry.kind !== "ws-handshake" && /compaction/.test(JSON.stringify((entry.body || {}).input || []) + JSON.stringify((entry.body || {}).client_metadata || {})))) fail(`${label}: the native Codex sent no compaction request; the scenario did not run`);
+  const ignored = new Set();
+  if (failover) {
+    const refused = pool.filter((entry) => entry.kind === "http-refused" || entry.kind === "ws-refused");
+    if (!refused.length) { fail(`${label}: no request was refused; the failover did not run`); return; }
+    const refusedAccount = refused[0].account;
+    if (!poolRequests.length || poolRequests.some((entry) => entry.kind !== "ws-message" && entry.headers && entry.headers["chatgpt-account-id"] === refusedAccount)) fail(`${label}: a request still reached the refused account after the failover`);
+    // A different account by design: its credential and account id differ.
+    ignored.add("authorization");
+    ignored.add("chatgpt-account-id");
+  }
+  for (const role of ["parent", "child"]) {
+    for (const kind of ["http", "ws-handshake", "ws-message"]) {
+      const left = nativeRequests.filter((entry) => entry.kind === kind && nativeRole(entry) === role);
+      const right = poolRequests.filter((entry) => entry.kind === kind && poolRole(entry) === role);
+      if (left.length !== right.length) fail(`${label}: native ${role} sent ${left.length} ${kind}, the pool ${right.length}`);
+      for (let i = 0; i < Math.min(left.length, right.length); i++) {
+        const name = `${label} ${role} ${kind} ${i + 1}`;
+        if (kind !== "ws-message") compareHeaders(name, left[i], right[i], ignored);
+        if (kind !== "ws-handshake") {
+          const difference = bodyDifference(left[i].body, right[i].body);
+          if (difference) fail(`${name}: body differs from a native Codex${difference}`);
+        }
+      }
+    }
+  }
+  const children = nativeRequests.filter((entry) => nativeRole(entry) === "child").length;
+  notes.push(`${label}: ${poolRequests.length} requests equal to a native Codex's${children ? ` (${children} from the subagent)` : ""}`);
+}
+
 compareOwn();
 compareTLS("tls-own.txt");
 comparePrime();
@@ -320,6 +369,11 @@ compareConnections("native-http.jsonl", "pool-http.jsonl");
 compareConnections("native-ws.jsonl", "pool-ws.jsonl");
 compareConnections("native-http.jsonl", "native-pool-http.jsonl");
 compareConnections("native-ws.jsonl", "native-pool-ws.jsonl");
+compareScenario("subagent-http", { requireChild: true });
+compareScenario("subagent-ws", { requireChild: true });
+compareScenario("compact", { requireCompaction: true });
+compareScenario("failover-http", { failover: true });
+compareScenario("failover-ws", { failover: true });
 compareTLS("tls-http.txt");
 compareTLS("tls-ws.txt");
 for (const note of notes) console.log(`ok   ${note}`);

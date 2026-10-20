@@ -5,13 +5,16 @@
 //   node mkauth.mjs expiring   an access token that expires in two minutes,
 //                              inside the five-minute window in which both
 //                              Codex and the pool refresh before using it
+// An optional second argument names another fake account (default
+// acct-capture), for the failover scenario's second pool account.
 const mode = process.argv[2] || "current";
+const account = process.argv[3] || "acct-capture";
 const b64 = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
 const token = (exp) => `${b64({ alg: "none", typ: "JWT" })}.${b64({
   exp,
   iat: 1700000000,
-  email: "capture@example.invalid",
-  "https://api.openai.com/auth": { chatgpt_account_id: "acct-capture", chatgpt_plan_type: "pro", chatgpt_user_id: "user-capture" },
+  email: `${account}@example.invalid`,
+  "https://api.openai.com/auth": { chatgpt_account_id: account, chatgpt_plan_type: "pro", chatgpt_user_id: `user-${account}` },
 })}.unsigned`;
 const longLived = token(4102444800);
 const now = Date.now();
@@ -22,7 +25,7 @@ process.stdout.write(JSON.stringify({
     id_token: longLived,
     access_token: mode === "expiring" ? token(Math.floor(now / 1000) + 120) : longLived,
     refresh_token: "<capture-placeholder>",
-    account_id: "acct-capture",
+    account_id: account,
   },
   last_refresh: new Date(now).toISOString(),
 }));

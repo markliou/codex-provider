@@ -320,6 +320,8 @@ All mutable and sensitive data must live under `/data`.
     service.log
 ```
 
+`logs/service.log` holds everything the pool logs, as Docker's log does. Each deploy recreates the container and discards Docker's log, so this copy is what lets an operator trace an event from before the last deploy (a session that moved accounts a minute after a restart once could not be traced). It rotates at 20 MiB, keeping `service.log.1` to `service.log.3`, and like the rest of `/data` it is never copied into the repository.
+
 Never store these in the Git repository or Docker image:
 
 ```text
@@ -637,8 +639,9 @@ balancing, not mutable request round-robin:
    rebalanced merely because another account becomes available.
 4. Selection balances only within the highest-priority eligible tier, preserving
    explicitly configured lower-priority standby accounts.
-5. When `preserveProQuota` is enabled, eligible non-Pro accounts form the
-   preferred tier before the priority comparison.
+5. When `preserveProQuota` is enabled, the lowest eligible plan tier forms the
+   preferred tier before the priority comparison: ordinary accounts, then
+   Pro 100 (Pro Lite), then Pro 200 and Pro 500 (6.4).
 6. Duplicate local slots for one upstream identity remain one balancing target.
    The hash identity must use the upstream identity when known so changing its
    healthy local representative does not create artificial capacity.
@@ -816,7 +819,9 @@ failback = new_session_only
 
 A session that failed over from `acct-a` to `acct-b` should remain on `acct-b` until it ends, unless `acct-b` also fails.
 
-Optional exception: when `preserveProQuota` is enabled from the admin Console, if the sticky account is a Pro account and any eligible non-Pro account is available, select the non-Pro account and rewrite the sticky binding on success. This keeps Pro quota as the last-resort pool while preserving normal failover for deployments that leave the mode disabled.
+Optional exception: when `preserveProQuota` is enabled from the admin Console, accounts are spent in three tiers: ordinary accounts first, then Pro 100 (Pro Lite), then Pro 200 and Pro 500. A new session uses the lowest tier with an eligible account. If a sticky or lineage account sits in a higher tier than an eligible account, select the lower-tier account and rewrite the binding on success. This keeps Pro quota as the last-resort pool while preserving normal failover for deployments that leave the mode disabled. Pro Lite was once an ordinary account here; its 5x weight then drew sessions about as often as a Business seat whose reset credit was about to expire, so the owner placed it between the two.
+
+A request that cannot reach upstream at all (the connection fails or drops before any answer) is retried on the same account twice, after 0.5 s and 1 s, before it fails over with `transport_failover`. A WebSocket that cannot be opened gets the same retries, and a socket that drops mid-response records the failure but sets no cooldown, so Codex's reconnect returns to the same account. A failed connection is no evidence against the account, and under strict lineage binding a move is permanent and costs a full prefill: two connection failures right after a restart once moved a session off the expiring-credit accounts it had been placed on. A revoked credential still fails over at once.
 
 On upstream quota exhaustion or rate limiting (`429`), mark the account/model in cooldown and retry the next eligible account in the same request. By default, the retry budget scales with the configured account count; `CODEX_POOL_MAX_RETRY_ACCOUNTS` can cap it.
 
