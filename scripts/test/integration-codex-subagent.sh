@@ -11,6 +11,8 @@ VOLUME=${VOLUME:-codex-subagent-data-itest-$$}
 CLIENT_KEY=${CLIENT_KEY:-test-client-key}
 ADMIN_PASSWORD=${ADMIN_PASSWORD:-test-admin-password}
 
+. "$ROOT/scripts/test/isolation.sh"
+
 cleanup() {
   docker rm -f "$POOL" "$MOCK" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
@@ -18,9 +20,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-docker build -t codex-pool:local .
-docker build -t codex-mock-upstream:local -f test/Dockerfile.mock .
-ADMIN_HASH=$(docker run --rm -e CODEX_POOL_ADMIN_PASSWORD="$ADMIN_PASSWORD" codex-pool:local hash-password)
+docker build -t "$POOL_IMAGE" .
+docker build -t "$MOCK_IMAGE" -f test/Dockerfile.mock .
+ADMIN_HASH=$(docker run --rm -e CODEX_POOL_ADMIN_PASSWORD="$ADMIN_PASSWORD" "$POOL_IMAGE" hash-password)
 
 docker network create --internal "$NETWORK" >/dev/null
 docker volume create "$VOLUME" >/dev/null
@@ -38,7 +40,7 @@ docker run -d \
   --network "$NETWORK" \
   --network-alias codex-mock \
   -e CODEX_MOCK_SUBAGENT_INTEGRATION=true \
-  codex-mock-upstream:local >/dev/null
+  "$MOCK_IMAGE" >/dev/null
 docker run -d \
   --name "$POOL" \
   --network "$NETWORK" \
@@ -51,9 +53,9 @@ docker run -d \
   -e CODEX_POOL_PROMPT_CACHE_KEY_POLICY=preserve \
   -e CODEX_POOL_ADDR=0.0.0.0:8317 \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
-  codex-pool:local >/dev/null
+  "$POOL_IMAGE" >/dev/null
 
-docker run --rm --network "$NETWORK" --entrypoint node codex-pool:local -e '
+docker run --rm --network "$NETWORK" --entrypoint node "$POOL_IMAGE" -e '
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 for (let i = 0; i < 80; i += 1) {
   try {
@@ -72,7 +74,7 @@ CODEX_OUTPUT=$(docker run --rm \
   --network "$NETWORK" \
   --entrypoint sh \
   -e CODEX_POOL_API_KEY="$CLIENT_KEY" \
-  codex-pool:local -lc '
+  "$POOL_IMAGE" -lc '
 set -eu
 mkdir -p /tmp/codex-home /tmp/work
 cat >/tmp/codex-home/config.toml <<EOF
@@ -100,7 +102,7 @@ CODEX_HOME=/tmp/codex-home timeout 90 codex exec \
 printf "%s\n" "$CODEX_OUTPUT"
 printf "%s\n" "$CODEX_OUTPUT" | grep -Fx SUBAGENT_PARENT_OK >/dev/null
 
-docker run --rm --network "$NETWORK" --entrypoint node codex-pool:local -e '
+docker run --rm --network "$NETWORK" --entrypoint node "$POOL_IMAGE" -e '
 const data = await (await fetch("http://codex-mock:4010/requests")).json();
 const events = data.events.filter((event) => event.kind === "subagent-integration");
 const failedPreferred = events.find((event) =>
@@ -139,7 +141,7 @@ if (!parentSpawn.promptCacheKey || child.promptCacheKey !== parentSpawn.promptCa
 }
 '
 
-docker run --rm -v "$VOLUME:/data:ro" --entrypoint node codex-pool:local -e '
+docker run --rm -v "$VOLUME:/data:ro" --entrypoint node "$POOL_IMAGE" -e '
 import fs from "node:fs";
 const state = JSON.parse(fs.readFileSync("/data/state/runtime.json", "utf8"));
 const bindings = Object.values(state.threadBindings ?? {});
