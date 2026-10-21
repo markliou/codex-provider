@@ -1,5 +1,9 @@
 # Repository Rules
 
+## Rust Port Branch
+
+This is the `rust-port` branch. Before any work here, read `RUST_PORT.md` in full and follow it: it says what this branch may and may not touch (never the production container, its image tag, its data volume, `.env` or real account credentials, and never `scripts/deploy.sh`), the order of the migration steps, and the conditions every step must keep. Remove this section when the port is merged and finished.
+
 ## Portability
 
 Do not install software, runtimes, package managers, libraries, build tools, or test tools on the host. All build, test, formatting, and service tooling must run inside Docker.
