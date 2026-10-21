@@ -606,7 +606,10 @@ type app struct {
 	authLockMu    sync.Mutex
 	// resetAttempts holds reset-credit spends that failed without an upstream
 	// verdict, so a retry resends the same key and credit (reset_credit.go).
-	resetAttempts        resetCreditAttempts
+	resetAttempts resetCreditAttempts
+	// refusedCredentials remembers tokens upstream refused for good, so
+	// background work stops asking with them (refused_credential.go).
+	refusedCredentials   refusedCredentials
 	config               config
 	state                state
 	dataDir              string
@@ -1099,14 +1102,20 @@ func (a *app) startQuotaRefresher(ctx context.Context) {
 
 func (a *app) refreshAllCodexQuotas(ctx context.Context) {
 	a.mu.RLock()
-	accountIDs := make([]string, 0, len(a.config.Accounts))
+	accounts := make([]account, 0, len(a.config.Accounts))
 	for _, account := range a.config.Accounts {
 		if isCodexDeviceAuth(account) {
-			accountIDs = append(accountIDs, account.ID)
+			accounts = append(accounts, account)
 		}
 	}
 	a.mu.RUnlock()
-	for _, accountID := range accountIDs {
+	for _, item := range accounts {
+		accountID := item.ID
+		// Upstream refused these tokens for good; asking again with them is a
+		// request a native Codex would not send (refused_credential.go).
+		if a.credentialRefused(item) {
+			continue
+		}
 		snapshot, err := a.refreshAccountQuota(ctx, accountID)
 		if err != nil {
 			a.logger.Printf("quota refresh skipped for %s: %s", accountID, err)
@@ -4220,15 +4229,23 @@ func (a *app) handleAccountHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (a *app) handleRefreshAllQuota(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
-	accountIDs := make([]string, 0, len(a.config.Accounts))
+	accounts := make([]account, 0, len(a.config.Accounts))
 	for _, account := range a.config.Accounts {
 		if isCodexDeviceAuth(account) {
-			accountIDs = append(accountIDs, account.ID)
+			accounts = append(accounts, account)
 		}
 	}
 	a.mu.RUnlock()
-	results := make([]map[string]any, 0, len(accountIDs))
-	for _, accountID := range accountIDs {
+	results := make([]map[string]any, 0, len(accounts))
+	for _, item := range accounts {
+		accountID := item.ID
+		// Refresh-all sweeps every account; one whose tokens upstream refused
+		// is left out, as the background poll leaves it out. Its own refresh
+		// button still asks.
+		if a.credentialRefused(item) {
+			results = append(results, map[string]any{"accountId": accountID, "ok": false, "error": map[string]any{"code": "credential_refused", "message": "upstream refused this account's credentials; log in again"}})
+			continue
+		}
 		snapshot, err := a.refreshAccountQuota(r.Context(), accountID)
 		if err != nil {
 			results = append(results, map[string]any{"accountId": accountID, "ok": false, "error": map[string]any{"code": "quota_refresh_failed", "message": err.Error()}})
@@ -7866,6 +7883,12 @@ func (a *app) refreshCodexAuthContext(ctx context.Context, item account, force b
 	if auth.Tokens.RefreshToken == "" {
 		return nil
 	}
+	// A refresh upstream already refused for these tokens fails without
+	// network until they change, as Codex's cached permanent_refresh_failure
+	// does (refused_credential.go).
+	if record, refused := a.refusedCredentials.refused(item.ID, codexTokensDigestOf(auth)); refused && record.Reason == refusedReasonRefresh {
+		return markAccountAuthError(fmt.Errorf("%w: token refresh refused earlier", errCodexCredentialRefused))
+	}
 	if !force {
 		expiry, ok := jwtExpiry(auth.Tokens.AccessToken)
 		if !ok || time.Until(expiry) > codexTokenRefreshWindow {
@@ -7874,6 +7897,9 @@ func (a *app) refreshCodexAuthContext(ctx context.Context, item account, force b
 	}
 	refreshed, err := a.requestCodexTokenRefreshContext(ctx, item.ID, auth.Tokens.RefreshToken)
 	if err != nil {
+		if errors.Is(err, errCodexCredentialRefused) {
+			a.recordRefusedTokens(item.ID, codexTokensDigestOf(auth), refusedReasonRefresh)
+		}
 		return err
 	}
 	if refreshed.IDToken != "" {
@@ -7956,6 +7982,10 @@ func (a *app) requestCodexTokenRefreshContext(ctx context.Context, accountID, re
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		err := fmt.Errorf("refresh codex token failed with status %d", response.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(response.Body, maxRequestBody))
+		if codexRefreshFailureIsPermanent(response.StatusCode, body) {
+			err = fmt.Errorf("%w: %w", errCodexCredentialRefused, err)
+		}
 		if oauthRefreshAuthFailureStatus(response.StatusCode) {
 			return codexRefreshResponse{}, markAccountAuthError(err)
 		}
@@ -8301,12 +8331,16 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 		if code != "" {
 			message += " [" + code + "]"
 		}
+		if usageRefusesCredential(response.StatusCode, code) {
+			a.recordRefusedCredential(accountID, code)
+		}
 		if upstreamAuthFailureStatus(response.StatusCode) && !quotaErrorBlocksRouting(&quotaErrorInfo{Code: code}) {
 			code = "account_auth_failed"
 		}
 		a.saveQuotaError(accountID, codeOr(code, "upstream_status"), message)
 		return quotaSnapshot{}, errors.New(message)
 	}
+	a.refusedCredentials.clear(accountID)
 	var usage codexUsageResponse
 	if err := json.Unmarshal(body, &usage); err != nil {
 		a.saveQuotaError(accountID, "decode_failed", "quota response JSON could not be decoded")

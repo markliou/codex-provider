@@ -628,6 +628,18 @@
       "source": "codex-rs/login/src/auth/manager.rs",
       "marker": "const CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;",
       "pool": "codexTokenRefreshWindow is the same five minutes, so a prime's Codex never finds its token due for refresh"
+    },
+    {
+      "name": "refused credential is not asked again",
+      "source": "codex-rs/login/src/auth/manager.rs",
+      "marker": "later refresh attempts for the same credentials fail fast without network.",
+      "pool": "refusedCredentials records a permanent refusal against the account's current tokens; the token refresh fails fast and background quota work skips the account until auth.json holds other tokens (refused_credential.go)"
+    },
+    {
+      "name": "permanent refresh failure",
+      "source": "codex-rs/login/src/auth/manager.rs",
+      "marker": "Some(\"refresh_token_invalidated\") => RefreshTokenFailedReason::Revoked,",
+      "pool": "codexRefreshFailureIsPermanent: a 401, a refresh_token_expired/reused/invalidated code, or a 400 invalid_grant is permanent; other failures stay retryable"
     }
   ]
 }
