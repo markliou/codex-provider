@@ -4853,10 +4853,11 @@ func (a *app) preferredLineageAccountLocked(balanceKey, model string, models []s
 // parent) account preference. It is never a hard pin: the account must pass
 // every normal eligibility, duplicate-identity, cooldown, and Pro-preservation
 // gate, otherwise an unhealthy lineage account would block failover. A Pro
-// account under Pro preservation yields to the balanceKey replacement directly
-// rather than to this thread's own sticky account, which may differ per member
-// and would split the lineage; models (strict mode) keeps that replacement
-// usable for the whole lineage. holdForRepair keeps a lineage on an account
+// account under Pro preservation, or an account without a red outline while a
+// red-outlined one can serve (boundSessionMovesToLocked), yields to the
+// balanceKey replacement directly rather than to this thread's own sticky
+// account, which may differ per member and would split the lineage; models
+// (strict mode) keeps that replacement usable for the whole lineage. holdForRepair keeps a lineage on an account
 // that is completing sign-in repair, the same rule as a live sticky session.
 func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string, models []string, excluded map[string]bool, holdForRepair bool, now time.Time) (account, bool, error) {
 	lineage := a.accountLocked(lineageAccountID)
@@ -4864,7 +4865,7 @@ func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string
 		return account{}, false, nil
 	}
 	if a.selectableAccountLocked(*lineage, model, excluded, now) {
-		if !a.preserveProQuota || a.proTierLocked(*lineage) == proTierOrdinary {
+		if !a.boundSessionMayMoveLocked(*lineage, now) {
 			return *lineage, true, nil
 		}
 		var replacement account
@@ -4874,7 +4875,7 @@ func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string
 		} else {
 			replacement, ok = a.preferredAccountForStickyLocked(balanceKey, model, excluded, now)
 		}
-		if ok && a.proTierLocked(replacement) < a.proTierLocked(*lineage) {
+		if ok && a.boundSessionMovesToLocked(*lineage, replacement, now) {
 			return replacement, true, nil
 		}
 		return *lineage, true, nil
@@ -4883,6 +4884,49 @@ func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string
 		return account{}, false, errAccountAuthRepairPending
 	}
 	return account{}, false, nil
+}
+
+// A bound session normally stays on its account while that account serves
+// (6.4, failback = new_session_only). Two exceptions move it on its next
+// request, rewriting the binding on success; under strict lineage binding the
+// whole lineage follows, at the cost of one prefill on the new account.
+//
+//   - Use Pro last: a session on a higher plan tier moves to an eligible
+//     lower-tier account, so Pro quota stays the last resort.
+//   - Red outline: a session on an account without an expiring reset credit
+//     moves to a red-outlined account in the same plan tier (and priority, as
+//     the replacement is picked from the best tier). A reset credit not spent
+//     before it expires is lost, so the owner treats those accounts as a
+//     special case: placing only new sessions there was not enough, because a
+//     transient overload or a one-minute 429 moved running sessions off them
+//     for good while the red-outlined accounts sat idle. The move only goes
+//     towards a red outline, never between two, so it cannot oscillate, and
+//     spending the credit stays the owner's decision.
+//
+// boundSessionMayMoveLocked is the cheap pre-check that spares computing a
+// replacement for a session no exception can move.
+func (a *app) boundSessionMayMoveLocked(current account, now time.Time) bool {
+	if a.preserveProQuota && a.proTierLocked(current) > proTierOrdinary {
+		return true
+	}
+	return !a.expiringResetCreditLocked(current, now)
+}
+
+func (a *app) boundSessionMovesToLocked(current, replacement account, now time.Time) bool {
+	if replacement.ID == current.ID {
+		return false
+	}
+	if a.preserveProQuota && a.proTierLocked(replacement) < a.proTierLocked(current) {
+		return true
+	}
+	if a.preserveProQuota && a.proTierLocked(replacement) > a.proTierLocked(current) {
+		return false
+	}
+	if a.expiringResetCreditLocked(replacement, now) && !a.expiringResetCreditLocked(current, now) {
+		a.logger.Printf("bound session moves from %s to red-outlined %s", current.ID, replacement.ID)
+		return true
+	}
+	return false
 }
 
 // selectAccountWithPreference serves routes without strict lineage affinity:
@@ -4897,8 +4941,8 @@ func (a *app) selectAccountWithPreference(stickyKey, balanceKey, model, parentAc
 			delete(a.state.StickySessions, stickyKey)
 			stickyChanged = true
 		} else if item := a.accountLocked(existing.AccountID); item != nil && a.usableLocked(*item, model, now) {
-			if a.preserveProQuota && a.proTierLocked(*item) > proTierOrdinary {
-				if replacement, ok := a.preferredAccountForStickyLocked(balanceKey, model, excluded, now); ok && replacement.ID != item.ID && a.proTierLocked(replacement) < a.proTierLocked(*item) {
+			if a.boundSessionMayMoveLocked(*item, now) {
+				if replacement, ok := a.preferredAccountForStickyLocked(balanceKey, model, excluded, now); ok && a.boundSessionMovesToLocked(*item, replacement, now) {
 					return replacement, nil
 				}
 			}
@@ -5108,9 +5152,10 @@ func (a *app) pickBalancedAccountLocked(stickyKey string, eligible []account) (a
 	// because the credit is lost at expiry; as a weight alone they still lost
 	// about one new session in six to ordinary accounts, which strict binding
 	// then kept there. It sits inside the Use Pro last tiers, so it never
-	// spends a Pro allowance early, and it only places new sessions: a bound
-	// lineage is never moved for it. Spending the credit stays the owner's
-	// decision.
+	// spends a Pro allowance early. A bound session on an account without a
+	// red outline also moves here (boundSessionMovesToLocked), because a
+	// transient failure once moved running sessions off these accounts for
+	// good. Spending the credit stays the owner's decision.
 	expiring := make([]account, 0, len(tier))
 	for _, item := range tier {
 		if a.expiringResetCreditLocked(item, now) {
@@ -5133,7 +5178,8 @@ func (a *app) pickBalancedAccountLocked(stickyKey string, eligible []account) (a
 	// window just reset takes one new session and the next goes elsewhere
 	// instead of the whole queue sticking to it. The hash keeps the choice
 	// deterministic for one balance key, so lineage members placed together
-	// converge, and a bound lineage never reaches here.
+	// converge. A bound lineage reaches here only to find a replacement, for a
+	// failed account or one of the moves in boundSessionMovesToLocked.
 	active := a.activeSessionCountsLocked(now, stickyKey)
 	idle := make([]account, 0, len(tier))
 	for _, item := range tier {

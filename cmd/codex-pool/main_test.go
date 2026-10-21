@@ -4146,6 +4146,69 @@ func TestStrictLineageReplacementServesEveryLineageModel(t *testing.T) {
 	}
 }
 
+func TestBoundSessionsMoveToRedOutlinedAccounts(t *testing.T) {
+	a, request := strictLineageTestApp(t, []account{
+		{ID: "plain", PlanType: "business", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://plain.example.test", UpstreamAPIKey: "plain"},
+		{ID: "red", PlanType: "business", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://red.example.test", UpstreamAPIKey: "red"},
+		{ID: "red-pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: "https://red-pro.example.test", UpstreamAPIKey: "red-pro"},
+	})
+	a.routingStrategy = routingStrategyBalanced
+	a.preserveProQuota = true
+	week := int64(10080)
+	one := int64(1)
+	snapshot := func(id string, expiresIn time.Duration) quotaSnapshot {
+		value := 50.0
+		quota := &accountQuota{Windows: []quotaWindow{{Label: "Week", WindowMinutes: &week, RemainingPercent: &value, Present: true, Observed: true}}}
+		if expiresIn != 0 {
+			at := time.Now().Add(expiresIn).Unix()
+			quota.ResetCredits = &quotaResetCredits{AvailableCount: &one, ExpiresAt: &at}
+		}
+		return quotaSnapshot{AccountID: id, Quota: quota}
+	}
+	a.state.Quotas["plain"] = snapshot("plain", 0)
+	a.state.Quotas["red"] = snapshot("red", 0)
+	a.state.Quotas["red-pro"] = snapshot("red-pro", 24*time.Hour)
+
+	// A transient failure once left the lineage on an ordinary account. Only
+	// the Pro account is red-outlined, and Use Pro last keeps the lineage off it.
+	a.markSuccess(request("gpt-test", strictMainMetadata), "gpt-test", "plain", proxyResponseInfo{})
+	a.markSuccess(request("gpt-test", strictChildMetadata), "gpt-test", "plain", proxyResponseInfo{})
+	mainRoute := request("gpt-test", strictMainMetadata)
+	if selected, err := a.selectAccountForRoute(&mainRoute, "gpt-test", map[string]bool{}); err != nil || selected.ID != "plain" {
+		t.Fatalf("with no red outline in its plan tier the lineage stays: %#v, %v", selected, err)
+	}
+
+	a.state.Quotas["red"] = snapshot("red", 24*time.Hour)
+	mainRoute = request("gpt-test", strictMainMetadata)
+	selected, err := a.selectAccountForRoute(&mainRoute, "gpt-test", map[string]bool{})
+	if err != nil || selected.ID != "red" {
+		t.Fatalf("a bound lineage must move to the red-outlined account: %#v, %v", selected, err)
+	}
+	a.markSuccess(mainRoute, "gpt-test", selected.ID, proxyResponseInfo{})
+	if got := a.state.LineageBindings["main"]; got.AccountID != "red" || got.FailoverFrom != "plain" {
+		t.Fatalf("lineage binding after the red-outline move = %#v", got)
+	}
+	child := request("gpt-test", strictChildMetadata)
+	if selected, err := a.selectAccountForRoute(&child, "gpt-test", map[string]bool{}); err != nil || selected.ID != "red" {
+		t.Fatalf("the subagent must follow its lineage to the red-outlined account: %#v, %v", selected, err)
+	}
+
+	// Once on a red outline it never hops to another one.
+	a.state.Quotas["plain"] = snapshot("plain", time.Hour)
+	mainRoute = request("gpt-test", strictMainMetadata)
+	if selected, err := a.selectAccountForRoute(&mainRoute, "gpt-test", map[string]bool{}); err != nil || selected.ID != "red" {
+		t.Fatalf("a lineage on a red-outlined account must stay: %#v, %v", selected, err)
+	}
+
+	// The same exception holds for a sticky session outside lineage affinity.
+	a.state.Quotas["plain"] = snapshot("plain", 0)
+	now := time.Now().UTC()
+	a.state.StickySessions["gpt-test:other"] = stickySession{Key: "gpt-test:other", ModelID: "gpt-test", AccountID: "plain", CreatedAt: now, LastSuccessAt: now, ExpiresAt: now.Add(time.Hour)}
+	if selected, err := a.selectAccount("gpt-test:other", "gpt-test", map[string]bool{}); err != nil || selected.ID != "red" {
+		t.Fatalf("a sticky session must move to the red-outlined account: %#v, %v", selected, err)
+	}
+}
+
 func TestLineageBindingsArePrunedAndClearedWithAccount(t *testing.T) {
 	a := testApp(t, nil)
 	now := time.Now().UTC()
