@@ -1,0 +1,57 @@
+{
+  "accounts": [
+    {
+      "accountId": "workspace-a",
+      "allowedModels": [
+        "gpt-test"
+      ],
+      "authType": "device",
+      "codexHome": "/fake/codex",
+      "createdAt": "2026-10-21T01:02:03.123456789+08:00",
+      "email": "member@example.test",
+      "enabled": true,
+      "excludedModels": [
+        "gpt-old"
+      ],
+      "id": "slot-a",
+      "inPool": true,
+      "label": "test account",
+      "lastLoginAt": "2026-10-21T01:02:05.123456796+08:00",
+      "organizationName": "Example Org",
+      "ownerNote": "fake fixture",
+      "pendingAuthExpectedAccountId": "workspace-a",
+      "pendingAuthVerification": true,
+      "planFamily": "plus",
+      "planLimit": "100",
+      "planRank": 2,
+      "planType": "Plus",
+      "priority": 3,
+      "quotaPolicy": [
+        "weekly"
+      ],
+      "quotaProtectionEnabled": true,
+      "quotaProtectionThreshold": 5,
+      "rawPlanType": "plus",
+      "remainingQuota": 72,
+      "seatType": "individual",
+      "seatTypeInferred": true,
+      "seatTypeRaw": "individual",
+      "updatedAt": "2026-10-21T01:02:05.123456796+08:00",
+      "upstreamApiKey": "fake-key",
+      "upstreamBaseUrl": "https://example.test",
+      "wireApi": "responses"
+    }
+  ],
+  "createdAt": "2026-10-21T01:02:03.123456789+08:00",
+  "defaultModel": "gpt-test",
+  "futureConfigField": {
+    "kept": true
+  },
+  "futureNull": null,
+  "lineageAffinity": false,
+  "modelAliases": {
+    "alias": "gpt-test"
+  },
+  "preserveProQuota": true,
+  "updatedAt": "2026-10-21T01:02:05.123456796+08:00"
+}
