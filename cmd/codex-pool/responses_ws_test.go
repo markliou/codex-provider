@@ -27,6 +27,12 @@ type fakeCodexUpstream struct {
 }
 
 func (f *fakeCodexUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// codex-upstream answers /classify apart from the relay; it is not a
+	// handshake, and with no verdict the pool only leaves the log field out.
+	if r.URL.Path == "/classify" {
+		http.NotFound(w, r)
+		return
+	}
 	identity := r.Header.Get("X-Codex-Upstream-Identity")
 	f.mu.Lock()
 	f.handshakes = append(f.handshakes, r.Header.Clone())

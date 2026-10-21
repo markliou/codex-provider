@@ -11,6 +11,9 @@
 //! so prewarm and incremental requests reach upstream exactly as Codex sent
 //! them. Keep it a transport: routing decisions here would split
 //! responsibility with the pool the way the retired CLIProxyAPI sidecar did.
+//! `/classify` is no exception: it reports what a native Codex would make of
+//! a failure, read with Codex's own code (codex_vendor::classify), and leaves
+//! every retry and failover decision to the pool.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -619,12 +622,93 @@ where
     }
 }
 
+/// Largest failure the pool hands /classify: an error event or an HTTP error
+/// body, never a whole stream.
+const CLASSIFY_BODY_LIMIT: usize = 1 << 20;
+
+/// Codex's verdict on one upstream failure the pool met (codex_vendor::classify).
+/// The pool posts {"source": "sse"|"ws"|"http", "data": <event text>} or, for
+/// an HTTP answer, {"source": "http", "status", "headers": {name: value},
+/// "body"}. Nothing is sent anywhere; the answer only reports what a native
+/// Codex would conclude, and the pool decides what to do with it.
+async fn classify(request: hyper::Request<Incoming>) -> Response<ResponseBody> {
+    let body = match http_body_util::Limited::new(request.into_body(), CLASSIFY_BODY_LIMIT)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) => {
+            return plain(
+                StatusCode::BAD_REQUEST,
+                None,
+                format!("classify body: {error}"),
+            );
+        }
+    };
+    let input: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(input) => input,
+        Err(error) => {
+            return plain(
+                StatusCode::BAD_REQUEST,
+                None,
+                format!("classify body: {error}"),
+            );
+        }
+    };
+    let text = |name: &str| input.get(name).and_then(serde_json::Value::as_str);
+    let verdict = match text("source") {
+        Some("sse") => codex_vendor::classify::sse_event(text("data").unwrap_or_default()),
+        Some("ws") => codex_vendor::classify::ws_message(text("data").unwrap_or_default()),
+        Some("http") => {
+            let status = input
+                .get("status")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok())
+                .and_then(|status| StatusCode::from_u16(status).ok());
+            let Some(status) = status else {
+                return plain(StatusCode::BAD_REQUEST, None, "classify: missing status");
+            };
+            let mut headers = HeaderMap::new();
+            if let Some(map) = input.get("headers").and_then(serde_json::Value::as_object) {
+                for (name, value) in map {
+                    if let (Ok(name), Some(Ok(value))) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        value.as_str().map(HeaderValue::from_str),
+                    ) {
+                        headers.append(name, value);
+                    }
+                }
+            }
+            codex_vendor::classify::http_response(status, headers, text("body").map(str::to_string))
+        }
+        _ => return plain(StatusCode::BAD_REQUEST, None, "classify: unknown source"),
+    };
+    match serde_json::to_vec(&verdict) {
+        Ok(json) => {
+            let mut response = plain(StatusCode::OK, None, json);
+            response.headers_mut().insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        }
+        Err(error) => plain(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            None,
+            format!("classify: {error}"),
+        ),
+    }
+}
+
 async fn route(
     transports: Arc<Transports>,
     request: hyper::Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
     if request.uri().path() == "/ws" {
         return Ok(websocket(transports, request).await);
+    }
+    if request.uri().path() == "/classify" && request.method() == Method::POST {
+        return Ok(classify(request).await);
     }
     forward(transports, request).await
 }

@@ -210,6 +210,8 @@ In the container the last hop of every direct request goes through `codex-upstre
 
 Moving to a new Codex release means changing the Codex tag on every Codex crate in `upstream/Cargo.toml`, reseeding `upstream/Cargo.lock` from that release's `codex-rs/Cargo.lock`, matching its Rust toolchain in the Dockerfile, re-copying the vendored Codex files (below), and re-measuring against that release by the procedure in 2.3.2.
 
+`codex-upstream` also answers a loopback `POST /classify` with Codex's verdict on one upstream failure the pool met (see the terminal-failure log in 12.3): what Codex's own code maps it to and whether a native Codex would send the same request again. It is read-only advice; every decision stays with Pool.
+
 `codex-upstream` also compiles a set of Codex's own source files, listed in `scripts/conformance/codex-vendor-files.txt` and kept under `upstream/vendor/codex` byte-for-byte equal to the pinned release: codex-api's Responses stream reader and its failure classification (`sse/`, the WebSocket wrapped-error parsing in `endpoint/responses_websocket.rs`, `api_bridge.rs`) and the crate-private modules they use, with their own tests. Codex keeps these functions crate-private, so the files are compiled rather than called; they are never edited, and `codex-conformance.sh check` fails if any differs from the release (`codex-vendor.sh check`). The pool's own code around them lives outside `upstream/vendor`, with its crate root `upstream/src/lib.rs` placing each file where codex-api's own root does. Codex is Apache-2.0; its `LICENSE` and `NOTICE` are vendored with the files.
 
 Pool is the only process that refreshes an account's credential, in its `auth.json`, under the per-account auth lock. It refreshes before a request when the access token is within five minutes of expiry, and on a `401` it refreshes once and retries the same account, as a native Codex does; only a second `401`, or a refresh that cannot produce a new token, is treated as an account auth failure. A refresh that finds the token already replaced by a concurrent request reuses it instead of spending the rotated refresh token again.
@@ -2144,6 +2146,21 @@ For streaming responses:
   stays in the service log — it must never enter runtime state, a routing event,
   or any admin or client response, which keeps the sanitized-code contract for
   every surface intact.
+- Beside the pool's own class, each such line carries Codex's verdict on the
+  same failure, `codex=<kind>/<api> retry=yes|no` (and `codex_skips` when Codex
+  itself does not act on that message, leaving the stream's end to decide). An
+  upstream HTTP refusal the request path handles (401/403, 429, 5xx) gets a line
+  of its own, `upstream http failure: account=… model=… status=… pool=<the
+  pool's reason> code=…` with the same verdict. The verdict comes from
+  `codex-upstream`'s loopback `/classify`, which reads the failure with Codex's
+  own vendored code (2.3): the event exactly as upstream sent it, on SSE or the
+  Responses WebSocket, or the HTTP status, headers and body. It is shadow
+  information only: no retry, failover or cooldown depends on it, a missing or
+  slow answer (two-second bound) only leaves the field out, and without
+  `codex-upstream` (tests) nothing is asked. Its purpose is to show, on real
+  traffic, where the pool's table and Codex's own reading disagree before the
+  pool relies on Codex's. The event text is held only in memory for that call
+  and is never logged, persisted or returned.
 - A retryable terminal failure that describes a server needing a moment
   (`server_is_overloaded`, `slow_down`, `server_error`,
   `internal_server_error`) takes the longer upstream-`5xx` cooldown; a drained
