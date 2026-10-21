@@ -195,11 +195,13 @@ healthy copy can stand in when the current one has failed.
 
 A new conversation is placed in steps:
 
-1. **Plan tier** (with **Use Pro last** on): ordinary accounts, then Pro 100,
-   then Pro 200/500.
-2. **Red outline**: accounts holding a reset credit that expires within seven
-   days come first. While one of them can take the conversation it goes to one
-   of them, even a busy one.
+1. **Red outline**: accounts holding a reset credit that expires within seven
+   days come first, Pro accounts included, since an unspent credit is lost
+   either way. While one of them can take the conversation it goes to one of
+   them, even a busy one.
+2. **Plan tier** (with **Use Pro last** on): ordinary accounts, then Pro 100,
+   then Pro 200/500, applied within the red-outlined accounts or, when none can
+   serve, within the rest.
 3. **Idle first**: an account no conversation is using is preferred; only when
    all are busy is one shared, with the weight divided by (1 + sessions on it)².
 4. **Weighted choice**: remaining allowance (the tighter window) × plan
@@ -210,8 +212,8 @@ A new conversation is placed in steps:
 A conversation already bound stays where it is, with two exceptions that move it
 (main agent and subagents together, at the cost of one prefill) on its next
 request: **Use Pro last** moves it down to a lower plan tier, and the **red
-outline** moves it from an account without one to a red-outlined account in the
-same tier, so a failover caused by a passing overload does not keep it away from
+outline** moves it from an account without one to a red-outlined account (a Pro
+one included), so a failover caused by a passing overload does not keep it away from
 an expiring credit. The pool never spends a reset credit; that stays the account
 owner's decision.
 
