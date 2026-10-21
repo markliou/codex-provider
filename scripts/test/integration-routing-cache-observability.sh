@@ -8,10 +8,10 @@ NETWORK=${NETWORK:-codex-routing-cache-itest-$$}
 POOL=${POOL:-codex-routing-cache-pool-itest-$$}
 MOCK=${MOCK:-codex-routing-cache-mock-itest-$$}
 VOLUME=${VOLUME:-codex-routing-cache-data-itest-$$}
-POOL_IMAGE=${POOL_IMAGE:-codex-pool:issue4-itest}
-MOCK_IMAGE=${MOCK_IMAGE:-codex-mock-upstream:issue4-itest}
 CLIENT_KEY=${CLIENT_KEY:-routing-cache-client-key}
 ADMIN_PASSWORD=${ADMIN_PASSWORD:-routing-cache-admin-password}
+
+. "$ROOT/scripts/test/isolation.sh"
 
 cleanup() {
   docker rm -f "$POOL" "$MOCK" >/dev/null 2>&1 || true

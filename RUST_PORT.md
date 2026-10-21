@@ -69,7 +69,9 @@
 
 每個步驟完成後都要能單獨合併進 `main` 並部署。
 
-### 第 0 步：測試隔離（必須最先完成）
+### 第 0 步：測試隔離（必須最先完成）— 已完成
+
+整合測試改用 `codex-pool:test`，並由 `scripts/test/isolation.sh` 拒絕正式環境的名稱；Rust 檢查為 `scripts/test/rust-check.sh`（第 7 節）。`codex-conformance.sh` 修正為可在 worktree 中執行。以下是原本的要求：
 
 - `scripts/test/integration-*.sh` 目前執行 `docker build -t codex-pool:local`，會覆蓋正式映像的標籤；下一次 `docker compose up` 就會把測試版部署上線。**在完成這一步之前，不可以執行任何 `integration-*.sh`。**
 - 改成使用 `codex-pool:test`（或可由環境變數指定、預設不是 `codex-pool:local` 的標籤）。`wire-capture.sh` 已經使用 `codex-pool:conformance`，確認沒有其他腳本用到 `codex-pool:local`（`scripts/build-local-image.sh` 與 `scripts/deploy.sh` 除外）。
@@ -128,7 +130,28 @@ sh scripts/conformance/wire-capture.sh   # 15–20 分鐘，在背景執行
 
 網頁資源：`sh scripts/test/render-web-assets.sh`
 
-Rust 測試：第 0 步完成後補在這裡。
+Rust 測試（rustfmt、clippy、cargo test；第一次要編譯 Codex 的依賴，之後用 Docker volume `codex-pool-rust-registry`、`codex-pool-rust-target` 的快取）：
+
+```sh
+sh scripts/test/rust-check.sh
+```
+
+原始碼以唯讀方式掛載，檢查不會改檔案。要格式化時：
+
+```sh
+docker run --rm -u "$(id -u):$(id -g)" -v "$PWD/upstream:/src" -w /src codex-pool-rust-check:test cargo fmt
+```
+
+新增 Rust crate 時，把它加進 `rust-check.sh`。
+
+整合測試（建置 `codex-pool:test`，不會動到 `codex-pool:local`；`scripts/test/isolation.sh` 會拒絕正式環境的映像、容器與 volume 名稱）：
+
+```sh
+sh scripts/test/integration-codex-config.sh
+sh scripts/test/integration-device-auth-failover.sh
+sh scripts/test/integration-codex-subagent.sh
+sh scripts/test/integration-routing-cache-observability.sh
+```
 
 ## 8. Commit 規則
 

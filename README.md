@@ -382,7 +382,13 @@ docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm sh -c \
 # The control page's JavaScript renderers
 sh scripts/test/render-web-assets.sh
 
-# Integration tests: a real `codex exec` against a mock upstream
+# The codex-upstream crate: rustfmt, clippy and cargo test (the first run
+# compiles Codex's dependencies; later runs reuse cached Docker volumes)
+sh scripts/test/rust-check.sh
+
+# Integration tests: a real `codex exec` against a mock upstream. They build
+# codex-pool:test, never the live codex-pool:local, and refuse the live
+# container and volume names (scripts/test/isolation.sh).
 sh scripts/test/integration-codex-config.sh
 sh scripts/test/integration-device-auth-failover.sh
 sh scripts/test/integration-codex-subagent.sh
