@@ -84,6 +84,7 @@
 - usage、帳號資料（accounts/check）、reset credits：可以直接用 Codex 的 `codex-backend-client`。它有 `with_user_agent()`，所以每個帳號仍可帶「最後使用該帳號的 Codex」的 User-Agent（SPEC 2.3.2）。Codex 的型別保留了方案（含 ProLite、ProMax）和組織名稱（`accounts/check` 的 `name`）。差別：Codex 不認識的新方案名稱會變成 `Unknown`。開工前要先用正式資料（只看欄位名稱）確認沒有 pool 在用、但 Codex 型別會丟掉的欄位。
 - token refresh：不能用 Codex 的 `AuthManager`。它的 HTTP client 的 originator 與 User-Agent 是整個 process 共用的全域值，作業系統部分取自容器本身，無法每個帳號不同。refresh 改為在 Rust 照 Codex 原始碼（`login/src/auth/manager.rs` `request_chatgpt_token_refresh`）組請求，行為與現在相同。
 - Go 透過本機介面取得結果；狀態與 `auth.json` 仍由 Go 寫入（單一寫入者）。`wire-capture.sh` 的 own-call 比對必須仍然相同。
+- 被拒的憑證不再使用（main c0d0d93，`cmd/codex-pool/refused_credential.go`）：refresh 被 Codex 判定為永久失敗（`classify_refresh_token_failure`），或 usage 回 401/403 `token_revoked`／`token_invalidated` 時，記下該帳號目前 token 的雜湊。在 `auth.json` 換成新的 token（重新登入）之前，refresh 不連網直接失敗，五分鐘一次的額度輪詢和 Refresh all 都跳過這個帳號。refresh 和 usage 搬到 Rust 時，這個行為要一起搬，Go 的 `refused_credential_test.go` 要翻成 Rust 並通過。
 
 ### 第 2 步：串流解析與錯誤分類
 
