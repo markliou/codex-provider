@@ -29,6 +29,9 @@ policy  codex-rs/core/src/responses_retry.rs                         which failu
 policy  codex-rs/core/src/util.rs                                    retry backoff
 send    codex-rs/backend-client/src/client.rs                       the pool's own backend calls: account check, headers
 send    codex-rs/backend-client/src/client/rate_limit_resets.rs     the pool's own usage and reset-credit calls
+send    codex-rs/tui/src/chatwidget/reset_credits.rs                 which credit a reset names (the picker's first)
+policy  codex-rs/tui/src/chatwidget/usage.rs                         a failed reset resent with the same key and credit
+send    codex-rs/app-server/src/request_processors/account_processor/rate_limit_resets.rs   reset listing and consume timeouts, listing fallback
 send    codex-rs/login/src/oauth/client.rs                          the pool's token refresh body
 send    codex-rs/login/src/auth/manager.rs                          the pool's token refresh endpoint and client
 send    codex-rs/login/src/auth/default_client.rs                   default headers, user agent, client per route

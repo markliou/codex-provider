@@ -897,7 +897,9 @@ func TestResetCreditRequiresAdminSession(t *testing.T) {
 }
 
 func TestResetCreditOutcomeMessages(t *testing.T) {
-	for _, spelling := range []string{"reset", "Reset", " reset "} {
+	// already_redeemed answers only a resent attempt whose earlier send went
+	// through, which Codex reports as a reset (reset_credit.go).
+	for _, spelling := range []string{"reset", "Reset", " reset ", "already_redeemed", "alreadyRedeemed"} {
 		if _, consumed := resetCreditOutcomeMessage(spelling); !consumed {
 			t.Fatalf("%q must count as consumed", spelling)
 		}
@@ -911,7 +913,7 @@ func TestResetCreditOutcomeMessages(t *testing.T) {
 	// Upstream's own snake_case spellings must be recognized, or every refusal
 	// would be reported as unrecognized. The camelCase spellings belong to the
 	// Codex client's JSON-RPC rename of the same enum and stay accepted.
-	for _, outcome := range []string{"nothing_to_reset", "nothingToReset", "no_credit", "noCreditsAvailable", "already_redeemed", "alreadyRedeemed", "somethingNew", ""} {
+	for _, outcome := range []string{"nothing_to_reset", "nothingToReset", "no_credit", "noCreditsAvailable", "somethingNew", ""} {
 		message, consumed := resetCreditOutcomeMessage(outcome)
 		if consumed {
 			t.Fatalf("%q must not count as consumed", outcome)

@@ -601,9 +601,12 @@ type app struct {
 	inFlight atomic.Int64
 	// shutdownGrace bounds how long a stop signal waits for in-flight requests.
 	// Zero means defaultShutdownGrace.
-	shutdownGrace        time.Duration
-	mu                   sync.RWMutex
-	authLockMu           sync.Mutex
+	shutdownGrace time.Duration
+	mu            sync.RWMutex
+	authLockMu    sync.Mutex
+	// resetAttempts holds reset-credit spends that failed without an upstream
+	// verdict, so a retry resends the same key and credit (reset_credit.go).
+	resetAttempts        resetCreditAttempts
 	config               config
 	state                state
 	dataDir              string
@@ -4356,13 +4359,29 @@ func (a *app) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusBadGateway, "account_auth_failed", "unable to authenticate this account with upstream")
 			return
 		}
-		outcome, err := a.consumeCodexResetCredit(ctx, accountCopy.ID, auth, randomUUID())
+		// A retry after a failed attempt resends that attempt, as Codex's "Try
+		// again" does; otherwise the credit is the one Codex's picker selects,
+		// under a fresh key (reset_credit.go).
+		attempt, retrying := a.resetAttempts.resume(accountCopy.ID, time.Now())
+		if !retrying {
+			attempt = resetCreditAttempt{RedeemRequestID: randomUUID(), CreditID: a.chooseResetCredit(ctx, accountCopy.ID, auth)}
+		}
+		attempt.At = time.Now()
+		consumeCtx, cancelConsume := context.WithTimeout(ctx, resetCreditConsumeTimeout)
+		outcome, err := a.consumeCodexResetCredit(consumeCtx, accountCopy.ID, auth, attempt.RedeemRequestID, attempt.CreditID)
+		cancelConsume()
 		if err != nil {
-			a.logger.Printf("reset credit consume failed for %s: %s", accountCopy.ID, err)
-			writeOpenAIError(w, http.StatusBadGateway, "reset_credit_failed", err.Error())
+			a.resetAttempts.keep(accountCopy.ID, attempt)
+			a.logger.Printf("reset credit consume failed for %s (retry=%t): %s", accountCopy.ID, retrying, err)
+			writeOpenAIError(w, http.StatusBadGateway, "reset_credit_failed", err.Error()+"; trying again resends the same reset, so it cannot spend a second credit")
 			return
 		}
+		// Any verdict ends the attempt: the next spend starts from the picker.
+		a.resetAttempts.clear(accountCopy.ID)
 		message, consumed := resetCreditOutcomeMessage(outcome)
+		if resetCreditNoLongerAvailable(outcome, attempt.CreditID) {
+			message = "That reset is no longer available. Refresh to see your current resets."
+		}
 		// Refresh regardless of outcome. A successful reset changes the windows
 		// the dashboard shows, and a refusal such as alreadyRedeemed means the
 		// local snapshot is the stale half of the disagreement.
@@ -8685,7 +8704,8 @@ func (a *app) enrichResetCreditExpiration(ctx context.Context, accountID string,
 }
 
 // resetCreditOutcomeMessage turns upstream's verdict on a consume attempt into
-// operator-visible wording. Only "reset" spends a credit; the others report why
+// operator-visible wording. "reset" spends a credit and "already_redeemed"
+// reports that a resent attempt's earlier send did; the others report why
 // nothing happened, and each needs its own wording because the remedy differs.
 //
 // Upstream spells these in snake_case: reset, nothing_to_reset, no_credit and
@@ -8703,7 +8723,10 @@ func resetCreditOutcomeMessage(outcome string) (string, bool) {
 	case "no_credit", "nocredit", "nocreditsavailable", "nocredits":
 		return "This account has no earned reset credits available.", false
 	case "already_redeemed", "alreadyredeemed":
-		return "This reset attempt already completed, so no further credit was spent.", false
+		// Only a resent attempt meets this: the earlier send went through and its
+		// answer was lost. Codex reports it as the reset it is (tui
+		// chatwidget/usage.rs treats Reset and AlreadyRedeemed alike).
+		return "The reset already went through on the earlier attempt, so no further credit was spent.", true
 	default:
 		return "Upstream returned an unrecognized reset outcome.", false
 	}
@@ -8717,14 +8740,14 @@ func resetCreditOutcomeMessage(outcome string) (string, bool) {
 // retry of the same logical attempt must carry the same id or upstream would
 // spend a second credit, so the caller owns it rather than this function
 // minting a fresh one on every network retry.
-func (a *app) consumeCodexResetCredit(ctx context.Context, accountID string, auth codexAuthInfo, redeemRequestID string) (string, error) {
+func (a *app) consumeCodexResetCredit(ctx context.Context, accountID string, auth codexAuthInfo, redeemRequestID, creditID string) (string, error) {
 	// Upstream reads this key as redeem_request_id and requires it. The Codex
 	// client calls the same value an idempotency key on its own JSON-RPC surface
 	// and renames it here, so both idempotency_key and idempotencyKey leave the
 	// required field absent and earn a 400: that is how every real attempt
-	// failed. The optional credit_id picks one specific credit; omitting it lets
-	// upstream choose, which is what this pool wants.
-	body, err := codexJSON(map[string]any{"redeem_request_id": redeemRequestID})
+	// failed. credit_id names the credit Codex's picker selected; it is left out
+	// only where Codex leaves it out (reset_credit.go nativeResetCreditChoice).
+	body, err := codexJSON(codexConsumeResetCreditRequest{RedeemRequestID: redeemRequestID, CreditID: creditID})
 	if err != nil {
 		return "", fmt.Errorf("encode reset-credit consume request: %w", err)
 	}
