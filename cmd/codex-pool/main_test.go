@@ -8417,8 +8417,8 @@ func TestTerminalFailureClassesAndCooldownPricing(t *testing.T) {
 	}
 	// A spent allowance stays out until the quota refresh has seen it.
 	for _, reason := range []string{"usage_limit_reached", "usage_not_included", "insufficient_quota"} {
-		if got := retryableTerminalCooldown(reason); got != quotaRefreshInterval {
-			t.Fatalf("retryableTerminalCooldown(%q) = %s, want %s", reason, got, quotaRefreshInterval)
+		if got := retryableTerminalCooldown(reason); got != quotaRefreshMaxInterval {
+			t.Fatalf("retryableTerminalCooldown(%q) = %s, want %s", reason, got, quotaRefreshMaxInterval)
 		}
 	}
 	// The outcome must name the cause an operator has to act on.

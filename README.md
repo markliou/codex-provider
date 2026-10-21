@@ -285,7 +285,8 @@ The control page refreshes every five minutes (**Refresh** reads at once).
   `Cooldown`, `Error`, `Login needed`, `Signing in`, `Duplicate`, `Disabled`,
   `Standby`), every quota window with its own percentage and reset time, credits,
   spend control, and reset credits with the nearest expiry (red within seven
-  days). Quota is read from `/wham/usage` every five minutes; a value upstream
+  days). Quota is read from `/wham/usage` every four to six minutes per
+  account, at random, one account at a time; a value upstream
   does not report shows as `Not reported`. **Use reset credit** spends one the
   way Codex's own `/usage` reset does: the credit expiring soonest, and a press
   after a failed attempt resends that attempt, so it cannot spend twice.
