@@ -101,6 +101,24 @@ wait_for_pool() {
   fi
 }
 
+# The pool's background quota poll has no fixed beat (quota_schedule.go): its
+# first round after a start is spread over two minutes, one account at a time,
+# so a phase waits for the call it needs instead of a fixed time.
+#   wait_until <seconds> <what> <command...>
+wait_until() {
+  limit=$1 what=$2
+  shift 2
+  i=0
+  until "$@"; do
+    i=$((i + 1))
+    if [ "$i" -ge "$limit" ]; then
+      echo "waited ${limit}s and saw no $what" >&2
+      return 0
+    fi
+    sleep 1
+  done
+}
+
 start_fake() {
   docker rm -f "$fake" >/dev/null 2>&1 || true
   docker run -d --name "$fake" --network "$net" -e REJECT_WS="$1" -e PRIME_WINDOW="${PRIME_WINDOW:-0}" \
@@ -170,8 +188,10 @@ docker run -d --name "$pool" --network "$net" --network-alias conformance-pool \
   "$image" >/dev/null
 docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$pool" > "$work/pool-ip.txt"
 wait_for_pool
-# The pool's first quota sweep runs at start; give it time to finish.
-sleep 10
+# The pool's first quota poll comes within its start spread; reset credits
+# are the last of its own calls.
+wait_until 200 "quota poll from the pool" grep -q 'rate-limit-reset-credits' "$work/logs/capture.jsonl"
+sleep 2
 docker run --rm --network "$net" -v "$work:/harness:ro" -v "$work/certs:/certs:ro" -v "$codex_vendor:/codex:ro" \
   -e CONFORMANCE_CLIENT_KEY="$CLIENT_KEY" alpine:3.21 sh /harness/run-codex.sh native-refresh "$model" > "$work/native-own.codex.log" 2>&1 || true
 cp "$work/logs/capture.jsonl" "$work/own.jsonl"
@@ -182,8 +202,10 @@ PRIME_WINDOW=1 start_fake 0 prime
 : > "$work/logs/capture.jsonl"
 docker restart "$pool" >/dev/null
 wait_for_pool
-# The prime is one Codex turn; give it time to start, answer and exit.
-sleep 30
+# The prime follows the account's first quota poll, and is one Codex turn;
+# the pool logs it once the turn is over.
+wait_until 240 "quota window prime" sh -c 'docker logs "$1" 2>&1 | grep -qi "quota window prime"' sh "$pool"
+sleep 2
 cp "$work/logs/capture.jsonl" "$work/prime.jsonl"
 docker logs "$pool" 2>&1 | grep -i 'quota window prime' | tail -3 > "$work/prime.log" || true
 stop_fake prime

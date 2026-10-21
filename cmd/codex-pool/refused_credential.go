@@ -15,7 +15,7 @@ import (
 // happened on, so later refreshes of the same credentials fail fast without
 // network (login auth/manager.rs CachedAuth.permanent_refresh_failure); it
 // asks again only once the user logs in and the credentials change. The pool
-// once polled such an account every five minutes regardless: an account that
+// once polled such an account about every five minutes regardless: an account that
 // OpenAI deactivated answered 401 token_revoked about 280 times a day, each
 // one a request a native Codex would never send. The pool now remembers the
 // refusal against the account's current tokens and its background work

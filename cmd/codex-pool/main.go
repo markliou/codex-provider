@@ -76,12 +76,15 @@ const (
 	// across conversations. 4 covers a heavy single user (~60 RPM) before any
 	// overflow; raise it if the dashboard shows a hot account with a low hit rate.
 	promptCacheBucketsDefault = 4
-	quotaRefreshInterval      = 5 * time.Minute
+	// quotaRefreshInterval is the mean spacing of one account's quota polls;
+	// each poll lands within quotaRefreshJitter of it (quota_schedule.go).
+	quotaRefreshInterval = 5 * time.Minute
 	// A quota window that has reset but has not yet been spent against reports a
 	// reset time that slides forward with the wall clock instead of counting
 	// down, so the window never actually elapses. quotaWindowAnchorSlack is how
 	// much closer than a full window the reset may sit and still be read as
-	// unanchored. It must exceed the refresh interval, because the reported reset
+	// unanchored. It must exceed the longest refresh interval
+	// (quotaRefreshMaxInterval), because the reported reset
 	// is only as fresh as the snapshot that carried it, and stay far below the
 	// smallest anchored gap observed in practice.
 	quotaWindowAnchorSlack = 10 * time.Minute
@@ -99,7 +102,7 @@ const (
 	// routing evidence. Refresh it far less often than quota windows so the
 	// dashboard can show the date without doubling five-minute upstream polling.
 	resetCreditDetailsRefreshInterval = 6 * time.Hour
-	// Quota telemetry is refreshed every five minutes. Give one missed poll a
+	// Quota telemetry is refreshed every four to six minutes. Give one missed poll a
 	// grace interval for display, but do not use freshness itself as a routing
 	// gate: SPEC section 6.4 deliberately keeps telemetry failures fail-open.
 	quotaTelemetryFreshness  = 10 * time.Minute
@@ -1084,45 +1087,40 @@ func (a *app) handleInFlight(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"inFlight": a.inFlight.Load()})
 }
 
-func (a *app) startQuotaRefresher(ctx context.Context) {
-	go func() {
-		a.refreshAllCodexQuotas(ctx)
-		ticker := time.NewTicker(quotaRefreshInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				a.refreshAllCodexQuotas(ctx)
-			}
-		}
-	}()
+// refreshAllCodexQuotas polls every account in one pass. The background
+// poll does not use it: it asks one account at a time on its own schedule
+// (quota_schedule.go).
+func (a *app) refreshAllCodexQuotas(ctx context.Context) {
+	for _, item := range a.quotaPollAccounts() {
+		a.pollAccountQuota(ctx, item)
+	}
 }
 
-func (a *app) refreshAllCodexQuotas(ctx context.Context) {
+func (a *app) quotaPollAccounts() []account {
 	a.mu.RLock()
+	defer a.mu.RUnlock()
 	accounts := make([]account, 0, len(a.config.Accounts))
 	for _, account := range a.config.Accounts {
 		if isCodexDeviceAuth(account) {
 			accounts = append(accounts, account)
 		}
 	}
-	a.mu.RUnlock()
-	for _, item := range accounts {
-		accountID := item.ID
-		// Upstream refused these tokens for good; asking again with them is a
-		// request a native Codex would not send (refused_credential.go).
-		if a.credentialRefused(item) {
-			continue
-		}
-		snapshot, err := a.refreshAccountQuota(ctx, accountID)
-		if err != nil {
-			a.logger.Printf("quota refresh skipped for %s: %s", accountID, err)
-			continue
-		}
-		a.primeUnanchoredQuotaWindow(ctx, accountID, snapshot)
+	return accounts
+}
+
+func (a *app) pollAccountQuota(ctx context.Context, item account) {
+	accountID := item.ID
+	// Upstream refused these tokens for good; asking again with them is a
+	// request a native Codex would not send (refused_credential.go).
+	if a.credentialRefused(item) {
+		return
 	}
+	snapshot, err := a.refreshAccountQuota(ctx, accountID)
+	if err != nil {
+		a.logger.Printf("quota refresh skipped for %s: %s", accountID, err)
+		return
+	}
+	a.primeUnanchoredQuotaWindow(ctx, accountID, snapshot)
 }
 
 // unanchoredBudgetWindow reports the account's longest reported quota window
@@ -3669,8 +3667,9 @@ func retryableTerminalCooldown(reason string) time.Duration {
 		// A spent allowance does not come back in seconds. Hold the account out
 		// until the next quota refresh has seen the spent window, which then keeps
 		// it out (or lets it back the moment its owner resets it); a short
-		// cooldown let new sessions land on it and bounce off in the gap.
-		return quotaRefreshInterval
+		// cooldown let new sessions land on it and bounce off in the gap. The
+		// longest poll interval, since the next poll may come that late.
+		return quotaRefreshMaxInterval
 	}
 	return 30 * time.Second
 }
