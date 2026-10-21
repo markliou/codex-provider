@@ -4169,31 +4169,44 @@ func TestBoundSessionsMoveToRedOutlinedAccounts(t *testing.T) {
 	a.state.Quotas["red"] = snapshot("red", 0)
 	a.state.Quotas["red-pro"] = snapshot("red-pro", 24*time.Hour)
 
-	// A transient failure once left the lineage on an ordinary account. Only
-	// the Pro account is red-outlined, and Use Pro last keeps the lineage off it.
+	// A transient failure once left the lineage on an ordinary account
+	// without a red outline.
+	a.state.Quotas["red-pro"] = snapshot("red-pro", 0)
 	a.markSuccess(request("gpt-test", strictMainMetadata), "gpt-test", "plain", proxyResponseInfo{})
 	a.markSuccess(request("gpt-test", strictChildMetadata), "gpt-test", "plain", proxyResponseInfo{})
 	mainRoute := request("gpt-test", strictMainMetadata)
 	if selected, err := a.selectAccountForRoute(&mainRoute, "gpt-test", map[string]bool{}); err != nil || selected.ID != "plain" {
-		t.Fatalf("with no red outline in its plan tier the lineage stays: %#v, %v", selected, err)
+		t.Fatalf("with no red outline anywhere the lineage stays: %#v, %v", selected, err)
 	}
 
-	a.state.Quotas["red"] = snapshot("red", 24*time.Hour)
+	// A red-outlined Pro account takes it despite Use Pro last.
+	a.state.Quotas["red-pro"] = snapshot("red-pro", 24*time.Hour)
 	mainRoute = request("gpt-test", strictMainMetadata)
 	selected, err := a.selectAccountForRoute(&mainRoute, "gpt-test", map[string]bool{})
-	if err != nil || selected.ID != "red" {
-		t.Fatalf("a bound lineage must move to the red-outlined account: %#v, %v", selected, err)
+	if err != nil || selected.ID != "red-pro" {
+		t.Fatalf("a bound lineage must move to the red-outlined Pro account: %#v, %v", selected, err)
 	}
 	a.markSuccess(mainRoute, "gpt-test", selected.ID, proxyResponseInfo{})
-	if got := a.state.LineageBindings["main"]; got.AccountID != "red" || got.FailoverFrom != "plain" {
-		t.Fatalf("lineage binding after the red-outline move = %#v", got)
+
+	// Once an ordinary account is red-outlined too, Use Pro last moves the
+	// lineage down to it, from one red outline to another.
+	a.state.Quotas["red"] = snapshot("red", 24*time.Hour)
+	mainRoute = request("gpt-test", strictMainMetadata)
+	selected, err = a.selectAccountForRoute(&mainRoute, "gpt-test", map[string]bool{})
+	if err != nil || selected.ID != "red" {
+		t.Fatalf("Use Pro last among red outlines must move the lineage to red: %#v, %v", selected, err)
+	}
+	a.markSuccess(mainRoute, "gpt-test", selected.ID, proxyResponseInfo{})
+	if got := a.state.LineageBindings["main"]; got.AccountID != "red" || got.FailoverFrom != "red-pro" {
+		t.Fatalf("lineage binding after the moves = %#v", got)
 	}
 	child := request("gpt-test", strictChildMetadata)
 	if selected, err := a.selectAccountForRoute(&child, "gpt-test", map[string]bool{}); err != nil || selected.ID != "red" {
 		t.Fatalf("the subagent must follow its lineage to the red-outlined account: %#v, %v", selected, err)
 	}
 
-	// Once on a red outline it never hops to another one.
+	// It never hops to another red outline in the same plan tier, and Use Pro
+	// last never pulls it off a red outline.
 	a.state.Quotas["plain"] = snapshot("plain", time.Hour)
 	mainRoute = request("gpt-test", strictMainMetadata)
 	if selected, err := a.selectAccountForRoute(&mainRoute, "gpt-test", map[string]bool{}); err != nil || selected.ID != "red" {
@@ -6243,8 +6256,9 @@ func TestExpiringResetCreditAccountsAreTheirOwnTier(t *testing.T) {
 		t.Fatalf("boost at expiry = %.2f, want about 7", boost)
 	}
 
-	// Use Pro last outranks the red outline: a red-outlined Pro account is not
-	// spent while an ordinary account can serve.
+	// The red outline outranks Use Pro last: an unspent credit on a Pro
+	// account is lost just the same, so the red-outlined Pro account comes
+	// before an ordinary one.
 	a = testApp(t, []account{
 		{ID: "pro", PlanType: "pro", Enabled: true, InPool: true, Priority: 100},
 		{ID: "plain", PlanType: "business", Enabled: true, InPool: true, Priority: 100},
@@ -6256,8 +6270,16 @@ func TestExpiringResetCreditAccountsAreTheirOwnTier(t *testing.T) {
 	a.mu.Lock()
 	picked, _ = a.pickBalancedAccountLocked("lineage:pro-check", append([]account(nil), a.config.Accounts...))
 	a.mu.Unlock()
+	if picked.ID != "pro" {
+		t.Fatalf("a red-outlined Pro account must come before an ordinary one, got %q", picked.ID)
+	}
+	// Among red-outlined accounts Use Pro last still orders the plan tiers.
+	a.state.Quotas["plain"] = snapshot("plain", 24*time.Hour)
+	a.mu.Lock()
+	picked, _ = a.pickBalancedAccountLocked("lineage:pro-check", append([]account(nil), a.config.Accounts...))
+	a.mu.Unlock()
 	if picked.ID != "plain" {
-		t.Fatalf("Use Pro last must still keep the Pro account back, got %q", picked.ID)
+		t.Fatalf("with both red-outlined, Use Pro last keeps the Pro account back, got %q", picked.ID)
 	}
 }
 

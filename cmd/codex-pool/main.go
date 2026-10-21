@@ -4891,17 +4891,20 @@ func (a *app) lineagePreferenceLocked(lineageAccountID, balanceKey, model string
 // request, rewriting the binding on success; under strict lineage binding the
 // whole lineage follows, at the cost of one prefill on the new account.
 //
-//   - Use Pro last: a session on a higher plan tier moves to an eligible
-//     lower-tier account, so Pro quota stays the last resort.
 //   - Red outline: a session on an account without an expiring reset credit
-//     moves to a red-outlined account in the same plan tier (and priority, as
-//     the replacement is picked from the best tier). A reset credit not spent
-//     before it expires is lost, so the owner treats those accounts as a
-//     special case: placing only new sessions there was not enough, because a
-//     transient overload or a one-minute 429 moved running sessions off them
-//     for good while the red-outlined accounts sat idle. The move only goes
-//     towards a red outline, never between two, so it cannot oscillate, and
-//     spending the credit stays the owner's decision.
+//     moves to a red-outlined account, a Pro one included. A reset credit not
+//     spent before it expires is lost, so the owner treats those accounts as
+//     a special case, ranked above Use Pro last because an unspent credit on
+//     a Pro account is lost just the same. Placing only new sessions there
+//     was not enough: a transient overload or a one-minute 429 moved running
+//     sessions off them for good while the red-outlined accounts sat idle.
+//   - Use Pro last: a session on a higher plan tier moves to an eligible
+//     lower-tier account, so Pro quota stays the last resort, but never off a
+//     red outline onto an account without one.
+//
+// Each move only goes towards a red outline or down a plan tier, so a
+// session cannot oscillate, and spending the credit stays the owner's
+// decision.
 //
 // boundSessionMayMoveLocked is the cheap pre-check that spares computing a
 // replacement for a session no exception can move.
@@ -4916,17 +4919,16 @@ func (a *app) boundSessionMovesToLocked(current, replacement account, now time.T
 	if replacement.ID == current.ID {
 		return false
 	}
-	if a.preserveProQuota && a.proTierLocked(replacement) < a.proTierLocked(current) {
-		return true
-	}
-	if a.preserveProQuota && a.proTierLocked(replacement) > a.proTierLocked(current) {
-		return false
-	}
-	if a.expiringResetCreditLocked(replacement, now) && !a.expiringResetCreditLocked(current, now) {
+	replacementRed, currentRed := a.expiringResetCreditLocked(replacement, now), a.expiringResetCreditLocked(current, now)
+	if replacementRed && !currentRed {
 		a.logger.Printf("bound session moves from %s to red-outlined %s", current.ID, replacement.ID)
 		return true
 	}
-	return false
+	if currentRed && !replacementRed {
+		// Use Pro last never pulls a session off a red outline.
+		return false
+	}
+	return a.preserveProQuota && a.proTierLocked(replacement) < a.proTierLocked(current)
 }
 
 // selectAccountWithPreference serves routes without strict lineage affinity:
@@ -5114,6 +5116,28 @@ func (a *app) pickBalancedAccountLocked(stickyKey string, eligible []account) (a
 	}
 
 	now := time.Now().UTC()
+	// Accounts holding a reset credit that expires within seven days (the
+	// dashboard's red outline) form the first tier: while one can take the
+	// session, the session goes to one of them, even a busy one over an idle
+	// ordinary account, and even a Pro account over an ordinary one. The
+	// owner asked for these to be spent first because the credit is lost at
+	// expiry; as a weight alone they still lost about one new session in six
+	// to ordinary accounts, which strict binding then kept there. It sits
+	// above Use Pro last because an unspent credit on a Pro account is lost
+	// just the same; Use Pro last still orders the red-outlined accounts among
+	// themselves. A bound session on an account without a red outline also
+	// moves here (boundSessionMovesToLocked), because a transient failure once
+	// moved running sessions off these accounts for good. Spending the credit
+	// stays the owner's decision.
+	expiring := make([]account, 0, len(eligible))
+	for _, item := range eligible {
+		if a.expiringResetCreditLocked(item, now) {
+			expiring = append(expiring, item)
+		}
+	}
+	if len(expiring) > 0 {
+		eligible = expiring
+	}
 	// Preserve the existing priority contract as capacity tiers, then balance
 	// sessions only across the best eligible tier. Newly-created accounts all use
 	// the same priority, so normal pools distribute evenly; operators who
@@ -5144,26 +5168,6 @@ func (a *app) pickBalancedAccountLocked(stickyKey string, eligible []account) (a
 		if item.Priority == highestPriority {
 			tier = append(tier, item)
 		}
-	}
-	// Accounts holding a reset credit that expires within seven days (the
-	// dashboard's red outline) form a tier of their own: while one can take
-	// the session, the session goes to one of them, even a busy one over an
-	// idle ordinary account. The owner asked for these to be spent first
-	// because the credit is lost at expiry; as a weight alone they still lost
-	// about one new session in six to ordinary accounts, which strict binding
-	// then kept there. It sits inside the Use Pro last tiers, so it never
-	// spends a Pro allowance early. A bound session on an account without a
-	// red outline also moves here (boundSessionMovesToLocked), because a
-	// transient failure once moved running sessions off these accounts for
-	// good. Spending the credit stays the owner's decision.
-	expiring := make([]account, 0, len(tier))
-	for _, item := range tier {
-		if a.expiringResetCreditLocked(item, now) {
-			expiring = append(expiring, item)
-		}
-	}
-	if len(expiring) > 0 {
-		tier = expiring
 	}
 
 	// Session placement. Separate sessions spread their consumption so no
@@ -5328,14 +5332,16 @@ func (a *app) hasPreferredAccount(model string, excluded map[string]bool) bool {
 }
 
 func (a *app) preferredBeforeLocked(left, right account) bool {
+	// Red outline first, then Use Pro last: the same order as balanced
+	// placement (pickBalancedAccountLocked).
+	now := time.Now()
+	if leftRed, rightRed := a.expiringResetCreditLocked(left, now), a.expiringResetCreditLocked(right, now); leftRed != rightRed {
+		return leftRed
+	}
 	if a.preserveProQuota {
 		if leftTier, rightTier := a.proTierLocked(left), a.proTierLocked(right); leftTier != rightTier {
 			return leftTier < rightTier
 		}
-	}
-	now := time.Now()
-	if leftRed, rightRed := a.expiringResetCreditLocked(left, now), a.expiringResetCreditLocked(right, now); leftRed != rightRed {
-		return leftRed
 	}
 	if left.Priority == right.Priority {
 		return left.ID < right.ID
