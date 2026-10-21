@@ -30,7 +30,11 @@ pub fn placement_score(sticky_key: &str, upstream_identity: &str, weight: f64) -
 // Go's math.Log on amd64 uses this FreeBSD/SunPro FDLIBM polynomial (the
 // Go source is src/math/log_amd64.s). Rust's intrinsic ln can differ by one
 // ulp, which changes rendezvous ordering, so keep the measured operation order
-// here for bit-for-bit placement compatibility.
+// here for bit-for-bit placement compatibility; the 1,024 placement vectors
+// compare the score's bits. Only the placement draw calls it, with x in
+// (0, 1), so zero, negatives, infinities and NaN are not handled. The vectors
+// come from the amd64 build the pool runs on; Go elsewhere uses math/log.go,
+// whose operation order is not checked here.
 fn go_natural_log(x: f64) -> f64 {
     const SQRT2_OVER_2: f64 = f64::from_bits(0x3fe6_a09e_667f_3bcd);
     const LN2_HI: f64 = f64::from_bits(0x3fe6_2e42_fee0_0000);
@@ -117,7 +121,6 @@ pub fn prompt_cache_bucket_index(sticky_key: &str, buckets: i32) -> i32 {
 /// consulted here; step 4 passes only the sanitized account metadata across
 /// the Rust boundary, and the Go vectors cover the no-auth-file fallback.
 pub fn upstream_identity_key(
-    slot_id: &str,
     auth_type: &str,
     account_id: &str,
     email: &str,
@@ -141,35 +144,42 @@ pub fn upstream_identity_key(
     if !email.is_empty() || !organization_name.is_empty() {
         return format!("codex-profile:{email}|{organization_name}");
     }
-    let _ = slot_id;
     String::new()
 }
 
+// Go's normalizeEmail: strings.ToLower maps rune by rune with Unicode's
+// simple case mapping. str::to_lowercase applies the full mapping instead,
+// which turns a dotted capital I into two characters and a word-final sigma
+// into ς; either would give the same member a second identity, so lower-case
+// per character and take the simple mapping's single result.
 fn normalize_email(value: &str) -> String {
-    value.trim().to_lowercase()
+    value.trim().chars().map(simple_lowercase).collect()
 }
 
-fn clean_organization_name(value: &str) -> String {
-    let mut result = String::new();
-    let mut pending_space = false;
-    for character in value.trim().chars() {
-        if character.is_control() {
-            continue;
-        }
-        if character.is_whitespace() {
-            pending_space = !result.is_empty();
-            continue;
-        }
-        if pending_space {
-            result.push(' ');
-            pending_space = false;
-        }
-        result.push(character);
-        if result.chars().count() == 120 {
-            break;
-        }
+fn simple_lowercase(character: char) -> char {
+    // U+0130 is the one character whose full lower-case mapping is longer than
+    // one character; its simple mapping is a plain i.
+    if character == '\u{130}' {
+        return 'i';
     }
-    result
+    let mut lower = character.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(single), None) => single,
+        _ => character,
+    }
+}
+
+// Go's cleanOrganizationName, step for step: drop control characters, split
+// on Unicode whitespace, join with one space, then cut at 120 characters.
+// The cut comes after the join, so a name can end in the joining space; a
+// version that stops while building the name gets that edge wrong.
+fn clean_organization_name(value: &str) -> String {
+    let without_controls: String = value.trim().chars().filter(|c| !c.is_control()).collect();
+    let joined = without_controls
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined.chars().take(120).collect()
 }
 
 /// Apply the slot fallback used by `stickyBalanceScore` when no upstream
@@ -216,8 +226,6 @@ mod tests {
         #[serde(default)]
         identity: String,
         #[serde(default)]
-        weight: f64,
-        #[serde(default)]
         weight_bits: u64,
         #[serde(default)]
         buckets: i32,
@@ -242,8 +250,10 @@ mod tests {
     }
 
     fn vectors() -> Vec<HashVector> {
-        serde_json::from_str(include_str!("testdata/hash-vectors.json"))
-            .expect("Go hash vectors must be valid JSON")
+        serde_json::from_str(include_str!(
+            "../../../cmd/codex-pool/testdata/hash-vectors.json"
+        ))
+        .expect("Go hash vectors must be valid JSON")
     }
 
     #[test]
@@ -273,23 +283,33 @@ mod tests {
                     )),
                     vector.digest_hex,
                 ),
-                "placement_score" => assert_eq!(
-                    placement_score(
-                        &vector.sticky_key,
-                        &sticky_identity_or_slot(&vector.identity, &vector.slot_id),
-                        f64::from_bits(vector.weight_bits),
-                    )
-                    .to_bits(),
-                    vector.score_bits,
-                    "placement vector {} identity={} weight={} weight_bits={:016x}",
-                    vector.slot_id,
-                    vector.identity,
-                    vector.weight,
-                    vector.weight_bits,
-                ),
+                "placement_score" => {
+                    // The identity is derived here from the account fields,
+                    // not taken from the vector, so the derivation is checked
+                    // on every placement input too.
+                    let identity = upstream_identity_key(
+                        &vector.auth_type,
+                        &vector.account_id,
+                        &vector.email,
+                        &vector.organization_name,
+                    );
+                    assert_eq!(identity, vector.identity, "identity of {}", vector.slot_id);
+                    assert_eq!(
+                        placement_score(
+                            &vector.sticky_key,
+                            &sticky_identity_or_slot(&identity, &vector.slot_id),
+                            f64::from_bits(vector.weight_bits),
+                        )
+                        .to_bits(),
+                        vector.score_bits,
+                        "placement vector {} identity={} weight_bits={:016x}",
+                        vector.slot_id,
+                        identity,
+                        vector.weight_bits,
+                    );
+                }
                 "upstream_identity" => assert_eq!(
                     upstream_identity_key(
-                        &vector.slot_id,
                         &vector.auth_type,
                         &vector.account_id,
                         &vector.email,

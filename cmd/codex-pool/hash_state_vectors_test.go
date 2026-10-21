@@ -1,114 +1,84 @@
 package main
 
-// This file is the compatibility contract for the step-4 Rust port.  The
-// vectors are deliberately generated from the production helpers below rather
-// than copied from a second implementation: changing a hash or JSON tag must
-// make this test fail until the Rust implementation is updated with the same
-// measured output.
+// This file is the compatibility contract for the step-4 Rust port
+// (RUST_PORT.md step 4, upstream/src/pool). The vectors are generated from the
+// production helpers rather than copied from a second implementation, and the
+// tests regenerate them and compare with the committed files: changing a hash,
+// a JSON tag or a state field makes these tests fail until the files are
+// regenerated (CODEX_POOL_GENERATE_VECTORS=1), and the regenerated files then
+// fail the Rust tests until the Rust side matches. Fixtures hold fake data
+// only; nothing here may come from a real account or /data.
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
 	"os"
-	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
 
+const (
+	hashVectorsPath  = "testdata/hash-vectors.json"
+	stateVectorsPath = "testdata/state-vectors.json"
+)
+
 type hashVector struct {
-	Kind             string  `json:"kind"`
-	Input            string  `json:"input,omitempty"`
-	KindInput        string  `json:"kindInput,omitempty"`
-	Value            string  `json:"value,omitempty"`
-	Model            string  `json:"model,omitempty"`
-	Source           string  `json:"source,omitempty"`
-	StickyKey        string  `json:"stickyKey,omitempty"`
-	Identity         string  `json:"identity,omitempty"`
-	Weight           float64 `json:"weight,omitempty"`
-	WeightBits       uint64  `json:"weightBits,omitempty"`
-	Buckets          int     `json:"buckets,omitempty"`
-	DigestHex        string  `json:"digestHex,omitempty"`
-	Output           string  `json:"output,omitempty"`
-	Bucket           int     `json:"bucket,omitempty"`
-	Score            float64 `json:"score,omitempty"`
-	ScoreBits        uint64  `json:"scoreBits,omitempty"`
-	SlotID           string  `json:"slotId,omitempty"`
-	AccountID        string  `json:"accountId,omitempty"`
-	Email            string  `json:"email,omitempty"`
-	OrganizationName string  `json:"organizationName,omitempty"`
-	AuthType         string  `json:"authType,omitempty"`
-	PlanFamily       string  `json:"planFamily,omitempty"`
-	PlanLimit        string  `json:"planLimit,omitempty"`
-	SeatType         string  `json:"seatType,omitempty"`
-	Remaining        int     `json:"remaining,omitempty"`
-	Active           int     `json:"active,omitempty"`
+	Kind             string `json:"kind"`
+	Input            string `json:"input,omitempty"`
+	KindInput        string `json:"kindInput,omitempty"`
+	Value            string `json:"value,omitempty"`
+	Model            string `json:"model,omitempty"`
+	Source           string `json:"source,omitempty"`
+	StickyKey        string `json:"stickyKey,omitempty"`
+	Identity         string `json:"identity,omitempty"`
+	WeightBits       uint64 `json:"weightBits,omitempty"`
+	Buckets          int    `json:"buckets,omitempty"`
+	DigestHex        string `json:"digestHex,omitempty"`
+	Output           string `json:"output,omitempty"`
+	Bucket           int    `json:"bucket,omitempty"`
+	ScoreBits        uint64 `json:"scoreBits,omitempty"`
+	SlotID           string `json:"slotId,omitempty"`
+	AccountID        string `json:"accountId,omitempty"`
+	Email            string `json:"email,omitempty"`
+	OrganizationName string `json:"organizationName,omitempty"`
+	AuthType         string `json:"authType,omitempty"`
+	PlanFamily       string `json:"planFamily,omitempty"`
+	PlanLimit        string `json:"planLimit,omitempty"`
+	SeatType         string `json:"seatType,omitempty"`
+	Remaining        int    `json:"remaining,omitempty"`
+	Active           int    `json:"active,omitempty"`
 }
 
-func TestCompatibilityVectors(t *testing.T) {
-	path := filepath.Join("testdata", "hash-vectors.json")
+// checkGeneratedFile compares a regenerated document with the committed one,
+// or rewrites it when CODEX_POOL_GENERATE_VECTORS=1.
+func checkGeneratedFile(t *testing.T, path string, generated []byte) {
+	t.Helper()
 	if os.Getenv("CODEX_POOL_GENERATE_VECTORS") == "1" {
-		if err := writeHashVectors(path); err != nil {
+		if err := os.WriteFile(path, generated, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeHashVectors(filepath.Join("..", "..", "upstream", "src", "pool", "testdata", "hash-vectors.json")); err != nil {
-			t.Fatal(err)
-		}
+		return
 	}
-	data, err := os.ReadFile(path)
+	committed, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read %s (set CODEX_POOL_GENERATE_VECTORS=1 once to create it): %v", path, err)
+		t.Fatalf("read %s (set CODEX_POOL_GENERATE_VECTORS=1 to create it): %v", path, err)
 	}
-	var vectors []hashVector
-	if err := json.Unmarshal(data, &vectors); err != nil {
-		t.Fatal(err)
+	if !bytes.Equal(committed, generated) {
+		t.Fatalf("%s no longer matches the Go code; regenerate it with CODEX_POOL_GENERATE_VECTORS=1, then make the Rust side (upstream/src/pool) pass", path)
 	}
-	for _, vector := range vectors {
-		switch vector.Kind {
-		case "short_hash":
-			if got := shortHash([]byte(vector.Input)); got != vector.Output {
-				t.Errorf("short hash %q: got %q want %q", vector.Input, got, vector.Output)
-			}
-		case "operational_identifier_hash":
-			if got := operationalIdentifierHash(vector.KindInput, vector.Value); got != vector.Output {
-				t.Errorf("operational hash %q/%q: got %q want %q", vector.KindInput, vector.Value, got, vector.Output)
-			}
-		case "prompt_cache_key_hash":
-			if got := promptCacheKeyHash(vector.Model, vector.Source, vector.Value); got != vector.Output {
-				t.Errorf("prompt cache hash: got %q want %q", got, vector.Output)
-			}
-		case "api_key_fingerprint":
-			if got := apiKeyFingerprint(vector.Input); got != vector.Output {
-				t.Errorf("api key fingerprint %q: got %q want %q", vector.Input, got, vector.Output)
-			}
-		case "prompt_cache_bucket":
-			if got := promptCacheBucketIndex(vector.Input, vector.Buckets); got != vector.Bucket {
-				t.Errorf("prompt cache bucket %q/%d: got %d want %d", vector.Input, vector.Buckets, got, vector.Bucket)
-			}
-		case "sticky_balance_score":
-			a, item := vectorAppAndAccount(vector)
-			sum := a.stickyBalanceScore(vector.StickyKey, item)
-			if got := hex.EncodeToString(sum[:]); got != vector.DigestHex {
-				t.Errorf("sticky digest: got %q want %q", got, vector.DigestHex)
-			}
-		case "placement_score":
-			a, item := vectorAppAndAccount(vector)
-			got := a.placementScoreLocked(vector.StickyKey, item, map[string]int{item.ID: vector.Active})
-			if math.Float64bits(got) != vector.ScoreBits {
-				t.Errorf("placement score bits: got %x want %x", math.Float64bits(got), vector.ScoreBits)
-			}
-		case "upstream_identity":
-			a := &app{}
-			item := vectorAccount(vector)
-			if got := a.upstreamIdentityKeyLocked(item); got != vector.Output {
-				t.Errorf("upstream identity: got %q want %q", got, vector.Output)
-			}
-		default:
-			t.Errorf("unknown vector kind %q", vector.Kind)
-		}
-	}
+}
+
+func TestHashVectorsMatchTheGoCode(t *testing.T) {
+	checkGeneratedFile(t, hashVectorsPath, generateHashVectors())
+}
+
+func TestStateVectorsMatchTheGoTypes(t *testing.T) {
+	checkGeneratedFile(t, stateVectorsPath, generateStateVectors(t))
 }
 
 func vectorAccount(vector hashVector) account {
@@ -127,34 +97,56 @@ func vectorAppAndAccount(vector hashVector) (*app, account) {
 	return a, item
 }
 
-func writeHashVectors(path string) error {
+// Strings Go and Rust might trim differently: Unicode spaces (NEL, NBSP,
+// ideographic space), control characters, and a zero-width space that is not
+// a space to either.
+var unicodeEdgeInputs = []string{
+	"\u0085value ",
+	"　value　",
+	"\tvalue\n",
+	"value​",
+}
+
+func generateHashVectors() []byte {
 	values := []hashVector{
-		{Kind: "short_hash", Input: "", Output: shortHash(nil)},
-		{Kind: "short_hash", Input: "hello", Output: shortHash([]byte("hello"))},
-		{Kind: "short_hash", Input: "  leading and trailing  ", Output: shortHash([]byte("  leading and trailing  "))},
-		{Kind: "short_hash", Input: "繁體中文/🦀", Output: shortHash([]byte("繁體中文/🦀"))},
-		{Kind: "operational_identifier_hash", KindInput: "thread", Value: " thread-42 ", Output: operationalIdentifierHash("thread", " thread-42 ")},
-		{Kind: "operational_identifier_hash", KindInput: "response", Value: "response-abc", Output: operationalIdentifierHash("response", "response-abc")},
-		{Kind: "operational_identifier_hash", KindInput: "lineage", Value: "   ", Output: operationalIdentifierHash("lineage", "   ")},
-		{Kind: "prompt_cache_key_hash", Model: "gpt-test", Source: "project", Value: "repo-main#3", Output: promptCacheKeyHash("gpt-test", "project", "repo-main#3")},
-		{Kind: "prompt_cache_key_hash", Model: "", Source: "fallback", Value: "value", Output: promptCacheKeyHash("", "fallback", "value")},
-		{Kind: "api_key_fingerprint", Input: "", Output: apiKeyFingerprint("")},
-		{Kind: "api_key_fingerprint", Input: "  ", Output: apiKeyFingerprint("  ")},
-		{Kind: "api_key_fingerprint", Input: "client-key-42", Output: apiKeyFingerprint("client-key-42")},
-		{Kind: "prompt_cache_bucket", Input: "gpt-test:thread:one", Buckets: 16, Bucket: promptCacheBucketIndex("gpt-test:thread:one", 16)},
-		{Kind: "prompt_cache_bucket", Input: "anything", Buckets: 1, Bucket: promptCacheBucketIndex("anything", 1)},
+		{Kind: "short_hash", Input: ""},
+		{Kind: "short_hash", Input: "hello"},
+		{Kind: "short_hash", Input: "  leading and trailing  "},
+		{Kind: "short_hash", Input: "繁體中文/🦀"},
+		{Kind: "operational_identifier_hash", KindInput: "thread", Value: " thread-42 "},
+		{Kind: "operational_identifier_hash", KindInput: "response", Value: "response-abc"},
+		{Kind: "operational_identifier_hash", KindInput: "lineage", Value: "   "},
+		{Kind: "prompt_cache_key_hash", Model: "gpt-test", Source: "project", Value: "repo-main#3"},
+		{Kind: "prompt_cache_key_hash", Model: "", Source: "fallback", Value: "value"},
+		{Kind: "api_key_fingerprint", Input: ""},
+		{Kind: "api_key_fingerprint", Input: "  "},
+		{Kind: "api_key_fingerprint", Input: "\u0085　"},
+		{Kind: "api_key_fingerprint", Input: "client-key-42"},
+		{Kind: "prompt_cache_bucket", Input: "gpt-test:thread:one", Buckets: 16},
+		{Kind: "prompt_cache_bucket", Input: "anything", Buckets: 1},
+	}
+	for _, input := range unicodeEdgeInputs {
+		values = append(values, hashVector{Kind: "operational_identifier_hash", KindInput: "thread", Value: input})
 	}
 	identityCases := []hashVector{
-		{Kind: "upstream_identity", SlotID: "identity-a", AuthType: "codex_device_auth", AccountID: "workspace-a", Email: " Member@Example.TEST ", Output: "codex-account:workspace-a|member:member@example.test"},
-		{Kind: "upstream_identity", SlotID: "identity-b", AuthType: "codex_device_auth", Email: "Member@Example.TEST", OrganizationName: " Example   Org ", Output: "codex-profile:member@example.test|Example Org"},
-		{Kind: "upstream_identity", SlotID: "identity-c", AuthType: "codex_device_auth", OrganizationName: "Org", Output: "codex-profile:|Org"},
-		{Kind: "upstream_identity", SlotID: "identity-d", AuthType: "codex_device_auth", Output: ""},
-		{Kind: "upstream_identity", SlotID: "identity-e", AuthType: "api_key", AccountID: "workspace-a", Email: "member@example.test", Output: ""},
+		{SlotID: "identity-a", AuthType: "codex_device_auth", AccountID: "workspace-a", Email: " Member@Example.TEST "},
+		{SlotID: "identity-b", AuthType: "codex_device_auth", Email: "Member@Example.TEST", OrganizationName: " Example   Org "},
+		{SlotID: "identity-c", AuthType: "codex_device_auth", OrganizationName: "Org"},
+		{SlotID: "identity-d", AuthType: "codex_device_auth"},
+		{SlotID: "identity-e", AuthType: "api_key", AccountID: "workspace-a", Email: "member@example.test"},
+		// The dotted capital I lower-cases to two characters under the full
+		// Unicode mapping and to one under Go's per-rune mapping; a final
+		// sigma changes only under a context-aware mapping.
+		{SlotID: "identity-f", AuthType: "codex_device_auth", AccountID: "　workspace-f\u0085", Email: " İSTANBUL@Example.TEST"},
+		{SlotID: "identity-g", AuthType: "codex_device_auth", Email: "ΟΔΟΣ@example.test", OrganizationName: "Org\twith\ncontrols\u0085and　spaces"},
+		// 119 letters, a space, then more: Go joins the words and then cuts at
+		// 120 runes, so the name ends in that space.
+		{SlotID: "identity-h", AuthType: "codex_device_auth", OrganizationName: strings.Repeat("a", 119) + " bcd"},
+		{SlotID: "identity-i", AuthType: "codex_device_auth", OrganizationName: strings.Repeat("組", 130)},
+		{SlotID: "identity-j", AuthType: "codex_device_auth", OrganizationName: "\x00\x7f\u0085​"},
 	}
 	for _, vector := range identityCases {
-		item := vectorAccount(vector)
-		a := &app{}
-		vector.Output = a.upstreamIdentityKeyLocked(item)
+		vector.Kind = "upstream_identity"
 		values = append(values, vector)
 	}
 	for i := 0; i < 1024; i++ {
@@ -177,172 +169,191 @@ func writeHashVectors(path string) error {
 		case 3:
 			vector.PlanFamily, vector.SeatType = "business", "premium"
 		}
-		a, item := vectorAppAndAccount(vector)
+		values = append(values, vector)
+	}
+	for i := range values {
+		fillHashVectorOutput(&values[i])
+	}
+	// One vector per line keeps the file reviewable and its diffs small.
+	var out bytes.Buffer
+	out.WriteString("[\n")
+	for i, vector := range values {
+		line, err := json.Marshal(vector)
+		if err != nil {
+			panic(err)
+		}
+		out.Write(line)
+		if i < len(values)-1 {
+			out.WriteByte(',')
+		}
+		out.WriteByte('\n')
+	}
+	out.WriteString("]\n")
+	return out.Bytes()
+}
+
+// fillHashVectorOutput computes a vector's expected output with the production
+// function it names.
+func fillHashVectorOutput(vector *hashVector) {
+	switch vector.Kind {
+	case "short_hash":
+		vector.Output = shortHash([]byte(vector.Input))
+	case "operational_identifier_hash":
+		vector.Output = operationalIdentifierHash(vector.KindInput, vector.Value)
+	case "prompt_cache_key_hash":
+		vector.Output = promptCacheKeyHash(vector.Model, vector.Source, vector.Value)
+	case "api_key_fingerprint":
+		vector.Output = apiKeyFingerprint(vector.Input)
+	case "prompt_cache_bucket":
+		vector.Bucket = promptCacheBucketIndex(vector.Input, vector.Buckets)
+	case "upstream_identity":
+		a := &app{}
+		vector.Output = a.upstreamIdentityKeyLocked(vectorAccount(*vector))
+	case "placement_score":
+		a, item := vectorAppAndAccount(*vector)
+		active := map[string]int{item.ID: vector.Active}
 		vector.Identity = a.upstreamIdentityKeyLocked(item)
 		sum := a.stickyBalanceScore(vector.StickyKey, item)
 		vector.DigestHex = hex.EncodeToString(sum[:])
-		vector.Score = a.placementScoreLocked(vector.StickyKey, item, map[string]int{item.ID: vector.Active})
-		vector.Weight = a.placementWeightLocked(item, map[string]int{item.ID: vector.Active})
-		vector.WeightBits = math.Float64bits(vector.Weight)
-		vector.ScoreBits = math.Float64bits(vector.Score)
-		values = append(values, vector)
-	}
-	data, err := json.MarshalIndent(values, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, append(data, '\n'), 0o644)
-}
-
-func TestStateVectorsAreGeneratedFromGoTypes(t *testing.T) {
-	configPath := filepath.Join("testdata", "state-vectors-config.json")
-	runtimePath := filepath.Join("testdata", "state-vectors-runtime.json")
-	if os.Getenv("CODEX_POOL_GENERATE_VECTORS") == "1" {
-		if err := writeStateVectors(configPath, runtimePath); err != nil {
-			t.Fatal(err)
-		}
-		if err := writeStateVectors(
-			filepath.Join("..", "..", "upstream", "src", "pool", "testdata", "state-vectors-config.json"),
-			filepath.Join("..", "..", "upstream", "src", "pool", "testdata", "state-vectors-runtime.json"),
-		); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, path := range []string{configPath, runtimePath} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("state vector %s missing (set CODEX_POOL_GENERATE_VECTORS=1 once): %v", path, err)
-		}
+		vector.WeightBits = math.Float64bits(a.placementWeightLocked(item, active))
+		vector.ScoreBits = math.Float64bits(a.placementScoreLocked(vector.StickyKey, item, active))
+	default:
+		panic("unknown hash vector kind " + vector.Kind)
 	}
 }
 
-func writeStateVectors(configPath, runtimePath string) error {
-	created := time.Date(2026, 10, 21, 1, 2, 3, 123456789, time.FixedZone("+08", 8*60*60))
-	updated := created.Add(2*time.Second + 7*time.Nanosecond)
-	acct := account{
-		ID: "slot-a", Label: "test account", OwnerNote: "fake fixture", Email: "member@example.test", AccountID: "workspace-a",
-		OrganizationName: "Example Org", PlanType: "Plus", PlanLimit: "100", PlanRank: 2, RawPlanType: "plus", PlanFamily: "plus", SeatType: "individual", SeatTypeRaw: "individual",
-		SeatTypeInferred: true, QuotaPolicy: []string{"weekly"}, AuthType: "device", CodexHome: "/fake/codex", Enabled: true, InPool: true, Priority: 3,
-		RemainingQuota: ptrInt(72), QuotaProtectionEnabled: true, QuotaProtectionThreshold: 5, AllowedModels: []string{"gpt-test"}, ExcludedModels: []string{"gpt-old"},
-		UpstreamBaseURL: "https://example.test", UpstreamAPIKey: "fake-key", WireAPI: "responses", PendingPoolActivation: false, PendingAuthVerification: true,
-		PendingAuthExpectedAccountID: "workspace-a", CreatedAt: created, UpdatedAt: updated, LastLoginAt: updated,
-	}
-	config := config{DefaultModel: "gpt-test", ModelAliases: map[string]string{"alias": "gpt-test"}, Accounts: []account{acct}, PreserveProQuota: ptrBool(true), LineageAffinity: ptrBool(false), CreatedAt: created, UpdatedAt: updated}
-	configRaw, err := json.Marshal(config)
-	if err != nil {
-		return err
-	}
-	var configObject map[string]any
-	if err := json.Unmarshal(configRaw, &configObject); err != nil {
-		return err
-	}
-	configObject["futureConfigField"] = map[string]any{"kept": true}
-	configObject["futureNull"] = nil
-	if err := writePrettyJSON(configPath, configObject); err != nil {
-		return err
-	}
-
-	state := state{
-		StickySessions:     map[string]stickySession{"gpt-test:thread:one": {Key: "gpt-test:thread:one", ModelID: "gpt-test", AccountID: "slot-a", CreatedAt: created, LastSuccessAt: updated, ExpiresAt: updated.Add(time.Hour), FailoverFrom: "slot-old"}},
-		ResponseBindings:   map[string]responseBinding{"resp-1": {ResponseID: "resp-1", StickyKey: "gpt-test:thread:one", ModelID: "gpt-test", AccountID: "slot-a", CreatedAt: created, ExpiresAt: updated.Add(time.Hour)}},
-		ThreadBindings:     map[string]threadBinding{"thread-1": {ThreadID: "thread-1", SessionID: "session-1", ParentThreadID: "parent-1", LineageRootID: "lineage-1", SubagentKind: "main", ModelID: "gpt-test", AccountID: "slot-a", StickyKey: "gpt-test:thread:one", PromptCacheKey: "cp_test", CreatedAt: created, LastSuccessAt: updated, ExpiresAt: updated.Add(time.Hour)}},
-		LineageBindings:    map[string]lineageBinding{"lineage-1": {LineageRootID: "lineage-1", AccountID: "slot-a", FailoverFrom: "slot-old", CreatedAt: created, MovedAt: updated, LastSuccessAt: updated, ExpiresAt: updated.Add(time.Hour)}},
-		Cooldowns:          map[string][]cooldown{"slot-a": {{ModelID: "gpt-test", NextRetryAt: updated, Reason: "upstream_5xx"}}},
-		Health:             map[string]accountHealth{"slot-a": {ConsecutiveFailure: 2, LastFailureReason: "upstream_5xx", LastFailureAt: updated}},
-		PromptCacheResetAt: updated, QuotaWindowPrimes: map[string]time.Time{"slot-a": updated}, RequestCount: 4, SuccessCount: 3, FailureCount: 1, UpstreamResponseFailedCount: 1, StreamIncompleteCount: 0, UpdatedAt: updated,
-	}
-	runtimeRaw, err := json.Marshal(state)
-	if err != nil {
-		return err
-	}
-	var runtimeObject map[string]any
-	if err := json.Unmarshal(runtimeRaw, &runtimeObject); err != nil {
-		return err
-	}
-	runtimeObject["futureRuntimeField"] = "preserve-me"
-	if sticky, ok := runtimeObject["stickySessions"].(map[string]any); ok {
-		if one, ok := sticky["gpt-test:thread:one"].(map[string]any); ok {
-			one["futureStickyField"] = []any{"kept", 7}
+// generateStateVectors writes config.json and runtime.json documents the way
+// the pool saves them, in two variants. "full" sets every field of every
+// nested type, found by reflection, so a field the Rust types lack shows up
+// as an unknown key there; "zero" leaves every value at its zero value, so
+// Go's omission rules (omitempty, nil versus empty) are on record. The full
+// documents also carry future fields at several depths, which Rust must keep.
+func generateStateVectors(t *testing.T) []byte {
+	t.Helper()
+	documents := map[string]map[string]any{"config": {}, "runtime": {}}
+	for _, full := range []bool{true, false} {
+		variant := "zero"
+		if full {
+			variant = "full"
 		}
-	}
-	return writePrettyJSON(runtimePath, runtimeObject)
-}
-
-func ptrBool(value bool) *bool { return &value }
-func ptrInt(value int) *int    { return &value }
-
-func writePrettyJSON(path string, value any) error {
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, append(data, '\n'), 0o644)
-}
-
-func TestRustStateShapeCanBeReadByGo(t *testing.T) {
-	// Rust's round-trip test compares its serde output with these Go-generated
-	// documents. Decode the same canonical documents here as the final
-	// compatibility gate: Go must still accept every known field Rust emits.
-	// Go intentionally drops unknown fields on re-marshal; preservation of those
-	// fields is Rust's responsibility and is asserted by the Rust fixture test.
-	for _, path := range []string{
-		filepath.Join("..", "..", "upstream", "src", "pool", "testdata", "state-vectors-config.json"),
-		filepath.Join("..", "..", "upstream", "src", "pool", "testdata", "state-vectors-runtime.json"),
-	} {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("read canonical Rust fixture %s: %v", path, err)
-		}
-		if path == filepath.Join("..", "..", "upstream", "src", "pool", "testdata", "state-vectors-config.json") {
-			var value config
-			if err := json.Unmarshal(data, &value); err != nil {
-				t.Fatalf("Go config decoder rejected Rust shape: %v", err)
+		filler := &stateFiller{full: full}
+		var cfg config
+		filler.fill(reflect.ValueOf(&cfg).Elem())
+		var runtime state
+		filler.fill(reflect.ValueOf(&runtime).Elem())
+		configDoc, runtimeDoc := genericJSON(t, cfg), genericJSON(t, runtime)
+		if full {
+			configDoc["futureConfigField"] = map[string]any{"kept": true}
+			configDoc["futureNull"] = nil
+			configDoc["accounts"].([]any)[0].(map[string]any)["futureAccountField"] = 7.5
+			runtimeDoc["futureRuntimeField"] = "preserve-me"
+			for _, sticky := range runtimeDoc["stickySessions"].(map[string]any) {
+				sticky.(map[string]any)["futureStickyField"] = []any{"kept", 7.0}
 			}
-			if value.DefaultModel != "gpt-test" || len(value.Accounts) != 1 {
-				t.Fatalf("Go config decoder lost known fields: %+v", value)
-			}
-		} else {
-			var value state
-			if err := json.Unmarshal(data, &value); err != nil {
-				t.Fatalf("Go runtime decoder rejected Rust shape: %v", err)
-			}
-			if value.RequestCount != 4 || value.SuccessCount != 3 || len(value.StickySessions) != 1 {
-				t.Fatalf("Go runtime decoder lost known fields: %+v", value)
+			for _, snapshot := range runtimeDoc["quotas"].(map[string]any) {
+				quota := snapshot.(map[string]any)["quota"].(map[string]any)
+				quota["primary"].(map[string]any)["futureWindowField"] = map[string]any{"nested": []any{}}
 			}
 		}
+		documents["config"][variant] = configDoc
+		documents["runtime"][variant] = runtimeDoc
 	}
-}
-
-func TestRustRoundTripArtifactsReadBackIdentically(t *testing.T) {
-	fixtureDir := filepath.Join("..", "..", "upstream", "src", "pool", "testdata")
-	for _, name := range []string{"config", "runtime"} {
-		original, err := readJSONMap(filepath.Join(fixtureDir, "state-vectors-"+name+".json"))
-		if err != nil {
-			t.Fatalf("read Go %s fixture: %v", name, err)
-		}
-		artifact, err := readJSONMap(filepath.Join(fixtureDir, "rust-roundtrip-"+name+".json"))
-		if err != nil {
-			t.Fatalf("read Rust %s round-trip artifact (run the Rust artifact test first): %v", name, err)
-		}
-		if !reflect.DeepEqual(original, artifact) {
-			t.Fatalf("Rust %s round-trip changed known fields or unknown future fields:\noriginal=%v\nartifact=%v", name, original, artifact)
-		}
-		if name == "config" && !reflect.DeepEqual(artifact["futureConfigField"], map[string]any{"kept": true}) {
-			t.Fatalf("Rust config artifact dropped futureConfigField: %v", artifact["futureConfigField"])
-		}
-		if name == "runtime" && artifact["futureRuntimeField"] != "preserve-me" {
-			t.Fatalf("Rust runtime artifact dropped futureRuntimeField: %v", artifact["futureRuntimeField"])
-		}
-	}
-}
-
-func readJSONMap(path string) (map[string]any, error) {
-	data, err := os.ReadFile(path)
+	data, err := json.MarshalIndent(documents, "", "  ")
 	if err != nil {
-		return nil, err
+		t.Fatal(err)
 	}
-	var value map[string]any
-	if err := json.Unmarshal(data, &value); err != nil {
-		return nil, err
+	return append(data, '\n')
+}
+
+func genericJSON(t *testing.T, value any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return value, nil
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	return doc
+}
+
+// stateFiller sets fields by reflection, so a field added to a persisted type
+// lands in the fixtures without anyone remembering to add it. Values are
+// distinct, integers exceed 32 bits (a Go int is 64 bits, and so must the
+// Rust field be), floats have a fraction, and times carry nanoseconds and a
+// non-UTC offset, so each would show a narrowing or rounding on the Rust side.
+type stateFiller struct {
+	full bool
+	n    int
+}
+
+var stateFillerBase = time.Date(2026, 10, 21, 1, 2, 3, 123456789, time.FixedZone("", 8*60*60))
+
+func (f *stateFiller) next() int {
+	f.n++
+	return f.n
+}
+
+func (f *stateFiller) fill(v reflect.Value) {
+	if v.Type() == reflect.TypeOf(time.Time{}) {
+		if f.full {
+			n := f.next()
+			v.Set(reflect.ValueOf(stateFillerBase.Add(time.Duration(n) * (time.Second + time.Nanosecond))))
+		}
+		return
+	}
+	switch v.Kind() {
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			field := v.Type().Field(i)
+			if !field.IsExported() || field.Tag.Get("json") == "-" {
+				continue
+			}
+			f.fill(v.Field(i))
+		}
+	case reflect.Pointer:
+		// A zero document leaves a pointer to a scalar nil, the common case,
+		// but still walks a pointer to a struct so its fields' zero values
+		// and omission rules are recorded.
+		if !f.full && v.Type().Elem().Kind() != reflect.Struct {
+			return
+		}
+		v.Set(reflect.New(v.Type().Elem()))
+		f.fill(v.Elem())
+	case reflect.Slice:
+		element := reflect.New(v.Type().Elem()).Elem()
+		f.fill(element)
+		v.Set(reflect.Append(reflect.MakeSlice(v.Type(), 0, 1), element))
+	case reflect.Map:
+		if v.Type().Key().Kind() != reflect.String {
+			panic("state vectors: map key " + v.Type().Key().String())
+		}
+		element := reflect.New(v.Type().Elem()).Elem()
+		f.fill(element)
+		v.Set(reflect.MakeMap(v.Type()))
+		v.SetMapIndex(reflect.ValueOf(fmt.Sprintf("key-%d", f.next())).Convert(v.Type().Key()), element)
+	case reflect.String:
+		if f.full {
+			v.SetString(fmt.Sprintf("value-%d", f.next()))
+		}
+	case reflect.Bool:
+		v.SetBool(f.full)
+	case reflect.Int, reflect.Int64:
+		if f.full {
+			v.SetInt(int64(1)<<33 + int64(f.next()))
+		}
+	case reflect.Uint64:
+		if f.full {
+			v.SetUint(uint64(1)<<33 + uint64(f.next()))
+		}
+	case reflect.Float64:
+		if f.full {
+			v.SetFloat(float64(f.next()) + 0.25)
+		}
+	default:
+		// A new kind (an int32, an interface) needs a deliberate value here
+		// and a matching Rust type; failing is how it gets noticed.
+		panic("state vectors: unsupported kind " + v.Kind().String() + " in " + v.Type().String())
+	}
 }

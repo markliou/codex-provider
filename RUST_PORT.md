@@ -116,6 +116,12 @@
 - 這是最大的一步。開始前，`main_test.go`、`responses_ws_test.go`、`native_codex_test.go` 等對應的路由測試必須全部翻成 Rust 並通過。
 - 切換時要用 Go 版產生的狀態檔做相容測試：Rust 讀入後寫出，Go 仍能讀回，反之亦然。
 
+前置工作（已完成，`upstream/src/pool`）：
+- 雜湊與身分字串：`pool/hash.rs` 對照 Go 產生的 `cmd/codex-pool/testdata/hash-vectors.json`。測試資料由正式的 Go 函式算出，包含 1,024 組放置分數（逐位元比對）、Unicode 空白／控制字元／大小寫的邊界情況，以及帳號欄位組成身分字串的各種組合。放置分數的 `ln()` 照 Go amd64 的 `math.Log` 運算順序移植。放置權重（`placementWeightLocked`）還沒有移植，目前直接用 Go 算好的權重。
+- 狀態檔：`pool/state.rs` 對照 `cmd/codex-pool/testdata/state-vectors.json`。Go 用反射把 `config`、`state` 的每個欄位都填上值（full），另外一份全部是零值（zero）。Rust 讀入後寫出必須和原文件相同；不認得的欄位會保留，但測試裡只要出現 `future*` 以外的未知欄位就失敗，表示 Rust 少了那個欄位。
+- Go 型別或雜湊改了，Go 測試會要求重新產生（`CODEX_POOL_GENERATE_VECTORS=1`），重新產生後 Rust 測試再要求 Rust 跟上。
+- 還沒做：讀 `auth.json`；Go 讀回 Rust 寫出的檔案，目前靠「Rust 寫出的內容和 Go 的原文件相同」間接保證。
+
 ### 第 5 步：管理介面
 
 - 管理介面 API、公開儀表板 API、登入與 session 移到 Rust；`web/` 的前端資源不變。

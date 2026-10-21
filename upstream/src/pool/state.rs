@@ -15,11 +15,6 @@ fn is_false(value: &bool) -> bool {
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero_i32(value: &i32) -> bool {
-    *value == 0
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_i64(value: &i64) -> bool {
     *value == 0
 }
@@ -30,6 +25,35 @@ fn option_map_empty<K, V>(value: &Option<BTreeMap<K, V>>) -> bool {
 
 fn option_vec_empty<T>(value: &Option<Vec<T>>) -> bool {
     value.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// Fields this port does not know, kept so a newer pool's state survives a
+/// read and a write here. In tests every key it receives is also recorded:
+/// the Go fixtures set every known field, so a key landing here that is not
+/// one of the fixtures' deliberate `future*` keys is a field the Rust types
+/// are missing, which serde's flatten would otherwise carry along silently.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct Unknown(pub BTreeMap<String, Value>);
+
+impl std::ops::Deref for Unknown {
+    type Target = BTreeMap<String, Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Unknown {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = BTreeMap::<String, Value>::deserialize(deserializer)?;
+        #[cfg(test)]
+        tests::record_unknown(fields.keys());
+        Ok(Self(fields))
+    }
 }
 
 /// RFC 3339 timestamp as emitted by Go's `time.Time.MarshalJSON`.
@@ -93,7 +117,7 @@ pub struct Config {
     #[serde(default)]
     pub updated_at: Timestamp,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -117,8 +141,8 @@ pub struct Account {
     pub plan_type: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub plan_limit: String,
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
-    pub plan_rank: i32,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub plan_rank: i64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub raw_plan_type: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -140,13 +164,13 @@ pub struct Account {
     #[serde(default)]
     pub in_pool: bool,
     #[serde(default)]
-    pub priority: i32,
+    pub priority: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remaining_quota: Option<i32>,
+    pub remaining_quota: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub quota_protection_enabled: bool,
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
-    pub quota_protection_threshold: i32,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub quota_protection_threshold: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -171,7 +195,7 @@ pub struct Account {
     #[serde(default)]
     pub last_login_at: Timestamp,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -184,7 +208,7 @@ pub struct Cooldown {
     #[serde(default)]
     pub reason: String,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -197,9 +221,9 @@ pub struct AccountHealth {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_failure_reason: String,
     #[serde(default)]
-    pub consecutive_failure: i32,
+    pub consecutive_failure: i64,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -220,7 +244,7 @@ pub struct StickySession {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub failover_from: String,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -239,7 +263,7 @@ pub struct ResponseBinding {
     #[serde(default)]
     pub expires_at: Timestamp,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -270,7 +294,7 @@ pub struct ThreadBinding {
     #[serde(default)]
     pub expires_at: Timestamp,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -291,7 +315,7 @@ pub struct LineageBinding {
     #[serde(default)]
     pub expires_at: Timestamp,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -302,7 +326,7 @@ pub struct QuotaWindow {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
     #[serde(default)]
-    pub percentage: i32,
+    pub percentage: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,7 +340,7 @@ pub struct QuotaWindow {
     #[serde(default)]
     pub present: bool,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -329,7 +353,7 @@ pub struct QuotaCredits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance: Option<String>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -346,11 +370,11 @@ pub struct QuotaSpendControl {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub remaining: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remaining_percent: Option<i32>,
+    pub remaining_percent: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<i64>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -375,7 +399,7 @@ pub struct QuotaLimit {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub exhaustion_reason: String,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -386,7 +410,7 @@ pub struct QuotaResetCredits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -429,7 +453,7 @@ pub struct AccountQuota {
     #[serde(default)]
     pub weekly: QuotaWindow,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -442,7 +466,7 @@ pub struct QuotaErrorInfo {
     #[serde(default)]
     pub timestamp: Timestamp,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -483,7 +507,7 @@ pub struct QuotaSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_error: Option<QuotaErrorInfo>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -528,7 +552,7 @@ pub struct PromptCacheStat {
     #[serde(default)]
     pub updated_at: Timestamp,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -573,10 +597,10 @@ pub struct RoutingCacheEvent {
     pub precommit_committed: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub precommit_close_reason: String,
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
-    pub precommit_blocks: i32,
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
-    pub precommit_bytes: i32,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub precommit_blocks: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub precommit_bytes: i64,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub precommit_hold_ms: i64,
     #[serde(default)]
@@ -614,7 +638,7 @@ pub struct RoutingCacheEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_entry: String,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -649,7 +673,7 @@ pub struct ThroughputBucket {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub duration_histogram: Vec<u64>,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -662,7 +686,7 @@ pub struct ClientAgent {
     #[serde(default)]
     pub seen_at: Timestamp,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -713,115 +737,108 @@ pub struct RuntimeState {
     #[serde(default)]
     pub updated_at: Timestamp,
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub extra: Unknown,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::DeserializeOwned;
+    use std::cell::RefCell;
 
-    fn fixture(source: &str) -> Value {
-        serde_json::from_str(source).expect("Go state fixture must be valid JSON")
+    thread_local! {
+        static UNKNOWN: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record_unknown<'a>(keys: impl Iterator<Item = &'a String>) {
+        UNKNOWN.with(|seen| seen.borrow_mut().extend(keys.cloned()));
+    }
+
+    fn take_unknown() -> Vec<String> {
+        UNKNOWN.with(|seen| std::mem::take(&mut *seen.borrow_mut()))
+    }
+
+    // Written by cmd/codex-pool/hash_state_vectors_test.go from the Go types.
+    fn documents() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../cmd/codex-pool/testdata/state-vectors.json"
+        ))
+        .expect("Go state vectors must be valid JSON")
+    }
+
+    // JSON equality with numbers compared by value: Go writes a whole float
+    // as 5 and serde_json as 5.0, which both read back as the same number.
+    fn same_json(left: &Value, right: &Value) -> bool {
+        match (left, right) {
+            (Value::Number(a), Value::Number(b)) => a == b || a.as_f64() == b.as_f64(),
+            (Value::Array(a), Value::Array(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same_json(x, y))
+            }
+            (Value::Object(a), Value::Object(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .all(|(k, v)| b.get(k).is_some_and(|w| same_json(v, w)))
+            }
+            _ => left == right,
+        }
+    }
+
+    /// Reads a Go document, checks that every key it does not know is a
+    /// deliberate future field, and writes it back unchanged.
+    fn round_trip<T: DeserializeOwned + Serialize>(name: &str, document: &Value) -> Vec<String> {
+        take_unknown();
+        let decoded: T = serde_json::from_value(document.clone())
+            .unwrap_or_else(|error| panic!("{name}: Go document does not decode: {error}"));
+        let unknown = take_unknown();
+        let missing: Vec<_> = unknown
+            .iter()
+            .filter(|key| !key.starts_with("future"))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{name}: fields the Rust types lack: {missing:?}"
+        );
+        let encoded = serde_json::to_value(decoded).expect("encode");
+        assert!(
+            same_json(&encoded, document),
+            "{name}: written back differently\nGo:   {document}\nRust: {encoded}"
+        );
+        unknown
     }
 
     #[test]
-    fn config_round_trip_preserves_known_and_unknown_fields() {
-        let source = fixture(include_str!("testdata/state-vectors-config.json"));
-        let config: Config = serde_json::from_value(source.clone()).expect("config should decode");
-        assert_eq!(config.default_model, "gpt-test");
-        assert_eq!(config.extra["futureConfigField"]["kept"], true);
-        let encoded = serde_json::to_value(config).expect("config should encode");
-        assert_eq!(encoded, source);
+    fn go_state_documents_round_trip() {
+        let documents = documents();
+        for variant in ["full", "zero"] {
+            let config = round_trip::<Config>(variant, &documents["config"][variant]);
+            let runtime = round_trip::<RuntimeState>(variant, &documents["runtime"][variant]);
+            if variant == "full" {
+                // The future fields sit at the top, in an account, a sticky
+                // session and a quota window; all of them must be carried.
+                assert_eq!(config.len(), 3, "{config:?}");
+                assert_eq!(runtime.len(), 3, "{runtime:?}");
+            } else {
+                assert!(config.is_empty() && runtime.is_empty());
+            }
+        }
     }
 
     #[test]
-    fn runtime_round_trip_preserves_known_and_unknown_fields() {
-        let source = fixture(include_str!("testdata/state-vectors-runtime.json"));
+    fn timestamps_keep_their_text() {
+        let documents = documents();
         let runtime: RuntimeState =
-            serde_json::from_value(source.clone()).expect("runtime should decode");
-        assert_eq!(runtime.extra["futureRuntimeField"], "preserve-me");
-        assert_eq!(
-            runtime.sticky_sessions.as_ref().expect("sticky sessions")["gpt-test:thread:one"].extra
-                ["futureStickyField"],
-            serde_json::json!(["kept", 7])
-        );
-        let encoded = serde_json::to_value(runtime).expect("runtime should encode");
-        assert_eq!(encoded, source);
-    }
-
-    #[test]
-    fn round_trip_writes_artifacts_when_requested() {
-        let Ok(directory) = std::env::var("POOL_STATE_ROUNDTRIP_DIR") else {
-            return;
-        };
-        let config = fixture(include_str!("testdata/state-vectors-config.json"));
-        let runtime = fixture(include_str!("testdata/state-vectors-runtime.json"));
-        let config_model: Config = serde_json::from_value(config).expect("config should decode");
-        let runtime_model: RuntimeState =
-            serde_json::from_value(runtime).expect("runtime should decode");
-        let config_output = serde_json::to_vec_pretty(
-            &serde_json::to_value(config_model).expect("config should encode"),
-        )
-        .expect("config output should encode");
-        let runtime_output = serde_json::to_vec_pretty(
-            &serde_json::to_value(runtime_model).expect("runtime should encode"),
-        )
-        .expect("runtime output should encode");
-        std::fs::write(
-            std::path::Path::new(&directory).join("rust-roundtrip-config.json"),
-            [config_output.as_slice(), b"\n"].concat(),
-        )
-        .expect("config artifact should write");
-        std::fs::write(
-            std::path::Path::new(&directory).join("rust-roundtrip-runtime.json"),
-            [runtime_output.as_slice(), b"\n"].concat(),
-        )
-        .expect("runtime artifact should write");
-    }
-
-    #[test]
-    fn zero_and_omitted_fields_match_go_json_rules() {
-        let config = serde_json::to_value(Config::default()).expect("default config encodes");
-        assert_eq!(
-            config,
-            serde_json::json!({
-                "accounts": null,
-                "createdAt": "0001-01-01T00:00:00Z",
-                "defaultModel": "",
-                "modelAliases": null,
-                "updatedAt": "0001-01-01T00:00:00Z"
-            })
-        );
-
-        let account = serde_json::to_value(Account::default()).expect("default account encodes");
-        assert_eq!(account["authType"], "");
-        assert_eq!(account["createdAt"], "0001-01-01T00:00:00Z");
-        assert_eq!(account["lastLoginAt"], "0001-01-01T00:00:00Z");
+            serde_json::from_value(documents["runtime"]["full"].clone()).expect("decode");
+        // Nanoseconds and the +08:00 offset survive as written, not as UTC.
         assert!(
-            !account
-                .as_object()
-                .expect("account object")
-                .contains_key("email")
+            runtime.updated_at.0.ends_with("+08:00"),
+            "{}",
+            runtime.updated_at.0
         );
-
-        let runtime = serde_json::to_value(RuntimeState {
-            sticky_sessions: None,
-            cooldowns: None,
-            health: None,
-            response_bindings: Some(BTreeMap::new()),
-            routing_cache_events: Some(Vec::new()),
-            ..RuntimeState::default()
-        })
-        .expect("default runtime encodes");
-        assert_eq!(runtime["stickySessions"], serde_json::Value::Null);
-        assert_eq!(runtime["cooldowns"], serde_json::Value::Null);
-        assert_eq!(runtime["health"], serde_json::Value::Null);
         assert!(
-            !runtime
-                .as_object()
-                .expect("runtime object")
-                .contains_key("responseBindings")
+            runtime.updated_at.0.contains('.'),
+            "{}",
+            runtime.updated_at.0
         );
-        assert_eq!(runtime["updatedAt"], "0001-01-01T00:00:00Z");
+        assert!(serde_json::from_value::<Timestamp>(Value::from("yesterday")).is_err());
     }
 }
