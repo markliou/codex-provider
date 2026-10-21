@@ -95,7 +95,14 @@
 - **2c 切換**：同帳號是否重試改以 Codex 層為準；換帳號與冷卻仍由 pool 層決定。`codex-upstream-failures.json` 中已由 Codex 程式碼保證的部分可以縮減，但每個移除的樣本都要有對應的 Rust 測試。
 - 儀表板的 Unrecognized failures 與 log 的 `class=unknown` 行為不變。
 
-已知差異（2b 要觀察的）：SSE 中獨立的 `error` 事件，Codex 除了 `flex_unavailable` 之外都不立即處理，而是等串流結束，以「stream closed before response.completed」（可重試）收尾；Go 目前依事件中的代碼分類。
+進度：2a、2b 已完成。2b 的 log 欄位：串流終止失敗那一行加上 `codex=<kind>/<api> retry=yes|no`（Codex 本身不處理該訊息時加 `codex_skips`）；HTTP 401/403/429/5xx 新增 `upstream http failure: ... pool=<pool 的理由> ... codex=...`。
+
+已找到的差異（2c 要逐一決定，部署 2b 後再用正式流量確認頻率）：
+1. fixture 的「stream overload」其實是 Codex 刻意做壞的樣本，Codex 讀成一般串流錯誤。已修正 fixture，並補上正常的 overload 樣本（`upstream/src/classify.rs` 的測試會讓 fixture 的 `codex` 欄永遠符合 Codex 的程式碼）。
+2. `server_is_overloaded`：Codex 只有在上游給 `retry-after` 時才重試（`retry_delay` 只看 `server_retry_delay`）；pool 目前不論有沒有 `retry-after`，都會在同帳號重試數次，程式碼註解卻寫「as a native Codex does」。
+3. SSE 中獨立的 `error` 事件：Codex 除了 `flex_unavailable` 都不立即處理，等串流結束以「stream closed before response.completed」（可重試）收尾；pool 依事件中的代碼分類。
+4. 串流中的 `organization_usage_limit_exceeded`：Codex 讀成一般可重試錯誤（只有 HTTP 429 的 body 才讀成 QuotaExceeded）；pool 一律當額度用完。
+5. WebSocket 包裝的 429 `rate_limit_exceeded`：Codex 讀成 `retry_limit`，依上游的 retry-after 重試。
 
 ### 第 3 步：Rust 成為對外入口
 

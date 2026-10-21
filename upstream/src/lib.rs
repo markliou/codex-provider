@@ -58,6 +58,17 @@ pub(crate) mod endpoint {
     // loads Codex's connector.rs (see that file).
     #[allow(dead_code)]
     pub(crate) mod responses_websocket {
+        // Before the include: the file ends with its test module.
+        /// Codex's reading of one WebSocket message as a wrapped error, the
+        /// first step of run_websocket_response_stream for a text message.
+        pub(crate) fn pool_wrapped_error(text: &str) -> Option<ApiError> {
+            let wrapped = parse_wrapped_websocket_error_event(text)?;
+            map_wrapped_websocket_error_event(wrapped, text.to_string())
+        }
+
         include!("../vendor/codex/codex-rs/codex-api/src/endpoint/responses_websocket.rs");
     }
 }
+
+// The pool's own code on top of the vendored files.
+pub mod classify;

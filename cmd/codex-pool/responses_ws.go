@@ -489,6 +489,7 @@ func (s *wsSession) relayUpstream(upstream *wsConn) {
 		}
 		block := "data: " + string(message) + "\n\n"
 		info := responseInfoFromSSEBlock(block)
+		markWebSocketTerminal(&info)
 		if info.TerminalEvent == "" && precommitLifecycleSSEBlock(block) && len(response.buffered) < wsPrecommitMaxBlocks {
 			response.info.merge(info)
 			response.buffered = append(response.buffered, message)
@@ -544,6 +545,7 @@ func (s *wsSession) relayUpstream(upstream *wsConn) {
 // account must not serve the next request.
 func (s *wsSession) record(response *wsResponse, message []byte) bool {
 	info := responseInfoFromSSEBlock("data: " + string(message) + "\n\n")
+	markWebSocketTerminal(&info)
 	response.info.merge(info)
 	if info.TerminalEvent == "" {
 		return true
@@ -767,5 +769,14 @@ func (a *app) noteEventTurnState(message []byte, accountID string) {
 		if text, ok := value.(string); ok && strings.EqualFold(name, "x-codex-turn-state") {
 			a.noteTurnStateIssuer(text, accountID)
 		}
+	}
+}
+
+// markWebSocketTerminal records that a terminal failure came on the Responses
+// WebSocket, which Codex reads differently from SSE (a wrapped error first;
+// see codex_verdict.go).
+func markWebSocketTerminal(info *proxyResponseInfo) {
+	if info.TerminalData != "" {
+		info.TerminalSource = "ws"
 	}
 }

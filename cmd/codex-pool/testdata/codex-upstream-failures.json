@@ -34,9 +34,29 @@
     },
     {
       "name": "stream overload",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "(\"server_is_overloaded\", CodexErrorInfo::ServerOverloaded),",
+      "codex": "ServerOverloaded (retried only on upstream's retry-after: retry_delay is server_retry_delay)",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "server_is_overloaded",
+            "headers": {
+              "retry-after": "7"
+            }
+          }
+        }
+      },
+      "class": "capacity",
+      "code": "server_is_overloaded"
+    },
+    {
+      "name": "stream overload with a malformed error",
       "source": "codex-rs/codex-api/src/sse/responses.rs",
       "marker": "{\"code\": \"server_is_overloaded\", \"plan_type\": 42}",
-      "codex": "ServerOverloaded",
+      "codex": "Stream (the error object does not parse, so Codex never reads its code: malformed_failed_responses_use_stream_error)",
+      "note": "Codex reads this as a generic stream failure; the pool reads the code and treats it as an overload. upstream/src/classify.rs tests hold this column to Codex's code.",
       "event": {
         "type": "response.failed",
         "response": {
