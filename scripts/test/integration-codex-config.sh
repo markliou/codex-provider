@@ -11,19 +11,21 @@ ADMIN_PASSWORD=${ADMIN_PASSWORD:-test-admin-password}
 CLIENT_KEY=${CLIENT_KEY:-test-client-key}
 UPSTREAM_KEY=${UPSTREAM_KEY:-upstream-test-key}
 
+. "$ROOT/scripts/test/isolation.sh"
+
 cleanup() {
   docker rm -f "$POOL" "$MOCK" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
-docker build -t codex-pool:local .
-docker build -t codex-mock-upstream:local -f test/Dockerfile.mock .
+docker build -t "$POOL_IMAGE" .
+docker build -t "$MOCK_IMAGE" -f test/Dockerfile.mock .
 
-ADMIN_HASH=$(docker run --rm -e CODEX_POOL_ADMIN_PASSWORD="$ADMIN_PASSWORD" codex-pool:local hash-password)
+ADMIN_HASH=$(docker run --rm -e CODEX_POOL_ADMIN_PASSWORD="$ADMIN_PASSWORD" "$POOL_IMAGE" hash-password)
 
 docker network create "$NETWORK" >/dev/null
-docker run -d --name "$MOCK" --network "$NETWORK" --network-alias codex-mock codex-mock-upstream:local >/dev/null
+docker run -d --name "$MOCK" --network "$NETWORK" --network-alias codex-mock "$MOCK_IMAGE" >/dev/null
 docker run -d \
   --name "$POOL" \
   --network "$NETWORK" \
@@ -36,9 +38,9 @@ docker run -d \
   -e CODEX_POOL_UPSTREAM_API_KEY="$UPSTREAM_KEY" \
   -e CODEX_POOL_ADDR="0.0.0.0:8317" \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
-  codex-pool:local >/dev/null
+  "$POOL_IMAGE" >/dev/null
 
-docker run --rm --network "$NETWORK" --entrypoint node codex-pool:local -e '
+docker run --rm --network "$NETWORK" --entrypoint node "$POOL_IMAGE" -e '
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 for (let i = 0; i < 60; i += 1) {
   try {
@@ -76,7 +78,7 @@ const models = await fetch("http://codex-pool:8317/v1/models", { headers: { Auth
 if (models.status !== 200) fail(`models with key status ${models.status}`);
 '
 
-CODEX_OUTPUT=$(docker run --rm --network "$NETWORK" --entrypoint sh -e CODEX_POOL_API_KEY="$CLIENT_KEY" codex-pool:local -lc '
+CODEX_OUTPUT=$(docker run --rm --network "$NETWORK" --entrypoint sh -e CODEX_POOL_API_KEY="$CLIENT_KEY" "$POOL_IMAGE" -lc '
 set -eu
 mkdir -p /tmp/codex-home /tmp/work
 cat >/tmp/codex-home/config.toml <<EOF
@@ -99,7 +101,7 @@ printf "%s\n" "$CODEX_OUTPUT" | grep -F "CODEX_PROVIDER_CONFIG_TOML_OK" >/dev/nu
 # which does not exist in its fallback catalog. A loose JSON-only check would
 # miss required fields and allow the startup refresh loop to regress.
 set +e
-APP_SERVER_OUTPUT=$(docker run --rm --network "$NETWORK" --entrypoint sh -e CODEX_POOL_API_KEY="$CLIENT_KEY" codex-pool:local -lc '
+APP_SERVER_OUTPUT=$(docker run --rm --network "$NETWORK" --entrypoint sh -e CODEX_POOL_API_KEY="$CLIENT_KEY" "$POOL_IMAGE" -lc '
 set -eu
 mkdir -p /tmp/codex-app-home
 cat >/tmp/codex-app-home/config.toml <<EOF

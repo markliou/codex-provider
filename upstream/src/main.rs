@@ -17,18 +17,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use codex_http_client::HttpClientFactory;
-use codex_http_client::OutboundProxyPolicy;
-use codex_websocket_client::WebSocketConnector;
-use futures::SinkExt;
 use codex_http_client::EncodedJsonBody;
 use codex_http_client::HttpClientBuilder;
+use codex_http_client::HttpClientFactory;
 use codex_http_client::HttpTransport;
-use codex_http_client::ReqwestTransport;
+use codex_http_client::OutboundProxyPolicy;
 use codex_http_client::Request as CodexRequest;
 use codex_http_client::RequestBody;
 use codex_http_client::RequestCompression;
+use codex_http_client::ReqwestTransport;
 use codex_http_client::TransportError;
+use codex_websocket_client::WebSocketConnector;
+use futures::SinkExt;
 use futures::StreamExt;
 use http::HeaderMap;
 use http::HeaderName;
@@ -245,7 +245,11 @@ fn named_order_headers(incoming: &HeaderMap, order: &str) -> (HeaderMap, HeaderM
     let (first, second) = order.split_once('|').unwrap_or((order, ""));
     let pick = |names: &str| {
         let mut headers = HeaderMap::new();
-        for name in names.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+        for name in names
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
             let lower = name.to_ascii_lowercase();
             if NOT_FORWARDED.contains(&lower.as_str()) {
                 continue;
@@ -258,7 +262,11 @@ fn named_order_headers(incoming: &HeaderMap, order: &str) -> (HeaderMap, HeaderM
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok()).map(str::trim).filter(|value| !value.is_empty())
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// Splits the pool's headers into the three groups Codex builds a request
@@ -266,7 +274,9 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 fn ordered_headers(incoming: &HeaderMap) -> (HeaderMap, HeaderMap) {
     let mut before = HeaderMap::new();
     let mut after = HeaderMap::new();
-    let is_listed = |name: &str| LEADING.contains(&name) || BEFORE_BODY.contains(&name) || AFTER_BODY.contains(&name);
+    let is_listed = |name: &str| {
+        LEADING.contains(&name) || BEFORE_BODY.contains(&name) || AFTER_BODY.contains(&name)
+    };
     for name in LEADING {
         copy_all(incoming, name, &mut before);
     }
@@ -299,8 +309,16 @@ fn copy_all(from: &HeaderMap, name: &str, to: &mut HeaderMap) {
     }
 }
 
-fn plain(status: StatusCode, headers: Option<HeaderMap>, body: impl Into<Bytes>) -> Response<ResponseBody> {
-    let mut response = Response::new(Full::new(body.into()).map_err(|never: Infallible| match never {}).boxed_unsync());
+fn plain(
+    status: StatusCode,
+    headers: Option<HeaderMap>,
+    body: impl Into<Bytes>,
+) -> Response<ResponseBody> {
+    let mut response = Response::new(
+        Full::new(body.into())
+            .map_err(|never: Infallible| match never {})
+            .boxed_unsync(),
+    );
     *response.status_mut() = status;
     if let Some(headers) = headers {
         *response.headers_mut() = response_headers(&headers);
@@ -320,7 +338,8 @@ fn response_headers(upstream: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in upstream {
         match name.as_str() {
-            "connection" | "keep-alive" | "transfer-encoding" | "content-length" | "trailer" | "upgrade" => {}
+            "connection" | "keep-alive" | "transfer-encoding" | "content-length" | "trailer"
+            | "upgrade" => {}
             _ => {
                 headers.append(name.clone(), value.clone());
             }
@@ -329,10 +348,17 @@ fn response_headers(upstream: &HeaderMap) -> HeaderMap {
     headers
 }
 
-async fn forward(transports: Arc<Transports>, request: hyper::Request<Incoming>) -> Result<Response<ResponseBody>, Infallible> {
+async fn forward(
+    transports: Arc<Transports>,
+    request: hyper::Request<Incoming>,
+) -> Result<Response<ResponseBody>, Infallible> {
     let (parts, body) = request.into_parts();
     let Some(url) = header_str(&parts.headers, UPSTREAM_URL).map(str::to_string) else {
-        return Ok(plain(StatusCode::BAD_REQUEST, None, "missing x-codex-upstream-url"));
+        return Ok(plain(
+            StatusCode::BAD_REQUEST,
+            None,
+            "missing x-codex-upstream-url",
+        ));
     };
     let compression = match header_str(&parts.headers, UPSTREAM_COMPRESSION) {
         Some("zstd") => RequestCompression::Zstd,
@@ -340,7 +366,13 @@ async fn forward(transports: Arc<Transports>, request: hyper::Request<Incoming>)
     };
     let body = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(error) => return Ok(plain(StatusCode::BAD_REQUEST, None, format!("request body: {error}"))),
+        Err(error) => {
+            return Ok(plain(
+                StatusCode::BAD_REQUEST,
+                None,
+                format!("request body: {error}"),
+            ));
+        }
     };
     let (before, after) = match header_str(&parts.headers, UPSTREAM_HEADER_ORDER) {
         Some(order) => named_order_headers(&parts.headers, order),
@@ -352,25 +384,44 @@ async fn forward(transports: Arc<Transports>, request: hyper::Request<Incoming>)
     // The pool's bytes are what the client sent, so they are encoded as-is:
     // re-serializing a parsed value would reorder keys. A body that is not
     // JSON cannot be compressed by Codex's request type and is sent raw.
-    let is_json = parts.method != Method::GET && serde_json::from_slice::<&serde_json::value::RawValue>(&body).is_ok();
+    let is_json = parts.method != Method::GET
+        && serde_json::from_slice::<&serde_json::value::RawValue>(&body).is_ok();
     if is_json {
         let raw: &serde_json::value::RawValue = match serde_json::from_slice(&body) {
             Ok(raw) => raw,
-            Err(error) => return Ok(plain(StatusCode::BAD_REQUEST, None, format!("request body: {error}"))),
+            Err(error) => {
+                return Ok(plain(
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    format!("request body: {error}"),
+                ));
+            }
         };
         match EncodedJsonBody::encode(raw) {
             Ok(encoded) => {
                 codex_request.body = Some(RequestBody::EncodedJson(encoded));
                 codex_request.compression = compression;
             }
-            Err(error) => return Ok(plain(StatusCode::BAD_REQUEST, None, format!("request body: {error}"))),
+            Err(error) => {
+                return Ok(plain(
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    format!("request body: {error}"),
+                ));
+            }
         }
     } else if !body.is_empty() {
         codex_request.body = Some(RequestBody::Raw(body));
     }
     let mut prepared = match codex_request.into_prepared() {
         Ok(prepared) => prepared,
-        Err(error) => return Ok(plain(StatusCode::BAD_REQUEST, None, format!("prepare request: {error}"))),
+        Err(error) => {
+            return Ok(plain(
+                StatusCode::BAD_REQUEST,
+                None,
+                format!("prepare request: {error}"),
+            ));
+        }
     };
     for (name, value) in &after {
         prepared.headers.append(name.clone(), value.clone());
@@ -387,8 +438,15 @@ async fn forward(transports: Arc<Transports>, request: hyper::Request<Incoming>)
             *response.headers_mut() = response_headers(&streamed.headers);
             Ok(response)
         }
-        Err(TransportError::Http { status, headers, body, .. }) => Ok(plain(status, headers, body.unwrap_or_default())),
-        Err(TransportError::Timeout) => Ok(transport_failure("timeout", "upstream timeout".to_string())),
+        Err(TransportError::Http {
+            status,
+            headers,
+            body,
+            ..
+        }) => Ok(plain(status, headers, body.unwrap_or_default())),
+        Err(TransportError::Timeout) => {
+            Ok(transport_failure("timeout", "upstream timeout".to_string()))
+        }
         Err(error) => Ok(transport_failure("connection", error.to_string())),
     }
 }
@@ -448,23 +506,41 @@ fn ordered_websocket_headers(incoming: &HeaderMap) -> HeaderMap {
 /// An upstream handshake refusal is answered as the same HTTP status, headers
 /// and body without upgrading, so the pool can fail over before the client
 /// has sent anything upstream.
-async fn websocket(transports: Arc<Transports>, mut request: hyper::Request<Incoming>) -> Response<ResponseBody> {
+async fn websocket(
+    transports: Arc<Transports>,
+    mut request: hyper::Request<Incoming>,
+) -> Response<ResponseBody> {
     let Some(url) = header_str(request.headers(), UPSTREAM_URL).map(str::to_string) else {
-        return plain(StatusCode::BAD_REQUEST, None, "missing x-codex-upstream-url");
+        return plain(
+            StatusCode::BAD_REQUEST,
+            None,
+            "missing x-codex-upstream-url",
+        );
     };
     let Some(key) = header_str(request.headers(), "sec-websocket-key").map(str::to_string) else {
         return plain(StatusCode::BAD_REQUEST, None, "missing sec-websocket-key");
     };
     let mut upstream_request = match url.as_str().into_client_request() {
         Ok(upstream_request) => upstream_request,
-        Err(error) => return plain(StatusCode::BAD_REQUEST, None, format!("upstream url: {error}")),
+        Err(error) => {
+            return plain(
+                StatusCode::BAD_REQUEST,
+                None,
+                format!("upstream url: {error}"),
+            );
+        }
     };
-    upstream_request.headers_mut().extend(ordered_websocket_headers(request.headers()));
+    upstream_request
+        .headers_mut()
+        .extend(ordered_websocket_headers(request.headers()));
     let connector = match transports.websocket() {
         Ok(connector) => connector,
         Err(error) => return transport_failure("connection", error.to_string()),
     };
-    let (upstream, handshake) = match connector.connect(upstream_request, websocket_config()).await {
+    let (upstream, handshake) = match connector
+        .connect(upstream_request, websocket_config())
+        .await
+    {
         Ok(connected) => connected,
         Err(WsError::Http(refused)) => {
             let (parts, body) = refused.into_parts();
@@ -480,7 +556,10 @@ async fn websocket(transports: Arc<Transports>, mut request: hyper::Request<Inco
         }
     }
     let headers = response.headers_mut();
-    headers.insert(http::header::CONNECTION, HeaderValue::from_static("upgrade"));
+    headers.insert(
+        http::header::CONNECTION,
+        HeaderValue::from_static("upgrade"),
+    );
     headers.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
     if let Ok(accept) = HeaderValue::from_str(&derive_accept_key(key.as_bytes())) {
         headers.insert(http::header::SEC_WEBSOCKET_ACCEPT, accept);
@@ -491,7 +570,8 @@ async fn websocket(transports: Arc<Transports>, mut request: hyper::Request<Inco
         };
         // The pool's leg is loopback and uncompressed; only the upstream leg
         // negotiates Codex's deflate extension.
-        let local = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
+        let local =
+            WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
         relay(local, upstream).await;
     });
     response
@@ -499,8 +579,12 @@ async fn websocket(transports: Arc<Transports>, mut request: hyper::Request<Inco
 
 async fn relay<L, U>(local: L, upstream: U)
 where
-    L: futures::Stream<Item = Result<Message, WsError>> + futures::Sink<Message, Error = WsError> + Unpin,
-    U: futures::Stream<Item = Result<Message, WsError>> + futures::Sink<Message, Error = WsError> + Unpin,
+    L: futures::Stream<Item = Result<Message, WsError>>
+        + futures::Sink<Message, Error = WsError>
+        + Unpin,
+    U: futures::Stream<Item = Result<Message, WsError>>
+        + futures::Sink<Message, Error = WsError>
+        + Unpin,
 {
     let (mut local_tx, mut local_rx) = local.split();
     let (mut upstream_tx, mut upstream_rx) = upstream.split();
@@ -535,7 +619,10 @@ where
     }
 }
 
-async fn route(transports: Arc<Transports>, request: hyper::Request<Incoming>) -> Result<Response<ResponseBody>, Infallible> {
+async fn route(
+    transports: Arc<Transports>,
+    request: hyper::Request<Incoming>,
+) -> Result<Response<ResponseBody>, Infallible> {
     if request.uri().path() == "/ws" {
         return Ok(websocket(transports, request).await);
     }
@@ -551,7 +638,9 @@ async fn main() -> std::io::Result<()> {
     // Only the pool in the same container may use this hop; it holds no
     // credentials of its own, but it sends whatever it is handed.
     if !addr.ip().is_loopback() {
-        return Err(std::io::Error::other("CODEX_UPSTREAM_ADDR must be a loopback address"));
+        return Err(std::io::Error::other(
+            "CODEX_UPSTREAM_ADDR must be a loopback address",
+        ));
     }
     let listener = TcpListener::bind(addr).await?;
     let transports = Arc::new(Transports::new()?);

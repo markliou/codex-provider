@@ -38,7 +38,9 @@ in_codex_repo() {
     -w /work \
     node:22-alpine sh -ceu "
       apk add --no-cache git >/dev/null
-      git config --global --add safe.directory /repo
+      # From /: in a git worktree /work/.git is a file pointing at a path
+      # outside the container, and git aborts any command started inside it.
+      (cd / && git config --global --add safe.directory /repo)
       if [ ! -d /repo/.git ]; then
         git clone --quiet --filter=blob:none --no-checkout https://github.com/openai/codex /repo
       fi
