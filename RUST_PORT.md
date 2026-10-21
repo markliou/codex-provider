@@ -78,17 +78,24 @@
 - 建立 Rust 的測試指令（Docker 內的 `cargo test`、`cargo fmt --check`、`cargo clippy`）與快取 volume，並記錄在本文件第 7 節。
 - 這一步也適用於 `main`；完成後告訴使用者，讓營運端一併合併。
 
-### 第 1 步：pool 自己的上游呼叫
+### 第 1 步：pool 自己的上游呼叫（順序改到第 2 步之後）
 
-- token refresh、usage、帳號資料、reset credits 改由 Rust 用 Codex 自己的 client（例如 Codex 的 login／backend client crate）組成並送出，取代 Go 依照量到的檔頭順序手動組請求。
-- Go 透過本機介面取得結果；狀態與 `auth.json` 仍由 Go 寫入（單一寫入者）。
-- `wire-capture.sh` 的 own-call 比對必須仍然相同。
+查證結果（2026-10-21）：
+- usage、帳號資料（accounts/check）、reset credits：可以直接用 Codex 的 `codex-backend-client`。它有 `with_user_agent()`，所以每個帳號仍可帶「最後使用該帳號的 Codex」的 User-Agent（SPEC 2.3.2）。Codex 的型別保留了方案（含 ProLite、ProMax）和組織名稱（`accounts/check` 的 `name`）。差別：Codex 不認識的新方案名稱會變成 `Unknown`。開工前要先用正式資料（只看欄位名稱）確認沒有 pool 在用、但 Codex 型別會丟掉的欄位。
+- token refresh：不能用 Codex 的 `AuthManager`。它的 HTTP client 的 originator 與 User-Agent 是整個 process 共用的全域值，作業系統部分取自容器本身，無法每個帳號不同。refresh 改為在 Rust 照 Codex 原始碼（`login/src/auth/manager.rs` `request_chatgpt_token_refresh`）組請求，行為與現在相同。
+- Go 透過本機介面取得結果；狀態與 `auth.json` 仍由 Go 寫入（單一寫入者）。`wire-capture.sh` 的 own-call 比對必須仍然相同。
 
 ### 第 2 步：串流解析與錯誤分類
 
-- Responses SSE／WebSocket 事件的解析，以及錯誤分類（capacity、transient、quota、auth、passthrough、unknown），改用 Codex 自己的程式碼。Go 只接收分類結果，並依結果決定重試與換帳號。
-- `codex-upstream-failures.json` 中已由 Codex 程式碼直接保證的部分可以縮減，但每個移除的樣本都要有對應的 Rust 測試。
+查證結果：Codex 把串流解析與錯誤分類放在 crate 私有的模組（codex-api `sse/`、`endpoint/responses_websocket.rs` 的私有函式），外部呼叫不到。做法是把這些檔案**原樣複製**進來編譯（`upstream/vendor/codex`，`scripts/conformance/codex-vendor.sh` 保證逐位元相同），連 Codex 自己的測試一起跑。Codex 的分類是單一帳號的判斷（同帳號重不重試），而且分類後丟掉錯誤代碼；pool 的換帳號與冷卻是多帳號的判斷，仍由 pool 自己讀代碼決定。所以分兩層：Codex 層決定「原生 Codex 會怎麼做」，pool 層決定「換不換帳號、冷卻多久」。
+
+分三段，每段都能單獨合併與部署：
+- **2a 複製與驗證**：複製檔案、編譯、跑 Codex 的測試、`codex-conformance.sh check` 納入逐位元比對。尚未接上 pool，行為不變。
+- **2b 影子模式**：Go 遇到上游失敗（串流中的終止事件、WebSocket 錯誤訊息、HTTP 非 2xx）時，把那一筆交給 Rust 的 `/classify`，Rust 用 Codex 的程式碼回傳 Codex 的判斷（`CodexErr::retry_delay` 是否可重試、`to_codex_protocol_error` 的類別）。Go 照舊決定，只在兩邊判斷不一致時記 log。部署後用真實流量觀察。
+- **2c 切換**：同帳號是否重試改以 Codex 層為準；換帳號與冷卻仍由 pool 層決定。`codex-upstream-failures.json` 中已由 Codex 程式碼保證的部分可以縮減，但每個移除的樣本都要有對應的 Rust 測試。
 - 儀表板的 Unrecognized failures 與 log 的 `class=unknown` 行為不變。
+
+已知差異（2b 要觀察的）：SSE 中獨立的 `error` 事件，Codex 除了 `flex_unavailable` 之外都不立即處理，而是等串流結束，以「stream closed before response.completed」（可重試）收尾；Go 目前依事件中的代碼分類。
 
 ### 第 3 步：Rust 成為對外入口
 

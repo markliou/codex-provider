@@ -1,0 +1,29 @@
+# Codex source files compiled into codex-upstream unchanged (see
+# codex-vendor.sh). Paths are relative to the Codex repository root.
+#
+# The Responses stream reader and its failure classification (codex-api sse/),
+# the WebSocket wrapped-error reader (endpoint/responses_websocket.rs), Codex's
+# own mapping of a failure to its error type (api_bridge.rs), and the
+# crate-private modules they use. Each file's tests come with it.
+LICENSE
+NOTICE
+codex-rs/codex-api/src/api_bridge.rs
+codex-rs/codex-api/src/api_bridge_tests.rs
+codex-rs/codex-api/src/auth.rs
+codex-rs/codex-api/src/common.rs
+codex-rs/codex-api/src/endpoint/responses_websocket.rs
+codex-rs/codex-api/src/endpoint/responses_websocket/connector.rs
+codex-rs/codex-api/src/error.rs
+codex-rs/codex-api/src/provider.rs
+codex-rs/codex-api/src/rate_limits.rs
+codex-rs/codex-api/src/responses_headers.rs
+codex-rs/codex-api/src/safety_buffering.rs
+codex-rs/codex-api/src/sse/mod.rs
+codex-rs/codex-api/src/sse/responses.rs
+codex-rs/codex-api/src/sse/responses_error.rs
+codex-rs/codex-api/src/sse/responses_error_parser_tests.rs
+codex-rs/codex-api/src/sse/responses_error_tests.rs
+codex-rs/codex-api/src/telemetry.rs
+
+# Pool-owned files inside the vendor tree ("pool <path>"); each explains itself.
+pool codex-rs/codex-api/src/endpoint/connector.rs
