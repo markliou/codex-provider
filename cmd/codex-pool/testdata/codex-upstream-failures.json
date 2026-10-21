@@ -546,6 +546,18 @@
       "pool": "the redemption body's one required field"
     },
     {
+      "name": "reset credit picker order",
+      "source": "codex-rs/tui/src/chatwidget/reset_credits.rs",
+      "marker": "available_credits.sort_by_key(|credit| credit.expires_at.unwrap_or(i64::MAX));",
+      "pool": "nativeResetCreditChoice: the credit named in credit_id is the available one expiring soonest"
+    },
+    {
+      "name": "reset credit retry keeps its key",
+      "source": "codex-rs/tui/src/chatwidget/usage.rs",
+      "marker": "self.pending_rate_limit_reset_idempotency_key = Some(idempotency_key.clone());",
+      "pool": "resetCreditAttempts: a failed spend is resent with the same redeem_request_id and credit_id"
+    },
+    {
       "name": "token refresh body",
       "source": "codex-rs/login/src/oauth/client.rs",
       "marker": ".json(&parameters.iter().copied().collect::<BTreeMap<_, _>>()),",

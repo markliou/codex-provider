@@ -2645,12 +2645,34 @@ Codex client calls the same value an idempotency key on its own JSON-RPC
 surface and renames it for the wire, so `idempotency_key` and `idempotencyKey`
 both leave the required field absent and earn a 400. The id is a UUID: one
 upstream rejects would be indistinguishable from one it never saw, and the retry
-would spend again. The optional `credit_id` is omitted, which lets upstream
-choose which credit to spend.
+would spend again.
 
-Upstream answers with a `code`; only `reset` spent a credit, while
-`nothing_to_reset`, `no_credit` and `already_redeemed` each explain why nothing
-was spent. That field is `code` and its values are snake_case for the same
+The spend is the one a native Codex makes from its `/usage` picker (tui
+`chatwidget/usage.rs`, `reset_credits.rs`; app-server
+`account_processor/rate_limit_resets.rs`). The service first lists the
+account's credits (`GET /wham/rate-limit-reset-credits`, five seconds) and
+names, as `credit_id`, the credit the picker selects first: the available
+credits sorted by expiry, one without an expiry last, ties in upstream's order.
+That is the credit nearest to being lost, the one a red outline marks. When the
+listing fails, a timestamp in it does not parse, or it offers no available
+credit, `credit_id` is left out, as Codex's fallback leaves it out. The body
+keeps Codex's field order (`redeem_request_id`, then `credit_id`), and the
+consume call has Codex's ten-second bound. The credit id is upstream's
+identifier and goes no further than the request: it never enters runtime state,
+a log line or a response.
+
+An attempt that fails without an upstream verdict (a transport error, a
+timeout, a non-success status) is kept in memory, and the next press on that
+account within ten minutes resends it unchanged, same key and same credit, as
+Codex's "Try again" does; a spend whose answer was lost then comes back
+`already_redeemed` instead of spending a second credit. Any verdict ends the
+attempt, and the next press lists the credits again under a fresh key.
+
+Upstream answers with a `code`. `reset` spent a credit, and `already_redeemed`
+reports that the resent attempt's earlier send did (Codex reports both as a
+reset); `nothing_to_reset` and `no_credit` explain why nothing was spent, and
+`no_credit` for a named credit means that credit is no longer available, as
+Codex's picker tells its user. That field is `code` and its values are snake_case for the same
 reason: `outcome` and the camelCase spellings belong to the client's JSON-RPC
 rename, and reading those names here leaves every verdict empty. Verdicts are
 matched case-insensitively because this pool sanitizes upstream metadata to
@@ -2658,9 +2680,8 @@ lowercase, and the response must report what upstream actually returned rather
 than assume success, or a refusal reads as a credit having been used. An
 unrecognized verdict is surfaced as such and never counted as a spend. The
 account's quota is refreshed after every attempt, including a refused one: a
-successful reset changes the windows the dashboard shows, and
-`already_redeemed` means the local snapshot is the stale half of the
-disagreement.
+successful reset changes the windows the dashboard shows, and a refusal means
+the local snapshot is the stale half of the disagreement.
 
 An upstream failure surfaces only a sanitized status and error code to the
 browser, never the raw response body. The service log additionally keeps
