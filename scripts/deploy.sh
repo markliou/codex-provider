@@ -9,6 +9,11 @@
 # the swap to the few seconds a restart takes, which Codex's own request retries
 # cover. The drain remains the backstop for a request that starts in between.
 #
+# Only a clean checkout of main is deployed. The image is built from whatever
+# the working tree holds, and the Rust port lives on its own branch in a
+# second worktree; deploying from there, or from main with edits not yet
+# committed, would put unfinished or unreviewed code in front of every account.
+#
 # Usage: sh scripts/deploy.sh [--force]
 #   --force  restart even when the running pool cannot report its in-flight
 #            count (a version that predates /internal/inflight).
@@ -20,6 +25,24 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+if [ "$branch" != "main" ]; then
+  echo "Refusing to deploy: checked out on '$branch', not main." >&2
+  echo "Deploy from the main worktree after merging." >&2
+  exit 1
+fi
+# Any tracked change blocks the deploy, and so does an untracked file in a
+# path the Dockerfile copies into the image. Untracked files elsewhere
+# (.claude/, scratch notes) never reach the image and are ignored.
+build_inputs="Dockerfile go.mod go.sum cmd upstream docker-entrypoint.sh supervisor.sh"
+# shellcheck disable=SC2086
+dirty=$( { git status --porcelain --untracked-files=no; git status --porcelain -- $build_inputs; } | sort -u)
+if [ -n "$dirty" ]; then
+  echo "Refusing to deploy: main has uncommitted changes:" >&2
+  echo "$dirty" >&2
+  exit 1
+fi
 
 container="${CODEX_POOL_CONTAINER:-codex-pool}"
 idle_wait="${CODEX_POOL_DEPLOY_IDLE_WAIT:-600}"
