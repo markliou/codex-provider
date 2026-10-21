@@ -207,8 +207,13 @@ A new conversation is placed in steps:
    × 7 at expiry. A weighted rendezvous hash makes the choice, so concurrent
    first requests for one conversation agree.
 
-Placement applies only to new conversations; one already bound stays where it is.
-The pool never spends a reset credit; that stays the account owner's decision.
+A conversation already bound stays where it is, with two exceptions that move it
+(main agent and subagents together, at the cost of one prefill) on its next
+request: **Use Pro last** moves it down to a lower plan tier, and the **red
+outline** moves it from an account without one to a red-outlined account in the
+same tier, so a failover caused by a passing overload does not keep it away from
+an expiring credit. The pool never spends a reset credit; that stays the account
+owner's decision.
 
 | Plan (as Codex names it) | Shown as | Multiplier |
 |---|---|---|

@@ -626,12 +626,14 @@ balancing, not mutable request round-robin:
    out rising to 7 at expiry, so the credit lost soonest draws the most. As a
    weight alone (the earlier rule) red-outlined accounts still lost about one
    new session in six, which strict binding then kept elsewhere. The tier sits
-   inside the Use Pro last tiers, only places new sessions (a bound lineage is
-   never moved for it), and spending the credit stays the owner's decision.
+   inside the Use Pro last tiers. It also moves bound sessions: one on an
+   account without a red outline moves to a red-outlined account (6.4), and
+   spending the credit stays the owner's decision.
    The score is a weighted rendezvous hash of the balance key and the
    upstream identity.
 3. Existing TTL-live sticky bindings remain authoritative and are never
-   rebalanced merely because another account becomes available.
+   rebalanced merely because another account becomes available, apart from
+   the two exceptions in 6.4 (Use Pro last, red outline).
 4. Selection balances only within the highest-priority eligible tier, preserving
    explicitly configured lower-priority standby accounts.
 5. When `preserveProQuota` is enabled, the lowest eligible plan tier forms the
@@ -815,6 +817,8 @@ failback = new_session_only
 A session that failed over from `acct-a` to `acct-b` should remain on `acct-b` until it ends, unless `acct-b` also fails.
 
 Optional exception: when `preserveProQuota` is enabled from the admin Console, accounts are spent in three tiers: ordinary accounts first, then Pro 100 (Pro Lite), then Pro 200 and Pro 500. A new session uses the lowest tier with an eligible account. If a sticky or lineage account sits in a higher tier than an eligible account, select the lower-tier account and rewrite the binding on success. This keeps Pro quota as the last-resort pool while preserving normal failover for deployments that leave the mode disabled. Pro Lite was once an ordinary account here; its 5x weight then drew sessions about as often as a Business seat whose reset credit was about to expire, so the owner placed it between the two.
+
+Red-outline exception: a reset credit not spent before it expires is lost, so the owner treats accounts holding one that expires within seven days (the dashboard's red outline) as a special case. A sticky or lineage session on an account without a red outline moves, on its next request, to a red-outlined account in the same plan tier and priority when one is eligible, and the binding is rewritten on success; under strict lineage binding the whole lineage follows and the main agent re-prefills once. On a WebSocket the pool closes the client socket (1012) before sending anything, and Codex reconnects and resends in full. The move goes only towards a red outline, never from one red-outlined account to another, so it cannot oscillate. Placing only new sessions there was not enough: a transient overload and a one-minute `429` moved running sessions off red-outlined accounts for good while those accounts sat idle.
 
 A request that cannot reach upstream at all (the connection fails or drops before any answer) is retried on the same account twice, after 0.5 s and 1 s, before it fails over with `transport_failover`. A WebSocket that cannot be opened gets the same retries, and a socket that drops mid-response records the failure but sets no cooldown, so Codex's reconnect returns to the same account. A failed connection is no evidence against the account, and under strict lineage binding a move is permanent and costs a full prefill: two connection failures right after a restart once moved a session off the expiring-credit accounts it had been placed on. A revoked credential still fails over at once.
 
