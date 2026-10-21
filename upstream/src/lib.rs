@@ -15,6 +15,7 @@
 pub(crate) use codex_client::TransportError;
 pub(crate) use error::ApiError;
 pub(crate) use telemetry::WebsocketTelemetry;
+pub mod pool;
 
 // Each file comes whole, while the pool uses part of it; an import that only
 // codex-api's other modules use is unused here.

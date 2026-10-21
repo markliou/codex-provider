@@ -1,0 +1,663 @@
+{
+  "config": {
+    "full": {
+      "accounts": [
+        {
+          "accountId": "value-8",
+          "allowedModels": [
+            "value-24"
+          ],
+          "authType": "value-19",
+          "codexHome": "value-20",
+          "createdAt": "2026-10-21T01:02:33.123456819+08:00",
+          "email": "value-7",
+          "enabled": true,
+          "excludedModels": [
+            "value-25"
+          ],
+          "futureAccountField": 7.5,
+          "id": "value-4",
+          "inPool": true,
+          "label": "value-5",
+          "lastLoginAt": "2026-10-21T01:02:35.123456821+08:00",
+          "organizationName": "value-9",
+          "organizationNameOverride": "value-10",
+          "ownerNote": "value-6",
+          "pendingAuthExpectedAccountId": "value-29",
+          "pendingAuthVerification": true,
+          "pendingPoolActivation": true,
+          "planFamily": "value-15",
+          "planLimit": "value-12",
+          "planRank": 8589934605,
+          "planType": "value-11",
+          "priority": 8589934613,
+          "quotaPolicy": [
+            "value-18"
+          ],
+          "quotaProtectionEnabled": true,
+          "quotaProtectionThreshold": 8589934615,
+          "rawPlanType": "value-14",
+          "remainingQuota": 8589934614,
+          "seatType": "value-16",
+          "seatTypeInferred": true,
+          "seatTypeRaw": "value-17",
+          "updatedAt": "2026-10-21T01:02:34.12345682+08:00",
+          "upstreamApiKey": "value-27",
+          "upstreamBaseUrl": "value-26",
+          "wireApi": "value-28"
+        }
+      ],
+      "createdAt": "2026-10-21T01:02:36.123456822+08:00",
+      "defaultModel": "value-1",
+      "futureConfigField": {
+        "kept": true
+      },
+      "futureNull": null,
+      "lineageAffinity": true,
+      "modelAliases": {
+        "key-3": "value-2"
+      },
+      "preserveProQuota": true,
+      "updatedAt": "2026-10-21T01:02:37.123456823+08:00"
+    },
+    "zero": {
+      "accounts": [
+        {
+          "allowedModels": [
+            ""
+          ],
+          "authType": "",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "enabled": false,
+          "excludedModels": [
+            ""
+          ],
+          "id": "",
+          "inPool": false,
+          "label": "",
+          "lastLoginAt": "0001-01-01T00:00:00Z",
+          "priority": 0,
+          "quotaPolicy": [
+            ""
+          ],
+          "updatedAt": "0001-01-01T00:00:00Z"
+        }
+      ],
+      "createdAt": "0001-01-01T00:00:00Z",
+      "defaultModel": "",
+      "modelAliases": {
+        "key-1": ""
+      },
+      "updatedAt": "0001-01-01T00:00:00Z"
+    }
+  },
+  "runtime": {
+    "full": {
+      "clientAgents": {
+        "key-253": {
+          "originator": "value-251",
+          "seenAt": "2026-10-21T01:06:15.123457041+08:00",
+          "userAgent": "value-250"
+        }
+      },
+      "cooldowns": {
+        "key-74": [
+          {
+            "modelId": "value-71",
+            "nextRetryAt": "2026-10-21T01:03:15.123456861+08:00",
+            "reason": "value-73"
+          }
+        ]
+      },
+      "failureCount": 8589934862,
+      "futureRuntimeField": "preserve-me",
+      "health": {
+        "key-79": {
+          "consecutiveFailure": 8589934670,
+          "lastFailureAt": "2026-10-21T01:03:19.123456865+08:00",
+          "lastFailureReason": "value-77",
+          "lastSuccessAt": "2026-10-21T01:03:18.123456864+08:00"
+        }
+      },
+      "lineageBindings": {
+        "key-70": {
+          "accountId": "value-64",
+          "createdAt": "2026-10-21T01:03:09.123456855+08:00",
+          "expiresAt": "2026-10-21T01:03:12.123456858+08:00",
+          "failoverFrom": "value-65",
+          "lastSuccessAt": "2026-10-21T01:03:11.123456857+08:00",
+          "lineageRootId": "value-63",
+          "movedAt": "2026-10-21T01:03:10.123456856+08:00"
+        }
+      },
+      "promptCache": {
+        "key-191": {
+          "accountId": "value-172",
+          "agentKind": "value-174",
+          "cacheEligibleRequestCount": 8589934775,
+          "cacheHitRequestCount": 8589934774,
+          "cacheWriteInputTokens": 8589934772,
+          "cacheWriteObservedRequestCount": 8589934773,
+          "cacheWriteTokens": 8589934771,
+          "cachedTokens": 8589934770,
+          "coldRequestCount": 8589934776,
+          "inputTokens": 8589934769,
+          "lineageFailoverCount": 8589934779,
+          "modelId": "value-173",
+          "parentAffinityFallbackCount": 8589934778,
+          "parentAffinityHitCount": 8589934777,
+          "requestCount": 8589934767,
+          "routingFailoverCount": 8589934780,
+          "unrecognizedFailureCount": 8589934781,
+          "updatedAt": "2026-10-21T01:05:13.123456979+08:00",
+          "usageObservedRequestCount": 8589934768
+        }
+      },
+      "promptCacheBaseline": {
+        "key-211": {
+          "accountId": "value-192",
+          "agentKind": "value-194",
+          "cacheEligibleRequestCount": 8589934795,
+          "cacheHitRequestCount": 8589934794,
+          "cacheWriteInputTokens": 8589934792,
+          "cacheWriteObservedRequestCount": 8589934793,
+          "cacheWriteTokens": 8589934791,
+          "cachedTokens": 8589934790,
+          "coldRequestCount": 8589934796,
+          "inputTokens": 8589934789,
+          "lineageFailoverCount": 8589934799,
+          "modelId": "value-193",
+          "parentAffinityFallbackCount": 8589934798,
+          "parentAffinityHitCount": 8589934797,
+          "requestCount": 8589934787,
+          "routingFailoverCount": 8589934800,
+          "unrecognizedFailureCount": 8589934801,
+          "updatedAt": "2026-10-21T01:05:33.123456999+08:00",
+          "usageObservedRequestCount": 8589934788
+        }
+      },
+      "promptCacheResetAt": "2026-10-21T01:05:35.123457001+08:00",
+      "promptCacheResetAtByAccount": {
+        "key-214": "2026-10-21T01:05:36.123457002+08:00"
+      },
+      "quotaWindowPrimes": {
+        "key-216": "2026-10-21T01:05:38.123457004+08:00"
+      },
+      "quotas": {
+        "key-171": {
+          "accountId": "value-80",
+          "freshness": "value-166",
+          "lastSuccessfulRefreshAt": "2026-10-21T01:04:47.123456953+08:00",
+          "observedAt": "2026-10-21T01:04:46.123456952+08:00",
+          "organizationName": "value-81",
+          "planFamily": "value-83",
+          "planLimit": "value-85",
+          "planType": "value-84",
+          "provenance": "value-167",
+          "quota": {
+            "additionalLimits": [
+              {
+                "allowed": true,
+                "exhausted": true,
+                "exhaustionReason": "value-143",
+                "limitId": "value-120",
+                "limitName": "value-121",
+                "limitReached": true,
+                "primary": {
+                  "label": "value-123",
+                  "observed": true,
+                  "percentage": 8589934716,
+                  "present": true,
+                  "remainingPercent": 126.25,
+                  "resetAt": 8589934719,
+                  "role": "value-122",
+                  "usedPercent": 125.25,
+                  "windowMinutes": 8589934720
+                },
+                "secondary": {
+                  "label": "value-130",
+                  "observed": true,
+                  "percentage": 8589934723,
+                  "present": true,
+                  "remainingPercent": 133.25,
+                  "resetAt": 8589934726,
+                  "role": "value-129",
+                  "usedPercent": 132.25,
+                  "windowMinutes": 8589934727
+                },
+                "windows": [
+                  {
+                    "label": "value-137",
+                    "observed": true,
+                    "percentage": 8589934730,
+                    "present": true,
+                    "remainingPercent": 140.25,
+                    "resetAt": 8589934733,
+                    "role": "value-136",
+                    "usedPercent": 139.25,
+                    "windowMinutes": 8589934734
+                  }
+                ]
+              }
+            ],
+            "allowed": true,
+            "credits": {
+              "balance": "value-112",
+              "hasCredits": true,
+              "unlimited": true
+            },
+            "exhausted": true,
+            "exhaustionReason": "value-146",
+            "hourly": {
+              "label": "value-150",
+              "observed": true,
+              "percentage": 8589934743,
+              "present": true,
+              "remainingPercent": 153.25,
+              "resetAt": 8589934746,
+              "role": "value-149",
+              "usedPercent": 152.25,
+              "windowMinutes": 8589934747
+            },
+            "individualLimit": {
+              "limit": "value-114",
+              "reached": true,
+              "remaining": "value-116",
+              "remainingPercent": 8589934709,
+              "resetAt": 8589934710,
+              "source": "value-113",
+              "used": "value-115"
+            },
+            "limitId": "value-89",
+            "limitName": "value-90",
+            "limitReached": true,
+            "observedAt": "2026-10-21T01:04:31.123456937+08:00",
+            "primary": {
+              "futureWindowField": {
+                "nested": []
+              },
+              "label": "value-92",
+              "observed": true,
+              "percentage": 8589934685,
+              "present": true,
+              "remainingPercent": 95.25,
+              "resetAt": 8589934688,
+              "role": "value-91",
+              "usedPercent": 94.25,
+              "windowMinutes": 8589934689
+            },
+            "provenance": "value-147",
+            "rateLimitReachedType": "value-119",
+            "resetCredits": {
+              "availableCount": 8589934736,
+              "expiresAt": 8589934737
+            },
+            "secondary": {
+              "label": "value-99",
+              "observed": true,
+              "percentage": 8589934692,
+              "present": true,
+              "remainingPercent": 102.25,
+              "resetAt": 8589934695,
+              "role": "value-98",
+              "usedPercent": 101.25,
+              "windowMinutes": 8589934696
+            },
+            "weekly": {
+              "label": "value-157",
+              "observed": true,
+              "percentage": 8589934750,
+              "present": true,
+              "remainingPercent": 160.25,
+              "resetAt": 8589934753,
+              "role": "value-156",
+              "usedPercent": 159.25,
+              "windowMinutes": 8589934754
+            },
+            "windows": [
+              {
+                "label": "value-106",
+                "observed": true,
+                "percentage": 8589934699,
+                "present": true,
+                "remainingPercent": 109.25,
+                "resetAt": 8589934702,
+                "role": "value-105",
+                "usedPercent": 108.25,
+                "windowMinutes": 8589934703
+              }
+            ]
+          },
+          "quotaError": {
+            "code": "value-168",
+            "message": "value-169",
+            "timestamp": "2026-10-21T01:04:53.123456959+08:00"
+          },
+          "quotaPolicy": [
+            "value-88"
+          ],
+          "rawPlanType": "value-82",
+          "seatType": "value-86",
+          "seatTypeInferred": true,
+          "seatTypeRaw": "value-87",
+          "usageUpdatedAt": "2026-10-21T01:04:48.123456954+08:00"
+        }
+      },
+      "requestCount": 8589934860,
+      "responseBindings": {
+        "key-49": {
+          "accountId": "value-46",
+          "createdAt": "2026-10-21T01:02:50.123456836+08:00",
+          "expiresAt": "2026-10-21T01:02:51.123456837+08:00",
+          "modelId": "value-45",
+          "responseId": "value-43",
+          "stickyKey": "value-44"
+        }
+      },
+      "routingCacheEvents": [
+        {
+          "accountId": "value-221",
+          "agentKind": "value-222",
+          "cacheHit": true,
+          "cacheReadRate": 242.25,
+          "cacheReuseBalance": 8589934836,
+          "cacheWriteRate": 243.25,
+          "cacheWriteTokens": 8589934832,
+          "cachedTokens": 8589934831,
+          "clientEntry": "value-249",
+          "clientOriginator": "value-245",
+          "clientRequestKind": "value-247",
+          "clientTurnState": "value-248",
+          "clientUserAgent": "value-246",
+          "coldCacheEligible": true,
+          "failoverFromAccountId": "value-237",
+          "inputTokens": 8589934830,
+          "lineageRootIdHash": "value-224",
+          "modelId": "value-220",
+          "parentAffinity": "value-236",
+          "precommitBlocks": 8589934825,
+          "precommitBytes": 8589934826,
+          "precommitCloseReason": "value-232",
+          "precommitCommitted": true,
+          "precommitHoldMs": 8589934827,
+          "promptCacheKeyHash": "value-226",
+          "requestIdHash": "value-218",
+          "responseIdHash": "value-219",
+          "routingOutcome": "value-227",
+          "routingSource": "value-228",
+          "stickyKeyHash": "value-225",
+          "terminalErrorCode": "value-231",
+          "terminalEvent": "value-229",
+          "terminalFailureClass": "value-230",
+          "threadIdHash": "value-223",
+          "timestamp": "2026-10-21T01:05:40.123457006+08:00",
+          "uncachedInputTokens": 8589934833,
+          "usageObserved": true
+        }
+      ],
+      "stickySessions": {
+        "key-42": {
+          "accountId": "value-37",
+          "createdAt": "2026-10-21T01:02:41.123456827+08:00",
+          "expiresAt": "2026-10-21T01:02:43.123456829+08:00",
+          "failoverFrom": "value-41",
+          "futureStickyField": [
+            "kept",
+            7
+          ],
+          "key": "value-35",
+          "lastSuccessAt": "2026-10-21T01:02:42.123456828+08:00",
+          "modelId": "value-36"
+        }
+      },
+      "streamIncompleteCount": 8589934864,
+      "successCount": 8589934861,
+      "threadBindings": {
+        "key-62": {
+          "accountId": "value-56",
+          "createdAt": "2026-10-21T01:03:02.123456848+08:00",
+          "expiresAt": "2026-10-21T01:03:04.12345685+08:00",
+          "lastSuccessAt": "2026-10-21T01:03:03.123456849+08:00",
+          "lineageRootId": "value-53",
+          "modelId": "value-55",
+          "parentThreadId": "value-52",
+          "promptCacheKey": "value-58",
+          "sessionId": "value-51",
+          "stickyKey": "value-57",
+          "subagentKind": "value-54",
+          "threadId": "value-50"
+        }
+      },
+      "throughputBuckets": [
+        {
+          "accountId": "value-255",
+          "bucketAt": "2026-10-21T01:06:17.123457043+08:00",
+          "cachedTokens": 8589934856,
+          "cancelledCount": 8589934851,
+          "durationHistogram": [
+            8589934859
+          ],
+          "failureCount": 8589934850,
+          "inputTokens": 8589934855,
+          "outputObservedRequestCount": 8589934854,
+          "outputTokens": 8589934857,
+          "requestCount": 8589934848,
+          "streamingRequestCount": 8589934852,
+          "successCount": 8589934849,
+          "totalDurationMillis": 8589934858,
+          "usageObservedRequestCount": 8589934853
+        }
+      ],
+      "updatedAt": "2026-10-21T01:06:36.123457062+08:00",
+      "upstreamResponseFailedCount": 8589934863
+    },
+    "zero": {
+      "clientAgents": {
+        "key-13": {
+          "originator": "",
+          "seenAt": "0001-01-01T00:00:00Z",
+          "userAgent": ""
+        }
+      },
+      "cooldowns": {
+        "key-6": [
+          {
+            "modelId": "",
+            "nextRetryAt": "0001-01-01T00:00:00Z",
+            "reason": ""
+          }
+        ]
+      },
+      "failureCount": 0,
+      "health": {
+        "key-7": {
+          "consecutiveFailure": 0,
+          "lastFailureAt": "0001-01-01T00:00:00Z",
+          "lastSuccessAt": "0001-01-01T00:00:00Z"
+        }
+      },
+      "lineageBindings": {
+        "key-5": {
+          "accountId": "",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "expiresAt": "0001-01-01T00:00:00Z",
+          "lastSuccessAt": "0001-01-01T00:00:00Z",
+          "lineageRootId": "",
+          "movedAt": "0001-01-01T00:00:00Z"
+        }
+      },
+      "promptCache": {
+        "key-9": {
+          "accountId": "",
+          "cacheEligibleRequestCount": 0,
+          "cacheHitRequestCount": 0,
+          "cacheWriteInputTokens": 0,
+          "cacheWriteObservedRequestCount": 0,
+          "cacheWriteTokens": 0,
+          "cachedTokens": 0,
+          "coldRequestCount": 0,
+          "inputTokens": 0,
+          "modelId": "",
+          "requestCount": 0,
+          "updatedAt": "0001-01-01T00:00:00Z",
+          "usageObservedRequestCount": 0
+        }
+      },
+      "promptCacheBaseline": {
+        "key-10": {
+          "accountId": "",
+          "cacheEligibleRequestCount": 0,
+          "cacheHitRequestCount": 0,
+          "cacheWriteInputTokens": 0,
+          "cacheWriteObservedRequestCount": 0,
+          "cacheWriteTokens": 0,
+          "cachedTokens": 0,
+          "coldRequestCount": 0,
+          "inputTokens": 0,
+          "modelId": "",
+          "requestCount": 0,
+          "updatedAt": "0001-01-01T00:00:00Z",
+          "usageObservedRequestCount": 0
+        }
+      },
+      "promptCacheResetAt": "0001-01-01T00:00:00Z",
+      "promptCacheResetAtByAccount": {
+        "key-11": "0001-01-01T00:00:00Z"
+      },
+      "quotaWindowPrimes": {
+        "key-12": "0001-01-01T00:00:00Z"
+      },
+      "quotas": {
+        "key-8": {
+          "accountId": "",
+          "lastSuccessfulRefreshAt": "0001-01-01T00:00:00Z",
+          "observedAt": "0001-01-01T00:00:00Z",
+          "quota": {
+            "additionalLimits": [
+              {
+                "exhausted": false,
+                "primary": {
+                  "percentage": 0,
+                  "present": false
+                },
+                "secondary": {
+                  "percentage": 0,
+                  "present": false
+                },
+                "windows": [
+                  {
+                    "percentage": 0,
+                    "present": false
+                  }
+                ]
+              }
+            ],
+            "credits": {
+              "hasCredits": false,
+              "unlimited": false
+            },
+            "exhausted": false,
+            "hourly": {
+              "percentage": 0,
+              "present": false
+            },
+            "individualLimit": {
+              "reached": false
+            },
+            "observedAt": "0001-01-01T00:00:00Z",
+            "primary": {
+              "percentage": 0,
+              "present": false
+            },
+            "resetCredits": {},
+            "secondary": {
+              "percentage": 0,
+              "present": false
+            },
+            "weekly": {
+              "percentage": 0,
+              "present": false
+            },
+            "windows": [
+              {
+                "percentage": 0,
+                "present": false
+              }
+            ]
+          },
+          "quotaError": {
+            "message": "",
+            "timestamp": "0001-01-01T00:00:00Z"
+          },
+          "quotaPolicy": [
+            ""
+          ],
+          "usageUpdatedAt": "0001-01-01T00:00:00Z"
+        }
+      },
+      "requestCount": 0,
+      "responseBindings": {
+        "key-3": {
+          "accountId": "",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "expiresAt": "0001-01-01T00:00:00Z",
+          "modelId": "",
+          "responseId": "",
+          "stickyKey": ""
+        }
+      },
+      "routingCacheEvents": [
+        {
+          "accountId": "",
+          "agentKind": "",
+          "cacheHit": false,
+          "cachedTokens": 0,
+          "coldCacheEligible": false,
+          "inputTokens": 0,
+          "modelId": "",
+          "parentAffinity": "",
+          "routingOutcome": "",
+          "routingSource": "",
+          "timestamp": "0001-01-01T00:00:00Z",
+          "uncachedInputTokens": 0,
+          "usageObserved": false
+        }
+      ],
+      "stickySessions": {
+        "key-2": {
+          "accountId": "",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "expiresAt": "0001-01-01T00:00:00Z",
+          "key": "",
+          "lastSuccessAt": "0001-01-01T00:00:00Z",
+          "modelId": ""
+        }
+      },
+      "successCount": 0,
+      "threadBindings": {
+        "key-4": {
+          "accountId": "",
+          "createdAt": "0001-01-01T00:00:00Z",
+          "expiresAt": "0001-01-01T00:00:00Z",
+          "lastSuccessAt": "0001-01-01T00:00:00Z",
+          "lineageRootId": "",
+          "modelId": "",
+          "stickyKey": "",
+          "threadId": ""
+        }
+      },
+      "throughputBuckets": [
+        {
+          "bucketAt": "0001-01-01T00:00:00Z",
+          "durationHistogram": [
+            0
+          ],
+          "failureCount": 0,
+          "requestCount": 0,
+          "successCount": 0
+        }
+      ],
+      "updatedAt": "0001-01-01T00:00:00Z"
+    }
+  }
+}
