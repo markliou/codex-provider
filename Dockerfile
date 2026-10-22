@@ -25,6 +25,8 @@ RUN apk add --no-cache musl-dev perl make gcc linux-headers git
 WORKDIR /src
 COPY upstream/Cargo.toml upstream/Cargo.lock ./
 COPY upstream/src ./src
+# Codex's stream reader and failure classifier, vendored unchanged (src/lib.rs).
+COPY upstream/vendor ./vendor
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked && \

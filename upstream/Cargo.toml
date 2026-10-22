@@ -4,6 +4,18 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+# The library is Codex's own Responses stream reader and failure classifier,
+# compiled from files vendored unchanged from the pinned release (see
+# src/lib.rs and scripts/conformance/codex-vendor.sh); the binary is the
+# transport.
+[lib]
+name = "codex_vendor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codex-upstream"
+path = "src/main.rs"
+
 # The upstream request must be the one a native Codex CLI sends, so the
 # transport is Codex's own HTTP client crate at the Codex release the pool
 # targets, and Cargo.lock is seeded from that release's lock so reqwest, hyper,
@@ -21,16 +33,76 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1", features = ["fs", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 # Same versions and features as the Codex workspace; the fork below supplies
 # the permessage-deflate extension Codex negotiates.
 tokio-tungstenite = { version = "0.28.0", features = ["proxy", "rustls-tls-native-roots"] }
 tungstenite = { version = "0.27.0", features = ["deflate", "proxy"] }
+# What the vendored codex-api files use, at the Codex workspace's versions and
+# features (codex-rs/Cargo.toml and codex-api/Cargo.toml).
+codex-client = { git = "https://github.com/openai/codex", tag = "rust-v0.163.0" }
+codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.163.0" }
+base64 = "0.22.1"
+chrono = "0.4.43"
+eventsource-stream = "0.2.3"
+regex-lite = "0.1.8"
+serde = { version = "1", features = ["derive", "rc"] }
+thiserror = "2.0.17"
+tokio-util = { version = "0.7.18", features = ["codec", "io"] }
+tracing = "0.1.44"
+url = "2"
+
+[dev-dependencies]
+assert_matches = "1.5.0"
+pretty_assertions = "1.4.1"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt", "sync", "test-util", "time"] }
+tokio-test = "0.4"
 
 # The official Linux release links a vendored OpenSSL for its default TLS
 # backend; linking the system one would change the TLS handshake.
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl-sys = { version = "*", features = ["vendored"] }
+
+# Codex's workspace lints (codex-rs/Cargo.toml [workspace.lints]): the vendored
+# files carry #[expect] attributes that only hold under these, and the pool's
+# own Rust is held to the same rules.
+[lints.clippy]
+await_holding_invalid_type = "deny"
+await_holding_lock = "deny"
+disallowed_methods = "deny"
+expect_used = "deny"
+identity_op = "deny"
+manual_clamp = "deny"
+manual_filter = "deny"
+manual_find = "deny"
+manual_flatten = "deny"
+manual_map = "deny"
+manual_memcpy = "deny"
+manual_non_exhaustive = "deny"
+manual_ok_or = "deny"
+manual_range_contains = "deny"
+manual_retain = "deny"
+manual_strip = "deny"
+manual_try_fold = "deny"
+manual_unwrap_or = "deny"
+needless_borrow = "deny"
+needless_borrowed_reference = "deny"
+needless_collect = "deny"
+needless_late_init = "deny"
+needless_option_as_deref = "deny"
+needless_question_mark = "deny"
+needless_update = "deny"
+redundant_clone = "deny"
+redundant_closure = "deny"
+redundant_closure_for_method_calls = "deny"
+redundant_static_lifetimes = "deny"
+trivially_copy_pass_by_ref = "deny"
+uninlined_format_args = "deny"
+unnecessary_filter_map = "deny"
+unnecessary_lazy_evaluations = "deny"
+unnecessary_sort_by = "deny"
+unnecessary_to_owned = "deny"
+unwrap_used = "deny"
 
 [profile.release]
 codegen-units = 1
@@ -44,3 +116,7 @@ tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev 
 
 [patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+
+# Pool compatibility hashes use the same SHA-256 primitive as the Go service.
+[dependencies.sha2]
+version = "0.10"
