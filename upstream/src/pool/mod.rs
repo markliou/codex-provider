@@ -10,6 +10,7 @@
 
 pub mod hash;
 pub mod installation_id;
+pub mod metadata;
 pub mod own_call;
 pub mod plan;
 pub mod quota;
