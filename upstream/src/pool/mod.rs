@@ -8,6 +8,7 @@
 //! interchange format rather than a second, independently invented schema.
 //! Keep a single copy of them there; a second copy here could drift.
 
+pub mod crypto;
 pub mod gosort;
 pub mod hash;
 pub mod installation_id;
@@ -16,6 +17,7 @@ pub mod own_call;
 pub mod plan;
 pub mod quota;
 pub mod quota_schedule;
+pub mod settings;
 pub mod state;
 pub mod time;
 pub mod tuning;
