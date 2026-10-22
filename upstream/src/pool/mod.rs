@@ -10,6 +10,7 @@
 
 pub mod app;
 pub mod crypto;
+pub mod gojson;
 pub mod gosort;
 pub mod hash;
 pub mod installation_id;
