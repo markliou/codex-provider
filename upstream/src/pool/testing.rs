@@ -48,6 +48,29 @@ pub fn test_app(accounts: Vec<Account>) -> (App, TempDir) {
     (app, dir)
 }
 
+pub fn test_app_with(
+    accounts: Vec<Account>,
+    configure: impl FnOnce(&mut super::settings::Settings),
+) -> (App, TempDir) {
+    let dir = TempDir::new();
+    let app = App::for_test_with(dir.path(), accounts, configure);
+    (app, dir)
+}
+
+/// An API-key provider slot (Go tests' {ID, Enabled, InPool, Priority,
+/// UpstreamBaseURL, UpstreamAPIKey}).
+pub fn provider_account(id: &str, priority: i64) -> Account {
+    Account {
+        id: id.to_string(),
+        enabled: true,
+        in_pool: true,
+        priority,
+        upstream_base_url: format!("https://{id}.example.test"),
+        upstream_api_key: id.to_string(),
+        ..Account::default()
+    }
+}
+
 pub fn fake_jwt_claims(claims: &Value) -> String {
     let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     format!(

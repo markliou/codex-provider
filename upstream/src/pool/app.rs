@@ -115,6 +115,10 @@ pub struct Inner {
     /// In-memory placement load: which account each recently active session
     /// is on (see note_session_placement).
     pub session_placements: HashMap<String, super::routing::SessionPlacement>,
+    /// The 48-hour throughput series: process memory only, never written to
+    /// runtime.json, so it starts fresh after a restart.
+    pub throughput_buckets: Vec<super::state::ThroughputBucket>,
+    pub active_proxy_requests: u64,
     pub logger: Arc<Logger>,
 }
 
@@ -137,6 +141,8 @@ impl App {
         let logger = Arc::new(logger);
         let inner = Inner {
             session_placements: HashMap::new(),
+            throughput_buckets: Vec::new(),
+            active_proxy_requests: 0,
             logger: logger.clone(),
             preserve_pro_quota: config
                 .preserve_pro_quota
@@ -160,6 +166,16 @@ impl App {
     /// Go testApp: a fresh pool over a temporary directory with these
     /// accounts, the default model "gpt-test" and the alias "alias".
     pub fn for_test(data_dir: &Path, accounts: Vec<Account>) -> Self {
+        Self::for_test_with(data_dir, accounts, |_| {})
+    }
+
+    /// for_test with settings a test changes first (Go tests assign
+    /// a.routingStrategy, a.sessionAffinityTTL and the like directly).
+    pub fn for_test_with(
+        data_dir: &Path,
+        accounts: Vec<Account>,
+        configure: impl FnOnce(&mut Settings),
+    ) -> Self {
         let mut config = Config {
             default_model: "gpt-test".to_string(),
             accounts: Some(accounts),
@@ -175,8 +191,10 @@ impl App {
             ..Tuning::default()
         };
         let _ = std::fs::create_dir_all(data_dir.join("state"));
+        let mut settings = Settings::for_test(data_dir.to_path_buf());
+        configure(&mut settings);
         Self::new(
-            Settings::for_test(data_dir.to_path_buf()),
+            settings,
             tuning,
             config,
             initialized_state(RuntimeState::default()),
@@ -224,11 +242,15 @@ impl App {
         {
             let mut inner = app.write();
             let now = Timestamp::now();
-            let migrated = inner
-                .state
-                .throughput_buckets
-                .take()
-                .is_some_and(|buckets| !buckets.is_empty());
+            // Upgrade compatibility: import the old persisted 30-minute
+            // buckets once, then clear the JSON field. From then on the
+            // 48-hour series is process-memory telemetry.
+            let legacy = inner.state.throughput_buckets.take().unwrap_or_default();
+            let migrated = !legacy.is_empty();
+            if migrated {
+                inner.throughput_buckets.extend(legacy);
+                inner.prune_throughput_buckets(now);
+            }
             if inner.prune_expired_runtime_state(now) || migrated {
                 let _ = inner.save();
             }
