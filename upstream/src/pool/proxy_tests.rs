@@ -3692,3 +3692,288 @@ async fn errored_duplicate_manual_quota_does_not_keep_zero_quota_representative_
         "pro-backup"
     );
 }
+
+// ---- the request body and headers the pool composes ----
+
+// Go TestParseModel.
+#[test]
+fn parse_model_reads_tier_suffixes() {
+    use super::proxy::parse_model;
+    for (input, model, tier) in [
+        ("gpt-5.4(high)", "gpt-5.4", "high"),
+        ("gpt-5.4(none)", "gpt-5.4", "none"),
+        ("gpt-5.6-sol(ultra)", "gpt-5.6-sol", "ultra"),
+        ("gpt-5.6-sol(max)", "gpt-5.6-sol", "max"),
+        ("gpt-5.4(unknown)", "gpt-5.4(unknown)", ""),
+        ("gpt-5.4", "gpt-5.4", ""),
+    ] {
+        assert_eq!(
+            parse_model(input),
+            (model.to_string(), tier.to_string()),
+            "parse_model({input:?})"
+        );
+    }
+}
+
+fn object(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    value.as_object().cloned().unwrap_or_default()
+}
+
+// Go TestDropHostedToolConflicts.
+#[test]
+fn drop_hosted_tool_conflicts_cases() {
+    use super::proxy::drop_hosted_tool_conflicts;
+    let image = serde_json::json!({"type": "function", "name": "image_gen.imagegen"});
+    let shell = serde_json::json!({"type": "function", "name": "shell"});
+    // image_gen is implicitly hosted upstream, so the twin must be dropped
+    // even when the request declares no hosted tool at all.
+    let mut implicit = object(serde_json::json!({"tools": [image, shell]}));
+    drop_hosted_tool_conflicts(&mut implicit);
+    assert_eq!(
+        implicit["tools"].as_array().map(Vec::len),
+        Some(1),
+        "implicitly reserved image_gen twin was not dropped"
+    );
+    let mut hosted = object(serde_json::json!({"tools": [
+        {"type": "web_search_preview"},
+        {"type": "function", "name": "web_search"},
+        {"type": "function", "name": "web_search.search"},
+        shell,
+    ]}));
+    drop_hosted_tool_conflicts(&mut hosted);
+    let tools = hosted["tools"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        tools.len(),
+        2,
+        "expected hosted web search plus shell: {tools:?}"
+    );
+    assert_eq!(tools[1]["name"], "shell", "wrong function tool survived");
+    // web_search is only reserved when the hosted tool is present, so a bare
+    // function named web_search must pass through untouched.
+    let mut bare =
+        object(serde_json::json!({"tools": [{"type": "function", "name": "web_search"}]}));
+    drop_hosted_tool_conflicts(&mut bare);
+    assert_eq!(bare["tools"].as_array().map(Vec::len), Some(1));
+    let mut missing = object(serde_json::json!({"input": "hello"}));
+    drop_hosted_tool_conflicts(&mut missing);
+    assert!(
+        !missing.contains_key("tools"),
+        "tools must not be created when absent"
+    );
+}
+
+// Go TestDropHostedToolConflictsFiltersAdditionalToolsItems: Codex 0.144+
+// declares tools in an additional_tools input item, and image_gen ships as a
+// namespace tool that upstream flattens to image_gen.imagegen.
+#[test]
+fn drop_hosted_tool_conflicts_filters_additional_tools_items() {
+    let mut payload = object(serde_json::json!({"input": [
+        {"type": "additional_tools", "role": "developer", "tools": [
+            {"type": "custom", "name": "exec"},
+            {"type": "namespace", "name": "image_gen", "tools": [{"type": "function", "name": "imagegen"}]},
+            {"type": "namespace", "name": "collaboration", "tools": [{"type": "function", "name": "spawn_agent"}]},
+            {"type": "function", "name": "image_gen.imagegen"},
+        ]},
+        {"type": "message", "role": "user", "content": "hello"},
+    ]}));
+    super::proxy::drop_hosted_tool_conflicts(&mut payload);
+    let input = payload["input"].as_array().cloned().unwrap_or_default();
+    let tools = input[0]["tools"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        tools.len(),
+        2,
+        "expected exec and collaboration to survive: {tools:?}"
+    );
+    assert_eq!(tools[0]["name"], "exec");
+    assert_eq!(tools[1]["name"], "collaboration");
+    assert_eq!(
+        input[1]["type"], "message",
+        "non-tool input items must pass through"
+    );
+}
+
+// Go TestCodexBackendRequestBodyChangesOnlyForeignRequests.
+#[test]
+fn codex_backend_request_body_changes_only_foreign_requests() {
+    use super::proxy::codex_backend_request_body;
+    const ENDPOINT: &str = "https://h/backend-api/codex/responses";
+    let native = bytes::Bytes::from_static(br#"{"model":"m","stream":true,"store":false,"input":[{"type":"message","role":"developer","content":"x"}],"service_tier":"flex"}"#);
+    let (got, aggregate) = codex_backend_request_body(ENDPOINT, &native);
+    assert!(
+        !aggregate && got == native,
+        "a native Codex request must pass byte for byte"
+    );
+    let foreign = bytes::Bytes::from_static(
+        br#"{"model":"m","input":"hello","max_output_tokens":10,"temperature":0.2,"top_p":1,"user":"u","previous_response_id":"r","prompt_cache_retention":"24h"}"#,
+    );
+    let (got, aggregate) = codex_backend_request_body(ENDPOINT, &foreign);
+    assert!(
+        aggregate,
+        "a non-streaming request must be assembled from the stream"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&got).unwrap_or_default();
+    assert!(
+        payload["stream"] == true && payload["store"] == false,
+        "the Codex backend needs stream=true and store=false"
+    );
+    for field in [
+        "max_output_tokens",
+        "temperature",
+        "top_p",
+        "user",
+        "previous_response_id",
+        "prompt_cache_retention",
+    ] {
+        assert!(
+            payload.get(field).is_none(),
+            "unsupported {field} must be removed"
+        );
+    }
+    let text = String::from_utf8_lossy(&got);
+    assert!(
+        payload["input"].as_array().map(Vec::len) == Some(1) && text.contains(r#""text":"hello""#),
+        "string input must become a user message: {text}"
+    );
+    let system = bytes::Bytes::from_static(br#"{"model":"m","stream":true,"store":false,"input":[{"type":"message","role":"system","content":"rules"}]}"#);
+    let (got, aggregate) = codex_backend_request_body(ENDPOINT, &system);
+    assert!(
+        !aggregate && String::from_utf8_lossy(&got).contains(r#""role":"developer""#),
+        "the system role must become developer"
+    );
+    let compact = bytes::Bytes::from_static(br#"{"model":"m","input":[]}"#);
+    let (got, aggregate) =
+        codex_backend_request_body("https://h/backend-api/codex/responses/compact", &compact);
+    assert!(
+        !aggregate && got == compact,
+        "compaction must be forwarded as sent"
+    );
+}
+
+// Go TestCodexClientVersionComesOnlyFromACodexUserAgent.
+#[test]
+fn codex_client_version_comes_only_from_a_codex_user_agent() {
+    use super::credentials::codex_client_version;
+    for (agent, want) in [
+        (
+            "codex_exec/0.163.0 (Alpine Linux 3.21.7; x86_64) unknown (codex_exec; 0.163.0)",
+            "0.163.0",
+        ),
+        ("codex-tui/0.163.0 (Mac OS 26.0.0; arm64)", "0.163.0"),
+        ("Python-urllib/3.12", ""),
+        ("", ""),
+    ] {
+        let mut headers = http::HeaderMap::new();
+        if let Ok(value) = http::HeaderValue::from_str(agent) {
+            headers.insert("user-agent", value);
+        }
+        assert_eq!(
+            codex_client_version(&headers),
+            want,
+            "version for {agent:?}"
+        );
+    }
+    // Go also tried "codex_exec/0.163.0\r\nX-Injected: 1"; an http::HeaderValue
+    // cannot hold a CR or LF at all, so that value cannot reach this function.
+    assert!(http::HeaderValue::from_str("codex_exec/0.163.0\r\nX-Injected: 1").is_err());
+}
+
+// Go TestRoutingHintFollowsNativeCodexRules.
+#[test]
+fn routing_hint_follows_native_codex_rules() {
+    use super::proxy::codex_routing_hint;
+    let headers = |pairs: &[(&'static str, &'static str)]| {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, http::HeaderValue::from_static(value));
+        }
+        map
+    };
+    for (name, body, inbound, want) in [
+        (
+            "model only",
+            r#"{"model":"gpt-x"}"#,
+            headers(&[]),
+            "model=gpt-x",
+        ),
+        (
+            "service tier",
+            r#"{"model":"gpt-x","service_tier":"priority"}"#,
+            headers(&[]),
+            "model=gpt-x;tier=priority",
+        ),
+        (
+            "guardian reviewer gets none",
+            r#"{"model":"gpt-x"}"#,
+            headers(&[("x-codex-guardian", "reviewer")]),
+            "",
+        ),
+        (
+            "client hint wins",
+            r#"{"model":"gpt-x"}"#,
+            headers(&[("x-codex-routing-hint", "model=other")]),
+            "",
+        ),
+        ("no model", r#"{"input":"hi"}"#, headers(&[]), ""),
+    ] {
+        assert_eq!(
+            codex_routing_hint(body.as_bytes(), &inbound),
+            want,
+            "{name}"
+        );
+    }
+}
+
+// Go TestExtendedReasoningRequiresFamilyBoundary.
+#[test]
+fn extended_reasoning_requires_family_boundary() {
+    use super::catalog::codex_extended_reasoning_model;
+    for model in [
+        "gpt-6",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-6.1",
+        "gpt-6.1-sol",
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+    ] {
+        assert!(
+            codex_extended_reasoning_model(model),
+            "{model:?} is a documented extended-tier family member"
+        );
+    }
+    for model in [
+        "gpt-60-legacy",
+        "gpt-6preview",
+        "gpt-5.61",
+        "gpt-5.6x",
+        "gpt-5.5",
+        "gpt-5.2-codex",
+        "gpt-61",
+        "gpt-6.10-sol",
+        "gpt-6.1x",
+    ] {
+        assert!(
+            !codex_extended_reasoning_model(model),
+            "{model:?} must not inherit the extended tiers"
+        );
+    }
+}
+
+// Go TestMissingCodexAuthClassifiesWithoutRetry.
+#[test]
+fn missing_codex_auth_classifies_without_retry() {
+    let (app, _dir) = test_app(vec![device_account("missing-fast", "", 0)]);
+    let item = account(&app, 0);
+    let start = std::time::Instant::now();
+    let result = app.read().codex_auth(&item);
+    assert!(
+        matches!(result, Err(super::app::AuthError::Missing(_))),
+        "missing auth must be classified as missing"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(200),
+        "missing auth classification must not wait for retries"
+    );
+}

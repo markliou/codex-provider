@@ -1613,10 +1613,12 @@ fn child_temporary_lineage_root_corrects_when_parent_appears() {
     assert_eq!(persisted, "root", "persisted corrected lineage root");
 }
 
+type Configure = Box<dyn Fn(&App)>;
+
 // Go TestIneligibleParentFallsBackWithoutBypassingSafeguards.
 #[test]
 fn ineligible_parent_falls_back_without_bypassing_safeguards() {
-    let cases: Vec<(&str, Box<dyn Fn(&App)>)> = vec![
+    let cases: Vec<(&str, Configure)> = vec![
         (
             "disabled",
             Box::new(|app: &App| app.write().config.accounts_mut()[0].enabled = false),
@@ -1837,4 +1839,353 @@ fn thread_bindings_and_responses_are_ttl_pruned() {
         inner.state.thread_bindings().contains_key("active"),
         "active thread binding was pruned"
     );
+}
+
+// ---- prompt cache keys and agent metrics ----
+
+fn configured(configure: impl FnOnce(&mut super::settings::Settings)) -> (App, TempDir) {
+    test_app_with(Vec::new(), configure)
+}
+
+fn project_request(
+    app: &App,
+    headers: &[(&'static str, &str)],
+    payload: serde_json::Value,
+    api_key: &str,
+) -> RoutingDecision {
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        if let Ok(value) = http::HeaderValue::from_str(value) {
+            map.insert(*name, value);
+        }
+    }
+    let facts = RequestFacts {
+        headers: &map,
+        native: false,
+        websocket: false,
+    };
+    app.routing_decision(
+        &facts,
+        payload.as_object().unwrap_or(&serde_json::Map::new()),
+        "gpt-test",
+        api_key,
+    )
+}
+
+// Go TestPromptCacheMetricsSeparateMainSubagentAndAffinity (the stored
+// counters; the dashboard window over them joins with the dashboard in 4.5).
+#[test]
+fn prompt_cache_metrics_separate_main_subagent_and_affinity() {
+    let (app, _dir) = test_app(vec![provider_account("acct", 0)]);
+    let now = Timestamp::now();
+    let usage = |input: u64, cached: u64| PromptCacheUsage {
+        input_tokens: input,
+        cached_tokens: cached,
+        present: true,
+        ..PromptCacheUsage::default()
+    };
+    let child = |thread: &str| RequestIdentity {
+        thread_id: thread.into(),
+        parent_thread_id: "main".into(),
+        lineage_root_id: "main".into(),
+        is_subagent: true,
+        ..RequestIdentity::default()
+    };
+    {
+        let mut inner = app.write();
+        let main = RequestIdentity {
+            thread_id: "main".into(),
+            ..RequestIdentity::default()
+        };
+        inner.record_prompt_cache_result(
+            "acct",
+            "gpt-test",
+            &main,
+            &usage(2000, 1500),
+            false,
+            false,
+            false,
+            "",
+            now,
+        );
+        inner.record_prompt_cache_result(
+            "acct",
+            "gpt-test",
+            &child("child"),
+            &usage(3000, 0),
+            true,
+            false,
+            false,
+            "",
+            now,
+        );
+        inner.record_prompt_cache_result(
+            "acct",
+            "gpt-test",
+            &child("sibling"),
+            &usage(4000, 2000),
+            false,
+            true,
+            true,
+            "",
+            now,
+        );
+    }
+    let inner = app.read();
+    let main = inner
+        .state
+        .prompt_cache()
+        .get("acct:gpt-test:main")
+        .cloned()
+        .unwrap_or_default();
+    let subagent = inner
+        .state
+        .prompt_cache()
+        .get("acct:gpt-test:subagent")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        (main.request_count, main.input_tokens, main.cached_tokens),
+        (1, 2000, 1500),
+        "main metrics"
+    );
+    assert_eq!(
+        (
+            subagent.request_count,
+            subagent.input_tokens,
+            subagent.cached_tokens,
+            subagent.cold_request_count
+        ),
+        (2, 7000, 2000, 1),
+        "subagent metrics"
+    );
+    assert_eq!(
+        (
+            subagent.parent_affinity_hit_count,
+            subagent.parent_affinity_fallback_count,
+            subagent.lineage_failover_count
+        ),
+        (1, 1, 1),
+        "affinity metrics"
+    );
+}
+
+// Go TestSubSatClampsToZero.
+#[test]
+fn sub_sat_clamps_to_zero() {
+    use super::outcome::sub_sat;
+    assert_eq!(sub_sat(5, 8), 0);
+    assert_eq!(sub_sat(10, 3), 7);
+}
+
+// Go TestScopedPromptCacheKeyGroupsByProject.
+#[test]
+fn scoped_prompt_cache_key_groups_by_project() {
+    let (app, _dir) = configured(|settings| {
+        settings.prompt_cache_key_scope = "auto".into();
+        settings.prompt_cache_buckets = 1;
+    });
+    let make = |session: &str, project: &str| {
+        project_request(
+            &app,
+            &[
+                ("x-codex-pool-session", session),
+                ("x-codex-pool-project", project),
+            ],
+            serde_json::json!({"input": "x"}),
+            "client-key",
+        )
+    };
+    let (a1, a2, b) = (
+        make("sess-1", "repo-x"),
+        make("sess-2", "repo-x"),
+        make("sess-3", "repo-y"),
+    );
+    // Same project, different conversations share one cache key (buckets=1)
+    // so they reuse the static prefix, while routing stays per-conversation.
+    assert!(
+        !a1.upstream_prompt_cache_key.is_empty()
+            && a1.upstream_prompt_cache_key == a2.upstream_prompt_cache_key
+    );
+    assert_ne!(
+        a1.sticky_key, a2.sticky_key,
+        "conversations collapsed to a single sticky route"
+    );
+    assert_ne!(
+        a1.upstream_prompt_cache_key, b.upstream_prompt_cache_key,
+        "different projects shared a cache key"
+    );
+    assert!(
+        a1.upstream_prompt_cache_key.starts_with("cp_")
+            && !a1.upstream_prompt_cache_key.contains("repo-x")
+    );
+}
+
+// Go TestScopedPromptCacheKeyConversationScopeUnchanged.
+#[test]
+fn scoped_prompt_cache_key_conversation_scope_unchanged() {
+    // The test app leaves the scope empty, which is conversation behavior.
+    let (app, _dir) = configured(|settings| settings.prompt_cache_key_scope = String::new());
+    let got = project_request(
+        &app,
+        &[("x-codex-pool-project", "repo-x")],
+        serde_json::json!({"input": "x"}),
+        "client-key",
+    )
+    .upstream_prompt_cache_key;
+    assert_eq!(
+        got,
+        super::hash::prompt_cache_key_hash("gpt-test", "project", "repo-x"),
+        "historical conversation-scope key"
+    );
+}
+
+// Go TestPromptCacheBucketIndex.
+#[test]
+fn prompt_cache_bucket_index_stays_in_range() {
+    use super::hash::prompt_cache_bucket_index;
+    assert_eq!(prompt_cache_bucket_index("anything", 1), 0);
+    assert_eq!(prompt_cache_bucket_index("anything", 0), 0);
+    for size in [4, 16, 256] {
+        for index in 0..200 {
+            let bucket = prompt_cache_bucket_index(&format!("sticky-{index}"), size);
+            assert!(
+                (0..size).contains(&bucket),
+                "bucket index {bucket} out of range for size {size}"
+            );
+        }
+        assert_eq!(
+            prompt_cache_bucket_index("stable", size),
+            prompt_cache_bucket_index("stable", size)
+        );
+    }
+}
+
+fn child_cache_payload(thread: &str, parent: &str, client_key: &str) -> serde_json::Value {
+    serde_json::json!({
+        "client_metadata": {"x-codex-turn-metadata": format!(r#"{{"thread_id":"{thread}","parent_thread_id":"{parent}","subagent_kind":"thread_spawn"}}"#)},
+        "prompt_cache_key": client_key,
+    })
+}
+
+// Go TestPromptCacheKeyPoliciesSeparateRoutingFromUpstreamKey.
+#[test]
+fn prompt_cache_key_policies_separate_routing_from_upstream_key() {
+    let request = |app: &App, thread: &str, client_key: &str| {
+        project_request(
+            app,
+            &[("x-codex-pool-project", "repo")],
+            child_cache_payload(thread, "root", client_key),
+            "client-key",
+        )
+    };
+    let (app, _dir) = configured(|settings| settings.prompt_cache_buckets = 1);
+    assert_eq!(
+        request(&app, "child-a", "native-codex-key").upstream_prompt_cache_key,
+        "native-codex-key",
+        "preserve policy changed client key"
+    );
+    let long_native_key = "native-".repeat(100);
+    assert_eq!(
+        request(&app, "child-long", &long_native_key).upstream_prompt_cache_key,
+        long_native_key,
+        "preserve policy truncated a long client key"
+    );
+    for policy in ["lineage", "project", "user"] {
+        let (app, _dir) = configured(|settings| {
+            settings.prompt_cache_key_policy = policy.into();
+            settings.prompt_cache_buckets = 1;
+        });
+        let (first, second) = (
+            request(&app, "child-a", "native-a"),
+            request(&app, "child-b", "native-b"),
+        );
+        assert_ne!(
+            first.sticky_key, second.sticky_key,
+            "{policy} policy collapsed sticky keys"
+        );
+        assert!(
+            first.upstream_prompt_cache_key != "native-a"
+                && first.upstream_prompt_cache_key.starts_with("cp_"),
+            "{policy} policy did not explicitly override/hash client key"
+        );
+        assert_eq!(
+            first.upstream_prompt_cache_key, second.upstream_prompt_cache_key,
+            "{policy} policy was not deterministic for shared scope"
+        );
+    }
+}
+
+// Go TestPromptCacheKeyPolicyControlsPayloadOverride.
+#[test]
+fn prompt_cache_key_policy_controls_payload_override() {
+    let run = |configure: fn(&mut super::settings::Settings)| {
+        let (app, _dir) = configured(configure);
+        let mut payload = child_cache_payload("child", "root", "native-codex-key");
+        let route = project_request(
+            &app,
+            &[("x-codex-pool-project", "repo")],
+            payload.clone(),
+            "client-key",
+        );
+        if let Some(object) = payload.as_object_mut() {
+            app.read().apply_prompt_cache_controls(object, &route);
+        }
+        (
+            payload["prompt_cache_key"].clone(),
+            route.upstream_prompt_cache_key,
+        )
+    };
+    let (kept, _) = run(|settings| settings.prompt_cache_key_mode = "passthrough".into());
+    assert_eq!(
+        kept, "native-codex-key",
+        "preserve policy rewrote client key"
+    );
+    let (overridden, route_key) = run(|settings| {
+        settings.prompt_cache_key_mode = "passthrough".into();
+        settings.prompt_cache_key_policy = "lineage".into();
+        settings.prompt_cache_buckets = 1;
+    });
+    assert!(
+        overridden == route_key.as_str() && overridden != "native-codex-key",
+        "explicit lineage policy did not override payload key"
+    );
+}
+
+// Go TestRoutingEventSourceNormalizesFallbackWithoutChangingKnownSources.
+#[test]
+fn routing_event_source_normalizes_fallback_without_changing_known_sources() {
+    use super::outcome::routing_event_source;
+    for (input, want) in [
+        ("prompt", "fallback"),
+        ("", "fallback"),
+        ("unexpected", "fallback"),
+        ("previous_response_id", "previous_response_id"),
+        ("thread_id", "thread_id"),
+        ("session", "session"),
+        ("project", "project"),
+        ("prompt_cache_key", "prompt_cache_key"),
+        ("conversation", "conversation"),
+        ("session_id", "session_id"),
+        ("conversation_id", "conversation_id"),
+    ] {
+        assert_eq!(
+            routing_event_source(input),
+            want,
+            "routing event source {input:?}"
+        );
+    }
+}
+
+// Go TestTelemetryLabelIsBoundedTokenText.
+#[test]
+fn telemetry_label_is_bounded_token_text() {
+    use super::routing::telemetry_label;
+    assert_eq!(telemetry_label(" codex_exec "), "codex_exec");
+    assert_eq!(
+        telemetry_label("a\nb\"c<d>"),
+        "a_b_c_d_",
+        "control and markup characters replaced"
+    );
+    assert_eq!(telemetry_label(&"x".repeat(200)).len(), 64);
 }

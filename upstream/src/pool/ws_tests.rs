@@ -1028,3 +1028,127 @@ fn native_endpoint_reports_headers_it_does_not_relay() {
         );
     }
 }
+
+// ---- the account's installation id (installation_id_test.go) ----
+
+const CLIENT_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+fn client_turn_metadata() -> String {
+    format!(
+        r#"{{"installation_id":"{CLIENT_INSTALLATION_ID}","session_id":"01a15f63-427f-7fa2-884a-01ebe2c60a47","thread_id":"01a15f63-427f-7fa2-884a-01ebe2c60a47","request_kind":"turn"}}"#
+    )
+}
+
+/// A Responses body whose client_metadata has the keys a native Codex
+/// 0.163.0 sends, and whose input quotes the client's installation id, which
+/// must not change.
+fn client_metadata_body() -> String {
+    let escaped = client_turn_metadata().replace('"', "\\\"");
+    format!(
+        r#"{{"model":"gpt-test","input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"my id is {CLIENT_INSTALLATION_ID}"}}]}}],"stream":true,"store":false,"client_metadata":{{"x-codex-window-id":"01a15f63-427f-7fa2-884a-01ebe2c60a47:0","x-codex-installation-id":"{CLIENT_INSTALLATION_ID}","x-codex-turn-metadata":"{escaped}"}},"prompt_cache_key":"thread-native"}}"#
+    )
+}
+
+// Go TestNativeEndpointPresentsTheAccountInstallationID.
+#[tokio::test]
+async fn native_endpoint_presents_the_account_installation_id() {
+    use super::installation_id::with_installation_id;
+    use super::testing::FakeResponse;
+    use super::testing::FakeServer;
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_native","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = codex_app(&upstream.url, &[("device", "acct-pool", 100)]);
+    let request = super::routes::Request::test(
+        http::Method::POST,
+        "/k/client-key/backend-api/codex/responses",
+        &client_metadata_body(),
+    )
+    .with_header("content-type", "application/json")
+    .with_header("x-codex-turn-metadata", &client_turn_metadata());
+    let result = serve(&app, request).await;
+    assert_eq!(
+        result.code(),
+        200,
+        "native endpoint: {}",
+        result.body_string()
+    );
+    let item = app.read().config.accounts()[0].clone();
+    let id = app.presented_installation_id(&item).unwrap_or_default();
+    let sent = upstream.requests().pop().unwrap_or_default();
+    let body = String::from_utf8_lossy(&zstd::decode_all(sent.body.as_slice()).unwrap_or_default())
+        .into_owned();
+    assert_eq!(
+        body,
+        with_installation_id(&client_metadata_body(), &id),
+        "upstream body"
+    );
+    assert_eq!(
+        sent.header("x-codex-turn-metadata"),
+        client_turn_metadata().replace(CLIENT_INSTALLATION_ID, &id)
+    );
+}
+
+// Go TestWebSocketPresentsTheAccountInstallationID.
+#[tokio::test]
+async fn websocket_presents_the_account_installation_id() {
+    use super::installation_id::with_installation_id;
+    let pool = ws_test_pool(
+        Behavior::scripted(|_| completed_events("resp_ws_id")),
+        |_| {},
+    )
+    .await;
+    let metadata = client_turn_metadata();
+    let (mut socket, _) = dial(
+        &pool.url,
+        &[
+            ("authorization", "Bearer client-key"),
+            ("openai-beta", "responses_websockets=2026-02-06"),
+            ("x-codex-turn-metadata", &metadata),
+        ],
+    )
+    .await
+    .unwrap_or_else(|_| panic!("dial pool"));
+    let message =
+        client_metadata_body().replacen(r#"{"model""#, r#"{"type":"response.create","model""#, 1);
+    send(&mut socket, &message).await;
+    read_until_terminal(&mut socket).await;
+    wait_in_flight_zero(&pool.app).await;
+    let identities = pool.upstream.identities();
+    let bound_id = identities.last().cloned().unwrap_or_default();
+    let accounts = pool.app.read().config.accounts().to_vec();
+    let bound = accounts
+        .iter()
+        .find(|item| item.id == bound_id)
+        .cloned()
+        .unwrap_or_default();
+    let id = pool
+        .app
+        .presented_installation_id(&bound)
+        .unwrap_or_default();
+    let handshake = pool.upstream.handshake(identities.len() - 1);
+    assert_eq!(
+        super::http_io::header_value(&handshake, "x-codex-turn-metadata"),
+        metadata.replace(CLIENT_INSTALLATION_ID, &id)
+    );
+    assert_eq!(
+        pool.upstream.messages().last().cloned().unwrap_or_default(),
+        with_installation_id(&message, &id)
+    );
+    let other = accounts
+        .iter()
+        .find(|item| item.id != bound.id)
+        .cloned()
+        .unwrap_or_default();
+    assert_ne!(
+        pool.app
+            .presented_installation_id(&other)
+            .unwrap_or_default(),
+        id,
+        "two accounts share an installation id"
+    );
+}
