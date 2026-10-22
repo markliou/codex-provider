@@ -5023,7 +5023,6 @@ fn codex_auth_retries_during_auth_file_rewrite() {
     let path = app.read().account_codex_home("acct-auth").join("auth.json");
     write_auth(&app, "acct-auth", r#"{"auth_mode":"chatgpt","tokens":"#);
     let writer = {
-        let path = path.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(25));
             let _ = std::fs::write(
