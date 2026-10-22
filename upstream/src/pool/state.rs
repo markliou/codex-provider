@@ -112,6 +112,8 @@ pub struct Config {
     pub preserve_pro_quota: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage_affinity: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_prime: Option<bool>,
     #[serde(default)]
     pub created_at: Timestamp,
     #[serde(default)]
