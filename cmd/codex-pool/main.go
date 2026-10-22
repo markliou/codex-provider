@@ -784,10 +784,12 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Quota priming defaults off. A prime is a request no native Codex sends,
-	// made only to start an idle account's quota window early; the owner turns
-	// it on from the Console when that trade is wanted (SPEC.md, quota prime).
-	quotaPrime, err := boolFromEnv("CODEX_POOL_QUOTA_PRIME")
+	// Quota priming defaults on, the owner's choice: an idle account's window
+	// should start counting so its quota cycles back. A prime is a request no
+	// native Codex sends, so it waits a random 5 to 30 minutes for a real
+	// request to start the window first (codex_prime.go, quota prime grace),
+	// and the Console switch turns it off (SPEC.md, quota window priming).
+	quotaPrime, err := boolFromEnvDefault("CODEX_POOL_QUOTA_PRIME", true)
 	if err != nil {
 		return nil, err
 	}
@@ -1266,7 +1268,7 @@ func (a *app) primeUnanchoredQuotaWindow(ctx context.Context, accountID string, 
 		return
 	}
 	candidate := *item
-	// Off unless the owner turned priming on (newApp, quotaPrime).
+	// Nothing when the owner turned priming off (newApp, quotaPrime).
 	if !a.quotaPrime {
 		a.mu.Unlock()
 		return

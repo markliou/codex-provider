@@ -178,7 +178,7 @@ docker run -d \
 | `CODEX_POOL_PROMPT_CACHE_BUCKETS` | no | `4` | Number of buckets (1–256) a coarse cache key is split across, keyed by the stable per-conversation routing key, to stay under OpenAI's ~15 RPM-per-(prefix+key) cache-routing limit. Raise for hot pools; set `1` to maximize sharing. |
 | `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | `24h` | Upstream prompt cache retention. Defaults to `24h` (extended retention) to maximize cache hit rate across conversation turns. Set `passthrough` to leave requests untouched, or `in_memory` for the shorter built-in retention. |
 | `CODEX_POOL_PRESERVE_PRO_QUOTA` | no | `false` | Initial default for the admin Console `Use Pro last` switch. Once saved in `/data/config.json`, the Console setting takes precedence. |
-| `CODEX_POOL_QUOTA_PRIME` | no | `false` | Initial default for the admin Console `Prime idle accounts` switch (quota window priming). Once saved in `/data/config.json`, the Console setting takes precedence. |
+| `CODEX_POOL_QUOTA_PRIME` | no | `true` | Initial default for the admin Console `Prime idle accounts` switch (quota window priming). Once saved in `/data/config.json`, the Console setting takes precedence. |
 | `CODEX_POOL_QUOTA_PRIME_GRACE` | no | random 5–30 min | Test override: a fixed wait (for example `0s`) before an unanchored window is primed. |
 | `CODEX_POOL_LINEAGE_AFFINITY` | no | `true` | Initial default for the admin Console `Keep subagents together` switch (section 6.2.1). Once saved in `/data/config.json`, the Console setting takes precedence. |
 
@@ -1644,14 +1644,14 @@ Response:
 A quota window that has reset but has seen no usage reports a reset instant a
 full window ahead that slides forward with the wall clock rather than counting
 down. Such a window never elapses, so an idle credential's quota never cycles
-back into usable capacity. When the owner has turned on the Console's `Prime idle
-accounts` switch (`quotaPrime`, initial value `CODEX_POOL_QUOTA_PRIME`), after
-each refresh the pool detects this state on the account's longest reported
-window and spends a minimal amount of quota against that account to anchor it.
-The switch is off by default: a prime is a request no native Codex sends, made
-for the pool's capacity rather than for a user, and without it a window anchors
-on its first real use, as it does for a native Codex. Even when it is on, a window is
-not primed as soon as it is seen unanchored: its user gets a random 5 to 30
+back into usable capacity. While the Console's `Prime idle accounts` switch is
+on (`quotaPrime`, initial value `CODEX_POOL_QUOTA_PRIME`, default on, the
+owner's choice), after each refresh the pool detects this state on the
+account's longest reported window and spends a minimal amount of quota against
+that account to anchor it. A prime is a request no native Codex sends, made for
+the pool's capacity rather than for a user; with the switch off a window anchors
+on its first real use, as it does for a native Codex. So a window is not primed
+as soon as it is seen unanchored: its user gets a random 5 to 30
 minute grace to start it with a real request, which anchors it with no prime.
 The pool polls the account again when the grace ends and primes only a window
 still untouched; a request in between anchors the window and the next poll drops
@@ -2026,7 +2026,7 @@ Request:
 }
 ```
 
-At least one field is required; an omitted field leaves that setting unchanged, so each Console switch posts only its own field. `preserveProQuota` backs the `Use Pro last` switch, `lineageAffinity` backs the `Keep subagents together` switch (default on), and `quotaPrime` backs the `Prime idle accounts` switch (default off). All are persisted in `/data/config.json` and returned in the admin state.
+At least one field is required; an omitted field leaves that setting unchanged, so each Console switch posts only its own field. `preserveProQuota` backs the `Use Pro last` switch, `lineageAffinity` backs the `Keep subagents together` switch (default on), and `quotaPrime` backs the `Prime idle accounts` switch (default on). All are persisted in `/data/config.json` and returned in the admin state.
 
 ---
 
