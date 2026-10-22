@@ -2,7 +2,7 @@
 
 ## Rust Port Branch
 
-This is the `rust-port` branch. Before any work here, read `RUST_PORT.md` in full and follow it: it says what this branch may and may not touch (never the production container, its image tag, its data volume, `.env` or real account credentials, and never `scripts/deploy.sh`), the order of the migration steps, and the conditions every step must keep. Remove this section when the port is merged and finished.
+The Rust pool is merged into `main` and is what `scripts/deploy.sh` deploys; work on `main` deploys from the main worktree as before. What remains of the port (RUST_PORT.md step 6, removing the Go code) is done on the `rust-port` branch in its own worktree. Before any work on that branch, read `RUST_PORT.md` in full and follow it: it says what that branch may and may not touch (never the production container, its image tag, its data volume, `.env` or real account credentials, and never `scripts/deploy.sh`), the order of the migration steps, and the conditions every step must keep. Remove this section when step 6 is merged.
 
 ## Portability
 
