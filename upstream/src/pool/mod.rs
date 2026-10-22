@@ -25,6 +25,8 @@ pub mod outcome;
 pub mod own_call;
 pub mod plan;
 pub mod proxy;
+#[cfg(test)]
+mod proxy_tests;
 pub mod quota;
 pub mod quota_schedule;
 pub mod response_info;

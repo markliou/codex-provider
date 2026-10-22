@@ -328,3 +328,13 @@ pub fn write_test_codex_auth_tokens(
         panic!("{error}");
     }
 }
+
+/// Go `a.logger = log.New(&logged, "", 0)`: the app logs into the returned
+/// lines.
+pub fn capture_logs(mut app: App) -> (App, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let (logger, lines) = super::log::Logger::capture();
+    let logger = std::sync::Arc::new(logger);
+    app.logger = logger.clone();
+    app.write().logger = logger;
+    (app, lines)
+}
