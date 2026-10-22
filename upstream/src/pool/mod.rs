@@ -8,6 +8,7 @@
 //! interchange format rather than a second, independently invented schema.
 //! Keep a single copy of them there; a second copy here could drift.
 
+pub mod admin;
 pub mod app;
 pub mod catalog;
 pub mod credentials;
@@ -19,6 +20,7 @@ pub mod http_io;
 pub mod installation_id;
 pub mod log;
 pub mod metadata;
+pub mod native;
 pub mod outcome;
 pub mod own_call;
 pub mod plan;
@@ -26,6 +28,8 @@ pub mod proxy;
 pub mod quota;
 pub mod quota_schedule;
 pub mod response_info;
+pub mod responses_ws;
+pub mod routes;
 pub mod routing;
 #[cfg(test)]
 mod routing_tests;

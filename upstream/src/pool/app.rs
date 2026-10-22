@@ -140,6 +140,12 @@ pub struct App {
     /// returned, streams included. The shutdown drain and the deploy script's
     /// idle wait both read it.
     pub in_flight: std::sync::atomic::AtomicI64,
+    /// Which account issued each turn state seen on a socket, so a message
+    /// presenting it reaches only that account (responses_ws.rs).
+    pub turn_state_issuers: std::sync::Mutex<HashMap<String, (String, Timestamp)>>,
+    /// The distinct sets of native-endpoint client headers already logged as
+    /// not relayed (native.rs), bounded at 256.
+    pub unrelayed_header_sets: std::sync::Mutex<std::collections::HashSet<String>>,
     inner: RwLock<Inner>,
 }
 
@@ -179,6 +185,8 @@ impl App {
             refused: super::credentials::RefusedCredentials::default(),
             account_activity: std::sync::Mutex::new(HashMap::new()),
             in_flight: std::sync::atomic::AtomicI64::new(0),
+            turn_state_issuers: std::sync::Mutex::new(HashMap::new()),
+            unrelayed_header_sets: std::sync::Mutex::new(std::collections::HashSet::new()),
             inner: RwLock::new(inner),
         }
     }

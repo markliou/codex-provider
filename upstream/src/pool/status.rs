@@ -201,3 +201,76 @@ impl App {
         headers
     }
 }
+
+pub fn to_value<T: serde::Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+}
+
+impl Inner {
+    /// What /v1/codex-pool/status shows about the account serving a session:
+    /// display names and plan metadata only, never local or upstream ids.
+    pub fn current_account_status(
+        &self,
+        item: &Account,
+        index: usize,
+        now: Timestamp,
+    ) -> serde_json::Value {
+        let (status, reason) = self.account_status(item, now);
+        let snapshot = quota::quota_snapshot_for_display(&self.quota_snapshot(&item.id), now);
+        let mut display = item.clone();
+        if !snapshot.organization_name.is_empty() {
+            display
+                .organization_name
+                .clone_from(&snapshot.organization_name);
+        }
+        if !snapshot.plan_type.is_empty() {
+            display.plan_type.clone_from(&snapshot.plan_type);
+            display.plan_family.clone_from(&snapshot.plan_family);
+            display.raw_plan_type.clone_from(&snapshot.raw_plan_type);
+            display.plan_rank = plan::plan_rank(&snapshot.plan_type);
+        }
+        if !snapshot.plan_limit.is_empty() {
+            display.plan_limit.clone_from(&snapshot.plan_limit);
+        }
+        // The snapshot is authoritative once it carries a seat, but before the
+        // first successful refresh it carries none. Overwriting
+        // unconditionally would then erase the seat already persisted on the
+        // slot and blank the row.
+        if !snapshot.seat_type.is_empty() {
+            display.seat_type.clone_from(&snapshot.seat_type);
+            display.seat_type_inferred = snapshot.seat_type_inferred;
+        }
+        if !snapshot.seat_type_raw.is_empty() {
+            display.seat_type_raw.clone_from(&snapshot.seat_type_raw);
+        }
+        display.quota_policy.clone_from(&snapshot.quota_policy);
+        let remaining = display
+            .remaining_quota
+            .or_else(|| snapshot.quota.as_ref().map(quota::remaining_quota_hint));
+        let metadata = plan::credential_metadata(&display);
+        let name = plan::public_credential_display_name(&display, Some(index));
+        serde_json::json!({
+            "label": name,
+            "displayName": name,
+            "credentialMetadata": metadata,
+            "email": metadata["email"],
+            "organizationName": metadata["organizationName"],
+            "planType": metadata["planType"],
+            "planLimit": metadata["planLimit"],
+            "planDisplayName": metadata["planDisplayName"],
+            "planRank": metadata["planRank"],
+            "status": status,
+            "statusReason": reason,
+            "available": status == "ready" || status == "low",
+            "remainingQuota": remaining,
+            "quota": to_value(&snapshot.quota),
+            "usageUpdatedAt": snapshot.usage_updated_at,
+            "lastSuccessfulRefreshAt": snapshot.last_successful_refresh_at,
+            "quotaFreshness": snapshot.freshness,
+            "quotaProvenance": snapshot.provenance,
+            "quotaError": to_value(&snapshot.quota_error),
+            "quotaProtection": to_value(&self.quota_protection_status(item, &snapshot, now)),
+            "quotaMetering": plan::quota_metering_kind(item),
+        })
+    }
+}

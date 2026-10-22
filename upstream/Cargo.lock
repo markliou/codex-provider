@@ -756,6 +756,7 @@ dependencies = [
  "tracing",
  "tungstenite",
  "url",
+ "zstd",
 ]
 
 [[package]]

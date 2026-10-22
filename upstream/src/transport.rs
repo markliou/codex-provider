@@ -495,3 +495,49 @@ pub fn build_own_call(
     }
     Ok((codex_request, composed.after_body))
 }
+
+pub type UpstreamSocket = codex_websocket_client::WebSocketConnection;
+
+/// How a WebSocket handshake to upstream ended without a socket.
+pub enum WebSocketRefusal {
+    /// Upstream answered the handshake with this status, headers and body.
+    Http {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    },
+    /// Upstream could not be reached.
+    Connection(String),
+}
+
+/// Opens an upstream Responses WebSocket with Codex's own connector and its
+/// permessage-deflate configuration, the handshake headers in native order.
+/// Returns the socket and the upstream handshake's response headers.
+pub async fn connect_websocket(
+    transports: &Transports,
+    url: &str,
+    headers: &HeaderMap,
+) -> Result<(UpstreamSocket, HeaderMap), WebSocketRefusal> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| WebSocketRefusal::Connection(format!("upstream url: {error}")))?;
+    request
+        .headers_mut()
+        .extend(ordered_websocket_headers(headers));
+    let connector = transports
+        .websocket()
+        .map_err(|error| WebSocketRefusal::Connection(error.to_string()))?;
+    match connector.connect(request, websocket_config()).await {
+        Ok((socket, handshake)) => Ok((socket, handshake.headers().clone())),
+        Err(WsError::Http(refused)) => {
+            let (parts, body) = refused.into_parts();
+            Err(WebSocketRefusal::Http {
+                status: parts.status,
+                headers: parts.headers,
+                body: body.unwrap_or_default(),
+            })
+        }
+        Err(error) => Err(WebSocketRefusal::Connection(error.to_string())),
+    }
+}

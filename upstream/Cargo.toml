@@ -51,6 +51,9 @@ thiserror = "2.0.17"
 tokio-util = { version = "0.7.18", features = ["codec", "io"] }
 tracing = "0.1.44"
 url = "2"
+# The native endpoint decodes the zstd request bodies a native Codex sends
+# (same version as Codex's own request compression).
+zstd = "0.13.3"
 
 [dev-dependencies]
 assert_matches = "1.5.0"
