@@ -8,6 +8,7 @@
 //! interchange format rather than a second, independently invented schema.
 //! Keep a single copy of them there; a second copy here could drift.
 
+pub mod gosort;
 pub mod hash;
 pub mod installation_id;
 pub mod metadata;
