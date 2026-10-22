@@ -1113,3 +1113,728 @@ fn recording_a_cooldown_prunes_expired_ones() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].model_id, "gpt-test");
 }
+
+fn decide(app: &App, payload: serde_json::Value, model: &str) -> RoutingDecision {
+    let headers = HeaderMap::new();
+    let facts = RequestFacts {
+        headers: &headers,
+        native: false,
+        websocket: false,
+    };
+    app.routing_decision(
+        &facts,
+        payload.as_object().unwrap_or(&serde_json::Map::new()),
+        model,
+        "client-key",
+    )
+}
+
+fn metadata_payload(metadata: &str) -> serde_json::Value {
+    serde_json::json!({"client_metadata": {"x-codex-turn-metadata": metadata}})
+}
+
+fn thread_binding(
+    thread: &str,
+    root: &str,
+    model: &str,
+    account: &str,
+    now: Timestamp,
+) -> super::state::ThreadBinding {
+    super::state::ThreadBinding {
+        thread_id: thread.to_string(),
+        lineage_root_id: root.to_string(),
+        model_id: model.to_string(),
+        account_id: account.to_string(),
+        sticky_key: format!("{model}:thread:{thread}"),
+        created_at: now,
+        last_success_at: now,
+        expires_at: now.add(hours(1)),
+        ..super::state::ThreadBinding::default()
+    }
+}
+
+// Go TestPreviousResponseIDRoutesToOriginalAccount.
+#[test]
+fn previous_response_id_routes_to_original_account() {
+    let (app, _dir) = test_app(vec![
+        provider_account("low", 10),
+        provider_account("high", 100),
+    ]);
+    let now = Timestamp::now();
+    {
+        let mut inner = app.write();
+        inner.state.sticky_sessions_mut().insert(
+            "gpt-test:conversation-a".into(),
+            sticky("gpt-test:conversation-a", "low", now),
+        );
+        inner.state.response_bindings_mut().insert(
+            "resp_previous".into(),
+            super::state::ResponseBinding {
+                response_id: "resp_previous".into(),
+                sticky_key: "gpt-test:conversation-a".into(),
+                model_id: "gpt-test".into(),
+                account_id: "low".into(),
+                created_at: now,
+                expires_at: now.add(hours(1)),
+                ..super::state::ResponseBinding::default()
+            },
+        );
+    }
+    let route = decide(
+        &app,
+        serde_json::json!({"previous_response_id": "resp_previous", "input": "next"}),
+        "gpt-test",
+    );
+    assert_eq!(
+        selected_id(app.select_account(&route.sticky_key, "gpt-test", &none())),
+        "low"
+    );
+}
+
+// Go TestRequestIdentityParsesCodexMetadataPrecedenceAndMalformedFallback.
+#[test]
+fn request_identity_parses_codex_metadata_precedence_and_malformed_fallback() {
+    use super::routing::request_identity_from;
+    let headers = |pairs: &[(&'static str, &'static str)]| {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, http::HeaderValue::from_static(value));
+        }
+        map
+    };
+    let object = |value: serde_json::Value| value.as_object().cloned().unwrap_or_default();
+    let identity = request_identity_from(
+        &headers(&[
+            (
+                "x-codex-turn-metadata",
+                r#"{"thread_id":"header-thread","parent_thread_id":"header-parent"}"#,
+            ),
+            ("x-codex-parent-thread-id", "direct-parent"),
+            ("x-openai-subagent", "collab_spawn"),
+        ]),
+        &object(serde_json::json!({
+            "thread_id": "top-thread",
+            "parent_thread_id": "top-parent",
+            "client_metadata": {
+                "thread_id": "flat-thread",
+                "session_id": "flat-session",
+                "x-codex-turn-metadata": r#"{"thread_id":"canonical-thread","parent_thread_id":"canonical-parent","forked_from_thread_id":"fork-source","subagent_kind":"thread_spawn"}"#,
+            },
+        })),
+    );
+    assert_eq!(
+        (
+            identity.thread_id.as_str(),
+            identity.parent_thread_id.as_str(),
+            identity.session_id.as_str()
+        ),
+        ("canonical-thread", "canonical-parent", "flat-session"),
+        "metadata precedence"
+    );
+    assert!(
+        identity.forked_from_id == "fork-source"
+            && identity.subagent_kind == "thread_spawn"
+            && identity.is_subagent
+    );
+
+    let identity = request_identity_from(
+        &headers(&[("x-codex-turn-metadata", "{not-json")]),
+        &object(serde_json::json!({"thread_id": "fallback-thread", "input": "unchanged"})),
+    );
+    assert!(
+        identity.thread_id == "fallback-thread" && !identity.is_subagent,
+        "malformed metadata did not fall back safely: {identity:?}"
+    );
+
+    let identity = request_identity_from(
+        &headers(&[
+            ("x-codex-thread-id", "header-child"),
+            ("x-codex-parent-thread-id", "header-parent"),
+            ("x-openai-subagent", "collab_spawn"),
+        ]),
+        &object(
+            serde_json::json!({"client_metadata": {"x-codex-turn-metadata": "{malformed", "session_id": "flat-session"}}),
+        ),
+    );
+    assert!(
+        identity.thread_id == "header-child"
+            && identity.parent_thread_id == "header-parent"
+            && identity.session_id == "flat-session"
+            && identity.is_subagent,
+        "compatibility headers or malformed nested fallback produced {identity:?}"
+    );
+}
+
+// Go TestCodexThreadsKeepIndependentStickyAndPreviousResponseChains.
+#[test]
+fn codex_threads_keep_independent_sticky_and_previous_response_chains() {
+    use super::routing::thread_binding_state_key;
+    let (app, _dir) = test_app(Vec::new());
+    let now = Timestamp::now();
+    {
+        let mut inner = app.write();
+        let mut child = thread_binding("child", "main", "gpt-test", "one", now);
+        child.parent_thread_id = "main".into();
+        child.subagent_kind = "thread_spawn".into();
+        inner
+            .state
+            .thread_bindings_mut()
+            .insert(thread_binding_state_key("gpt-test", "child"), child);
+        inner.state.response_bindings_mut().insert(
+            "resp-child".into(),
+            super::state::ResponseBinding {
+                response_id: "resp-child".into(),
+                sticky_key: "gpt-test:thread:child".into(),
+                model_id: "gpt-test".into(),
+                account_id: "one".into(),
+                created_at: now,
+                expires_at: now.add(hours(1)),
+                ..super::state::ResponseBinding::default()
+            },
+        );
+    }
+    let request = |metadata: &str, previous: Option<&str>| {
+        let mut payload = serde_json::json!({"client_metadata": {"x-codex-turn-metadata": metadata}, "prompt_cache_key": "client-thread-key"});
+        if let Some(previous) = previous {
+            payload["previous_response_id"] = serde_json::Value::String(previous.to_string());
+        }
+        decide(&app, payload, "gpt-test")
+    };
+    let main_route = request(r#"{"thread_id":"main"}"#, None);
+    let child_route = request(
+        r#"{"thread_id":"child","parent_thread_id":"main","subagent_kind":"thread_spawn"}"#,
+        None,
+    );
+    let sibling_route = request(
+        r#"{"thread_id":"sibling","parent_thread_id":"main","subagent_kind":"thread_spawn"}"#,
+        None,
+    );
+    let continued = request(
+        r#"{"thread_id":"wrong-version-skew-id"}"#,
+        Some("resp-child"),
+    );
+    assert!(
+        main_route.sticky_key != child_route.sticky_key
+            && child_route.sticky_key != sibling_route.sticky_key
+            && main_route.sticky_key != sibling_route.sticky_key,
+        "thread routes collapsed"
+    );
+    assert!(
+        continued.sticky_key == "gpt-test:thread:child" && continued.identity.thread_id == "child",
+        "previous_response_id lost child chain"
+    );
+    app.mark_success(
+        &continued,
+        "gpt-test",
+        "one",
+        &ProxyResponseInfo {
+            response_id: "resp-child-next".into(),
+            ..ProxyResponseInfo::default()
+        },
+    );
+    assert!(
+        !app.read()
+            .state
+            .thread_bindings()
+            .contains_key(&thread_binding_state_key(
+                "gpt-test",
+                "wrong-version-skew-id"
+            )),
+        "version-skewed metadata created a second thread binding for a bound response chain"
+    );
+    assert_eq!(main_route.upstream_prompt_cache_key, "client-thread-key");
+    assert_eq!(child_route.upstream_prompt_cache_key, "client-thread-key");
+}
+
+// Go TestChildSoftPrefersEligibleParentAndNestedLineageRoot.
+#[test]
+fn child_soft_prefers_eligible_parent_and_nested_lineage_root() {
+    use super::routing::thread_binding_state_key;
+    let (app, _dir) = test_app(vec![
+        provider_account("parent-account", 10),
+        provider_account("pool-first", 100),
+    ]);
+    let now = Timestamp::now();
+    app.write().state.thread_bindings_mut().insert(
+        thread_binding_state_key("gpt-test", "root-thread"),
+        thread_binding(
+            "root-thread",
+            "root-thread",
+            "gpt-test",
+            "parent-account",
+            now,
+        ),
+    );
+    let child_payload = serde_json::json!({
+        "client_metadata": {"x-codex-turn-metadata": r#"{"thread_id":"child-thread","parent_thread_id":"root-thread","subagent_kind":"thread_spawn"}"#},
+        "prompt_cache_key": "child-key",
+    });
+    let mut child_route = decide(&app, child_payload.clone(), "gpt-test");
+    let selected = selected_id(app.select_account_for_route(&mut child_route, "gpt-test", &none()));
+    assert!(
+        selected == "parent-account" && child_route.identity.lineage_root_id == "root-thread",
+        "child affinity/lineage"
+    );
+    app.mark_success(
+        &child_route,
+        "gpt-test",
+        &selected,
+        &ProxyResponseInfo::default(),
+    );
+    let continued = decide(&app, child_payload, "gpt-test");
+    assert!(
+        !continued.parent_affinity_attempted,
+        "parent affinity was counted again after the child acquired its own sticky binding"
+    );
+    app.mark_success(
+        &continued,
+        "gpt-test",
+        &selected,
+        &ProxyResponseInfo::default(),
+    );
+    {
+        let inner = app.read();
+        let hits = inner
+            .state
+            .prompt_cache()
+            .get("parent-account:gpt-test:subagent")
+            .map_or(0, |stat| stat.parent_affinity_hit_count);
+        assert_eq!(hits, 1, "parent affinity hit count");
+        let events = inner.state.routing_cache_events();
+        assert!(
+            events.len() >= 2
+                && events[0].routing_outcome == "parent_affinity"
+                && events[1].routing_outcome == "sticky_reuse"
+        );
+    }
+    let nested = decide(
+        &app,
+        metadata_payload(
+            r#"{"thread_id":"nested-thread","parent_thread_id":"child-thread","subagent_kind":"thread_spawn"}"#,
+        ),
+        "gpt-test",
+    );
+    assert!(
+        nested.identity.lineage_root_id == "root-thread"
+            && nested.lineage_account_id == "parent-account",
+        "nested lineage was not inherited"
+    );
+    assert_ne!(
+        nested.sticky_key, child_route.sticky_key,
+        "nested child reused parent sticky key"
+    );
+}
+
+// Go TestBoundChildFollowsMainAgentAfterMainMovesAccount.
+#[test]
+fn bound_child_follows_main_agent_after_main_moves_account() {
+    let (app, _dir) = test_app(vec![
+        provider_account("account-a", 100),
+        provider_account("account-b", 100),
+    ]);
+    let main = r#"{"thread_id":"main"}"#;
+    let child = r#"{"thread_id":"child","parent_thread_id":"main","subagent_kind":"thread_spawn"}"#;
+    let info = ProxyResponseInfo::default();
+    app.mark_success(
+        &request(&app, "gpt-test", main),
+        "gpt-test",
+        "account-a",
+        &info,
+    );
+    app.mark_success(
+        &request(&app, "gpt-test", child),
+        "gpt-test",
+        "account-a",
+        &info,
+    );
+    // The main agent fails over to account-b; the bound child must follow it
+    // on its next request instead of staying on its own sticky account-a.
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    app.mark_success(
+        &request(&app, "gpt-test", main),
+        "gpt-test",
+        "account-b",
+        &info,
+    );
+    let mut child_route = request(&app, "gpt-test", child);
+    assert_eq!(child_route.lineage_account_id, "account-b");
+    let selected = selected_id(app.select_account_for_route(&mut child_route, "gpt-test", &none()));
+    assert_eq!(
+        selected, "account-b",
+        "bound child must take the main agent's account"
+    );
+    app.mark_success(&child_route, "gpt-test", &selected, &info);
+    let outcome = app
+        .read()
+        .state
+        .routing_cache_events()
+        .last()
+        .map(|event| event.routing_outcome.clone())
+        .unwrap_or_default();
+    assert_eq!(outcome, "lineage_follow");
+    // The reverse direction: a child that fails over pulls the main agent
+    // along.
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    app.mark_success(
+        &request(&app, "gpt-test", child),
+        "gpt-test",
+        "account-a",
+        &info,
+    );
+    let mut main_route = request(&app, "gpt-test", main);
+    assert_eq!(
+        selected_id(app.select_account_for_route(&mut main_route, "gpt-test", &none())),
+        "account-a"
+    );
+}
+
+// Go TestChildFindsParentBoundUnderDifferentModel.
+#[test]
+fn child_finds_parent_bound_under_different_model() {
+    use super::routing::thread_binding_state_key;
+    let (app, _dir) = test_app(vec![
+        provider_account("parent-account", 10),
+        provider_account("pool-first", 100),
+    ]);
+    app.write().state.thread_bindings_mut().insert(
+        thread_binding_state_key("gpt-main", "main"),
+        thread_binding(
+            "main",
+            "main",
+            "gpt-main",
+            "parent-account",
+            Timestamp::now(),
+        ),
+    );
+    let mut route = request(
+        &app,
+        "gpt-test",
+        r#"{"thread_id":"child","parent_thread_id":"main","subagent_kind":"thread_spawn"}"#,
+    );
+    assert_eq!(route.identity.lineage_root_id, "main");
+    assert_eq!(
+        selected_id(app.select_account_for_route(&mut route, "gpt-test", &none())),
+        "parent-account"
+    );
+}
+
+// Go TestUnboundLineageMembersConvergeOnSameNewAccount.
+#[test]
+fn unbound_lineage_members_converge_on_same_new_account() {
+    // Balanced routing hashes the route key; failover mode would pick the
+    // same top-priority account for everyone and prove nothing.
+    let (app, _dir) = balanced(
+        (0..6)
+            .map(|index| provider_account(&format!("account-{index}"), 100))
+            .collect(),
+    );
+    let mut main_route = request(&app, "gpt-test", r#"{"thread_id":"main"}"#);
+    let main_selected =
+        selected_id(app.select_account_for_route(&mut main_route, "gpt-test", &none()));
+    // No binding exists yet (concurrent first turns), so only the
+    // lineage-seeded balance key can keep these together.
+    for child in ["child-a", "child-b", "child-c", "child-d"] {
+        let mut route = request(
+            &app,
+            "gpt-test",
+            &format!(
+                r#"{{"thread_id":"{child}","parent_thread_id":"main","subagent_kind":"thread_spawn"}}"#
+            ),
+        );
+        assert_ne!(
+            route.sticky_key, main_route.sticky_key,
+            "child {child} reused the main sticky key"
+        );
+        assert_eq!(
+            selected_id(app.select_account_for_route(&mut route, "gpt-test", &none())),
+            main_selected,
+            "unbound child {child}"
+        );
+    }
+}
+
+const PARENT_CHILD_METADATA: &str =
+    r#"{"thread_id":"child","parent_thread_id":"parent","subagent_kind":"thread_spawn"}"#;
+
+fn bind_parent(app: &App, account: &str) {
+    use super::routing::thread_binding_state_key;
+    app.write().state.thread_bindings_mut().insert(
+        thread_binding_state_key("gpt-test", "parent"),
+        thread_binding("parent", "parent", "gpt-test", account, Timestamp::now()),
+    );
+}
+
+fn last_outcome(app: &App) -> String {
+    app.read()
+        .state
+        .routing_cache_events()
+        .last()
+        .map(|event| event.routing_outcome.clone())
+        .unwrap_or_default()
+}
+
+// Go TestChildTemporaryLineageRootCorrectsWhenParentAppears.
+#[test]
+fn child_temporary_lineage_root_corrects_when_parent_appears() {
+    use super::routing::thread_binding_state_key;
+    let (app, _dir) = test_app(vec![provider_account("account", 100)]);
+    let initial = request(&app, "gpt-test", PARENT_CHILD_METADATA);
+    assert_eq!(
+        initial.identity.lineage_root_id, "parent",
+        "temporary lineage root must be the immediate parent"
+    );
+    app.mark_success(
+        &initial,
+        "gpt-test",
+        "account",
+        &ProxyResponseInfo::default(),
+    );
+    let mut parent = thread_binding("parent", "root", "gpt-test", "account", Timestamp::now());
+    parent.parent_thread_id = "root".into();
+    app.write()
+        .state
+        .thread_bindings_mut()
+        .insert(thread_binding_state_key("gpt-test", "parent"), parent);
+    let corrected = request(&app, "gpt-test", PARENT_CHILD_METADATA);
+    assert_eq!(corrected.identity.lineage_root_id, "root");
+    app.mark_success(
+        &corrected,
+        "gpt-test",
+        "account",
+        &ProxyResponseInfo::default(),
+    );
+    let persisted = app
+        .read()
+        .state
+        .thread_bindings()
+        .get(&thread_binding_state_key("gpt-test", "child"))
+        .map(|binding| binding.lineage_root_id.clone())
+        .unwrap_or_default();
+    assert_eq!(persisted, "root", "persisted corrected lineage root");
+}
+
+// Go TestIneligibleParentFallsBackWithoutBypassingSafeguards.
+#[test]
+fn ineligible_parent_falls_back_without_bypassing_safeguards() {
+    let cases: Vec<(&str, Box<dyn Fn(&App)>)> = vec![
+        (
+            "disabled",
+            Box::new(|app: &App| app.write().config.accounts_mut()[0].enabled = false),
+        ),
+        (
+            "out of pool",
+            Box::new(|app: &App| app.write().config.accounts_mut()[0].in_pool = false),
+        ),
+        (
+            "missing provider auth",
+            Box::new(|app: &App| {
+                app.write().config.accounts_mut()[0].upstream_base_url = String::new()
+            }),
+        ),
+        (
+            "model incompatible",
+            Box::new(|app: &App| {
+                app.write().config.accounts_mut()[0].allowed_models = vec!["other-model".into()]
+            }),
+        ),
+        (
+            "quota exhausted",
+            Box::new(|app: &App| app.write().config.accounts_mut()[0].remaining_quota = Some(0)),
+        ),
+        (
+            "cooldown",
+            Box::new(|app: &App| {
+                app.write().state.cooldowns_mut().insert(
+                    "parent-account".into(),
+                    vec![Cooldown {
+                        model_id: "gpt-test".into(),
+                        next_retry_at: Timestamp::now().add(hours(1)),
+                        reason: "rate_limited".into(),
+                        ..Cooldown::default()
+                    }],
+                );
+            }),
+        ),
+        (
+            "pro preservation",
+            Box::new(|app: &App| {
+                let mut inner = app.write();
+                inner.preserve_pro_quota = true;
+                inner.config.accounts_mut()[0].plan_type = "pro".into();
+                inner.config.accounts_mut()[1].plan_type = "plus".into();
+            }),
+        ),
+    ];
+    for (name, configure) in cases {
+        let (app, _dir) = test_app(vec![
+            provider_account("parent-account", 100),
+            provider_account("fallback", 10),
+        ]);
+        bind_parent(&app, "parent-account");
+        configure(&app);
+        let mut route = request(&app, "gpt-test", PARENT_CHILD_METADATA);
+        let selected = selected_id(app.select_account_for_route(&mut route, "gpt-test", &none()));
+        assert_eq!(selected, "fallback", "{name}: ineligible parent selected");
+        app.mark_success(&route, "gpt-test", &selected, &ProxyResponseInfo::default());
+        assert_eq!(last_outcome(&app), "parent_affinity_fallback", "{name}");
+    }
+}
+
+// Go TestChildAffinityDoesNotBypassDuplicateIdentityRepresentative.
+#[test]
+fn child_affinity_does_not_bypass_duplicate_identity_representative() {
+    let (app, _dir) = test_app(vec![
+        super::testing::device_account("parent-slot", "shared-upstream", 10),
+        super::testing::device_account("representative-slot", "shared-upstream", 100),
+    ]);
+    write_codex_device_auth(
+        &app,
+        "parent-slot",
+        "shared-upstream",
+        "shared@example.test",
+    );
+    write_codex_device_auth(
+        &app,
+        "representative-slot",
+        "shared-upstream",
+        "shared@example.test",
+    );
+    bind_parent(&app, "parent-slot");
+    let mut route = request(&app, "gpt-test", PARENT_CHILD_METADATA);
+    assert_eq!(
+        selected_id(app.select_account_for_route(&mut route, "gpt-test", &none())),
+        "representative-slot",
+        "child affinity selected duplicate non-representative"
+    );
+}
+
+// Go TestLineageAffinityOffRestoresFirstRequestOnlyParentPreference.
+#[test]
+fn lineage_affinity_off_restores_first_request_only_parent_preference() {
+    let (app, _dir) = test_app(vec![
+        provider_account("account-a", 100),
+        provider_account("account-b", 100),
+    ]);
+    app.write().lineage_affinity = false;
+    let main = r#"{"thread_id":"main"}"#;
+    let child = r#"{"thread_id":"child","parent_thread_id":"main","subagent_kind":"thread_spawn"}"#;
+    let info = ProxyResponseInfo::default();
+    app.mark_success(
+        &request(&app, "gpt-test", main),
+        "gpt-test",
+        "account-b",
+        &info,
+    );
+    // An unbound child still softly prefers its parent's account.
+    let mut child_route = request(&app, "gpt-test", child);
+    assert_eq!(
+        child_route.balance_key, child_route.sticky_key,
+        "lineage-off balance key must be per thread"
+    );
+    let selected = selected_id(app.select_account_for_route(&mut child_route, "gpt-test", &none()));
+    assert_eq!(
+        selected, "account-b",
+        "unbound child must take the parent's account"
+    );
+    app.mark_success(&child_route, "gpt-test", &selected, &info);
+    // Once bound, the child keeps its own route even after the parent moves.
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    app.mark_success(
+        &request(&app, "gpt-test", main),
+        "gpt-test",
+        "account-a",
+        &info,
+    );
+    let mut bound = request(&app, "gpt-test", child);
+    assert_eq!(
+        selected_id(app.select_account_for_route(&mut bound, "gpt-test", &none())),
+        "account-b"
+    );
+}
+
+// Go TestLineageBindingsArePrunedAndClearedWithAccount.
+#[test]
+fn lineage_bindings_are_pruned_and_cleared_with_account() {
+    let (app, _dir) = test_app(Vec::new());
+    let now = Timestamp::now();
+    let binding = |root: &str, account: &str, expires_at: Timestamp| LineageBinding {
+        lineage_root_id: root.into(),
+        account_id: account.into(),
+        expires_at,
+        ..LineageBinding::default()
+    };
+    let mut inner = app.write();
+    for (root, account, expires_at) in [
+        ("expired", "one", now.add(-minutes(1))),
+        ("active", "one", now.add(hours(1))),
+        ("other", "two", now.add(hours(1))),
+    ] {
+        inner
+            .state
+            .lineage_bindings_mut()
+            .insert(root.into(), binding(root, account, expires_at));
+    }
+    assert!(
+        inner.prune_expired_runtime_state(now),
+        "expired lineage binding was not pruned"
+    );
+    assert!(!inner.state.lineage_bindings().contains_key("expired"));
+    inner.clear_sticky_for_account("one");
+    assert!(
+        !inner.state.lineage_bindings().contains_key("active"),
+        "lineage binding survived clearing its account"
+    );
+    assert!(
+        inner.state.lineage_bindings().contains_key("other"),
+        "clearing one account removed another account's lineage binding"
+    );
+}
+
+// Go TestThreadBindingsAndResponsesAreTTLPruned.
+#[test]
+fn thread_bindings_and_responses_are_ttl_pruned() {
+    let (app, _dir) = test_app(Vec::new());
+    let now = Timestamp::now();
+    let mut inner = app.write();
+    inner.state.sticky_sessions_mut().insert(
+        "expired".into(),
+        StickySession {
+            key: "expired".into(),
+            expires_at: now.add(-minutes(1)),
+            ..StickySession::default()
+        },
+    );
+    inner.state.response_bindings_mut().insert(
+        "expired".into(),
+        super::state::ResponseBinding {
+            response_id: "expired".into(),
+            expires_at: now.add(-minutes(1)),
+            ..super::state::ResponseBinding::default()
+        },
+    );
+    for (id, expires_at) in [
+        ("expired", now.add(-minutes(1))),
+        ("active", now.add(hours(1))),
+    ] {
+        inner.state.thread_bindings_mut().insert(
+            id.into(),
+            super::state::ThreadBinding {
+                thread_id: id.into(),
+                expires_at,
+                ..super::state::ThreadBinding::default()
+            },
+        );
+    }
+    assert!(
+        inner.prune_expired_runtime_state(now),
+        "expired runtime state was not reported as pruned"
+    );
+    assert!(
+        !inner.state.thread_bindings().contains_key("expired"),
+        "expired thread binding was retained"
+    );
+    assert!(
+        inner.state.thread_bindings().contains_key("active"),
+        "active thread binding was pruned"
+    );
+}

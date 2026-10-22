@@ -2906,3 +2906,789 @@ async fn responses_proxy_injects_prompt_cache_controls_and_tracks_usage() {
         (1, 2006, 1920)
     );
 }
+
+// ---- chat completions, routing events and device-auth failover ----
+
+fn write_auth(app: &App, id: &str, auth: &str) {
+    let home = app.read().account_codex_home(id);
+    std::fs::create_dir_all(&home).unwrap_or_else(|error| panic!("{error}"));
+    std::fs::write(home.join("auth.json"), auth).unwrap_or_else(|error| panic!("{error}"));
+}
+
+fn device_at(id: &str, upstream_account: &str, priority: i64, url: &str) -> Account {
+    Account {
+        upstream_base_url: url.to_string(),
+        ..device_account(id, upstream_account, priority)
+    }
+}
+
+// Go TestChatCompletionConversionPreservesPromptCacheControls.
+#[test]
+fn chat_completion_conversion_preserves_prompt_cache_controls() {
+    let (app, _dir) = test_app(Vec::new());
+    let candidate = Account {
+        id: "one".into(),
+        upstream_base_url: "https://upstream.example.test/v1".into(),
+        wire_api: "responses".into(),
+        ..Account::default()
+    };
+    let body = bytes::Bytes::from_static(
+        br#"{"model":"gpt-test","messages":[{"role":"system","content":"static"},{"role":"user","content":"dynamic"}],"prompt_cache_key":"cache-a","prompt_cache_retention":"24h","stream":true}"#,
+    );
+    let (endpoint, outbound, convert) = app
+        .prepare_upstream_request(&candidate, &body, true)
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        endpoint == "https://upstream.example.test/v1/responses" && convert,
+        "endpoint={endpoint} convert={convert}"
+    );
+    let converted: serde_json::Value = serde_json::from_slice(&outbound).unwrap_or_default();
+    assert_eq!(converted["prompt_cache_key"], "cache-a");
+    assert_eq!(converted["prompt_cache_retention"], "24h");
+    assert!(
+        converted["input"].is_array(),
+        "messages were not converted to input: {}",
+        converted["input"]
+    );
+}
+
+// Go TestStickyFallbackUsesChatMessagesAndAPIKey.
+#[test]
+fn sticky_fallback_uses_chat_messages_and_api_key() {
+    let (app, _dir) = test_app(Vec::new());
+    let headers = http::HeaderMap::new();
+    let facts = super::routing::RequestFacts {
+        headers: &headers,
+        native: false,
+        websocket: false,
+    };
+    let payload = |text: &str| {
+        serde_json::json!({"messages": [{"role": "system", "content": "static"}, {"role": "user", "content": text}]})
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let key_a = app
+        .routing_decision(&facts, &payload("one"), "gpt-test", "client-key")
+        .sticky_key;
+    let key_b = app
+        .routing_decision(&facts, &payload("two"), "gpt-test", "client-key")
+        .sticky_key;
+    let key_other = app
+        .routing_decision(&facts, &payload("one"), "gpt-test", "other-client-key")
+        .sticky_key;
+    assert_ne!(
+        key_a, key_b,
+        "different chat messages produced same sticky fallback key"
+    );
+    assert_ne!(
+        key_a, key_other,
+        "different API keys produced same sticky fallback key"
+    );
+    assert!(
+        !key_a.contains("client-key") && !key_a.contains("static") && !key_a.contains("one"),
+        "sticky fallback key leaked raw request data: {key_a}"
+    );
+}
+
+// Go TestRoutingCacheEventsCorrelateStickyReuseAndFailover.
+#[tokio::test]
+async fn routing_cache_events_correlate_sticky_reuse_and_failover() {
+    let first = FakeServer::start(counting(|hits| {
+        if hits == 3 {
+            return status_response(429, &[("retry-after", "1")]);
+        }
+        let cached = (hits - 1) * 1500;
+        let written = 400 - (hits - 1) * 300;
+        FakeResponse::json(
+            200,
+            &format!(
+                r#"{{"id":"resp_primary_{hits}","object":"response","output":[],"usage":{{"input_tokens":2000,"input_tokens_details":{{"cached_tokens":{cached},"cache_write_tokens":{written}}}}}}}"#
+            ),
+        )
+    }))
+    .await;
+    let second = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_secondary","object":"response","output":[],"usage":{"input_tokens":2400,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":1800}}}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = arc_app(vec![
+        Account {
+            label: "Primary".into(),
+            ..provider("private-primary-id", 100, &first.url, "first-key")
+        },
+        Account {
+            label: "Secondary".into(),
+            ..provider("private-secondary-id", 10, &second.url, "second-key")
+        },
+    ]);
+    for _ in 0..3 {
+        let result = serve(
+            &app,
+            responses(
+                r#"{"model":"gpt-test","input":"hello"}"#,
+                "raw-sticky-session",
+            ),
+        )
+        .await;
+        assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    }
+    let events = events(&app);
+    let outcomes: Vec<&str> = events
+        .iter()
+        .map(|event| event.routing_outcome.as_str())
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            "new_route_assignment",
+            "sticky_reuse",
+            "rate_limit_failover"
+        ]
+    );
+    let failover = &events[2];
+    assert!(
+        failover.account_id == "private-secondary-id"
+            && failover.failover_from_account_id == "private-primary-id"
+            && failover.cache_write_tokens == Some(1800)
+            && failover.cold_cache_eligible,
+        "failover cache correlation = {failover:?}"
+    );
+    let views = serde_json::to_string(&app.read().routing_cache_event_views(Timestamp::now()))
+        .unwrap_or_default();
+    for leaked in [
+        "private-primary-id",
+        "private-secondary-id",
+        "raw-sticky-session",
+    ] {
+        assert!(
+            !views.contains(leaked),
+            "routing cache browser view leaked identifiers: {views}"
+        );
+    }
+    for label in ["Primary", "Secondary"] {
+        assert!(
+            views.contains(label),
+            "routing cache browser view omitted {label}: {views}"
+        );
+    }
+}
+
+// Go TestDeviceAuthFailoverAfterRateLimit.
+#[tokio::test]
+async fn device_auth_failover_after_rate_limit() {
+    let first = FakeServer::start(|_| status_response(429, &[("retry-after", "1")])).await;
+    let second = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_device_failover","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = arc_app(vec![
+        device_at("device-first", "acct-first", 100, &first.url),
+        device_at("device-second", "acct-second", 10, &second.url),
+    ]);
+    write_auth(
+        &app,
+        "device-first",
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"<first-access-token>"}}"#,
+    );
+    write_auth(
+        &app,
+        "device-second",
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"<second-access-token>"}}"#,
+    );
+    let result = serve(
+        &app,
+        responses(r#"{"model":"gpt-test","input":"hello"}"#, "device-failover"),
+    )
+    .await;
+    assert_eq!(
+        result.code(),
+        200,
+        "device-auth failover: {}",
+        result.body_string()
+    );
+    assert_eq!((first.count(), second.count()), (1, 1));
+    let (sent_first, sent_second) = (
+        first.requests().pop().unwrap_or_default(),
+        second.requests().pop().unwrap_or_default(),
+    );
+    assert_eq!(
+        (
+            sent_first.header("authorization"),
+            sent_first.header("chatgpt-account-id")
+        ),
+        ("Bearer <first-access-token>", "acct-first")
+    );
+    assert_eq!(
+        (
+            sent_second.header("authorization"),
+            sent_second.header("chatgpt-account-id")
+        ),
+        ("Bearer <second-access-token>", "acct-second")
+    );
+    assert_eq!(
+        sticky(&app, "gpt-test:device-failover").account_id,
+        "device-second"
+    );
+    assert_eq!(
+        health(&app, "device-first").last_failure_reason,
+        "rate_limited"
+    );
+}
+
+// Go TestDeviceAuthFailoverAfterRefreshTokenRevoked.
+#[tokio::test]
+async fn device_auth_failover_after_refresh_token_revoked() {
+    let refresh = FakeServer::start(|_| FakeResponse::status(400)).await;
+    let first = FakeServer::start(|_| FakeResponse::status(500)).await;
+    let second = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_refresh_failover","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let accounts = vec![
+        device_at("device-first", "", 100, &first.url),
+        device_at("device-second", "", 10, &second.url),
+    ];
+    let refresh_url = refresh.url.clone();
+    let (app, _dir) =
+        super::testing::test_app_with(accounts, |settings| settings.refresh_url = refresh_url);
+    let app = Arc::new(app);
+    let expired = super::testing::fake_jwt(Timestamp::now().add(-minutes(1)));
+    write_auth(
+        &app,
+        "device-first",
+        &format!(
+            r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{expired}","refresh_token":"<revoked-refresh-token>"}}}}"#
+        ),
+    );
+    write_auth(
+        &app,
+        "device-second",
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"<second-access-token>"}}"#,
+    );
+    let result = serve(
+        &app,
+        responses(
+            r#"{"model":"gpt-test","input":"hello"}"#,
+            "refresh-auth-failover",
+        ),
+    )
+    .await;
+    assert_eq!(
+        result.code(),
+        200,
+        "refresh auth failover: {}",
+        result.body_string()
+    );
+    assert_eq!((first.count(), second.count()), (0, 1));
+    assert_eq!(
+        second
+            .requests()
+            .pop()
+            .unwrap_or_default()
+            .header("authorization"),
+        "Bearer <second-access-token>"
+    );
+    assert_eq!(
+        sticky(&app, "gpt-test:refresh-auth-failover").account_id,
+        "device-second"
+    );
+    let snapshot = app
+        .read()
+        .state
+        .quotas()
+        .get("device-first")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        snapshot
+            .quota_error
+            .map(|error| error.code)
+            .unwrap_or_default(),
+        "account_auth_failed",
+        "refresh auth failure did not mark first account unavailable"
+    );
+}
+
+// Go TestDeviceAuthZeroQuotaAccountIsNotSelected.
+#[tokio::test]
+async fn device_auth_zero_quota_account_is_not_selected() {
+    let empty = FakeServer::start(|_| FakeResponse::status(500)).await;
+    let ready = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_device_ready","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = arc_app(vec![
+        Account {
+            remaining_quota: Some(0),
+            ..device_at("device-empty", "", 100, &empty.url)
+        },
+        device_at("device-ready", "", 10, &ready.url),
+    ]);
+    write_auth(
+        &app,
+        "device-ready",
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"<ready-access-token>"}}"#,
+    );
+    let result = serve(
+        &app,
+        post("/v1/responses", r#"{"model":"gpt-test","input":"hello"}"#),
+    )
+    .await;
+    assert_eq!(
+        result.code(),
+        200,
+        "device-auth zero quota routing: {}",
+        result.body_string()
+    );
+    assert_eq!(
+        empty.count(),
+        0,
+        "zero-quota device-auth account was called"
+    );
+    assert_eq!(
+        ready
+            .requests()
+            .pop()
+            .unwrap_or_default()
+            .header("authorization"),
+        "Bearer <ready-access-token>"
+    );
+}
+
+// Go TestTransientQuotaRefreshErrorDoesNotBlockProFailover.
+#[tokio::test]
+async fn transient_quota_refresh_error_does_not_block_pro_failover() {
+    let plus = FakeServer::start(|_| FakeResponse::status(500)).await;
+    let pro = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_pro_fallback","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = arc_app(vec![
+        Account {
+            plan_type: "plus".into(),
+            ..provider("plus", 100, &plus.url, "plus")
+        },
+        Account {
+            plan_type: "pro".into(),
+            plan_limit: "20x".into(),
+            ..provider("pro", 100, &pro.url, "pro")
+        },
+    ]);
+    app.write().preserve_pro_quota = true;
+    set_quota(&app, "plus", "plus", windows(Some(0), Some(80)));
+    app.write().state.quotas_mut().insert(
+        "pro".into(),
+        QuotaSnapshot {
+            account_id: "pro".into(),
+            plan_type: "pro".into(),
+            quota: Some(windows(Some(98), Some(100))),
+            quota_error: Some(super::state::QuotaErrorInfo {
+                code: "upstream_status".into(),
+                message: "quota API returned status 500".into(),
+                timestamp: Timestamp::now(),
+                ..super::state::QuotaErrorInfo::default()
+            }),
+            ..QuotaSnapshot::default()
+        },
+    );
+    let result = serve(
+        &app,
+        responses(
+            r#"{"model":"gpt-test","input":"hello"}"#,
+            "plus-to-pro-after-quota-poll-500",
+        ),
+    )
+    .await;
+    assert_eq!(
+        result.code(),
+        200,
+        "transient quota error caused failover response: {}",
+        result.body_string()
+    );
+    assert_eq!((plus.count(), pro.count()), (0, 1));
+    assert_eq!(
+        sticky(&app, "gpt-test:plus-to-pro-after-quota-poll-500").account_id,
+        "pro"
+    );
+    let item = account(&app, 1);
+    let (status, reason) = app.read().account_status(&item, Timestamp::now());
+    assert_eq!(
+        status, "ready",
+        "transient quota error made Pro dashboard unavailable: {reason}"
+    );
+}
+
+// ---- duplicate upstream identities ----
+
+fn planned_device(
+    id: &str,
+    upstream_account: &str,
+    plan_type: &str,
+    priority: i64,
+    url: &str,
+) -> Account {
+    Account {
+        plan_type: plan_type.to_string(),
+        ..device_at(id, upstream_account, priority, url)
+    }
+}
+
+fn ok_named(
+    id: &'static str,
+) -> impl Fn(&super::testing::RecordedRequest) -> FakeResponse + Send + Sync + 'static {
+    move |_| {
+        FakeResponse::json(
+            200,
+            &format!(r#"{{"id":"{id}","object":"response","output":[]}}"#),
+        )
+    }
+}
+
+fn quota_error(code: &str) -> QuotaSnapshot {
+    QuotaSnapshot {
+        quota_error: Some(super::state::QuotaErrorInfo {
+            code: code.into(),
+            message: "credential unavailable".into(),
+            timestamp: Timestamp::now(),
+            ..super::state::QuotaErrorInfo::default()
+        }),
+        ..QuotaSnapshot::default()
+    }
+}
+
+fn set_snapshot(app: &App, id: &str, plan_type: &str, mut snapshot: QuotaSnapshot) {
+    snapshot.account_id = id.to_string();
+    snapshot.plan_type = plan_type.to_string();
+    app.write()
+        .state
+        .quotas_mut()
+        .insert(id.to_string(), snapshot);
+}
+
+fn write_device_auths(app: &App, slots: &[(&str, &str, &str)]) {
+    for (id, upstream_account, email) in slots {
+        write_codex_device_auth(app, id, upstream_account, email);
+    }
+}
+
+// Go TestDuplicateUpstreamAccountsAreNotFailoverCapacity: two local slots for
+// one upstream ChatGPT account must not become immediate retry targets inside
+// the same request. The next request may elect a healthy sibling as the single
+// representative.
+#[tokio::test]
+async fn duplicate_upstream_accounts_are_not_failover_capacity() {
+    let primary = FakeServer::start(|_| status_response(429, &[("retry-after", "1")])).await;
+    let duplicate = FakeServer::start(|_| FakeResponse::status(200)).await;
+    let backup = FakeServer::start(ok_named("resp_duplicate_guard")).await;
+    let (app, _dir) = arc_app(vec![
+        device_at("slot-primary", "upstream-shared", 100, &primary.url),
+        device_at("slot-duplicate", "upstream-shared", 90, &duplicate.url),
+        device_at("slot-backup", "upstream-backup", 10, &backup.url),
+    ]);
+    write_device_auths(
+        &app,
+        &[
+            ("slot-primary", "upstream-shared", "shared@example.test"),
+            ("slot-duplicate", "upstream-shared", "shared@example.test"),
+            ("slot-backup", "upstream-backup", "backup@example.test"),
+        ],
+    );
+    let result = serve(
+        &app,
+        responses(
+            r#"{"model":"gpt-test","input":"hello"}"#,
+            "duplicate-upstream",
+        ),
+    )
+    .await;
+    assert_eq!(
+        result.code(),
+        200,
+        "duplicate upstream guard: {}",
+        result.body_string()
+    );
+    assert_eq!(
+        (primary.count(), duplicate.count(), backup.count()),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        sticky(&app, "gpt-test:duplicate-upstream").account_id,
+        "slot-backup"
+    );
+    let item = account(&app, 1);
+    let (status, reason) = app.read().account_status(&item, Timestamp::now());
+    assert_eq!(
+        status, "ready",
+        "duplicate sibling did not become next-request representative: {reason}"
+    );
+}
+
+// Go TestWorkspaceMembersAreSeparateRoutingIdentities.
+#[tokio::test]
+async fn workspace_members_are_separate_routing_identities() {
+    let spent = FakeServer::start(|_| status_response(429, &[("retry-after", "1")])).await;
+    let member = FakeServer::start(ok_named("resp_member")).await;
+    let other = FakeServer::start(ok_named("resp_other")).await;
+    let (app, _dir) = arc_app(vec![
+        device_at("slot-spent", "workspace-shared", 100, &spent.url),
+        device_at("slot-member", "workspace-shared", 90, &member.url),
+        device_at("slot-other", "workspace-other", 10, &other.url),
+    ]);
+    write_device_auths(
+        &app,
+        &[
+            (
+                "slot-spent",
+                "workspace-shared",
+                "first-member@example.test",
+            ),
+            (
+                "slot-member",
+                "workspace-shared",
+                "second-member@example.test",
+            ),
+            ("slot-other", "workspace-other", "other@example.test"),
+        ],
+    );
+    {
+        let inner = app.read();
+        let (spent_item, member_item) = (
+            inner.config.accounts()[0].clone(),
+            inner.config.accounts()[1].clone(),
+        );
+        assert_ne!(
+            inner.upstream_identity_key(&spent_item),
+            inner.upstream_identity_key(&member_item),
+            "two members of one workspace share a routing identity"
+        );
+        let (status, _) = inner.account_status(&member_item, Timestamp::now());
+        assert_eq!(
+            status, "ready",
+            "a second workspace member must be routable, not a standby duplicate"
+        );
+    }
+    let result = serve(
+        &app,
+        responses(
+            r#"{"model":"gpt-test","input":"hello"}"#,
+            "workspace-members",
+        ),
+    )
+    .await;
+    assert_eq!(
+        result.code(),
+        200,
+        "workspace member failover: {}",
+        result.body_string()
+    );
+    assert_eq!((spent.count(), member.count(), other.count()), (1, 1, 0));
+}
+
+/// Two Team slots of one upstream identity and a Pro backup, Pro preserved.
+/// Each test expects only the duplicate to be reached, so the primary's and
+/// Pro's answers never matter.
+async fn team_pair_and_pro(duplicate_id: &'static str) -> (Arc<App>, TempDir, [FakeServer; 3]) {
+    let primary = FakeServer::start(|_| FakeResponse::status(200)).await;
+    let duplicate = FakeServer::start(ok_named(duplicate_id)).await;
+    let pro = FakeServer::start(|_| FakeResponse::status(200)).await;
+    let (app, dir) = arc_app(vec![
+        planned_device("team-primary", "upstream-team", "team", 100, &primary.url),
+        planned_device(
+            "team-duplicate",
+            "upstream-team",
+            "team",
+            90,
+            &duplicate.url,
+        ),
+        planned_device("pro-backup", "upstream-pro", "pro", 100, &pro.url),
+    ]);
+    app.write().preserve_pro_quota = true;
+    write_device_auths(
+        &app,
+        &[
+            ("team-primary", "upstream-team", "team@example.test"),
+            ("team-duplicate", "upstream-team", "team@example.test"),
+            ("pro-backup", "upstream-pro", "pro@example.test"),
+        ],
+    );
+    (app, dir, [primary, duplicate, pro])
+}
+
+fn counts(servers: &[FakeServer; 3]) -> (usize, usize, usize) {
+    (servers[0].count(), servers[1].count(), servers[2].count())
+}
+
+// Go TestDuplicateUpstreamPositiveQuotaCredentialRepresentsIdentityBeforePro:
+// the representative must come from the credential copy with positive quota,
+// not from the stale zero-quota slot that happens to sort first.
+#[tokio::test]
+async fn duplicate_upstream_positive_quota_credential_represents_identity_before_pro() {
+    let (app, _dir, servers) = team_pair_and_pro("resp_team_duplicate").await;
+    app.write().config.preserve_pro_quota = Some(true);
+    set_quota(&app, "team-primary", "team", windows(Some(99), Some(0)));
+    set_quota(&app, "team-duplicate", "team", windows(Some(99), Some(61)));
+    set_quota(&app, "pro-backup", "pro", windows(Some(97), Some(11)));
+    let result = serve(
+        &app,
+        responses(r#"{"model":"gpt-test","input":"hello"}"#, "team-before-pro"),
+    )
+    .await;
+    assert_eq!(
+        result.code(),
+        200,
+        "same-identity quota routing: {}",
+        result.body_string()
+    );
+    assert_eq!(counts(&servers), (0, 1, 0));
+    assert_eq!(
+        sticky(&app, "gpt-test:team-before-pro").account_id,
+        "team-duplicate"
+    );
+}
+
+// Go TestDuplicateUpstreamCoolingRepresentativeUsesHealthyCredentialBeforePro.
+#[tokio::test]
+async fn duplicate_upstream_cooling_representative_uses_healthy_credential_before_pro() {
+    let (app, _dir, servers) = team_pair_and_pro("resp_team_cooldown_duplicate").await;
+    app.write().state.cooldowns_mut().insert(
+        "team-primary".into(),
+        vec![super::state::Cooldown {
+            model_id: "gpt-test".into(),
+            next_retry_at: Timestamp::now().add(minutes(1)),
+            reason: "rate_limited".into(),
+            ..super::state::Cooldown::default()
+        }],
+    );
+    set_quota(&app, "team-primary", "team", windows(Some(80), Some(80)));
+    set_quota(&app, "team-duplicate", "team", windows(Some(99), Some(61)));
+    set_quota(&app, "pro-backup", "pro", windows(Some(97), Some(11)));
+    let result = serve(
+        &app,
+        responses(
+            r#"{"model":"gpt-test","input":"hello"}"#,
+            "cooling-team-before-pro",
+        ),
+    )
+    .await;
+    assert_eq!(
+        result.code(),
+        200,
+        "cooldown duplicate routing: {}",
+        result.body_string()
+    );
+    assert_eq!(counts(&servers), (0, 1, 0));
+    assert_eq!(
+        sticky(&app, "gpt-test:cooling-team-before-pro").account_id,
+        "team-duplicate"
+    );
+}
+
+// Go TestDuplicateUpstreamHealthyCredentialCanRepresentIdentity: an auth
+// error means the local credential copy is unavailable, not that the shared
+// upstream identity should be abandoned for Pro.
+#[tokio::test]
+async fn duplicate_upstream_healthy_credential_can_represent_identity() {
+    let (app, _dir, servers) = team_pair_and_pro("resp_team_credential_copy").await;
+    set_snapshot(
+        &app,
+        "team-primary",
+        "team",
+        quota_error("token_invalidated"),
+    );
+    set_quota(&app, "team-duplicate", "team", windows(Some(99), Some(61)));
+    set_quota(&app, "pro-backup", "pro", windows(Some(97), Some(11)));
+    let result = serve(
+        &app,
+        responses(
+            r#"{"model":"gpt-test","input":"hello"}"#,
+            "healthy-copy-before-pro",
+        ),
+    )
+    .await;
+    assert_eq!(
+        result.code(),
+        200,
+        "healthy duplicate credential routing: {}",
+        result.body_string()
+    );
+    assert_eq!(counts(&servers), (0, 1, 0));
+    assert_eq!(
+        sticky(&app, "gpt-test:healthy-copy-before-pro").account_id,
+        "team-duplicate"
+    );
+}
+
+// Go TestErroredDuplicateManualQuotaDoesNotKeepZeroQuotaRepresentativeEligible:
+// a stale manual quota hint on an errored duplicate must not keep a
+// zero-quota representative selectable.
+#[tokio::test]
+async fn errored_duplicate_manual_quota_does_not_keep_zero_quota_representative_eligible() {
+    let team = FakeServer::start(|_| FakeResponse::status(429)).await;
+    let duplicate = FakeServer::start(|_| FakeResponse::status(429)).await;
+    let pro = FakeServer::start(ok_named("resp_pro_backup")).await;
+    let mut duplicate_slot = planned_device(
+        "team-duplicate",
+        "upstream-team",
+        "team",
+        90,
+        &duplicate.url,
+    );
+    duplicate_slot.remaining_quota = Some(1);
+    let (app, _dir) = arc_app(vec![
+        planned_device("team-primary", "upstream-team", "team", 100, &team.url),
+        duplicate_slot,
+        planned_device("pro-backup", "upstream-pro", "pro", 100, &pro.url),
+    ]);
+    app.write().preserve_pro_quota = true;
+    set_quota(&app, "team-primary", "team", windows(Some(0), Some(37)));
+    set_snapshot(
+        &app,
+        "team-duplicate",
+        "team",
+        quota_error("token_invalidated"),
+    );
+    set_quota(&app, "pro-backup", "pro", windows(Some(93), Some(99)));
+    write_device_auths(
+        &app,
+        &[
+            ("team-primary", "upstream-team", "team@example.test"),
+            ("team-duplicate", "upstream-team", "team@example.test"),
+            ("pro-backup", "upstream-pro", "pro@example.test"),
+        ],
+    );
+    let result = serve(
+        &app,
+        responses(
+            r#"{"model":"gpt-test","input":"hello"}"#,
+            "errored-duplicate-quota-hint",
+        ),
+    )
+    .await;
+    assert_eq!(
+        result.code(),
+        200,
+        "errored duplicate quota hint routing: {}",
+        result.body_string()
+    );
+    assert_eq!((team.count(), duplicate.count(), pro.count()), (0, 0, 1));
+    assert_eq!(
+        sticky(&app, "gpt-test:errored-duplicate-quota-hint").account_id,
+        "pro-backup"
+    );
+}
