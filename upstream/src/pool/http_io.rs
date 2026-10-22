@@ -260,9 +260,21 @@ impl ResponseWriter for ChannelWriter {
 
 impl Drop for ChannelWriter {
     /// A handler that returned without writing sends an empty 200, as
-    /// net/http does.
+    /// net/http does; one that panicked before writing answers 500 with the
+    /// OpenAI error Go's recovery middleware writes.
     fn drop(&mut self) {
-        if self.head.is_some() {
+        if self.head.is_none() {
+            return;
+        }
+        if std::thread::panicking() {
+            self.headers.clear();
+            write_openai_error(
+                self,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "internal server error",
+            );
+        } else {
             self.write_header(StatusCode::OK);
         }
     }

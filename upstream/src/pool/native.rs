@@ -102,7 +102,7 @@ const NATIVE_HANDLED_HEADERS: &[&str] = &[
 
 /// The front door's peer header is consumed before handlers run; it is never
 /// a client header.
-const FRONT_PEER_HEADER: &str = "x-codex-pool-peer";
+use super::listener::FRONT_PEER_HEADER;
 
 /// Bounds both the compressed and the decoded size, so a small body cannot
 /// expand past the limit every other request is held to.

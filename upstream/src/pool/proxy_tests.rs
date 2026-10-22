@@ -2056,3 +2056,853 @@ async fn proxy_client_cancel_does_not_mark_transport_failure() {
     );
     assert!(cooldown_reasons(&app, "provider").is_empty());
 }
+
+// ---- the Codex backend, reached directly with an account's credential ----
+
+/// Go's device-auth slots with `a.codexBaseURL = <server>/backend-api`.
+pub(super) fn codex_app(server_url: &str, slots: &[(&str, &str, i64)]) -> (Arc<App>, TempDir) {
+    let accounts = slots
+        .iter()
+        .map(|(id, upstream, priority)| device_account(id, upstream, *priority))
+        .collect();
+    let base = format!("{server_url}/backend-api");
+    let (app, dir) =
+        super::testing::test_app_with(accounts, |settings| settings.codex_base_url = base);
+    for (id, upstream, _) in slots {
+        write_codex_device_auth(&app, id, upstream, &format!("{id}@example.test"));
+    }
+    (Arc::new(fast_overload(app)), dir)
+}
+
+fn account(app: &App, index: usize) -> Account {
+    app.read().config.accounts()[index].clone()
+}
+
+// Go TestDirectCodexGatewaySendsTheNativeCodexRequest.
+#[tokio::test]
+async fn direct_codex_gateway_sends_the_native_codex_request() {
+    const RAW: &str = r#"{"model":"gpt-test","stream":true,"input":[{"type":"message","role":"user","content":"hi"}],"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}],"store":false,"prompt_cache_key":"thread-native","n":1.50}"#;
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_native","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = codex_app(&upstream.url, &[("device", "acct-up", 100)]);
+    let auth = app
+        .read()
+        .codex_auth(&account(&app, 0))
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let request = post("/v1/responses", RAW)
+        .with_header("cookie", "client-cookie")
+        .with_header("session-id", "session-native")
+        .with_header("thread-id", "thread-native")
+        .with_header("x-codex-window-id", "window-native")
+        .with_header("x-openai-memgen-request", "true")
+        .with_header(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        )
+        .with_header("x-codex-pool-session", "pool-only")
+        .with_header("x-codex-thread-id", "pool-only-thread")
+        .with_header("x-openai-fedramp", "true");
+    let result = serve(&app, request).await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let sent = upstream.requests().pop().unwrap_or_default();
+    assert_eq!(sent.path, "/backend-api/codex/responses");
+    assert_eq!(sent.header("content-encoding"), "zstd");
+    let body = zstd::decode_all(sent.body.as_slice()).unwrap_or_default();
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        RAW,
+        "an unchanged request must reach upstream byte for byte"
+    );
+    for (name, want) in [
+        ("authorization", format!("Bearer {}", auth.access_token)),
+        ("chatgpt-account-id", "acct-up".to_string()),
+        ("x-codex-routing-hint", "model=gpt-test".to_string()),
+        ("session-id", "session-native".to_string()),
+        ("thread-id", "thread-native".to_string()),
+        ("x-codex-window-id", "window-native".to_string()),
+        ("x-openai-memgen-request", "true".to_string()),
+        (
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+        ),
+    ] {
+        assert_eq!(sent.header(name), want, "upstream {name}");
+    }
+    for name in [
+        "cookie",
+        "x-codex-pool-session",
+        "x-codex-thread-id",
+        "x-openai-fedramp",
+    ] {
+        assert_eq!(sent.header(name), "", "{name} must not reach upstream");
+    }
+}
+
+// Go TestDirectCodexGatewayAnswersNonStreamingClientsFromTheStream.
+#[tokio::test]
+async fn direct_codex_gateway_answers_non_streaming_clients_from_the_stream() {
+    let upstream = FakeServer::start(|request| {
+        if request.header("chatgpt-account-id") == "acct-first" {
+            return sse_response(&[created("resp_busy"), failed("resp_busy", r#"{"code":"server_is_overloaded","message":"busy"}"#, "")]);
+        }
+        let item = r#"{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"assembled"}]}"#;
+        sse_response(&[
+            created("resp_ok"),
+            sse("response.output_item.done", &format!(r#"{{"type":"response.output_item.done","output_index":0,"item":{item}}}"#)),
+            sse(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"id":"resp_ok","object":"response","status":"completed","output":[]}}"#,
+            ),
+        ])
+    })
+    .await;
+    let (app, _dir) = codex_app(
+        &upstream.url,
+        &[("first", "acct-first", 100), ("second", "acct-second", 10)],
+    );
+    let result = serve(
+        &app,
+        post(
+            "/v1/responses",
+            r#"{"model":"gpt-test","input":"hi","max_output_tokens":50}"#,
+        ),
+    )
+    .await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let first_bodies: Vec<String> = upstream
+        .requests()
+        .iter()
+        .filter(|request| request.header("chatgpt-account-id") == "acct-first")
+        .map(|request| {
+            String::from_utf8_lossy(&zstd::decode_all(request.body.as_slice()).unwrap_or_default())
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(first_bodies.len(), 1, "first account attempts");
+    for body in &first_bodies {
+        assert!(
+            body.contains(r#""stream":true"#)
+                && body.contains(r#""store":false"#)
+                && !body.contains("max_output_tokens"),
+            "{body}"
+        );
+    }
+    let reply: serde_json::Value = serde_json::from_slice(&result.body)
+        .unwrap_or_else(|error| panic!("one JSON response: {error} {}", result.body_string()));
+    assert_eq!(reply["id"], "resp_ok");
+    assert!(
+        result.body_string().contains("assembled"),
+        "the output must be rebuilt from the stream"
+    );
+}
+
+// Go TestDirectCodexGatewaySendsCompactionToTheCompactEndpoint.
+#[tokio::test]
+async fn direct_codex_gateway_sends_compaction_to_the_compact_endpoint() {
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_compact","object":"response.compaction","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = codex_app(&upstream.url, &[("device", "acct-up", 100)]);
+    const RAW: &str = r#"{"model":"gpt-test","input":[{"type":"message","role":"user","content":"hi"}],"instructions":"","prompt_cache_key":"k"}"#;
+    let result = serve(&app, post("/v1/responses/compact", RAW)).await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let sent = upstream.requests().pop().unwrap_or_default();
+    assert_eq!(
+        (sent.path.as_str(), sent.body_string().as_str()),
+        ("/backend-api/codex/responses/compact", RAW)
+    );
+}
+
+// Go TestDirectCodexGatewaySendsThroughCodexUpstream. The transport is
+// in-process now, so the hop is the request upstream receives: the first
+// account's endpoint refuses connections, is retried on that account
+// (TRANSPORT_SAME_ACCOUNT_RETRY_LIMIT), and only then fails over.
+#[tokio::test]
+async fn direct_codex_gateway_sends_through_codex_upstream() {
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_via_transport","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = codex_app(
+        &upstream.url,
+        &[("first", "acct-first", 100), ("second", "acct-second", 10)],
+    );
+    app.write().config.accounts_mut()[0].upstream_base_url =
+        "http://127.0.0.1:1/backend-api/codex".into();
+    let (app, logged) = {
+        let app = Arc::try_unwrap(app).unwrap_or_else(|_| panic!("shared app"));
+        let (app, logged) = super::testing::capture_logs(app);
+        (Arc::new(app), logged)
+    };
+    let second = app
+        .read()
+        .codex_auth(&account(&app, 1))
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let request = post(
+        "/v1/responses",
+        r#"{"model":"gpt-test","stream":true,"store":false,"input":[]}"#,
+    )
+    .with_header(
+        "user-agent",
+        "codex-tui/0.163.0 (Mac OS 26.0.0; arm64) iTerm.app/3.6.6 (codex-tui; 0.163.0)",
+    );
+    let result = serve(&app, request).await;
+    assert!(
+        result.code() == 200 && result.body_string().contains("resp_via_transport"),
+        "{}",
+        result.body_string()
+    );
+    let retries = logged
+        .lock()
+        .map(|lines| {
+            lines
+                .iter()
+                .filter(|line| line.contains("upstream unreachable for first"))
+                .count()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        retries,
+        usize::try_from(super::tuning::TRANSPORT_SAME_ACCOUNT_RETRY_LIMIT).unwrap_or_default(),
+        "retries must stay on the first account"
+    );
+    let sent = upstream.requests();
+    assert_eq!(sent.len(), 1);
+    let hop = &sent[0];
+    assert_eq!(hop.path, "/backend-api/codex/responses");
+    assert_eq!(hop.header("content-encoding"), "zstd");
+    assert_eq!(hop.header("version"), "0.163.0");
+    assert_eq!(hop.header("x-codex-routing-hint"), "model=gpt-test");
+    assert_eq!(
+        hop.header("authorization"),
+        format!("Bearer {}", second.access_token)
+    );
+}
+
+// Go TestCodexBackendStreamWithoutContentTypeIsStillAStream.
+#[tokio::test]
+async fn codex_backend_stream_without_content_type_is_still_a_stream() {
+    let upstream = FakeServer::start(|request| {
+        let blocks = if request.header("chatgpt-account-id") == "acct-first" {
+            vec![created("resp_busy"), overloaded("resp_busy")]
+        } else {
+            vec![
+                created("resp_ok"),
+                delta("OK"),
+                completed("resp_ok", r#"{"input_tokens":50,"input_tokens_details":{"cached_tokens":40},"output_tokens":2}"#),
+            ]
+        };
+        FakeResponse {
+            headers: Vec::new(),
+            ..sse_response(&blocks)
+        }
+    })
+    .await;
+    let (app, _dir) = codex_app(
+        &upstream.url,
+        &[("first", "acct-first", 100), ("second", "acct-second", 10)],
+    );
+    let body = serve(
+        &app,
+        post(
+            "/v1/responses",
+            r#"{"model":"gpt-test","stream":true,"store":false,"input":[]}"#,
+        ),
+    )
+    .await
+    .body_string();
+    assert!(
+        !body.contains("server_is_overloaded") && body.contains("resp_ok"),
+        "the overload before output must be retried on the next account: {body}"
+    );
+    let events = events(&app);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        (
+            events[0].terminal_event.as_str(),
+            events[0].cached_tokens,
+            events[0].account_id.as_str()
+        ),
+        ("response.completed", 40, "second")
+    );
+}
+
+// Go TestPoolReencodesTheBodyOnlyWhenItChangesTheRequest.
+#[tokio::test]
+async fn pool_reencodes_the_body_only_when_it_changes_the_request() {
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_changed","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = arc_app(vec![provider(
+        "provider",
+        100,
+        &format!("{}/v1", upstream.url),
+        "upstream-key",
+    )]);
+    const RAW: &str = r#"{"model":"gpt-test(high)","input":"hi","prompt_cache_key":"k"}"#;
+    let result = serve(&app, post("/v1/responses", RAW)).await;
+    assert_eq!(result.code(), 200);
+    let body = upstream.requests().pop().unwrap_or_default().body_string();
+    assert!(
+        body != RAW
+            && body.contains(r#""effort":"high""#)
+            && body.contains(r#""model":"gpt-test""#),
+        "{body}"
+    );
+}
+
+// Go TestDirectCodexGatewayRefreshesOnceOnUnauthorizedAndRetriesTheSameAccount.
+#[tokio::test]
+async fn direct_codex_gateway_refreshes_once_on_unauthorized_and_retries_the_same_account() {
+    let fresh = super::testing::fake_jwt_claims(
+        &serde_json::json!({"exp": Timestamp::now().add(hours(1)).unix(), "n": 2}),
+    );
+    let refresh_reply =
+        format!(r#"{{"access_token":"{fresh}","refresh_token":"<rotated-refresh>"}}"#);
+    let refresh = FakeServer::start(move |_| FakeResponse::json(200, &refresh_reply)).await;
+    let expected = format!("Bearer {fresh}");
+    let upstream = FakeServer::start(move |request| {
+        if request.header("chatgpt-account-id") != "acct-second"
+            && request.header("authorization") != expected
+        {
+            return FakeResponse::json(401, r#"{"error":{"code":"token_expired"}}"#);
+        }
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_refreshed","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let accounts = vec![
+        device_account("first", "acct-first", 100),
+        device_account("second", "acct-second", 10),
+    ];
+    let (base, refresh_url) = (format!("{}/backend-api", upstream.url), refresh.url.clone());
+    let (app, _dir) = super::testing::test_app_with(accounts, |settings| {
+        settings.codex_base_url = base;
+        settings.refresh_url = refresh_url;
+    });
+    write_codex_device_auth(&app, "first", "acct-first", "first@example.test");
+    write_codex_device_auth(&app, "second", "acct-second", "second@example.test");
+    let app = Arc::new(app);
+    let result = serve(
+        &app,
+        post("/v1/responses", r#"{"model":"gpt-test","input":"hi"}"#),
+    )
+    .await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let by_account = |id: &str| {
+        upstream
+            .requests()
+            .iter()
+            .filter(|request| request.header("chatgpt-account-id") == id)
+            .count()
+    };
+    assert_eq!(
+        (
+            refresh.count(),
+            by_account("acct-first"),
+            by_account("acct-second")
+        ),
+        (1, 2, 0)
+    );
+    let file = app
+        .read()
+        .read_codex_auth_file(&account(&app, 0))
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let tokens = file.tokens.unwrap_or_default();
+    assert!(
+        tokens.access_token == fresh && tokens.refresh_token == "<rotated-refresh>",
+        "the refreshed credential must be persisted for the next request"
+    );
+}
+
+// Go TestOverloadRetriesTheSameAccountBeforeMovingTheLineage.
+#[tokio::test]
+async fn overload_retries_the_same_account_before_moving_the_lineage() {
+    // server_error is the server's fault too; a native Codex retries it.
+    for code in ["server_is_overloaded", "server_error"] {
+        same_account_retry_before_moving(code).await;
+    }
+}
+
+async fn same_account_retry_before_moving(code: &'static str) {
+    use super::tuning::OVERLOAD_SAME_ACCOUNT_RETRY_LIMIT;
+    let run = |failures: usize| async move {
+        let first_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = first_hits.clone();
+        let upstream = FakeServer::start(move |request| {
+            let mut blocks = vec![created("resp_x")];
+            if request.header("chatgpt-account-id") == "acct-first"
+                && counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < failures
+            {
+                blocks.push(failed("resp_x", &format!(r#"{{"code":"{code}"}}"#), ""));
+            } else {
+                blocks.push(delta("ok"));
+                blocks.push(completed("resp_x", ""));
+            }
+            sse_response(&blocks)
+        })
+        .await;
+        let (app, dir) = codex_app(
+            &upstream.url,
+            &[("first", "acct-first", 100), ("second", "acct-second", 10)],
+        );
+        let request = post(
+            "/v1/responses",
+            r#"{"model":"gpt-test","stream":true,"store":false,"input":[]}"#,
+        )
+        .with_header("x-codex-turn-metadata", r#"{"thread_id":"thread-main"}"#);
+        let body = serve(&app, request).await.body_string();
+        assert!(
+            !body.contains(code) && body.contains("response.completed"),
+            "the {code} must be retried before output: {body}"
+        );
+        let second_hits = upstream
+            .requests()
+            .iter()
+            .filter(|request| request.header("chatgpt-account-id") == "acct-second")
+            .count();
+        (
+            first_hits.load(std::sync::atomic::Ordering::SeqCst),
+            second_hits,
+            app,
+            dir,
+        )
+    };
+    let lineage = |app: &App| {
+        app.read()
+            .lineage_account_id("thread-main", Timestamp::now())
+            .unwrap_or_default()
+    };
+
+    let (first, second, app, _dir) = run(2).await;
+    assert_eq!(
+        (first, second),
+        (3, 0),
+        "a passing overload must be retried on the same account"
+    );
+    assert_eq!(
+        active_cooldown_count(&app, "first"),
+        0,
+        "an overload inside the same-account schedule must not cool the account"
+    );
+    assert_eq!(
+        lineage(&app),
+        "first",
+        "the lineage must stay on its account"
+    );
+
+    let limit = usize::try_from(OVERLOAD_SAME_ACCOUNT_RETRY_LIMIT).unwrap_or_default();
+    let (first, second, app, _dir) = run(limit + 1).await;
+    assert_eq!(
+        (first, second),
+        (limit + 1, 1),
+        "only an overload that outlasts the schedule moves on"
+    );
+    assert!(
+        active_cooldown_count(&app, "first") > 0,
+        "the account that kept refusing must cool down"
+    );
+    assert_eq!(
+        lineage(&app),
+        "second",
+        "the whole lineage moves with the request"
+    );
+}
+
+// ---- what of the client's request reaches upstream ----
+
+// Go TestResponsesProxyAddsCodexMetadataHeaders.
+#[tokio::test]
+async fn responses_proxy_adds_codex_metadata_headers() {
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(200, r#"{"id":"resp_test","object":"response","output":[]}"#)
+    })
+    .await;
+    let account = Account {
+        upstream_base_url: format!("{}/backend-api", upstream.url),
+        ..device_account("codex-meta", "acct-from-metadata", 100)
+    };
+    let (app, _dir) = arc_app(vec![account]);
+    let home = app.read().account_codex_home("codex-meta");
+    std::fs::create_dir_all(&home).unwrap_or_else(|error| panic!("{error}"));
+    let id_token = super::testing::fake_jwt_claims(
+        &serde_json::json!({"https://api.openai.com/auth": {"chatgpt_account_is_fedramp": true}}),
+    );
+    let auth = serde_json::json!({"auth_mode": "chatgpt", "tokens": {"id_token": id_token, "access_token": "<access-token>", "refresh_token": "<refresh-token>"}});
+    std::fs::write(home.join("auth.json"), auth.to_string())
+        .unwrap_or_else(|error| panic!("{error}"));
+    let result = serve(
+        &app,
+        post("/v1/responses", r#"{"model":"gpt-test","input":"hello"}"#),
+    )
+    .await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let sent = upstream.requests().pop().unwrap_or_default();
+    assert_eq!(sent.header("authorization"), "Bearer <access-token>");
+    assert_eq!(
+        sent.header("chatgpt-account-id"),
+        "acct-from-metadata",
+        "missing account id from account metadata"
+    );
+    assert_eq!(
+        sent.header("x-openai-fedramp"),
+        "true",
+        "missing fedramp header"
+    );
+}
+
+// Go TestResponsesProxyForwardsOnlyCodexMetadataHeaderAllowlist.
+#[tokio::test]
+async fn responses_proxy_forwards_only_codex_metadata_header_allowlist() {
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_headers","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = arc_app(vec![provider(
+        "provider",
+        100,
+        &format!("{}/v1", upstream.url),
+        "upstream-key",
+    )]);
+    let relayed = [
+        ("x-codex-parent-thread-id", "parent-thread"),
+        ("x-openai-subagent", "collab_spawn"),
+        ("x-codex-turn-metadata", r#"{"thread_id":"child-thread"}"#),
+        ("x-codex-window-id", "window-a"),
+        ("x-codex-installation-id", "installation-a"),
+        ("session-id", "session-a"),
+        ("session_id", "legacy-session-a"),
+        ("thread-id", "child-thread"),
+        ("x-client-request-id", "request-a"),
+        ("originator", "codex_exec"),
+        ("user-agent", "codex_exec/0.141.0 (Debian 12.0.0; x86_64)"),
+        ("x-codex-beta-features", "remote_compaction_v2"),
+    ];
+    let mut request = post("/v1/responses", r#"{"model":"gpt-test","input":"hello"}"#)
+        .with_header("cookie", "client-cookie")
+        .with_header("x-unrelated-client-header", "do-not-forward")
+        .with_header("x-codex-thread-id", "child-thread");
+    for (name, value) in relayed {
+        request = request.with_header(name, value);
+    }
+    let result = serve(&app, request).await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let sent = upstream.requests().pop().unwrap_or_default();
+    for (name, want) in relayed {
+        assert_eq!(sent.header(name), want, "{name}");
+    }
+    assert_eq!(
+        sent.header("authorization"),
+        "Bearer upstream-key",
+        "client authorization leaked or upstream auth missing"
+    );
+    for forbidden in [
+        "cookie",
+        "x-unrelated-client-header",
+        "x-codex-thread-id",
+        "x-codex-routing-hint",
+    ] {
+        assert_eq!(
+            sent.header(forbidden),
+            "",
+            "non-allowlisted header {forbidden} leaked upstream"
+        );
+    }
+}
+
+// Go TestClientFingerprintIsRecordedLocallyAndNeverSentUpstream.
+#[tokio::test]
+async fn client_fingerprint_is_recorded_locally_and_never_sent_upstream() {
+    const USER_AGENT: &str = "codex_exec/0.141.0 (Debian 12.0.0; x86_64) xterm";
+    const TURN_METADATA: &str = r#"{"thread_id":"thread-a","request_kind":"memory consolidation"}"#;
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_fingerprint","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = arc_app(vec![provider(
+        "provider",
+        100,
+        &format!("{}/v1", upstream.url),
+        "upstream-key",
+    )]);
+    let request = post("/v1/responses", r#"{"model":"gpt-test","input":"hello"}"#)
+        .with_header("originator", "codex_exec")
+        .with_header("user-agent", USER_AGENT)
+        .with_header("x-codex-turn-metadata", TURN_METADATA);
+    let result = serve(&app, request).await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    // Upstream must see the client's own values verbatim, not the shortened
+    // telemetry labels, and no diagnostic field may reach the body.
+    let sent = upstream.requests().pop().unwrap_or_default();
+    assert_eq!(sent.header("user-agent"), USER_AGENT);
+    assert_eq!(sent.header("x-codex-turn-metadata"), TURN_METADATA);
+    let body = sent.body_string();
+    for leaked in [
+        "clientOriginator",
+        "clientUserAgent",
+        "clientRequestKind",
+        "memory_consolidation",
+    ] {
+        assert!(
+            !body.contains(leaked),
+            "diagnostic {leaked:?} leaked into upstream body: {body}"
+        );
+        for (name, value) in &sent.headers {
+            assert!(
+                !format!("{name}{}", value.to_str().unwrap_or_default()).contains(leaked),
+                "diagnostic {leaked:?} leaked into upstream header {name}"
+            );
+        }
+    }
+    let events = events(&app);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        (
+            events[0].client_originator.as_str(),
+            events[0].client_user_agent.as_str(),
+            events[0].client_request_kind.as_str()
+        ),
+        ("codex_exec", "codex_exec/0.141.0", "memory_consolidation")
+    );
+}
+
+// Go TestTurnStateIsRelayedOnlyToTheAccountThatIssuedIt.
+#[tokio::test]
+async fn turn_state_is_relayed_only_to_the_account_that_issued_it() {
+    let first = FakeServer::start(|_| status_response(429, &[("retry-after", "60")])).await;
+    let second = FakeServer::start(|_| {
+        let mut response = FakeResponse::json(
+            200,
+            r#"{"id":"resp_turn_state","object":"response","output":[]}"#,
+        );
+        for (name, value) in [
+            ("x-codex-turn-state", "ts-second"),
+            ("openai-model", "gpt-test"),
+            ("x-reasoning-included", "true"),
+            ("x-models-etag", "upstream-etag"),
+            ("x-codex-primary-used-percent", "40"),
+        ] {
+            response.headers.push((name.into(), value.into()));
+        }
+        response
+    })
+    .await;
+    let (app, _dir) = arc_app(vec![
+        Account {
+            auth_type: "provider_api_key".into(),
+            ..provider("first", 100, &first.url, "first-key")
+        },
+        Account {
+            auth_type: "provider_api_key".into(),
+            ..provider("second", 10, &second.url, "second-key")
+        },
+    ]);
+    set_sticky(&app, "gpt-test:thread:thread-ts", "first", Timestamp::now());
+    let send = |turn_state: &'static str| {
+        let app = app.clone();
+        async move {
+            let request = post("/v1/responses", r#"{"model":"gpt-test","input":"hello"}"#)
+                .with_header("x-codex-turn-metadata", r#"{"thread_id":"thread-ts"}"#)
+                .with_header("x-codex-turn-state", turn_state);
+            let result = serve(&app, request).await;
+            assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+            result
+        }
+    };
+    let saw = |server: &FakeServer| {
+        server
+            .requests()
+            .iter()
+            .map(|request| request.header("x-codex-turn-state").to_string())
+            .collect::<Vec<_>>()
+    };
+    let last_turn_state = || {
+        events(&app)
+            .last()
+            .map(|event| event.client_turn_state.clone())
+            .unwrap_or_default()
+    };
+
+    let result = send("ts-first").await;
+    assert_eq!(
+        saw(&first),
+        ["ts-first"],
+        "issuing account must get its turn state"
+    );
+    assert_eq!(
+        saw(&second),
+        [""],
+        "failover account must not get another account's turn state"
+    );
+    assert_eq!(last_turn_state(), "withheld");
+    for (name, want) in [
+        ("x-codex-turn-state", "ts-second"),
+        ("openai-model", "gpt-test"),
+        ("x-reasoning-included", "true"),
+    ] {
+        assert_eq!(result.header(name), want, "response {name}");
+    }
+    for name in ["x-models-etag", "x-codex-primary-used-percent"] {
+        assert_eq!(
+            result.header(name),
+            "",
+            "response header {name} must not be relayed"
+        );
+    }
+    // The success moved the thread to the second account, so the turn state
+    // it issued now goes back to it.
+    send("ts-second").await;
+    assert_eq!(
+        saw(&second),
+        ["", "ts-second"],
+        "issuing account must get its own turn state back"
+    );
+    assert_eq!(last_turn_state(), "relayed");
+}
+
+// Go TestTurnStateWithoutKnownIssuerIsWithheldWithoutTouchingTheInboundRequest.
+#[test]
+fn turn_state_without_known_issuer_is_withheld_without_touching_the_inbound_request() {
+    use super::proxy::turn_state_for_attempt;
+    let mut inbound = http::HeaderMap::new();
+    inbound.insert("x-codex-turn-state", http::HeaderValue::from_static("ts"));
+    let (forwarded, disposition) = turn_state_for_attempt(&inbound, "", "any");
+    assert_eq!(disposition, "withheld");
+    assert!(forwarded.get("x-codex-turn-state").is_none());
+    assert_eq!(
+        inbound
+            .get("x-codex-turn-state")
+            .and_then(|value| value.to_str().ok()),
+        Some("ts"),
+        "withholding must not mutate the inbound headers"
+    );
+    assert_eq!(
+        turn_state_for_attempt(&http::HeaderMap::new(), "a", "a").1,
+        ""
+    );
+}
+
+// Go TestResponsesProxyDropsFunctionToolsConflictingWithHostedTools.
+#[tokio::test]
+async fn responses_proxy_drops_function_tools_conflicting_with_hosted_tools() {
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_tools","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = arc_app(vec![provider(
+        "one",
+        100,
+        &format!("{}/v1", upstream.url),
+        "upstream-key",
+    )]);
+    let request = r#"{"model":"gpt-test","input":"hello","tools":[{"type":"image_generation"},{"type":"function","name":"image_gen.imagegen","parameters":{}},{"type":"function","name":"shell","parameters":{}}]}"#;
+    let result = serve(&app, post("/v1/responses", request)).await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let tools = upstream.requests().pop().unwrap_or_default().json()["tools"].clone();
+    let tools = tools.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        tools.len(),
+        2,
+        "expected hosted tool plus unrelated function: {tools:?}"
+    );
+    assert_eq!(
+        tools[0]["type"], "image_generation",
+        "hosted tool was not preserved"
+    );
+    assert_eq!(
+        tools[1]["name"], "shell",
+        "unrelated function tool was not preserved"
+    );
+}
+
+// Go TestResponsesProxyInjectsPromptCacheControlsAndTracksUsage.
+#[tokio::test]
+async fn responses_proxy_injects_prompt_cache_controls_and_tracks_usage() {
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_cache","object":"response","output":[],"usage":{"input_tokens":2006,"input_tokens_details":{"cached_tokens":1920}}}"#,
+        )
+    })
+    .await;
+    let accounts = vec![provider(
+        "one",
+        100,
+        &format!("{}/v1", upstream.url),
+        "upstream-key",
+    )];
+    let (app, _dir) = super::testing::test_app_with(accounts, |settings| {
+        settings.prompt_cache_retention = "24h".into()
+    });
+    let app = Arc::new(app);
+    let result = serve(
+        &app,
+        post("/v1/responses", r#"{"model":"gpt-test","input":"hello"}"#)
+            .with_header("x-codex-pool-project", "repo-main"),
+    )
+    .await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let body = upstream.requests().pop().unwrap_or_default().json();
+    let key = body["prompt_cache_key"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        key.starts_with("cp_"),
+        "prompt_cache_key was not auto-generated: {}",
+        body["prompt_cache_key"]
+    );
+    assert_eq!(body["prompt_cache_retention"], "24h");
+    assert_ne!(
+        key, "repo-main",
+        "raw project id was sent as prompt_cache_key"
+    );
+    let inner = app.read();
+    let binding = inner
+        .state
+        .response_bindings()
+        .get("resp_cache")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        (binding.account_id.as_str(), binding.sticky_key.as_str()),
+        ("one", "gpt-test:repo-main")
+    );
+    let stat = inner
+        .state
+        .prompt_cache()
+        .get("one:gpt-test:main")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        (stat.request_count, stat.input_tokens, stat.cached_tokens),
+        (1, 2006, 1920)
+    );
+}

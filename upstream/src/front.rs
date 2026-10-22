@@ -46,7 +46,7 @@ use tokio::net::TcpStream;
 
 /// The address the front door accepted the request's connection from. Set
 /// here on every relayed request; the pool believes it only from loopback.
-pub const PEER_HEADER: &str = "x-codex-pool-peer";
+pub const PEER_HEADER: &str = codex_vendor::pool::listener::FRONT_PEER_HEADER;
 
 /// Go's http.Server ReadHeaderTimeout for the pool: a client that never
 /// finishes its headers is dropped here as it was there.
