@@ -3977,3 +3977,661 @@ fn missing_codex_auth_classifies_without_retry() {
         "missing auth classification must not wait for retries"
     );
 }
+
+// ---- the stream writers: pre-commit hold, early headers, keepalives ----
+
+use super::http_io::ResponseWriter;
+use super::stream::EarlyStreamWriter;
+use super::stream::SseReader;
+use super::stream::copy_streaming_proxy_response_with_precommit;
+use super::stream::precommit_byte_limit;
+use super::tuning::Tuning;
+use std::time::Duration;
+use std::time::Instant;
+
+/// Go io.Pipe: an upstream body fed piece by piece.
+fn pipe() -> (tokio::sync::mpsc::UnboundedSender<&'static str>, SseReader) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|chunk| (Ok(bytes::Bytes::from_static(chunk.as_bytes())), rx))
+    });
+    (tx, SseReader::new(Box::pin(stream)))
+}
+
+fn reader_of(text: String) -> SseReader {
+    SseReader::new(super::stream::byte_stream_from(text))
+}
+
+async fn wait_for(mut done: impl FnMut() -> bool, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while !done() {
+        if Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    true
+}
+
+fn keepalive_tuning(interval: Duration) -> Tuning {
+    Tuning {
+        stream_keepalive_interval: interval,
+        stream_keepalive_tick: interval / 3,
+        ..Tuning::default()
+    }
+}
+
+// Go TestCopyStreamingProxyResponseFlushesSSE.
+#[tokio::test]
+async fn copy_streaming_proxy_response_flushes_sse() {
+    let mut recorder = Recorder::new();
+    let mut reader = reader_of(completed("resp_flushed", ""));
+    let info = super::stream::copy_streaming_proxy_response(
+        &mut recorder,
+        &mut reader,
+        &Tuning::default(),
+    )
+    .await;
+    assert!(
+        recorder.result().flushed,
+        "SSE proxy buffered the response without flushing"
+    );
+    assert_eq!(info.response_id, "resp_flushed");
+}
+
+// Go TestStreamingPrecommitBlockLimitCommitsBeforeCapacityFailure.
+#[tokio::test]
+async fn streaming_precommit_block_limit_commits_before_capacity_failure() {
+    use super::stream::STREAMING_PRECOMMIT_MAX_BLOCKS;
+    let mut text: String = (0..=STREAMING_PRECOMMIT_MAX_BLOCKS)
+        .map(|index| in_progress(&format!("resp_{index}")))
+        .collect();
+    text.push_str(&overloaded("resp_failed"));
+    let mut recorder = Recorder::new();
+    let mut commits = 0;
+    let mut before = |writer: &mut dyn ResponseWriter| {
+        commits += 1;
+        writer.write_header(http::StatusCode::OK);
+    };
+    let result = copy_streaming_proxy_response_with_precommit(
+        &mut recorder,
+        &mut reader_of(text),
+        precommit_byte_limit(0),
+        &Tuning::default(),
+        Some(&mut before),
+    )
+    .await;
+    assert!(
+        !result.retryable_terminal_failure,
+        "capacity failure remained retryable after precommit block limit"
+    );
+    let recorded = recorder.result();
+    assert!(
+        commits == 1 && recorded.flushed && recorded.body_string().contains("response.failed"),
+        "bounded precommit stream was not committed once"
+    );
+    assert!(result.info.precommit_committed && result.info.precommit_close_reason == "bounds");
+}
+
+// Go TestShellEventsKeepTheRetryWindowOpen.
+#[test]
+fn shell_events_keep_the_retry_window_open() {
+    use super::stream::precommit_lifecycle_sse_block;
+    let shell = |kind: &str| format!("event: {kind}\ndata: {{\"type\":\"{kind}\"}}\n\n");
+    for kind in [
+        "response.created",
+        "response.in_progress",
+        "response.queued",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.reasoning_summary_part.added",
+    ] {
+        assert!(
+            precommit_lifecycle_sse_block(&shell(kind)),
+            "{kind} must keep the retry window open"
+        );
+    }
+    // Content, and the completion of an item that carries content, still
+    // commit: a retry after either would duplicate what the caller saw.
+    for kind in [
+        "response.output_text.delta",
+        "response.reasoning_summary_text.delta",
+        "response.function_call_arguments.delta",
+        "response.output_item.done",
+        "response.content_part.done",
+        "response.custom_tool_call_input.delta",
+    ] {
+        assert!(
+            !precommit_lifecycle_sse_block(&shell(kind)),
+            "{kind} must close the retry window"
+        );
+    }
+}
+
+// Go TestPrecommitReleasesHeadersWhenUpstreamStaysSilent: a plain writer
+// takes the timed commit.
+#[tokio::test]
+async fn precommit_releases_headers_when_upstream_stays_silent() {
+    const PREAMBLE: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_hold\"}}\n\nevent: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\nevent: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n\n";
+    const REST: &str = "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_hold\"}}\n\n";
+    let tuning = Tuning {
+        unmanaged_precommit_commit_after: Duration::from_millis(50),
+        ..Tuning::default()
+    };
+    let (tx, mut reader) = pipe();
+    let mut recorder = Recorder::new();
+    let committed: Arc<std::sync::Mutex<Option<Instant>>> = Arc::default();
+    let start = Instant::now();
+    let mark = committed.clone();
+    let mut before = move |_: &mut dyn ResponseWriter| {
+        if let Ok(mut at) = mark.lock() {
+            *at = Some(Instant::now());
+        }
+    };
+    let feeder = async {
+        let _ = tx.send(PREAMBLE);
+        // Upstream now "reasons" in silence. The headers must go out anyway.
+        let released = wait_for(
+            || committed.lock().is_ok_and(|at| at.is_some()),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            released,
+            "headers were still withheld while upstream was silent"
+        );
+        let held = committed
+            .lock()
+            .ok()
+            .and_then(|at| *at)
+            .map(|at| at - start)
+            .unwrap_or_default();
+        assert!(
+            held >= Duration::from_millis(40) && held <= Duration::from_secs(2),
+            "headers released after {held:?}"
+        );
+        let _ = tx.send(REST);
+        drop(tx);
+    };
+    let copy = copy_streaming_proxy_response_with_precommit(
+        &mut recorder,
+        &mut reader,
+        precommit_byte_limit(0),
+        &tuning,
+        Some(&mut before),
+    );
+    let (result, ()) = tokio::join!(copy, feeder);
+    assert!(
+        !result.retryable_terminal_failure,
+        "a released stream must not be reported as retryable"
+    );
+    assert!(
+        result.info.precommit_close_reason == "hold_timeout" && result.info.precommit_hold_ms >= 40,
+        "{:?}",
+        result.info.precommit_close_reason
+    );
+    assert_eq!(
+        recorder.result().body_string(),
+        format!("{PREAMBLE}{REST}"),
+        "stream was altered"
+    );
+}
+
+// Go TestEarlyHeadersKeepRetryWindowOpenForLateCapacityRefusal.
+#[tokio::test]
+async fn early_headers_keep_retry_window_open_for_late_capacity_refusal() {
+    let tuning = Tuning {
+        precommit_max_hold: Duration::from_millis(30),
+        ..keepalive_tuning(Duration::from_millis(20))
+    };
+    let client = Recorder::new();
+    let mut early =
+        EarlyStreamWriter::new(Box::new(client.clone()), tuning.precommit_max_hold, &tuning);
+    let (tx, mut reader) = pipe();
+    let feeder = async {
+        let _ = tx.send("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_q\"}}\n\nevent: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n");
+        assert!(
+            wait_for(|| client.result().status.is_some(), Duration::from_secs(2)).await,
+            "headers were not sent early while upstream queued the request"
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await; // let a few keepalives through
+        let _ = tx.send("event: error\ndata: {\"type\":\"error\",\"code\":\"server_is_overloaded\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_q\",\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n");
+        drop(tx);
+    };
+    let mut before = |writer: &mut dyn ResponseWriter| writer.write_header(http::StatusCode::OK);
+    let copy = copy_streaming_proxy_response_with_precommit(
+        &mut early,
+        &mut reader,
+        precommit_byte_limit(0),
+        &tuning,
+        Some(&mut before),
+    );
+    let (result, ()) = tokio::join!(copy, feeder);
+    early.finish().await;
+    assert!(
+        result.retryable_terminal_failure,
+        "a late capacity refusal must stay retryable after early headers"
+    );
+    let recorded = client.result();
+    assert!(
+        recorded.code() == 200 && recorded.header("content-type") == "text/event-stream",
+        "early headers"
+    );
+    let body = recorded.body_string();
+    assert!(
+        !body.contains("data:") && body.matches(": keepalive").count() >= 2,
+        "only keepalive comments may reach the client before a retry: {body:?}"
+    );
+}
+
+// Go TestEarlyHeadersConvertLaterErrorResponseIntoStreamFailure.
+#[tokio::test]
+async fn early_headers_convert_later_error_response_into_stream_failure() {
+    let tuning = Tuning::default();
+    let client = Recorder::new();
+    let mut early =
+        EarlyStreamWriter::new(Box::new(client.clone()), Duration::from_millis(1), &tuning);
+    assert!(wait_for(|| client.result().status.is_some(), Duration::from_secs(2)).await);
+    super::http_io::write_openai_error(
+        &mut early,
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        "all_accounts_cooling_down",
+        "every account is cooling down",
+    );
+    early.finish().await;
+    let recorded = client.result();
+    let body = recorded.body_string();
+    assert_eq!(recorded.code(), 200);
+    assert!(
+        body.contains("event: response.failed")
+            && body.contains(r#""code":"all_accounts_cooling_down""#)
+            && body.contains("every account is cooling down"),
+        "error was not converted into a stream failure: {body:?}"
+    );
+    // "invalid_request_error" is only in write_openai_error's raw JSON body.
+    assert!(
+        !body.contains("invalid_request_error"),
+        "raw JSON error body leaked into the stream"
+    );
+}
+
+// Go TestEarlyWriterIsTransparentWhenResponseStartsInTime.
+#[tokio::test]
+async fn early_writer_is_transparent_when_response_starts_in_time() {
+    let client = Recorder::new();
+    let mut early = EarlyStreamWriter::new(
+        Box::new(client.clone()),
+        Duration::from_secs(3600),
+        &Tuning::default(),
+    );
+    super::http_io::set_header(&mut early, "content-type", "text/event-stream");
+    early.write_header(http::StatusCode::OK);
+    early.write(b"event: response.created\ndata: {}\n\n");
+    early.finish().await;
+    assert_eq!(
+        client.result().body_string(),
+        "event: response.created\ndata: {}\n\n"
+    );
+    assert!(
+        early.headers_sent_early().is_none(),
+        "headers were reported early for a prompt response"
+    );
+}
+
+// Go TestKeepalivesCoverSilenceAfterRealOutput.
+#[tokio::test]
+async fn keepalives_cover_silence_after_real_output() {
+    let tuning = keepalive_tuning(Duration::from_millis(30));
+    let client = Recorder::new();
+    let mut early =
+        EarlyStreamWriter::new(Box::new(client.clone()), Duration::from_secs(3600), &tuning);
+    super::http_io::set_header(&mut early, "content-type", "text/event-stream");
+    early.write_header(http::StatusCode::OK);
+    early.write(b"event: response.created\ndata: {}\n\n");
+    tokio::time::sleep(Duration::from_millis(150)).await; // the model "thinks"
+    early.write(b"event: response.completed\ndata: {}\n\n");
+    early.finish().await;
+    let body = client.result().body_string();
+    assert!(
+        body.starts_with("event: response.created\ndata: {}\n\n: keepalive\n\n"),
+        "no keepalive during the silence after real output: {body:?}"
+    );
+    assert!(
+        body.ends_with("event: response.completed\ndata: {}\n\n"),
+        "stream was altered: {body:?}"
+    );
+    for block in body.trim_end_matches("\n\n").split("\n\n") {
+        assert!(
+            block == ": keepalive" || block.starts_with("event: "),
+            "a keepalive landed inside an event: {body:?}"
+        );
+    }
+}
+
+// Go TestKeepalivesNeverEnterANonSSEResponse.
+#[tokio::test]
+async fn keepalives_never_enter_a_non_sse_response() {
+    let tuning = keepalive_tuning(Duration::from_millis(10));
+    let client = Recorder::new();
+    let mut early =
+        EarlyStreamWriter::new(Box::new(client.clone()), Duration::from_secs(3600), &tuning);
+    super::http_io::write_openai_error(
+        &mut early,
+        http::StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "slow down",
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    early.finish().await;
+    let recorded = client.result();
+    assert!(
+        !recorded.body_string().contains("keepalive") && recorded.code() == 429,
+        "status {} body {:?}",
+        recorded.code(),
+        recorded.body_string()
+    );
+}
+
+// ---- failure classes, cooldown pricing and Codex's verdict ----
+
+// Go TestTerminalFailureClassesAndCooldownPricing.
+#[test]
+fn terminal_failure_classes_and_cooldown_pricing() {
+    use super::outcome::UPSTREAM_5XX_COOLDOWN_SECONDS;
+    use super::outcome::retryable_terminal_cooldown;
+    use super::response_info::retryable_terminal_failure_class;
+    use super::response_info::stream_retry_failover_outcome;
+    use super::response_info::terminal_failure_class;
+    for (code, want) in [
+        ("server_error", "transient"),
+        ("internal_server_error", "transient"),
+        ("server_is_overloaded", "capacity"),
+        ("rate_limit_exceeded", "capacity"),
+        ("usage_limit_reached", "capacity"),
+        ("invalid_prompt", "request"),
+        ("unauthorized", "authentication"),
+        ("some_new_condition", "unknown"),
+    ] {
+        assert_eq!(
+            terminal_failure_class("response.failed", code),
+            want,
+            "terminal_failure_class({code:?})"
+        );
+    }
+    for class in ["capacity", "transient"] {
+        assert!(
+            retryable_terminal_failure_class(class),
+            "{class:?} must be retryable"
+        );
+    }
+    for class in ["unknown", "request", "authentication", "incomplete", ""] {
+        assert!(
+            !retryable_terminal_failure_class(class),
+            "{class:?} must not be retryable"
+        );
+    }
+    // A server fault needs a moment, not a spent allowance, so it is priced
+    // like overload rather than getting the short default.
+    for reason in [
+        "server_error",
+        "internal_server_error",
+        "server_is_overloaded",
+        "slow_down",
+    ] {
+        assert_eq!(
+            retryable_terminal_cooldown(reason),
+            seconds(UPSTREAM_5XX_COOLDOWN_SECONDS),
+            "{reason}"
+        );
+    }
+    assert_eq!(
+        retryable_terminal_cooldown("rate_limit_exceeded"),
+        seconds(30)
+    );
+    // A spent allowance stays out until the quota refresh has seen it.
+    let longest_poll =
+        chrono::TimeDelta::from_std(super::quota_schedule::MAX_INTERVAL).unwrap_or_default();
+    for reason in [
+        "usage_limit_reached",
+        "usage_not_included",
+        "insufficient_quota",
+    ] {
+        assert_eq!(
+            retryable_terminal_cooldown(reason),
+            longest_poll,
+            "{reason}"
+        );
+    }
+    // The outcome must name the cause an operator has to act on.
+    assert_eq!(
+        stream_retry_failover_outcome("transient"),
+        "stream_transient_failover"
+    );
+    assert_eq!(
+        stream_retry_failover_outcome("capacity"),
+        "stream_capacity_failover"
+    );
+}
+
+fn cooled_only(reasons: &[(&str, chrono::TimeDelta)]) -> impl FnOnce(&App) {
+    let cooldowns: Vec<super::state::Cooldown> = reasons
+        .iter()
+        .map(|(reason, wait)| super::state::Cooldown {
+            model_id: "gpt-test".into(),
+            next_retry_at: Timestamp::now().add(*wait),
+            reason: (*reason).into(),
+            ..super::state::Cooldown::default()
+        })
+        .collect();
+    move |app: &App| {
+        app.write()
+            .state
+            .cooldowns_mut()
+            .insert("only".into(), cooldowns);
+    }
+}
+
+async fn only_with_cooldowns(cool: impl FnOnce(&App)) -> (Recorded, usize) {
+    let upstream =
+        FakeServer::start(|_| FakeResponse::json(200, r#"{"id":"resp_ok","output":[]}"#)).await;
+    let (app, _dir) = arc_app(vec![api_slot("only", "", 100, &upstream.url)]);
+    cool(&app);
+    let result = serve(
+        &app,
+        post("/v1/responses", r#"{"model":"gpt-test","input":"hello"}"#),
+    )
+    .await;
+    let hits = upstream.count();
+    (result, hits)
+}
+
+// Go TestOverloadCooldownIsSoftenedAsLastResort.
+#[tokio::test]
+async fn overload_cooldown_is_softened_as_last_resort() {
+    let (result, hits) =
+        only_with_cooldowns(cooled_only(&[("server_is_overloaded", seconds(30))])).await;
+    assert!(
+        result.code() == 200 && hits == 1,
+        "overload cooldown was not softened: {}",
+        result.body_string()
+    );
+    assert!(!result.body_string().contains("all_accounts_cooling_down"));
+}
+
+// Go TestRateLimitCooldownIsNotSoftened.
+#[tokio::test]
+async fn rate_limit_cooldown_is_not_softened() {
+    let (result, hits) = only_with_cooldowns(cooled_only(&[("rate_limited", seconds(30))])).await;
+    assert!(
+        hits == 0 && result.code() != 200,
+        "rate-limit cooldown was bypassed"
+    );
+}
+
+// Go TestMixedCooldownKeepsAccountBlocked.
+#[tokio::test]
+async fn mixed_cooldown_keeps_account_blocked() {
+    let (result, hits) = only_with_cooldowns(cooled_only(&[
+        ("server_is_overloaded", seconds(5)),
+        ("rate_limited", minutes(10)),
+    ]))
+    .await;
+    assert!(
+        hits == 0 && result.code() != 200,
+        "mixed cooldown was bypassed"
+    );
+}
+
+// Go TestCompletedResponseKeepsNoTerminalData.
+#[test]
+fn completed_response_keeps_no_terminal_data() {
+    let info = super::response_info::response_info_from_sse_block(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\"}}\n\n",
+    );
+    assert!(
+        info.terminal_event == "response.completed" && info.terminal_data.is_empty(),
+        "{info:?}"
+    );
+}
+
+// Go TestHTTPFailureLogCarriesCodexVerdict. Go asked a fake classifier over
+// HTTP; the classifier is Codex's own code in-process now, so the verdict in
+// the line is Codex's real one for this answer.
+#[test]
+fn http_failure_log_carries_codex_verdict() {
+    let (app, _dir) = test_app(Vec::new());
+    let (app, logged) = super::testing::capture_logs(app);
+    let mut headers = http::HeaderMap::new();
+    headers.insert("retry-after", http::HeaderValue::from_static("5"));
+    let body = br#"{"error":{"type":"usage_limit_reached","message":"limit"}}"#;
+    app.log_codex_verdict_for_http(
+        "acct",
+        "gpt-test",
+        http::StatusCode::TOO_MANY_REQUESTS,
+        &headers,
+        body,
+        "rate_limited",
+    );
+    let line = logged
+        .lock()
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_default();
+    assert_eq!(
+        line,
+        "upstream http failure: account=acct model=gpt-test status=429 pool=rate_limited code=usage_limit_reached codex=usage_limit_reached/Transport retry=no"
+    );
+}
+
+// Go TestTerminalFailureLogCarriesCodexVerdict.
+#[test]
+fn terminal_failure_log_carries_codex_verdict() {
+    use super::response_info::response_info_from_sse_block;
+    let (app, _dir) = test_app(Vec::new());
+    let (app, logged) = super::testing::capture_logs(app);
+    let event = r#"{"type":"response.failed","response":{"id":"resp_1","error":{"code":"server_error","message":"boom"}}}"#;
+    let sse_info =
+        response_info_from_sse_block(&format!("event: response.failed\ndata: {event}\n\n"));
+    assert!(
+        sse_info.terminal_data == event && sse_info.terminal_source.is_empty(),
+        "SSE terminal data"
+    );
+    app.log_terminal_response_failure("acct", "gpt-test", &sse_info, false);
+    let mut ws_info = response_info_from_sse_block(&format!("data: {event}\n\n"));
+    ws_info.terminal_source = "ws".into();
+    app.log_terminal_response_failure("acct", "gpt-test", &ws_info, true);
+    let lines = logged.lock().map(|lines| lines.clone()).unwrap_or_default();
+    assert_eq!(lines.len(), 2);
+    for line in &lines {
+        assert!(
+            line.contains("class=transient") && line.ends_with("codex=stream/Retryable retry=yes"),
+            "log line lacks the pool class or Codex's verdict: {line}"
+        );
+    }
+}
+
+// Go TestUnrecognizedUpstreamFailuresAreCounted (the stored counter; Go read
+// it through the dashboard window).
+#[test]
+fn unrecognized_upstream_failures_are_counted() {
+    let (app, _dir) = test_app(vec![device_account("first", "", 0)]);
+    for payload in [
+        r#"{"type":"response.failed","response":{"error":{"code":"brand_new_condition"}}}"#,
+        r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"websocket_connection_limit_reached"}}"#,
+    ] {
+        let info =
+            super::response_info::response_info_from_sse_block(&format!("data: {payload}\n\n"));
+        app.mark_terminal_response_failure(
+            &super::routing::RoutingDecision::default(),
+            "gpt-test",
+            "first",
+            &info,
+            None,
+            true,
+        );
+    }
+    let total: u64 = app
+        .read()
+        .state
+        .prompt_cache()
+        .values()
+        .map(|stat| stat.unrecognized_failure_count)
+        .sum();
+    assert_eq!(total, 1, "the unknown code counts, not the passthrough one");
+}
+
+// Go TestCodexUpstreamShapesClassifyAsCodexReadsThem: every recorded Codex
+// failure shape is terminal with its class and code, and every lifecycle
+// shape stays before the commit point.
+#[test]
+fn codex_upstream_shapes_classify_as_codex_reads_them() {
+    use super::response_info::response_info_from_sse_block;
+    use super::stream::precommit_lifecycle_sse_block;
+    let raw = include_str!("../../../cmd/codex-pool/testdata/codex-upstream-failures.json");
+    let fixture: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
+    let failures = fixture["failures"].as_array().cloned().unwrap_or_default();
+    let lifecycle = fixture["lifecycle"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !failures.is_empty() && !lifecycle.is_empty(),
+        "empty shape fixture"
+    );
+    for shape in &failures {
+        let name = shape["name"].as_str().unwrap_or_default();
+        assert!(
+            !shape["source"].as_str().unwrap_or_default().is_empty()
+                && !shape["marker"].as_str().unwrap_or_default().is_empty(),
+            "{name}: every shape must name the Codex source it was taken from"
+        );
+        let info = response_info_from_sse_block(&format!("data: {}\n\n", shape["event"]));
+        assert!(
+            !info.terminal_event.is_empty(),
+            "{name}: a failure Codex treats as terminal was not terminal"
+        );
+        assert_eq!(
+            (
+                info.terminal_failure_class.as_str(),
+                info.terminal_error_code.as_str()
+            ),
+            (
+                shape["class"].as_str().unwrap_or_default(),
+                shape["code"].as_str().unwrap_or_default()
+            ),
+            "{name}"
+        );
+    }
+    for shape in &lifecycle {
+        let name = shape["name"].as_str().unwrap_or_default();
+        let block = format!("data: {}\n\n", shape["event"]);
+        assert!(
+            response_info_from_sse_block(&block)
+                .terminal_event
+                .is_empty(),
+            "lifecycle {name} read as terminal"
+        );
+        assert!(
+            precommit_lifecycle_sse_block(&block),
+            "lifecycle {name} must stay before the commit point"
+        );
+    }
+}
