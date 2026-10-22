@@ -1897,6 +1897,7 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			// transient capacity. Keep the error body out of persisted state and
 			// route to a different upstream account if one exists.
 			reason := codeOr(extractUpstreamErrorCode(body), "account_auth_failed")
+			a.logCodexVerdictForHTTP(candidate.ID, model, response.StatusCode, response.Header, body, "auth_failover")
 			failoverFromAccountID = candidate.ID
 			failoverOutcome = "auth_failover"
 			a.markAccountAuthFailure(candidate.ID, model, reason)
@@ -1921,6 +1922,9 @@ func (a *app) handleProxy(w http.ResponseWriter, r *http.Request, chat bool) {
 			reason := "upstream_5xx"
 			if response.StatusCode == http.StatusTooManyRequests {
 				reason = "rate_limited"
+			}
+			a.logCodexVerdictForHTTP(candidate.ID, model, response.StatusCode, response.Header, gatewayBody, reason)
+			if response.StatusCode == http.StatusTooManyRequests {
 				excluded[candidate.ID] = true
 				capacityExcluded[candidate.ID] = true
 				// Another identity is cheaper than any wait, so fail over whenever
@@ -2687,7 +2691,14 @@ type proxyResponseInfo struct {
 	// control characters. It exists for the service log and nothing else: it must
 	// never enter runtime state, a routing event, or an admin response, which is
 	// why it carries no json tag and is copied nowhere but the log line.
-	TerminalErrorMessage  string
+	TerminalErrorMessage string
+	// TerminalData is the terminal failure event exactly as upstream sent it,
+	// and TerminalSource the stream it came on ("ws" for the Responses
+	// WebSocket, empty for SSE). They exist only to ask Codex's own code what
+	// it makes of the failure (codex_verdict.go); like TerminalErrorMessage they
+	// carry no json tag and never enter state, an event or a response.
+	TerminalData          string
+	TerminalSource        string
 	RequestID             string
 	FailoverFromAccountID string
 	FailoverOutcome       string
@@ -3575,6 +3586,8 @@ func (info *proxyResponseInfo) merge(next proxyResponseInfo) {
 		info.TerminalFailureClass = next.TerminalFailureClass
 		info.TerminalErrorCode = next.TerminalErrorCode
 		info.TerminalErrorMessage = next.TerminalErrorMessage
+		info.TerminalData = next.TerminalData
+		info.TerminalSource = next.TerminalSource
 	}
 }
 
@@ -3626,6 +3639,9 @@ func responseInfoFromSSEBlock(block string) proxyResponseInfo {
 	}
 	if isTerminalResponseEvent(eventType) {
 		info.TerminalEvent = eventType
+		if eventType != "response.completed" {
+			info.TerminalData = boundedVerdictData(data)
+		}
 		info.TerminalFailureClass = terminalFailureClass(eventType, info.TerminalErrorCode)
 		if info.TerminalFailureClass == "unknown" && eventType == "error" {
 			// A Responses WebSocket wraps an HTTP refusal as {"type":"error",
@@ -3739,6 +3755,9 @@ func (a *app) logTerminalResponseFailure(accountID, model string, info proxyResp
 	}
 	if info.TerminalErrorMessage != "" {
 		line += fmt.Sprintf(" message=%q", info.TerminalErrorMessage)
+	}
+	if verdict, ok := a.codexVerdictForTerminal(info); ok {
+		line += " " + verdict.logField()
 	}
 	a.logger.Print(line)
 }

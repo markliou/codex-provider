@@ -25,7 +25,12 @@ if [ -n "$prohibited_paths" ]; then
 fi
 
 added_lines=$(git diff --cached --no-ext-diff --unified=0 | sed -n '/^+[^+]/s/^+//p')
-if printf '%s\n' "$added_lines" | grep -E '(sk-[A-Za-z0-9_-]{20,}|sess-[A-Za-z0-9_-]{20,}|codex_[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9_]{20,}|pbkdf2-sha256:[0-9]+:[A-Za-z0-9+/=]{16,}:[A-Za-z0-9+/=]{32,})' >/dev/null; then
+# A match made only of lowercase letters and underscores is a snake_case
+# identifier (Codex's own source names fields like
+# codex_rollout_budget_units...), not a credential: a token carries digits or
+# mixed case. Only that exact shape is excused; every other match still fails.
+token_hits=$(printf '%s\n' "$added_lines" | grep -oE '(sk-[A-Za-z0-9_-]{20,}|sess-[A-Za-z0-9_-]{20,}|codex_[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9_]{20,}|pbkdf2-sha256:[0-9]+:[A-Za-z0-9+/=]{16,}:[A-Za-z0-9+/=]{32,})' | grep -vE '^codex_[a-z_]+$' || true)
+if [ -n "$token_hits" ]; then
   fail "staged content appears to include an API key, session token, or JWT"
 fi
 

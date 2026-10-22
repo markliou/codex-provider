@@ -1,0 +1,10 @@
+# Codex's codex-rs/clippy.toml settings that apply here (its disallowed
+# methods are for crates this package does not use).
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+await-holding-invalid-types = [
+    "tokio::sync::MutexGuard",
+    "tokio::sync::RwLockReadGuard",
+    "tokio::sync::RwLockWriteGuard",
+]
+large-error-threshold = 256

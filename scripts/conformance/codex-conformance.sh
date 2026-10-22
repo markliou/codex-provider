@@ -13,7 +13,8 @@
 # Moving to a new Codex release: run `diff <tag>`, read every hunk, match the
 # pool to it (or note why it does not apply), update the tag in
 # upstream/Cargo.toml, reseed upstream/Cargo.lock, update codexRelease and the
-# shapes in cmd/codex-pool/testdata/codex-upstream-failures.json, then run
+# shapes in cmd/codex-pool/testdata/codex-upstream-failures.json, re-copy the
+# vendored Codex files (scripts/conformance/codex-vendor.sh sync), then run
 # `check` and scripts/conformance/wire-capture.sh. See AGENTS.md.
 set -eu
 
@@ -72,6 +73,8 @@ case "${1:-}" in
     tag=${2:-$pinned}
     echo "Checking the pool's Codex shapes against $tag"
     check "$tag"
+    # The Codex files codex-upstream compiles must be the pinned release's.
+    sh scripts/conformance/codex-vendor.sh check
     ;;
   diff)
     tag=${2:?usage: codex-conformance.sh diff <tag>}
