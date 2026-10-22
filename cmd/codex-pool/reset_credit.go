@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"math"
-	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -131,8 +130,7 @@ func nativeResetCreditChoice(listing codexResetCreditListing) string {
 func (a *app) chooseResetCredit(ctx context.Context, accountID string, auth codexAuthInfo) string {
 	ctx, cancel := context.WithTimeout(ctx, resetCreditDetailsTimeout)
 	defer cancel()
-	response, err := a.sendCodexOwnRequest(ctx, accountID, http.MethodGet, a.codexResetCreditsURL(), codexBackendHeaderOrder,
-		codexBackendHeaders(a.clientAgentFor(accountID), auth, auth.AccountID), nil)
+	response, err := a.sendCodexOwnCall(ctx, accountID, a.codexBackendCall(ownCallResetCredits, a.codexResetCreditsURL(), accountID, auth))
 	if err != nil {
 		return ""
 	}

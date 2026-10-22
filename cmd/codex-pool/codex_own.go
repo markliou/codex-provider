@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -28,9 +29,12 @@ import (
 // keeps the three together.
 const pinnedCodexVersion = "0.163.0"
 
-// Wire orders captured from a native Codex (see UPSTREAM_HEADER_ORDER in
-// codex-upstream): names before the body step, "|", names after it. Codex's
-// HTTP client adds `accept: */*` last on its own.
+// Wire orders captured from a native Codex: names before the body step, "|",
+// names after it. Codex's HTTP client adds `accept: */*` last on its own. The
+// own calls are composed in codex-upstream (pool/own_call.rs); these orders
+// are what own-call-vectors.json records it must produce. The models catalog
+// is a relayed client request and still names its order to /forward
+// (UPSTREAM_HEADER_ORDER there).
 const (
 	// backend-client (wham/usage, rate-limit-reset-credits, accounts/check):
 	// backend-client/src/client.rs headers().
@@ -168,34 +172,105 @@ func codexBackendHeaders(agent clientAgent, auth codexAuthInfo, accountID string
 	return header
 }
 
-// sendCodexOwnRequest sends one of the pool's own upstream calls through
-// codex-upstream in the given native header order. Without codex-upstream
-// (tests) it is sent from Go with the same headers.
-func (a *app) sendCodexOwnRequest(ctx context.Context, accountID, method, target, order string, header http.Header, body []byte) (*http.Response, error) {
-	viaTransport := a.codexTransportURL != ""
-	endpoint := target
-	if viaTransport {
-		endpoint = a.codexTransportURL + "/forward"
+// codexOwnCall names one of the pool's own upstream calls and what it is sent
+// with, and nothing about how it is written: codex-upstream composes the
+// request itself, as Codex's source composes it (upstream/src/pool/own_call.rs,
+// RUST_PORT.md step 1), so the Go side no longer decides a header, its order or
+// a body byte. request() is the same composition in Go, used only without
+// codex-upstream (tests); own-call-vectors.json holds the two together.
+type codexOwnCall struct {
+	Call            string `json:"call"`
+	URL             string `json:"url"`
+	UserAgent       string `json:"user_agent"`
+	Originator      string `json:"originator,omitempty"`
+	AccessToken     string `json:"access_token,omitempty"`
+	AccountID       string `json:"account_id,omitempty"`
+	FedRAMP         bool   `json:"fedramp,omitempty"`
+	ClientID        string `json:"client_id,omitempty"`
+	RefreshToken    string `json:"refresh_token,omitempty"`
+	RedeemRequestID string `json:"redeem_request_id,omitempty"`
+	CreditID        string `json:"credit_id,omitempty"`
+}
+
+const (
+	ownCallUsage              = "usage"
+	ownCallAccountsCheck      = "accounts_check"
+	ownCallResetCredits       = "reset_credits"
+	ownCallConsumeResetCredit = "consume_reset_credit"
+	ownCallTokenRefresh       = "token_refresh"
+)
+
+// codexBackendCall is a backend-client call for the account: the agent of the
+// Codex that last used it, and its credential.
+func (a *app) codexBackendCall(call, target, accountID string, auth codexAuthInfo) codexOwnCall {
+	return codexOwnCall{
+		Call:        call,
+		URL:         target,
+		UserAgent:   a.clientAgentFor(accountID).UserAgent,
+		AccessToken: auth.AccessToken,
+		AccountID:   auth.AccountID,
+		FedRAMP:     auth.FedRAMP,
 	}
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
+}
+
+// request is the call as Codex writes it: method, header order (see the wire
+// orders above) and body.
+func (call codexOwnCall) request() (method, order string, header http.Header, body []byte, err error) {
+	switch call.Call {
+	case ownCallUsage, ownCallAccountsCheck, ownCallResetCredits:
+		header = codexBackendHeaders(clientAgent{UserAgent: call.UserAgent}, codexAuthInfo{AccessToken: call.AccessToken, FedRAMP: call.FedRAMP}, call.AccountID)
+		return http.MethodGet, codexBackendHeaderOrder, header, nil, nil
+	case ownCallConsumeResetCredit:
+		body, err = codexJSON(codexConsumeResetCreditRequest{RedeemRequestID: call.RedeemRequestID, CreditID: call.CreditID})
+		header = codexBackendHeaders(clientAgent{UserAgent: call.UserAgent}, codexAuthInfo{AccessToken: call.AccessToken, FedRAMP: call.FedRAMP}, call.AccountID)
+		header.Set("Content-Type", "application/json")
+		return http.MethodPost, codexBackendHeaderOrder, header, body, err
+	case ownCallTokenRefresh:
+		body, err = codexJSON(map[string]string{
+			"client_id":     call.ClientID,
+			"grant_type":    "refresh_token",
+			"refresh_token": call.RefreshToken,
+		})
+		header = http.Header{}
+		header.Set("Content-Type", "application/json")
+		header.Set("Originator", call.Originator)
+		header.Set("User-Agent", call.UserAgent)
+		return http.MethodPost, codexTokenRefreshHeaderOrder, header, body, err
 	}
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
+	return "", "", nil, nil, fmt.Errorf("unknown own call %q", call.Call)
+}
+
+// sendCodexOwnCall sends one of the pool's own upstream calls. Through
+// codex-upstream the call goes to /own, which composes and sends it; the answer
+// is upstream's, as /forward returns it. Without codex-upstream (tests) Go sends
+// request() itself.
+func (a *app) sendCodexOwnCall(ctx context.Context, accountID string, call codexOwnCall) (*http.Response, error) {
+	if a.codexTransportURL == "" {
+		method, _, header, body, err := call.request()
+		if err != nil {
+			return nil, err
+		}
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, call.URL, reader)
+		if err != nil {
+			return nil, err
+		}
+		req.Header = header
+		return a.client.Do(req)
+	}
+	body, err := json.Marshal(call)
 	if err != nil {
 		return nil, err
 	}
-	for name, values := range header {
-		req.Header[name] = append([]string(nil), values...)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.codexTransportURL+"/own", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
-	if !viaTransport {
-		return a.client.Do(req)
-	}
-	req.Header.Set("X-Codex-Upstream-Url", target)
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Codex-Upstream-Identity", accountID)
-	if order != "" {
-		req.Header.Set("X-Codex-Upstream-Header-Order", order)
-	}
 	response, err := a.streamClient.Do(req)
 	if err != nil {
 		return nil, err

@@ -13,7 +13,10 @@
 //! responsibility with the pool the way the retired CLIProxyAPI sidecar did.
 //! `/classify` is no exception: it reports what a native Codex would make of
 //! a failure, read with Codex's own code (codex_vendor::classify), and leaves
-//! every retry and failover decision to the pool.
+//! every retry and failover decision to the pool. Nor is `/own`: it writes the
+//! pool's own calls (refresh, usage, account check, reset credits) as Codex
+//! writes them (codex_vendor::pool::own_call), sends them, and hands upstream's
+//! answer back; which call, for which account and when stay the pool's.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -30,6 +33,8 @@ use codex_http_client::RequestBody;
 use codex_http_client::RequestCompression;
 use codex_http_client::ReqwestTransport;
 use codex_http_client::TransportError;
+use codex_vendor::pool::own_call;
+use codex_vendor::pool::own_call::OwnCall;
 use codex_websocket_client::WebSocketConnector;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -416,17 +421,28 @@ async fn forward(
     } else if !body.is_empty() {
         codex_request.body = Some(RequestBody::Raw(body));
     }
+    Ok(send(&transports, codex_request, &after).await)
+}
+
+/// The final hop of /forward and /own: Codex's request assembly (the body step
+/// adds its content headers), the headers a client adds after it, and Codex's
+/// client. Upstream's answer is streamed back as it arrives.
+async fn send(
+    transports: &Transports,
+    codex_request: CodexRequest,
+    after: &HeaderMap,
+) -> Response<ResponseBody> {
     let mut prepared = match codex_request.into_prepared() {
         Ok(prepared) => prepared,
         Err(error) => {
-            return Ok(plain(
+            return plain(
                 StatusCode::BAD_REQUEST,
                 None,
                 format!("prepare request: {error}"),
-            ));
+            );
         }
     };
-    for (name, value) in &after {
+    for (name, value) in after {
         prepared.headers.append(name.clone(), value.clone());
     }
 
@@ -439,19 +455,65 @@ async fn forward(
             let mut response = Response::new(BodyExt::boxed_unsync(StreamBody::new(frames)));
             *response.status_mut() = streamed.status;
             *response.headers_mut() = response_headers(&streamed.headers);
-            Ok(response)
+            response
         }
         Err(TransportError::Http {
             status,
             headers,
             body,
             ..
-        }) => Ok(plain(status, headers, body.unwrap_or_default())),
+        }) => plain(status, headers, body.unwrap_or_default()),
         Err(TransportError::Timeout) => {
-            Ok(transport_failure("timeout", "upstream timeout".to_string()))
+            transport_failure("timeout", "upstream timeout".to_string())
         }
-        Err(error) => Ok(transport_failure("connection", error.to_string())),
+        Err(error) => transport_failure("connection", error.to_string()),
     }
+}
+
+/// The pool's own calls (refresh, usage, account check, reset credits): the
+/// pool posts which call and what it is sent with, and this process writes the
+/// request the way a native Codex writes it (codex_vendor::pool::own_call) and
+/// sends it as /forward does, answering with upstream's response. The pool
+/// still reads that answer and owns every decision and all state.
+async fn own(
+    transports: Arc<Transports>,
+    request: hyper::Request<Incoming>,
+) -> Response<ResponseBody> {
+    let body = match http_body_util::Limited::new(request.into_body(), OWN_BODY_LIMIT)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) => {
+            return plain(StatusCode::BAD_REQUEST, None, format!("own call: {error}"));
+        }
+    };
+    let call: OwnCall = match serde_json::from_slice(&body) {
+        Ok(call) => call,
+        Err(error) => {
+            return plain(StatusCode::BAD_REQUEST, None, format!("own call: {error}"));
+        }
+    };
+    let composed = match own_call::compose(&call) {
+        Ok(composed) => composed,
+        Err(error) => {
+            return plain(StatusCode::BAD_REQUEST, None, format!("own call: {error}"));
+        }
+    };
+    let mut codex_request = CodexRequest::new(composed.method, composed.url);
+    codex_request.headers = composed.before_body;
+    if let Some(json) = composed.json_body {
+        let encoded = serde_json::from_slice::<&serde_json::value::RawValue>(&json)
+            .map_err(|error| error.to_string())
+            .and_then(|raw| EncodedJsonBody::encode(raw).map_err(|error| error.to_string()));
+        match encoded {
+            Ok(encoded) => codex_request.body = Some(RequestBody::EncodedJson(encoded)),
+            Err(error) => {
+                return plain(StatusCode::BAD_REQUEST, None, format!("own call: {error}"));
+            }
+        }
+    }
+    send(&transports, codex_request, &composed.after_body).await
 }
 
 /// Codex's Responses WebSocket configuration: default limits plus the
@@ -625,6 +687,8 @@ where
 /// Largest failure the pool hands /classify: an error event or an HTTP error
 /// body, never a whole stream.
 const CLASSIFY_BODY_LIMIT: usize = 1 << 20;
+/// An own call is a few short strings; anything larger is not one.
+const OWN_BODY_LIMIT: usize = 64 << 10;
 
 /// Codex's verdict on one upstream failure the pool met (codex_vendor::classify).
 /// The pool posts {"source": "sse"|"ws"|"http", "data": <event text>} or, for
@@ -709,6 +773,9 @@ async fn route(
     }
     if request.uri().path() == "/classify" && request.method() == Method::POST {
         return Ok(classify(request).await);
+    }
+    if request.uri().path() == "/own" && request.method() == Method::POST {
+        return Ok(own(transports, request).await);
     }
     forward(transports, request).await
 }

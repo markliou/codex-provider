@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -170,13 +171,15 @@ func TestCodexJSONMatchesSerde(t *testing.T) {
 	}
 }
 
-// Through codex-upstream the pool's own calls name their native header order,
-// since the hop to codex-upstream cannot carry one.
-func TestPoolOwnCallsNameTheirHeaderOrder(t *testing.T) {
-	var gotOrder, gotURL string
+// Through codex-upstream the pool's own calls are named, not written: Go sends
+// /own the call and its credential, and codex-upstream composes the request.
+func TestPoolOwnCallsGoToCodexUpstreamAsCalls(t *testing.T) {
+	var got codexOwnCall
+	var gotPath, gotIdentity string
 	transport := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotOrder = r.Header.Get("X-Codex-Upstream-Header-Order")
-		gotURL = r.Header.Get("X-Codex-Upstream-Url")
+		gotPath = r.URL.Path
+		gotIdentity = r.Header.Get("X-Codex-Upstream-Identity")
+		_ = json.NewDecoder(r.Body).Decode(&got)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"plan_type":"plus","rate_limit":{}}`))
 	}))
@@ -186,9 +189,98 @@ func TestPoolOwnCallsNameTheirHeaderOrder(t *testing.T) {
 	a.codexTransportURL = transport.URL
 	writeCodexDeviceAuth(t, a, "device", "acct-device", "device@example.test")
 	_, _ = a.refreshAccountQuota(context.Background(), "device")
-	if gotURL != "https://chatgpt.example.test/backend-api/wham/usage" || gotOrder != codexBackendHeaderOrder {
-		t.Fatalf("usage hop url %q order %q", gotURL, gotOrder)
+	if gotPath != "/own" || gotIdentity != "device" {
+		t.Fatalf("usage hop path %q identity %q", gotPath, gotIdentity)
 	}
+	if got.Call != ownCallUsage || got.URL != "https://chatgpt.example.test/backend-api/wham/usage" || got.AccountID != "acct-device" || got.AccessToken == "" || got.UserAgent == "" {
+		t.Fatalf("usage call = %+v", got)
+	}
+}
+
+const ownCallVectorsPath = "testdata/own-call-vectors.json"
+
+// ownCallVector is one of the pool's own calls and the request it must become:
+// headers in wire order, the body step's content-type included.
+type ownCallVector struct {
+	Input   codexOwnCall `json:"input"`
+	Method  string       `json:"method"`
+	URL     string       `json:"url"`
+	Headers [][2]string  `json:"headers"`
+	Body    *string      `json:"body"`
+}
+
+// The Go composition (codexOwnCall.request) and codex-upstream's
+// (upstream/src/pool/own_call.rs) are held together by this file: Go writes it,
+// and the Rust tests compose every input and must produce the same request.
+// Fake credentials only.
+func TestOwnCallVectorsMatchTheGoCode(t *testing.T) {
+	backend := func(call string) codexOwnCall {
+		return codexOwnCall{
+			Call:        call,
+			URL:         "https://chatgpt.example.test/backend-api/wham/" + call,
+			UserAgent:   "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)",
+			AccessToken: "replace-access-token",
+			AccountID:   "fake-account-id",
+		}
+	}
+	fedramp := backend(ownCallAccountsCheck)
+	fedramp.FedRAMP = true
+	noAccount := backend(ownCallUsage)
+	noAccount.AccountID = ""
+	consume := backend(ownCallConsumeResetCredit)
+	consume.RedeemRequestID = "8f14e45f-ceea-467f-9575-c2d1e2a3b4c5"
+	consume.CreditID = "fake-credit-id"
+	consumeAny := consume
+	consumeAny.CreditID = ""
+	inputs := []codexOwnCall{
+		backend(ownCallUsage),
+		noAccount,
+		fedramp,
+		backend(ownCallResetCredits),
+		consume,
+		consumeAny,
+		{
+			Call:         ownCallTokenRefresh,
+			URL:          "https://auth.example.test/oauth/token",
+			UserAgent:    "codex-tui/0.163.0 (Mac OS 26.0.0; arm64) iTerm.app/3.6",
+			Originator:   "codex_tui",
+			ClientID:     codexOAuthClientIDDefault,
+			RefreshToken: "replace-refresh<&>token",
+		},
+	}
+	vectors := make([]ownCallVector, 0, len(inputs))
+	for _, input := range inputs {
+		method, order, header, body, err := input.request()
+		if err != nil {
+			t.Fatal(err)
+		}
+		vector := ownCallVector{Input: input, Method: method, URL: input.URL, Headers: [][2]string{}}
+		before, after, _ := strings.Cut(order, "|")
+		add := func(names string) {
+			for _, name := range strings.Split(names, ",") {
+				if value := header.Get(name); name != "" && value != "" {
+					vector.Headers = append(vector.Headers, [2]string{name, value})
+				}
+			}
+		}
+		add(before)
+		if body != nil {
+			text := string(body)
+			vector.Body = &text
+			vector.Headers = append(vector.Headers, [2]string{"content-type", header.Get("Content-Type")})
+		}
+		add(after)
+		vectors = append(vectors, vector)
+	}
+	// Written without HTML escaping, so the bodies read as they go out.
+	var data bytes.Buffer
+	encoder := json.NewEncoder(&data)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(vectors); err != nil {
+		t.Fatal(err)
+	}
+	checkGeneratedFile(t, ownCallVectorsPath, data.Bytes())
 }
 
 // Behind a reverse proxy the login lockout must count each real client, and a
