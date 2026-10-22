@@ -179,6 +179,7 @@ docker run -d \
 | `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | `24h` | Upstream prompt cache retention. Defaults to `24h` (extended retention) to maximize cache hit rate across conversation turns. Set `passthrough` to leave requests untouched, or `in_memory` for the shorter built-in retention. |
 | `CODEX_POOL_PRESERVE_PRO_QUOTA` | no | `false` | Initial default for the admin Console `Use Pro last` switch. Once saved in `/data/config.json`, the Console setting takes precedence. |
 | `CODEX_POOL_QUOTA_PRIME` | no | `false` | Initial default for the admin Console `Prime idle accounts` switch (quota window priming). Once saved in `/data/config.json`, the Console setting takes precedence. |
+| `CODEX_POOL_QUOTA_PRIME_GRACE` | no | random 5–30 min | Test override: a fixed wait (for example `0s`) before an unanchored window is primed. |
 | `CODEX_POOL_LINEAGE_AFFINITY` | no | `true` | Initial default for the admin Console `Keep subagents together` switch (section 6.2.1). Once saved in `/data/config.json`, the Console setting takes precedence. |
 
 ### 2.2 Startup safety checks
@@ -1649,7 +1650,13 @@ each refresh the pool detects this state on the account's longest reported
 window and spends a minimal amount of quota against that account to anchor it.
 The switch is off by default: a prime is a request no native Codex sends, made
 for the pool's capacity rather than for a user, and without it a window anchors
-on its first real use, as it does for a native Codex.
+on its first real use, as it does for a native Codex. Even when it is on, a window is
+not primed as soon as it is seen unanchored: its user gets a random 5 to 30
+minute grace to start it with a real request, which anchors it with no prime.
+The pool polls the account again when the grace ends and primes only a window
+still untouched; a request in between anchors the window and the next poll drops
+the wait. The grace is kept in memory, so a restart starts a new one.
+`CODEX_POOL_QUOTA_PRIME_GRACE` fixes the grace to one duration for tests.
 
 The window is unanchored when it is present, reports a window duration and a
 reset instant, has full remaining percentage, and its reset sits no closer than

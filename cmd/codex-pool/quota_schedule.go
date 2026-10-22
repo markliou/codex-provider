@@ -49,6 +49,9 @@ type quotaPollPlan struct {
 	last      time.Time
 	activeGap time.Duration
 	idleGap   time.Duration
+	// by, when set, brings the next poll forward to decide a waiting prime
+	// (codex_prime.go, quota prime grace).
+	by time.Time
 }
 
 type quotaPollSchedule struct {
@@ -65,13 +68,17 @@ func (s *quotaPollSchedule) between(low, high time.Duration) time.Duration {
 }
 
 func (s *quotaPollSchedule) nextAt(plan quotaPollPlan, active bool) time.Time {
-	if plan.last.IsZero() {
-		return plan.first
+	next := plan.first
+	if !plan.last.IsZero() {
+		next = plan.last.Add(plan.idleGap)
+		if active {
+			next = plan.last.Add(plan.activeGap)
+		}
 	}
-	if active {
-		return plan.last.Add(plan.activeGap)
+	if !plan.by.IsZero() && plan.by.Before(next) {
+		return plan.by
 	}
-	return plan.last.Add(plan.idleGap)
+	return next
 }
 
 // due names the account whose poll is most overdue at now; active reports
@@ -110,6 +117,14 @@ func (s *quotaPollSchedule) polled(accountID string, finished time.Time) {
 		last:      finished,
 		activeGap: s.between(quotaRefreshInterval-quotaRefreshJitter, quotaRefreshMaxInterval),
 		idleGap:   s.between(quotaIdleRefreshMinInterval, quotaIdleRefreshMaxInterval),
+	}
+}
+
+// pollBy makes the account due no later than at.
+func (s *quotaPollSchedule) pollBy(accountID string, at time.Time) {
+	if plan, ok := s.plans[accountID]; ok {
+		plan.by = at
+		s.plans[accountID] = plan
 	}
 }
 
@@ -154,6 +169,9 @@ func (a *app) startQuotaRefresher(ctx context.Context) {
 					}
 				}
 				schedule.polled(id, time.Now())
+				if at, waiting := a.primeGraceDue(id); waiting {
+					schedule.pollBy(id, at)
+				}
 			}
 			select {
 			case <-ctx.Done():
