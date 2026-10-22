@@ -287,8 +287,9 @@ The control page refreshes every five minutes (**Refresh** reads at once).
   `Cooldown`, `Error`, `Login needed`, `Signing in`, `Duplicate`, `Disabled`,
   `Standby`), every quota window with its own percentage and reset time, credits,
   spend control, and reset credits with the nearest expiry (red within seven
-  days). Quota is read from `/wham/usage` every four to six minutes per
-  account, at random, one account at a time; a value upstream
+  days). Quota is read from `/wham/usage` one account at a time, at random:
+  every four to six minutes for an account used in the last 30 minutes, every
+  20 to 30 for an idle one; a value upstream
   does not report shows as `Not reported`. **Use reset credit** spends one the
   way Codex's own `/usage` reset does: the credit expiring soonest, and a press
   after a failed attempt resends that attempt, so it cannot spend twice.
@@ -323,7 +324,8 @@ connection per request, as Codex does.
 The pool's own calls also go out the way Codex makes them. Token refresh, usage,
 account check and reset-credit reads use Codex's endpoints and header order, with
 the identity of the Codex that last used the account. A quota-window prime is one
-read-only turn of the bundled Codex CLI that holds no refresh token.
+read-only turn of the bundled Codex CLI that holds no refresh token; no native
+Codex sends one, so it is off until **Prime idle accounts** is turned on.
 
 A bundled CLIProxyAPI sidecar used to be the gateway; it rewrote what Codex
 sent and was removed (issue #32). Setting `CODEX_POOL_CODEX_GATEWAY_MODE=sidecar`
@@ -360,6 +362,7 @@ settings and SPEC.md 2.1 lists them all. The ones most often changed:
 | `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` | `5` | Assumed Business Premium seat size |
 | `CODEX_POOL_PRESERVE_PRO_QUOTA` | `false` | Initial **Use Pro last** setting |
 | `CODEX_POOL_LINEAGE_AFFINITY` | `true` | Initial **Keep subagents together** setting |
+| `CODEX_POOL_QUOTA_PRIME` | `false` | Initial **Prime idle accounts** setting |
 | `CODEX_POOL_SHUTDOWN_GRACE` | `120s` | Drain time on stop (keep `stop_grace_period` above it) |
 
 ### Data and logs
