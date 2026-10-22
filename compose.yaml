@@ -19,7 +19,7 @@ services:
     # its shutdown drain, which waits up to CODEX_POOL_SHUTDOWN_GRACE (120s by
     # default) for in-flight streams. Keep this above that grace.
     stop_grace_period: 150s
-    # The pool and codex-upstream log to stdout, and Docker's json-file driver
+    # The pool logs to stdout, and Docker's json-file driver
     # has no default size limit, so the container log grows until the disk fills.
     # It looks bounded only because every deploy recreates the container and
     # starts a new file; a long uptime is what would fill the disk.

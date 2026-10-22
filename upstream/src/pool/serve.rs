@@ -173,6 +173,12 @@ pub async fn serve_until_stopped<C, Fut>(
             app.in_flight.load(Ordering::SeqCst)
         ));
     }
+    // The last word on routing state, so what the drained requests recorded
+    // (bindings, health, prompt-cache counts) reaches the next container.
+    if let Err(error) = app.write().save() {
+        app.logger
+            .printf(&format!("final state save failed: {error}"));
+    }
 }
 
 /// Go's time.Duration String: "2m0s", "150ms", "1h0m0s".
