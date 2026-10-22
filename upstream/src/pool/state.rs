@@ -368,8 +368,13 @@ pub struct QuotaLimit {
 pub struct QuotaResetCredits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_count: Option<i64>,
+    /// The earliest expiry among currently available reset credits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    /// Process-local fetch throttling (Go `json:"-"`): it must not add
+    /// diagnostic noise to the dashboard or the persisted runtime JSON.
+    #[serde(skip)]
+    pub details_observed_at: super::time::Timestamp,
     #[serde(flatten)]
     pub extra: Unknown,
 }
