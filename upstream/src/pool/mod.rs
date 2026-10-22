@@ -9,5 +9,6 @@
 //! Keep a single copy of them there; a second copy here could drift.
 
 pub mod hash;
+pub mod installation_id;
 pub mod quota_schedule;
 pub mod state;

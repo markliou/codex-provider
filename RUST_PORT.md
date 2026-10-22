@@ -110,6 +110,7 @@
 
 - Rust 接收所有對外請求（port 8317 的角色），還沒搬的功能反向轉給 Go（改為只在容器內監聽）。
 - 對 Codex 而言檔頭、內容、WebSocket 行為都不能改變；`wire-capture.sh` 必須維持相同。
+- 安裝 ID（main `cmd/codex-pool/installation_id.go`，SPEC 2.3.2）：每個帳號在自己的 `.codex/installation_id` 有一組固定的 UUID，送上游時只替換 `client_metadata` 裡和 `x-codex-turn-metadata` 檔頭裡的安裝 ID，其他位元組不動；WebSocket 的握手和每則訊息用該 socket 綁定帳號的 ID，prime 的暫時 home 也放同一組。Rust 的函式已寫好（`upstream/src/pool/installation_id.rs`，測試對應 Go 的 `installation_id_test.go`）；轉送搬到 Rust 時直接用它，`wire-capture.sh` 的 installation id 檢查必須仍然通過。
 - 更新 `upstream/src/main.rs` 開頭「Keep it a transport」的意圖註解、`supervisor.sh` 與 `SPEC.md`。
 
 ### 第 4 步：路由與狀態檔
