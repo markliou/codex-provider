@@ -5,7 +5,7 @@
 //! newer pool before this Rust port knows their meaning.  The fixture tests
 //! intentionally exercise both top-level and nested unknown fields.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -56,48 +56,7 @@ impl<'de> Deserialize<'de> for Unknown {
     }
 }
 
-/// RFC 3339 timestamp as emitted by Go's `time.Time.MarshalJSON`.
-///
-/// Keeping the source text preserves nanosecond precision and the original
-/// offset during a read/write migration.  Values are validated on read so a
-/// malformed state file fails closed just as Go's `time.Time` decoder does.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct Timestamp(pub String);
-
-impl Timestamp {
-    pub fn new(value: impl Into<String>) -> Result<Self, chrono::ParseError> {
-        let value = value.into();
-        chrono::DateTime::parse_from_rfc3339(&value)?;
-        Ok(Self(value))
-    }
-}
-
-impl Default for Timestamp {
-    fn default() -> Self {
-        Self("0001-01-01T00:00:00Z".to_owned())
-    }
-}
-
-impl Serialize for Timestamp {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for Timestamp {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        chrono::DateTime::parse_from_rfc3339(&value)
-            .map_err(serde::de::Error::custom)
-            .map(|_| Self(value))
-    }
-}
+pub use super::time::Timestamp;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -409,8 +368,13 @@ pub struct QuotaLimit {
 pub struct QuotaResetCredits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_count: Option<i64>,
+    /// The earliest expiry among currently available reset credits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    /// Process-local fetch throttling (Go `json:"-"`): it must not add
+    /// diagnostic noise to the dashboard or the persisted runtime JSON.
+    #[serde(skip)]
+    pub details_observed_at: super::time::Timestamp,
     #[serde(flatten)]
     pub extra: Unknown,
 }
@@ -742,6 +706,98 @@ pub struct RuntimeState {
     pub extra: Unknown,
 }
 
+/// Go's maps and slices are nil until set, and the state files carry that as
+/// `null`; the pool's code reads a nil map as empty and Go's load() makes the
+/// main ones non-nil. These accessors give the same reading.
+macro_rules! map_access {
+    ($owner:ty, $field:ident, $field_mut:ident, $value:ty) => {
+        impl $owner {
+            pub fn $field(&self) -> &BTreeMap<String, $value> {
+                static EMPTY: BTreeMap<String, $value> = BTreeMap::new();
+                self.$field.as_ref().unwrap_or(&EMPTY)
+            }
+
+            pub fn $field_mut(&mut self) -> &mut BTreeMap<String, $value> {
+                self.$field.get_or_insert_with(BTreeMap::new)
+            }
+        }
+    };
+}
+
+map_access!(
+    RuntimeState,
+    sticky_sessions,
+    sticky_sessions_mut,
+    StickySession
+);
+map_access!(
+    RuntimeState,
+    response_bindings,
+    response_bindings_mut,
+    ResponseBinding
+);
+map_access!(
+    RuntimeState,
+    thread_bindings,
+    thread_bindings_mut,
+    ThreadBinding
+);
+map_access!(
+    RuntimeState,
+    lineage_bindings,
+    lineage_bindings_mut,
+    LineageBinding
+);
+map_access!(RuntimeState, cooldowns, cooldowns_mut, Vec<Cooldown>);
+map_access!(RuntimeState, health, health_mut, AccountHealth);
+map_access!(RuntimeState, quotas, quotas_mut, QuotaSnapshot);
+map_access!(
+    RuntimeState,
+    prompt_cache,
+    prompt_cache_mut,
+    PromptCacheStat
+);
+map_access!(
+    RuntimeState,
+    prompt_cache_baseline,
+    prompt_cache_baseline_mut,
+    PromptCacheStat
+);
+map_access!(
+    RuntimeState,
+    prompt_cache_reset_at_by_account,
+    prompt_cache_reset_at_by_account_mut,
+    Timestamp
+);
+map_access!(
+    RuntimeState,
+    quota_window_primes,
+    quota_window_primes_mut,
+    Timestamp
+);
+map_access!(RuntimeState, client_agents, client_agents_mut, ClientAgent);
+map_access!(Config, model_aliases, model_aliases_mut, String);
+
+impl RuntimeState {
+    pub fn routing_cache_events(&self) -> &[RoutingCacheEvent] {
+        self.routing_cache_events.as_deref().unwrap_or_default()
+    }
+
+    pub fn routing_cache_events_mut(&mut self) -> &mut Vec<RoutingCacheEvent> {
+        self.routing_cache_events.get_or_insert_with(Vec::new)
+    }
+}
+
+impl Config {
+    pub fn accounts(&self) -> &[Account] {
+        self.accounts.as_deref().unwrap_or_default()
+    }
+
+    pub fn accounts_mut(&mut self) -> &mut Vec<Account> {
+        self.accounts.get_or_insert_with(Vec::new)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,16 +887,9 @@ mod tests {
         let runtime: RuntimeState =
             serde_json::from_value(documents["runtime"]["full"].clone()).expect("decode");
         // Nanoseconds and the +08:00 offset survive as written, not as UTC.
-        assert!(
-            runtime.updated_at.0.ends_with("+08:00"),
-            "{}",
-            runtime.updated_at.0
-        );
-        assert!(
-            runtime.updated_at.0.contains('.'),
-            "{}",
-            runtime.updated_at.0
-        );
+        let text = runtime.updated_at.to_string();
+        assert!(text.ends_with("+08:00"), "{text}");
+        assert!(text.contains('.'), "{text}");
         assert!(serde_json::from_value::<Timestamp>(Value::from("yesterday")).is_err());
     }
 }

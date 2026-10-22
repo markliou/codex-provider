@@ -30,10 +30,10 @@ futures = "0.3"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1", features = ["fs", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 # Same versions and features as the Codex workspace; the fork below supplies
 # the permessage-deflate extension Codex negotiates.
 tokio-tungstenite = { version = "0.28.0", features = ["proxy", "rustls-tls-native-roots"] }
@@ -51,6 +51,11 @@ thiserror = "2.0.17"
 tokio-util = { version = "0.7.18", features = ["codec", "io"] }
 tracing = "0.1.44"
 url = "2"
+# The native endpoint decodes the zstd request bodies a native Codex sends
+# (same version as Codex's own request compression).
+zstd = "0.13.3"
+# kill(2) on a sign-in's process group (login.rs), at the lock's version.
+libc = "0.2.186"
 
 [dev-dependencies]
 assert_matches = "1.5.0"
@@ -103,6 +108,12 @@ unnecessary_lazy_evaluations = "deny"
 unnecessary_sort_by = "deny"
 unnecessary_to_owned = "deny"
 unwrap_used = "deny"
+
+# The admin password is verified with 100,000 PBKDF2-SHA256 rounds; with an
+# unoptimized sha2 every test login takes seconds. Only debug builds (the
+# tests) change; release is optimized anyway.
+[profile.dev.package.sha2]
+opt-level = 3
 
 [profile.release]
 codegen-units = 1

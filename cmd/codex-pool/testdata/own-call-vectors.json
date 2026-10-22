@@ -1,0 +1,196 @@
+[
+  {
+    "input": {
+      "call": "usage",
+      "url": "https://chatgpt.example.test/backend-api/wham/usage",
+      "user_agent": "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)",
+      "access_token": "replace-access-token",
+      "account_id": "fake-account-id"
+    },
+    "method": "GET",
+    "url": "https://chatgpt.example.test/backend-api/wham/usage",
+    "headers": [
+      [
+        "user-agent",
+        "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)"
+      ],
+      [
+        "authorization",
+        "Bearer replace-access-token"
+      ],
+      [
+        "chatgpt-account-id",
+        "fake-account-id"
+      ]
+    ],
+    "body": null
+  },
+  {
+    "input": {
+      "call": "usage",
+      "url": "https://chatgpt.example.test/backend-api/wham/usage",
+      "user_agent": "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)",
+      "access_token": "replace-access-token"
+    },
+    "method": "GET",
+    "url": "https://chatgpt.example.test/backend-api/wham/usage",
+    "headers": [
+      [
+        "user-agent",
+        "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)"
+      ],
+      [
+        "authorization",
+        "Bearer replace-access-token"
+      ]
+    ],
+    "body": null
+  },
+  {
+    "input": {
+      "call": "accounts_check",
+      "url": "https://chatgpt.example.test/backend-api/wham/accounts_check",
+      "user_agent": "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)",
+      "access_token": "replace-access-token",
+      "account_id": "fake-account-id",
+      "fedramp": true
+    },
+    "method": "GET",
+    "url": "https://chatgpt.example.test/backend-api/wham/accounts_check",
+    "headers": [
+      [
+        "user-agent",
+        "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)"
+      ],
+      [
+        "authorization",
+        "Bearer replace-access-token"
+      ],
+      [
+        "chatgpt-account-id",
+        "fake-account-id"
+      ],
+      [
+        "x-openai-fedramp",
+        "true"
+      ]
+    ],
+    "body": null
+  },
+  {
+    "input": {
+      "call": "reset_credits",
+      "url": "https://chatgpt.example.test/backend-api/wham/reset_credits",
+      "user_agent": "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)",
+      "access_token": "replace-access-token",
+      "account_id": "fake-account-id"
+    },
+    "method": "GET",
+    "url": "https://chatgpt.example.test/backend-api/wham/reset_credits",
+    "headers": [
+      [
+        "user-agent",
+        "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)"
+      ],
+      [
+        "authorization",
+        "Bearer replace-access-token"
+      ],
+      [
+        "chatgpt-account-id",
+        "fake-account-id"
+      ]
+    ],
+    "body": null
+  },
+  {
+    "input": {
+      "call": "consume_reset_credit",
+      "url": "https://chatgpt.example.test/backend-api/wham/consume_reset_credit",
+      "user_agent": "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)",
+      "access_token": "replace-access-token",
+      "account_id": "fake-account-id",
+      "redeem_request_id": "8f14e45f-ceea-467f-9575-c2d1e2a3b4c5",
+      "credit_id": "fake-credit-id"
+    },
+    "method": "POST",
+    "url": "https://chatgpt.example.test/backend-api/wham/consume_reset_credit",
+    "headers": [
+      [
+        "user-agent",
+        "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)"
+      ],
+      [
+        "authorization",
+        "Bearer replace-access-token"
+      ],
+      [
+        "chatgpt-account-id",
+        "fake-account-id"
+      ],
+      [
+        "content-type",
+        "application/json"
+      ]
+    ],
+    "body": "{\"redeem_request_id\":\"8f14e45f-ceea-467f-9575-c2d1e2a3b4c5\",\"credit_id\":\"fake-credit-id\"}"
+  },
+  {
+    "input": {
+      "call": "consume_reset_credit",
+      "url": "https://chatgpt.example.test/backend-api/wham/consume_reset_credit",
+      "user_agent": "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)",
+      "access_token": "replace-access-token",
+      "account_id": "fake-account-id",
+      "redeem_request_id": "8f14e45f-ceea-467f-9575-c2d1e2a3b4c5"
+    },
+    "method": "POST",
+    "url": "https://chatgpt.example.test/backend-api/wham/consume_reset_credit",
+    "headers": [
+      [
+        "user-agent",
+        "codex_exec/0.163.0 (Ubuntu 24.4.0; x86_64) xterm-256color (codex_exec; 0.163.0)"
+      ],
+      [
+        "authorization",
+        "Bearer replace-access-token"
+      ],
+      [
+        "chatgpt-account-id",
+        "fake-account-id"
+      ],
+      [
+        "content-type",
+        "application/json"
+      ]
+    ],
+    "body": "{\"redeem_request_id\":\"8f14e45f-ceea-467f-9575-c2d1e2a3b4c5\"}"
+  },
+  {
+    "input": {
+      "call": "token_refresh",
+      "url": "https://auth.example.test/oauth/token",
+      "user_agent": "codex-tui/0.163.0 (Mac OS 26.0.0; arm64) iTerm.app/3.6",
+      "originator": "codex_tui",
+      "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+      "refresh_token": "replace-refresh<&>token"
+    },
+    "method": "POST",
+    "url": "https://auth.example.test/oauth/token",
+    "headers": [
+      [
+        "content-type",
+        "application/json"
+      ],
+      [
+        "originator",
+        "codex_tui"
+      ],
+      [
+        "user-agent",
+        "codex-tui/0.163.0 (Mac OS 26.0.0; arm64) iTerm.app/3.6"
+      ]
+    ],
+    "body": "{\"client_id\":\"app_EMoamEEZ73f0CkXaXp7hrann\",\"grant_type\":\"refresh_token\",\"refresh_token\":\"replace-refresh<&>token\"}"
+  }
+]

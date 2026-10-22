@@ -10685,6 +10685,54 @@ func TestInFlightEndpointIsLoopbackOnly(t *testing.T) {
 	}
 }
 
+// Behind codex-upstream's front door every request arrives from loopback; the
+// door's peer header restores the client's address, so the loopback-only
+// endpoint and the login lockout still see the real client. The header counts
+// only on a loopback connection and never reaches a handler.
+func TestFrontPeerRestoresTheClientAddress(t *testing.T) {
+	a := testApp(t, nil)
+	a.inFlight.Store(3)
+	handler := withFrontPeer(a.mux())
+	for _, testCase := range []struct {
+		remote, peer string
+		want         int
+	}{
+		{"127.0.0.1:50000", "192.168.3.1:41000", http.StatusNotFound},
+		{"127.0.0.1:50000", "[2001:db8::1]:41000", http.StatusNotFound},
+		{"127.0.0.1:50000", "127.0.0.1:41000", http.StatusOK},
+		// A client claiming loopback from the network is not believed.
+		{"192.168.3.1:41000", "127.0.0.1:1", http.StatusNotFound},
+		{"127.0.0.1:50000", "not-an-address", http.StatusOK},
+	} {
+		request := httptest.NewRequest(http.MethodGet, "/internal/inflight", nil)
+		request.RemoteAddr = testCase.remote
+		request.Header.Set(frontPeerHeader, testCase.peer)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != testCase.want {
+			t.Fatalf("%s via %s: status %d, want %d", testCase.peer, testCase.remote, recorder.Code, testCase.want)
+		}
+	}
+
+	t.Setenv("CODEX_POOL_TRUSTED_PROXIES", "172.18.0.0/16")
+	if err := applyTrustedProxiesEnv(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { trustedProxyNetworks = nil })
+	var key, seenPeer string
+	probe := withFrontPeer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key, seenPeer = adminLoginKey(r), r.Header.Get(frontPeerHeader)
+	}))
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/login", nil)
+	request.RemoteAddr = "127.0.0.1:50000"
+	request.Header.Set(frontPeerHeader, "172.18.0.5:41000")
+	request.Header.Set("X-Forwarded-For", "203.0.113.9")
+	probe.ServeHTTP(httptest.NewRecorder(), request)
+	if key != "203.0.113.9" || seenPeer != "" {
+		t.Fatalf("behind Caddy and the door the key = %q, peer header left = %q", key, seenPeer)
+	}
+}
+
 func TestShutdownGraceFromEnv(t *testing.T) {
 	t.Setenv("CODEX_POOL_SHUTDOWN_GRACE", "")
 	if grace, err := shutdownGraceFromEnv(); err != nil || grace != defaultShutdownGrace {

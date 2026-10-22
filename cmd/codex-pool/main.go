@@ -1038,7 +1038,30 @@ func (a *app) serve() error {
 	a.startQuotaRefresher(context.Background())
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
-	return a.serveUntilStopped(ctx, listener, a.mux())
+	return a.serveUntilStopped(ctx, listener, withFrontPeer(a.mux()))
+}
+
+// frontPeerHeader carries the address codex-upstream's front door accepted a
+// client connection from (RUST_PORT.md step 3; upstream/src/front.rs). In the
+// container every request reaches the pool from that door on loopback, so
+// without it every client would look like loopback: /internal/inflight would
+// answer the network, and the admin login lockout would count every client
+// as one. The door overwrites any copy a client sends; the pool believes the
+// header only on a loopback connection and always removes it, so it is never
+// relayed upstream. X-Forwarded-For stays the trusted proxy's
+// (CODEX_POOL_TRUSTED_PROXIES), judged against the address this restores.
+const frontPeerHeader = "X-Codex-Pool-Peer"
+
+func withFrontPeer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if peer := r.Header.Get(frontPeerHeader); peer != "" {
+			r.Header.Del(frontPeerHeader)
+			if _, _, err := net.SplitHostPort(peer); err == nil && isLoopbackAddress(r.RemoteAddr) {
+				r.RemoteAddr = peer
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // serveUntilStopped serves until ctx is cancelled by a stop signal, then
@@ -8040,22 +8063,15 @@ func (a *app) requestCodexTokenRefresh(refreshToken string) (codexRefreshRespons
 // (Codex serializes a BTreeMap, Go a map, both sorted) sent by Codex's HTTP
 // client with its default originator and user-agent, nothing else.
 func (a *app) requestCodexTokenRefreshContext(ctx context.Context, accountID, refreshToken string) (codexRefreshResponse, error) {
-	request := map[string]string{
-		"client_id":     envOr("CODEX_APP_SERVER_LOGIN_CLIENT_ID", codexOAuthClientIDDefault),
-		"grant_type":    "refresh_token",
-		"refresh_token": refreshToken,
-	}
-	body, err := codexJSON(request)
-	if err != nil {
-		return codexRefreshResponse{}, err
-	}
-	endpoint := envOr("CODEX_REFRESH_TOKEN_URL_OVERRIDE", codexRefreshURLDefault)
 	agent := a.clientAgentFor(accountID)
-	header := http.Header{}
-	header.Set("Content-Type", "application/json")
-	header.Set("Originator", agent.Originator)
-	header.Set("User-Agent", codexDefaultClientUserAgent(agent.UserAgent))
-	response, err := a.sendCodexOwnRequest(ctx, accountID, http.MethodPost, endpoint, codexTokenRefreshHeaderOrder, header, body)
+	response, err := a.sendCodexOwnCall(ctx, accountID, codexOwnCall{
+		Call:         ownCallTokenRefresh,
+		URL:          envOr("CODEX_REFRESH_TOKEN_URL_OVERRIDE", codexRefreshURLDefault),
+		UserAgent:    codexDefaultClientUserAgent(agent.UserAgent),
+		Originator:   agent.Originator,
+		ClientID:     envOr("CODEX_APP_SERVER_LOGIN_CLIENT_ID", codexOAuthClientIDDefault),
+		RefreshToken: refreshToken,
+	})
 	if err != nil {
 		return codexRefreshResponse{}, fmt.Errorf("refresh codex token: %w", err)
 	}
@@ -8120,8 +8136,7 @@ func (a *app) fetchCodexSubscriptionMetadata(ctx context.Context, accountID stri
 	if strings.TrimSpace(auth.AccessToken) == "" {
 		return codexSubscriptionMetadata{}, errors.New("codex access token is missing")
 	}
-	response, err := a.sendCodexOwnRequest(ctx, accountID, http.MethodGet, a.codexAccountsCheckURL(), codexBackendHeaderOrder,
-		codexBackendHeaders(a.clientAgentFor(accountID), auth, auth.AccountID), nil)
+	response, err := a.sendCodexOwnCall(ctx, accountID, a.codexBackendCall(ownCallAccountsCheck, a.codexAccountsCheckURL(), accountID, auth))
 	if err != nil {
 		return codexSubscriptionMetadata{}, err
 	}
@@ -8387,8 +8402,7 @@ func (a *app) refreshAccountQuotaWithExpectedIdentity(ctx context.Context, accou
 
 	// Codex's own rate-limit read (backend-client rate_limit_resets.rs
 	// get_rate_limit_status): GET /wham/usage with the backend-client headers.
-	response, err := a.sendCodexOwnRequest(ctx, accountID, http.MethodGet, a.codexUsageURL(), codexBackendHeaderOrder,
-		codexBackendHeaders(a.clientAgentFor(accountID), auth, auth.AccountID), nil)
+	response, err := a.sendCodexOwnCall(ctx, accountID, a.codexBackendCall(ownCallUsage, a.codexUsageURL(), accountID, auth))
 	if err != nil {
 		if ctx.Err() != nil {
 			return quotaSnapshot{}, errors.New("quota refresh cancelled")
@@ -8861,16 +8875,12 @@ func (a *app) consumeCodexResetCredit(ctx context.Context, accountID string, aut
 	// required field absent and earn a 400: that is how every real attempt
 	// failed. credit_id names the credit Codex's picker selected; it is left out
 	// only where Codex leaves it out (reset_credit.go nativeResetCreditChoice).
-	body, err := codexJSON(codexConsumeResetCreditRequest{RedeemRequestID: redeemRequestID, CreditID: creditID})
-	if err != nil {
-		return "", fmt.Errorf("encode reset-credit consume request: %w", err)
-	}
 	// Codex's own redemption (backend-client rate_limit_resets.rs
 	// consume_rate_limit_reset_credit_request): the backend-client headers,
 	// then the JSON body step.
-	header := codexBackendHeaders(a.clientAgentFor(accountID), auth, auth.AccountID)
-	header.Set("Content-Type", "application/json")
-	response, err := a.sendCodexOwnRequest(ctx, accountID, http.MethodPost, a.codexResetCreditConsumeURL(), codexBackendHeaderOrder, header, body)
+	call := a.codexBackendCall(ownCallConsumeResetCredit, a.codexResetCreditConsumeURL(), accountID, auth)
+	call.RedeemRequestID, call.CreditID = redeemRequestID, creditID
+	response, err := a.sendCodexOwnCall(ctx, accountID, call)
 	if err != nil {
 		return "", fmt.Errorf("consume reset credit: %w", err)
 	}
@@ -8908,8 +8918,7 @@ func (a *app) consumeCodexResetCredit(ctx context.Context, accountID string, aut
 func (a *app) fetchCodexResetCreditExpiration(ctx context.Context, accountID string, auth codexAuthInfo, now time.Time) (*int64, error) {
 	// Codex's own listing (backend-client rate_limit_resets.rs
 	// list_rate_limit_reset_credits) with the backend-client headers.
-	response, err := a.sendCodexOwnRequest(ctx, accountID, http.MethodGet, a.codexResetCreditsURL(), codexBackendHeaderOrder,
-		codexBackendHeaders(a.clientAgentFor(accountID), auth, auth.AccountID), nil)
+	response, err := a.sendCodexOwnCall(ctx, accountID, a.codexBackendCall(ownCallResetCredits, a.codexResetCreditsURL(), accountID, auth))
 	if err != nil {
 		return nil, fmt.Errorf("fetch reset-credit details: %w", err)
 	}

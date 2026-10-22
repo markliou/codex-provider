@@ -51,14 +51,21 @@ struct Plan {
     last: Option<Instant>,
     active_gap: Duration,
     idle_gap: Duration,
+    /// Brings the next poll forward to decide a waiting prime (Go
+    /// codex_prime.go, quota prime grace).
+    by: Option<Instant>,
 }
 
 impl Plan {
     fn next_at(&self, active: bool) -> Instant {
-        match self.last {
+        let next = match self.last {
             None => self.first,
             Some(last) if active => last + self.active_gap,
             Some(last) => last + self.idle_gap,
+        };
+        match self.by {
+            Some(by) if by < next => by,
+            _ => next,
         }
     }
 }
@@ -98,6 +105,7 @@ impl<R: FnMut() -> f64> QuotaPollSchedule<R> {
                     last: None,
                     active_gap: Duration::ZERO,
                     idle_gap: Duration::ZERO,
+                    by: None,
                 };
                 self.plans.insert(id.clone(), plan);
             }
@@ -123,8 +131,16 @@ impl<R: FnMut() -> f64> QuotaPollSchedule<R> {
             last: Some(finished),
             active_gap: self.between(INTERVAL - JITTER, MAX_INTERVAL),
             idle_gap: self.between(IDLE_MIN_INTERVAL, IDLE_MAX_INTERVAL),
+            by: None,
         };
         self.plans.insert(account_id.to_string(), plan);
+    }
+
+    /// Makes the account due no later than `at`.
+    pub fn poll_by(&mut self, account_id: &str, at: Instant) {
+        if let Some(plan) = self.plans.get_mut(account_id) {
+            plan.by = Some(at);
+        }
     }
 
     pub fn pause(&mut self) -> Duration {
@@ -244,6 +260,28 @@ mod tests {
                 .due(resumed, &["idle".to_string()], |_| true)
                 .as_deref(),
             Some("idle")
+        );
+    }
+
+    // Go TestQuotaPollScheduleDecidesAWaitingPrimeOnTime.
+    #[test]
+    fn decides_a_waiting_prime_on_time() {
+        let mut schedule = QuotaPollSchedule::new(|| 0.5);
+        let now = Instant::now();
+        let a = vec!["a".to_string()];
+        schedule.due(now, &a, |_| false);
+        schedule.polled("a", now);
+        let by = now + Duration::from_secs(7 * 60);
+        schedule.poll_by("a", by);
+        assert_eq!(
+            schedule.due(by - Duration::from_secs(1), &a, |_| false),
+            None
+        );
+        assert_eq!(schedule.due(by, &a, |_| false).as_deref(), Some("a"));
+        schedule.polled("a", by);
+        assert_eq!(
+            schedule.due(by + Duration::from_secs(10 * 60), &a, |_| false),
+            None
         );
     }
 }

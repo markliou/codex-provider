@@ -41,7 +41,7 @@
 
 - **Go**（`cmd/codex-pool/`）：約 1.2 萬行 `main.go`，加上 `responses_ws.go`、`native_codex.go`、`codex_own.go`、`codex_prime.go`、`websocket.go`、`logfile.go`、`admin_assets.go` 與 `web/`；測試約 1.1 萬行。負責 API 金鑰、路由（放置、嚴格 lineage 綁定、搬家、冷卻、重試、Use Pro last、紅框）、額度更新、狀態檔、管理介面與儀表板。
 - **Rust**（`upstream/src/main.rs`，約 570 行）：`codex-upstream`，本機回環的傳輸層。Go 把要送的請求交給它的 `/forward`（以及 WebSocket 中繼），它用 Codex 的 `codex-http-client`、`codex-websocket-client` 送出。檔頭的註解寫著「Keep it a transport」；第 3 步之後這個意圖會改變，必須同時更新該註解與 `SPEC.md`（`AGENTS.md`：不可默默移除意圖註解）。
-- **pool 自己的上游呼叫**（refresh、usage、帳號資料、reset credits）：目前由 Go 依照從原生 Codex 量到的檔頭順序組好（`sendCodexOwnRequest`），再經由 Rust 的 `/forward` 送出。priming 用內建的 Codex CLI。
+- **pool 自己的上游呼叫**（refresh、usage、帳號資料、reset credits）：Go 只把「哪一種呼叫、哪個帳號的憑證與 agent」交給 Rust 的 `/own`（`sendCodexOwnCall`），由 Rust 照 Codex 原始碼組出請求並送出（`upstream/src/pool/own_call.rs`），上游的回應原樣交回 Go 判讀。priming 用內建的 Codex CLI。
 - **啟動**：`docker-entrypoint.sh` → `supervisor.sh` 先啟動 `codex-upstream`，再啟動 `codex-pool`。
 - **狀態**：`/data/state/runtime.json`（綁定、冷卻、額度、健康度、事件）、`/data/config.json`（帳號與設定）、`/data/accounts/<id>/auth.json`（憑證）、`/data/logs/service.log`。
 
@@ -85,7 +85,14 @@
 - token refresh：不能用 Codex 的 `AuthManager`。它的 HTTP client 的 originator 與 User-Agent 是整個 process 共用的全域值，作業系統部分取自容器本身，無法每個帳號不同。refresh 改為在 Rust 照 Codex 原始碼（`login/src/auth/manager.rs` `request_chatgpt_token_refresh`）組請求，行為與現在相同。
 - Go 透過本機介面取得結果；狀態與 `auth.json` 仍由 Go 寫入（單一寫入者）。`wire-capture.sh` 的 own-call 比對必須仍然相同。
 - 被拒的憑證不再使用（main c0d0d93，`cmd/codex-pool/refused_credential.go`）：refresh 被 Codex 判定為永久失敗（`classify_refresh_token_failure`），或 usage 回 401/403 `token_revoked`／`token_invalidated` 時，記下該帳號目前 token 的雜湊。在 `auth.json` 換成新的 token（重新登入）之前，refresh 不連網直接失敗，背景額度輪詢和 Refresh all 都跳過這個帳號。refresh 和 usage 搬到 Rust 時，這個行為要一起搬，Go 的 `refused_credential_test.go` 要翻成 Rust 並通過。
-- 額度輪詢沒有固定節拍（main `cmd/codex-pool/quota_schedule.go`）：每個帳號各自排程。30 分鐘內有請求的帳號，下一次在上一次結束後隨機 4～6 分鐘；閒置的帳號隨機 20～30 分鐘，一有請求就回到 4～6 分鐘。啟動後的第一輪分散在 2 分鐘內，一次只問一個帳號，之間隨機停 3～12 秒。預熱（prime）預設關閉，由管理頁面的 Prime idle accounts 開關決定（`quotaPrime`），搬到 Rust 時預設值不可改回開啟。Rust 的排程已寫好（`upstream/src/pool/quota_schedule.rs`，測試對應 Go 的 `quota_schedule_test.go`）；輪詢搬到 Rust 時直接用它，不要改回共用計時器或一次掃完所有帳號。
+- 額度輪詢沒有固定節拍（main `cmd/codex-pool/quota_schedule.go`）：每個帳號各自排程。30 分鐘內有請求的帳號，下一次在上一次結束後隨機 4～6 分鐘；閒置的帳號隨機 20～30 分鐘，一有請求就回到 4～6 分鐘。啟動後的第一輪分散在 2 分鐘內，一次只問一個帳號，之間隨機停 3～12 秒。預熱（prime）預設開啟（使用者的決定），由管理頁面的 Prime idle accounts 開關關閉（`quotaPrime`），搬到 Rust 時預設值要維持開啟。開啟時，看到時間窗重置後先隨機等 5～30 分鐘（`codex_prime.go` quota prime grace），等待結束時排程提前查一次（`poll_by`），時間窗仍未開始才預熱；期間有請求就不預熱。Rust 的排程已寫好（`upstream/src/pool/quota_schedule.rs`，測試對應 Go 的 `quota_schedule_test.go`）；輪詢搬到 Rust 時直接用它，不要改回共用計時器或一次掃完所有帳號。
+
+進度（2026-10-22）：組請求這一段已完成。
+- Go 不再自己寫這些請求：`sendCodexOwnCall` 把呼叫名稱、網址、該帳號的憑證與 agent 交給 `codex-upstream` 的 `/own`，Rust 照 Codex 原始碼組出方法、檔頭順序與 body（`upstream/src/pool/own_call.rs`，每一段都註明對應的 Codex 原始碼），用和 `/forward` 相同的 Codex client 送出，上游的回應原樣交回 Go。
+- 開工前的查證推翻了「直接用 `codex-backend-client`」：它的 `headers()` 是私有的，公開的函式只回傳 Codex 自己的型別，會丟掉 pool 用來分配帳號的欄位（`limit_reached`、`code_review_rate_limit`、`reset_after_seconds`、Codex 不認識的方案名稱），額度的 `used_percent` 也只接受整數（正式資料目前都是整數）。token refresh 所在的 login `oauth` 模組也是私有的。所以改成在 Rust 照原始碼組請求，回應交給 pool 判讀。
+- 沒有 `codex-upstream` 時（Go 測試），Go 仍用 `codexOwnCall.request()` 自己送同樣的請求。兩邊由 `cmd/codex-pool/testdata/own-call-vectors.json` 綁在一起：Go 測試產生它，Rust 測試逐一組出每個呼叫並比對方法、網址、檔頭（含順序）與 body。`wire-capture.sh` 再把 Rust 組的請求和原生 Codex 比對。
+- 還在 Go 的部分（第 4 步搬狀態時一起搬）：回應的判讀（額度解析、方案與組織名稱）、被拒憑證的記錄與跳過（`refused_credential.go`，它要寫狀態）、refresh 失敗是否永久的判斷、背景輪詢的排程（Rust 版 `quota_schedule.rs` 已備好）。
+- 未量測的差異：Codex 的 backend client 用 `RouteAwareClientPool`（`ClientRouteClass::Api`），pool 的 `/own` 和 `/forward` 用 Codex 的預設 client。`wire-capture.sh` 量到的檔頭與 body 相同；兩者在重新導向和 proxy 備援上的差異沒有量測，正常情況下不會發生。
 
 ### 第 2 步：串流解析與錯誤分類
 
@@ -113,6 +120,12 @@
 - 安裝 ID（main `cmd/codex-pool/installation_id.go`，SPEC 2.3.2）：每個帳號在自己的 `.codex/installation_id` 有一組固定的 UUID，送上游時只替換 `client_metadata` 裡和 `x-codex-turn-metadata` 檔頭裡的安裝 ID，其他位元組不動；WebSocket 的握手和每則訊息用該 socket 綁定帳號的 ID，prime 的暫時 home 也放同一組。Rust 的函式已寫好（`upstream/src/pool/installation_id.rs`，測試對應 Go 的 `installation_id_test.go`）；轉送搬到 Rust 時直接用它，`wire-capture.sh` 的 installation id 檢查必須仍然通過。
 - 更新 `upstream/src/main.rs` 開頭「Keep it a transport」的意圖註解、`supervisor.sh` 與 `SPEC.md`。
 
+進度（2026-10-22）：完成，在 `rust-port`，尚未部署。
+- `upstream/src/front.rs`：`codex-upstream` 綁定 pool 的對外位址（`CODEX_POOL_ADDR`，預設 `:8317`，非 loopback 一樣要 `CODEX_POOL_ALLOW_REMOTE_ADMIN=true`），每個請求開一條自己的連線原樣轉給 Go（`127.0.0.1:8318`）：方法、路徑、檔頭（hop-by-hop 除外）、body、串流回應、WebSocket 升級。Go 沒在回應時回 502。
+- 來源位址：所有請求到 Go 都變成 loopback，所以前門把接到的連線位址放在 `X-Codex-Pool-Peer`（覆蓋 client 自己送的），Go 的 `withFrontPeer` 只在 loopback 連線上採信並一律刪掉這個檔頭。`/internal/inflight` 仍只對本機開放，登入鎖定和 `CODEX_POOL_TRUSTED_PROXIES` 照舊看真正的 client。`X-Forwarded-For` 原樣轉送。
+- 停止順序不變：前門在 helper 裡，pool 排空時串流仍經過它；排空期間的新連線改回 502（以前是 pool 關掉 listener 直接拒絕連線）。
+- 對上游送出的內容不變：pool 仍把上游請求交給同一個 process 的 `/forward`、`/ws`、`/own`。安裝 ID 仍由 Go 替換；`installation_id.rs` 等轉送搬到 Rust（第 4 步）時再接上。
+
 ### 第 4 步：路由與狀態檔
 
 - Rust 一次整塊接手：API 金鑰、放置、嚴格 lineage 綁定、搬家、冷卻、重試、Use Pro last、紅框、額度更新與 `runtime.json`／`config.json`／`auth.json` 的寫入。這一步完成後，Go 不再寫入任何狀態。
@@ -124,6 +137,36 @@
 - 狀態檔：`pool/state.rs` 對照 `cmd/codex-pool/testdata/state-vectors.json`。Go 用反射把 `config`、`state` 的每個欄位都填上值（full），另外一份全部是零值（zero）。Rust 讀入後寫出必須和原文件相同；不認得的欄位會保留，但測試裡只要出現 `future*` 以外的未知欄位就失敗，表示 Rust 少了那個欄位。
 - Go 型別或雜湊改了，Go 測試會要求重新產生（`CODEX_POOL_GENERATE_VECTORS=1`），重新產生後 Rust 測試再要求 Rust 跟上。
 - 還沒做：讀 `auth.json`；Go 讀回 Rust 寫出的檔案，目前靠「Rust 寫出的內容和 Go 的原文件相同」間接保證。
+
+做法（2026-10-22 決定）：第 4 步和第 5 步一起開發、一次切換。
+- 原因：狀態檔只能有一個寫入者。若第 4 步先上線而管理介面還在 Go，Go 的每個管理動作（加帳號、設定開關、加入／退出、修復、清 sticky、重置額度）都要另外寫一層呼叫 Rust 的介面，第 5 步又要拆掉，是白做的工。
+- 做法：在 `rust-port` 把整個 pool 照 Go 逐段翻成 Rust（結構、函式名稱、註解盡量對應，方便對照與翻測試），Go 在正式環境照常運作。全部翻完、Go 的測試都翻成 Rust 並通過、整合測試和 `wire-capture.sh` 都通過後，前門改成自己處理請求、不再轉給 Go，一次部署。狀態檔格式雙向相容（state-vectors），所以出問題時可以部署回上一版。
+- 分段（每段翻完程式與對應測試就 commit）：
+  - 4.1 帳號與額度的基礎：設定與狀態的讀寫、方案與權重、額度解析與可用判斷、冷卻、模型解析。
+  - 4.2 路由：放置、sticky、嚴格 lineage 綁定、搬家、重複身分、Use Pro last、紅框。
+  - 4.3 請求流程：Responses（HTTP 與 WebSocket）、compact、chat completions、原生端點、SSE 預先緩衝、重試與換帳號、事件與統計。
+  - 4.4 帳號的上游工作：讀寫 `auth.json`、refresh、額度輪詢、預熱、重置額度、被拒憑證、裝置登入。
+  - 4.5 管理介面與儀表板 API、登入與 session（原第 5 步）。
+  - 4.6 切換：前門改為本地處理，移除轉給 Go 的路徑。
+- 4.3 進度（2026-10-22）：請求流程已翻完，前門尚未接上。
+  - 程式：`pool/routes.rs`（路由表，照 Go ServeMux 回 404／405）、`pool/native.rs`（原生端點：路徑金鑰、zstd、passthrough）、`pool/responses_ws.rs`（WebSocket：握手時選帳號、預先緩衝內的過載重試、turn state 只交給簽發的帳號）、`pool/listener.rs`（hyper 連線轉成路由請求：前門 peer header、用戶端斷線即取消、panic 回 500）、`pool/admin.rs`（管理頁靜態檔）。
+  - 測試：`pool/proxy_tests.rs`、`pool/ws_tests.rs`、`pool/routing_tests.rs` 逐一對應 Go 測試（註解寫 Go 名稱）。上游假伺服器經由真正的 Codex transport；WebSocket 測試的上游是真的 WebSocket 伺服器。Codex 判讀改成在程式內呼叫 Codex 的分類器，日誌內容和 Go 測試預期的一字不差。
+  - 留到後段的 Go 測試：吞吐量與儀表板視窗（`TestThroughput*`、`TestManagementThroughputProjection`、prompt cache 視窗與重設）、容量條（`poolCapacity`）、管理動作（額度保護設定、`adminLoginKey`）屬 4.5；`TestStopSignalDrain*` 屬 4.6；額度更新、預熱、重置額度、裝置登入、被拒憑證屬 4.4。
+- 4.4 進度（2026-10-22）：帳號的上游工作已翻完。
+  - 程式：`pool/quota_refresh.rs`（額度更新、工作區與方案、重置額度到期日、輪詢迴圈）、`pool/reset_credit.rs`（照 Codex 的選單選重置額度、重試沿用同一個 redeem key）、`pool/prime.rs`（未開始的視窗等使用者 5–30 分鐘後，用內附的 Codex CLI 跑一輪啟動）、`pool/login.rs`（`codex login --device-auth` 登入工作、身分驗證閘門、取消時整個 process group 一起結束）。
+  - 測試：`pool/quota_tests.rs`、`pool/login_tests.rs`。Go 的登入測試把假的 `codex` 放在 PATH；Rust 測試平行執行、PATH 全程式共用，所以改用設定 `Settings::codex_cli` 指向假腳本，正式環境仍是 PATH 上的 `codex`。
+  - 管理動作的 HTTP 外殼（重置額度、更新額度、登入、取消工作）的邏輯已在上述模組，路由與 session 檢查屬 4.5。
+- 4.5 進度（2026-10-22）：管理介面與儀表板 API 已翻完，前門尚未接上。
+  - 程式：`pool/admin_api.rs`（登入、登出、失敗 5 次鎖 15 分鐘、CSRF、信任的 proxy、所有 `/admin/api` 動作）、`pool/dashboard.rs`（狀態卡、摘要、容量條、吞吐量、prompt cache 視窗、公開儀表板與公開帳號代號）。路由表改成照 Go 1.22 ServeMux：最具體的規則優先、GET 也接 HEAD、405 附 `Allow`、子樹根目錄 301、路徑清理。
+  - 測試：`pool/admin_tests.rs`、`pool/dashboard_tests.rs`、`pool/asset_tests.rs`（管理頁、script、style 的必要與禁止字串），以及 4.3、4.4 留下的儀表板部分（公開儀表板內容、容量條、額度保護動作、經由路由取消登入工作、Caddy 後方的登入 key）。測試直接簽 admin session，不跑 PBKDF2 登入；只有登入測試本身會跑。
+  - 只對 Go 有意義、不翻的 Go 測試：`TestHashVectorsMatchTheGoCode`、`TestStateVectorsMatchTheGoTypes`、`TestOwnCallVectorsMatchTheGoCode`（Go 產生、Rust 讀的對照檔；Rust 端的讀取測試保留）、`TestPoolOwnCallsGoToCodexUpstreamAsCalls`、`TestNoCodexVerdictWithoutTransport`（Go 呼叫 Rust transport 的介面，切換後不存在）、`TestMain`（Go 的測試等待時間；Rust 用設定）。`TestBundledCodexMatchesThePinnedRelease`、`TestCodexShapeFixtureTracksThePinnedCodexRelease`、`TestConsumeResetCreditBodyIsCodexs` 已翻成 Rust，移除 Go 後仍檢查。
+  - 剩下 4.6：前門改為本地處理（`listener.rs` 接上、啟動額度輪詢）、`TestStopSignalDrain*`、完整驗證。
+- 4.6 進度（2026-10-22）：A、B 完成，尚未驗證與部署。
+  - A（啟動）：`pool/serve.rs` 從環境變數載入設定和資料、啟動額度輪詢、自己綁 `CODEX_POOL_ADDR`；收到 SIGTERM 時關閉 listener，每條連線處理完手上的請求就關，WebSocket 上還在跑的回應用 in-flight 計數等，最多等 `CODEX_POOL_SHUTDOWN_GRACE`，最後存檔。`TestStopSignalDrain*` 兩個已翻。
+  - B（容器）：`main.rs` 直接跑 pool（保留 `hash-password`）；刪除 `front.rs` 和給 Go 用的 loopback 介面（`/forward`、`/ws`、`/own`、`/classify`）；Dockerfile 不再建 Go，Rust 執行檔裝成 `/usr/local/bin/codex-pool`，管理頁檔案從 `cmd/codex-pool/web` 編進去；`supervisor.sh` 直接 `exec` pool。SPEC、README、AGENTS 的架構描述已改成單一 Rust process。
+  - 隔離容器的煙霧測試通過：首頁、API key、模型清單、in-flight、版本號；`docker stop` 以狀態 0 結束並記錄 drain 完成。
+  - C（驗證，2026-10-22，`547d26f`）：Rust 測試 459 個、`codex-conformance.sh check`、4 個整合測試、`wire-capture.sh` 22 項全部通過。第一次 wire-capture 的 `subagent-ws` 少了子代理的預熱訊息：情境裡主代理一產生子代理就結束、Codex 隨即退出，預熱能否送出差幾毫秒（原生 Codex 自己也時前時後），多一段轉送偶爾趕不上；加診斷記錄重跑確認 pool 收到的每則訊息都有轉送，之後乾淨重跑通過。待改：讓子代理先完成一輪，去掉這個競爭。
+  - 剩下：部署（需要使用者同意；先把 rust-port 合併回 main，從 main 部署，rust-port 不跑 `deploy.sh`）。回滾：重新部署 main 的上一版 image。
 
 ### 第 5 步：管理介面
 

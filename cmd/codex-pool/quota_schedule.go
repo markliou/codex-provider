@@ -29,7 +29,7 @@ import (
 // rate_limit_refresh_interval) and not at all while nobody uses it; polling
 // idle accounts at the in-use rate around the clock was most of the pool's own
 // load on upstream. Only when a poll is sent is the pool's own; what is sent
-// is still the native Codex request of sendCodexOwnRequest.
+// is still the native Codex request of sendCodexOwnCall.
 const (
 	quotaRefreshJitter          = time.Minute
 	quotaRefreshMaxInterval     = quotaRefreshInterval + quotaRefreshJitter

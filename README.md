@@ -5,9 +5,9 @@ Desktop, IDE extension) talk to the pool as if it were OpenAI's Codex backend;
 the pool places each conversation on one of its accounts and sends the request
 upstream exactly as a native Codex of the pinned release would.
 
-- **Looks native upstream.** Requests leave through `codex-upstream`, a Rust
-  process built from Codex's own HTTP client crate, so TLS, HTTP/2, header order
-  and compression are those of a native Codex. A conformance harness measures
+- **Looks native upstream.** The pool is a Rust program built from Codex's own
+  HTTP and WebSocket client crates, so TLS, HTTP/2, header order and
+  compression are those of a native Codex. A conformance harness measures
   this before every deploy (see [Development](#development)).
 - **Keeps a conversation on one account.** A main agent and all its subagents
   stay bound to one account, so the upstream prompt cache keeps working; it moves
@@ -316,10 +316,10 @@ only what a native Codex adds (`ChatGPT-Account-ID`, `X-Codex-Routing-Hint`). It
 refreshes the account's token five minutes before expiry, and once more on a
 `401` before treating the account as signed out.
 
-The last hop is `codex-upstream`, a loopback-only Rust process in the same
-container built from Codex's HTTP client crate at the pinned release
-(`rust-v0.163.0` in [upstream/Cargo.toml](upstream/Cargo.toml)). It opens one
-connection per request, as Codex does.
+The pool is one Rust process ([upstream/](upstream/)) built from Codex's HTTP
+and WebSocket client crates at the pinned release (`rust-v0.163.0` in
+[upstream/Cargo.toml](upstream/Cargo.toml)). It opens one connection per
+request, as Codex does, and serves clients on port 8317 itself.
 
 The pool's own calls also go out the way Codex makes them. Token refresh, usage,
 account check and reset-credit reads use Codex's endpoints and header order, with
@@ -392,7 +392,7 @@ docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm sh -c \
 # The control page's JavaScript renderers
 sh scripts/test/render-web-assets.sh
 
-# The codex-upstream crate: rustfmt, clippy and cargo test (the first run
+# The pool (upstream/): rustfmt, clippy and cargo test (the first run
 # compiles Codex's dependencies; later runs reuse cached Docker volumes)
 sh scripts/test/rust-check.sh
 
