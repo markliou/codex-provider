@@ -51,7 +51,7 @@ func testApp(t *testing.T, accounts []account) *app {
 		// never reaches the code paths that log.
 		logger:  log.New(io.Discard, "", 0),
 		dataDir: dir, apiKeys: [][]byte{[]byte("client-key")}, adminUser: "admin", adminHash: []byte(hash),
-		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, routingStrategy: routingStrategyFailover, lineageAffinity: true, promptCacheKeyMode: "auto", publicDashboard: true, codexBaseURL: "https://chatgpt.example.test/backend-api", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second}, streamClient: &http.Client{Timeout: time.Second},
+		sessionKey: []byte("01234567890123456789012345678901"), sessionAffinityTTL: sessionAffinityTTLDefault, routingStrategy: routingStrategyFailover, lineageAffinity: true, quotaPrimeGrace: func() time.Duration { return 0 }, promptCacheKeyMode: "auto", publicDashboard: true, codexBaseURL: "https://chatgpt.example.test/backend-api", jobs: map[string]*loginJob{}, loginCancels: map[string]context.CancelFunc{}, authLocks: map[string]*sync.Mutex{}, client: &http.Client{Timeout: time.Second}, streamClient: &http.Client{Timeout: time.Second},
 	}
 }
 
@@ -10928,4 +10928,83 @@ func streamKeepaliveIntervalForTest(t *testing.T, interval time.Duration) time.D
 	}
 	t.Cleanup(func() { streamKeepaliveInterval, streamKeepaliveTick = old, oldTick })
 	return old
+}
+
+// A window that reset is left to its user for a grace first: a request in
+// that time anchors it and no prime is sent; only a window still untouched
+// when the grace runs out is primed.
+func TestQuotaPrimeWaitsForTheUserFirst(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_prime","output":[]}`))
+	}))
+	defer upstream.Close()
+	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
+	a.quotaPrime = true
+	a.quotaPrimeGrace = func() time.Duration { return 10 * time.Minute }
+	full := 100.0
+	week := func() *int64 { v := int64(10080); return &v }
+	snapshotFor := func(resetAt int64) quotaSnapshot {
+		return quotaSnapshot{AccountID: "only", Quota: &accountQuota{Windows: []quotaWindow{
+			{Label: "Week", WindowMinutes: week(), ResetAt: &resetAt, RemainingPercent: &full, Present: true, Observed: true},
+		}}}
+	}
+	unanchored := func() quotaSnapshot { return snapshotFor(time.Now().Add(7 * 24 * time.Hour).Unix()) }
+	anchored := snapshotFor(time.Now().Add(7*24*time.Hour - time.Hour).Unix())
+
+	a.primeUnanchoredQuotaWindow(context.Background(), "only", unanchored())
+	a.primeUnanchoredQuotaWindow(context.Background(), "only", unanchored())
+	if hits != 0 {
+		t.Fatalf("primed inside the grace: hits=%d", hits)
+	}
+	due, waiting := a.primeGraceDue("only")
+	if !waiting || time.Until(due) < 9*time.Minute || time.Until(due) > 10*time.Minute {
+		t.Fatalf("grace due %v, waiting %v", due, waiting)
+	}
+	// The user used the account: the window anchored and the wait is dropped.
+	a.primeUnanchoredQuotaWindow(context.Background(), "only", anchored)
+	if _, waiting := a.primeGraceDue("only"); waiting || hits != 0 {
+		t.Fatalf("an anchored window kept its wait (waiting %v) or was primed (hits %d)", waiting, hits)
+	}
+	// Untouched again, and this time the grace runs out.
+	a.primeUnanchoredQuotaWindow(context.Background(), "only", unanchored())
+	a.primeGraceMu.Lock()
+	a.primeGraceUntil["only"] = time.Now().Add(-time.Second)
+	a.primeGraceMu.Unlock()
+	a.primeUnanchoredQuotaWindow(context.Background(), "only", unanchored())
+	if hits != 1 {
+		t.Fatalf("an untouched window was not primed after the grace: hits=%d", hits)
+	}
+	if _, waiting := a.primeGraceDue("only"); waiting {
+		t.Fatal("the wait outlived its prime")
+	}
+}
+
+func TestQuotaPrimeGraceIsRandomUnlessFixedForTests(t *testing.T) {
+	t.Setenv("CODEX_POOL_QUOTA_PRIME_GRACE", "")
+	grace, err := quotaPrimeGraceFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 50; i++ {
+		d := grace()
+		if d < quotaPrimeGraceMin || d > quotaPrimeGraceMax {
+			t.Fatalf("grace %s outside [%s, %s]", d, quotaPrimeGraceMin, quotaPrimeGraceMax)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 40 {
+		t.Fatalf("the grace is not random: %d distinct in 50", len(seen))
+	}
+	t.Setenv("CODEX_POOL_QUOTA_PRIME_GRACE", "0s")
+	if grace, err := quotaPrimeGraceFromEnv(); err != nil || grace() != 0 {
+		t.Fatalf("a fixed grace was not honored: %v", err)
+	}
+	t.Setenv("CODEX_POOL_QUOTA_PRIME_GRACE", "soon")
+	if _, err := quotaPrimeGraceFromEnv(); err == nil {
+		t.Fatal("an invalid grace was accepted")
+	}
 }

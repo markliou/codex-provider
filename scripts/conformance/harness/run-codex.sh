@@ -9,6 +9,9 @@
 #   sh run-codex.sh native-pool <model>   Codex's built-in OpenAI provider with
 #                                         ChatGPT auth, its base URL moved to the
 #                                         pool's native endpoint (SPEC.md 2.3.3)
+#   sh run-codex.sh native-reset <model>  as native, but Codex's app-server spends
+#                                         a reset credit over JSON-RPC, as the
+#                                         TUI's /usage reset does
 #   sh run-codex.sh client-http <model>   the pool's provider config, pointed
 #   sh run-codex.sh client-ws <model>     straight at the fake: what Codex sends
 #                                         the pool before the pool touches it
@@ -23,7 +26,7 @@ export CODEX_HOME=/tmp/codex-home PATH=/codex/codex-path:$PATH
 mkdir -p "$CODEX_HOME" /tmp/work
 cd /tmp/work
 case "$target" in
-  native|native-refresh|native-pool)
+  native|native-refresh|native-pool|native-reset)
     cat /certs/ca.pem >> /etc/ssl/certs/ca-certificates.crt
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt CODEX_CA_CERTIFICATE=/certs/ca.pem
     if [ "$target" = native-refresh ]; then
@@ -72,4 +75,19 @@ CFG
     exit 2
     ;;
 esac
+if [ "$target" = native-reset ]; then
+  # app-server JSON-RPC over stdio, one message per line (app-server
+  # tests/common/test_app_server.rs): initialize, the initialized
+  # notification, then account/rateLimitResetCredit/consume with the credit
+  # the fake lists and a fresh idempotency key, as the TUI picker sends it.
+  key=$(cat /proc/sys/kernel/random/uuid)
+  {
+    printf '%s\n' '{"id":1,"method":"initialize","params":{"clientInfo":{"name":"conformance","title":null,"version":"0.1.0"}}}'
+    sleep 2
+    printf '%s\n' '{"method":"initialized"}'
+    printf '%s\n' '{"id":2,"method":"account/rateLimitResetCredit/consume","params":{"idempotencyKey":"'"$key"'","creditId":"credit-capture"}}'
+    sleep 8
+  } | timeout 30 /codex/bin/codex app-server 2>&1 | tail -5
+  exit 0
+fi
 timeout 180 /codex/bin/codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "${CONFORMANCE_PROMPT:-run echo hi}" 2>&1 | tail -5

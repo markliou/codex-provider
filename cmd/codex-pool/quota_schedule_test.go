@@ -128,3 +128,25 @@ func TestAccountActivitySetsTheCadence(t *testing.T) {
 		t.Fatal("the account stayed in use past the active window")
 	}
 }
+
+// A waiting prime brings the account's next poll forward to the end of its
+// grace, and the next regular poll clears it.
+func TestQuotaPollScheduleDecidesAWaitingPrimeOnTime(t *testing.T) {
+	schedule := newQuotaPollSchedule(func() float64 { return 0.5 })
+	now := time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC)
+	idle := func(string) bool { return false }
+	schedule.due(now, []string{"a"}, idle)
+	schedule.polled("a", now)
+	by := now.Add(7 * time.Minute)
+	schedule.pollBy("a", by)
+	if _, ok := schedule.due(by.Add(-time.Second), []string{"a"}, idle); ok {
+		t.Fatal("due before the grace ended")
+	}
+	if id, ok := schedule.due(by, []string{"a"}, idle); !ok || id != "a" {
+		t.Fatal("not due when the grace ended, though idle polls are 20 minutes apart")
+	}
+	schedule.polled("a", by)
+	if _, ok := schedule.due(by.Add(10*time.Minute), []string{"a"}, idle); ok {
+		t.Fatal("the grace outlived the poll that decided it")
+	}
+}
