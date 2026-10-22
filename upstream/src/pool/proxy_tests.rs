@@ -4635,3 +4635,694 @@ fn codex_upstream_shapes_classify_as_codex_reads_them() {
         );
     }
 }
+
+// ---- large and agent payloads pass through unchanged ----
+
+// Go TestResponsesProxyPreservesLargeMCPToolPayloadAndStreamingEvents.
+#[tokio::test]
+async fn responses_proxy_preserves_large_mcp_tool_payload_and_streaming_events() {
+    const TOOL_COUNT: usize = 320;
+    const LONG_TOOL_NAME: &str = "mcp__apps_runtime__workspace_agents__upsert_agent_application_configuration_with_extended_name";
+    let upstream = FakeServer::start(counting(|round| {
+        let (first, id, input, cached, written) = if round == 1 {
+            (
+                sse(
+                    "response.output_item.added",
+                    &format!(
+                        r#"{{"type":"response.output_item.added","item":{{"type":"function_call","call_id":"call_mcp_long_1","name":"{LONG_TOOL_NAME}","arguments":"{{\"enabled\":true}}"}}}}"#
+                    ),
+                ),
+                "resp_mcp_large",
+                4096,
+                3072,
+                512,
+            )
+        } else {
+            (delta("saved"), "resp_mcp_large_2", 5120, 4096, 256)
+        };
+        sse_response(&[
+            first,
+            completed(
+                id,
+                &format!(r#"{{"input_tokens":{input},"input_tokens_details":{{"cached_tokens":{cached},"cache_write_tokens":{written}}}}}"#),
+            ),
+        ])
+    }))
+    .await;
+    let (app, _dir) = arc_app(vec![provider(
+        "provider",
+        100,
+        &upstream.url,
+        "provider-key",
+    )]);
+    let description = "schema-detail-".repeat(200);
+    let tools: Vec<serde_json::Value> = (0..TOOL_COUNT)
+        .map(|index| {
+            let name = if index == 0 { LONG_TOOL_NAME.to_string() } else { format!("mcp__apps_runtime__tool_{index:03}") };
+            serde_json::json!({"type": "function", "function": {"name": name, "parameters": {"type": "object", "properties": {"configuration": {"type": "string", "description": description}}}}})
+        })
+        .collect();
+    let proxy = |payload: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let result = serve(&app, post("/v1/responses", &payload.to_string())).await;
+            assert_eq!(
+                result.code(),
+                200,
+                "large MCP proxy: {}",
+                result.body_string()
+            );
+            result.body_string()
+        }
+    };
+    let first = proxy(
+        serde_json::json!({"model": "gpt-test", "input": "hello", "stream": true, "tools": tools}),
+    )
+    .await;
+    for expected in [
+        LONG_TOOL_NAME,
+        "call_mcp_long_1",
+        "response.output_item.added",
+        "response.completed",
+    ] {
+        assert!(
+            first.contains(expected),
+            "streaming response lost {expected:?}"
+        );
+    }
+    let second = proxy(serde_json::json!({
+        "model": "gpt-test",
+        "previous_response_id": "resp_mcp_large",
+        "input": [{"type": "function_call_output", "call_id": "call_mcp_long_1", "output": r#"{"saved":true}"#}],
+        "stream": true,
+        "tools": tools,
+    }))
+    .await;
+    for expected in [
+        "response.output_text.delta",
+        "saved",
+        "resp_mcp_large_2",
+        "response.completed",
+    ] {
+        assert!(
+            second.contains(expected),
+            "second streaming round lost {expected:?}"
+        );
+    }
+    let sent = upstream.requests();
+    assert_eq!(sent.len(), 2, "upstream rounds");
+    for (round, request) in sent.iter().enumerate() {
+        let payload = request.json();
+        let tools = payload["tools"].as_array().cloned().unwrap_or_default();
+        assert_eq!(tools.len(), TOOL_COUNT, "forwarded tools");
+        assert_eq!(
+            tools[0]["function"]["name"], LONG_TOOL_NAME,
+            "long MCP tool name changed"
+        );
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["configuration"]["description"],
+            description,
+            "large MCP JSON Schema was truncated or changed"
+        );
+        if round == 1 {
+            assert_eq!(payload["previous_response_id"], "resp_mcp_large");
+            let input = payload["input"].as_array().cloned().unwrap_or_default();
+            assert_eq!(input.len(), 1);
+            assert!(
+                input[0]["type"] == "function_call_output"
+                    && input[0]["call_id"] == "call_mcp_long_1"
+                    && input[0]["output"] == r#"{"saved":true}"#,
+                "function call output changed: {}",
+                input[0]
+            );
+        }
+    }
+    let stat = app
+        .read()
+        .state
+        .prompt_cache()
+        .get("provider:gpt-test:main")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        (
+            stat.input_tokens,
+            stat.cached_tokens,
+            stat.cache_write_tokens,
+            stat.cache_write_observed_request_count,
+            stat.request_count
+        ),
+        (9216, 7168, 768, 2, 2),
+        "streaming usage was not recorded"
+    );
+}
+
+// Go TestResponsesProxyPreservesSpawnAgentForkTurnsSchemaArgumentsAndHistory.
+#[tokio::test]
+async fn responses_proxy_preserves_spawn_agent_fork_turns_schema_arguments_and_history() {
+    let spawn_tool = serde_json::json!({
+        "type": "function",
+        "name": "spawn_agent",
+        "description": "Spawn a child agent",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"},
+                "task_name": {"type": "string"},
+                "fork_turns": {"type": "string", "description": "none, all, or a positive integer string"},
+            },
+            "required": ["message", "task_name"],
+            "additionalProperties": false,
+        },
+    });
+    let child_history = serde_json::json!([
+        {"role": "developer", "content": "shared instructions"},
+        {"role": "user", "content": "parent turn one"},
+        {"role": "assistant", "content": "parent answer one"},
+        {"role": "user", "content": "child task"},
+    ]);
+    for (name, args, stream) in [
+        (
+            "none streamed",
+            r#"{"message":"child","task_name":"child_none","fork_turns":"none"}"#,
+            true,
+        ),
+        (
+            "last n nonstreamed",
+            r#"{"message":"child","task_name":"child_three","fork_turns":"3"}"#,
+            false,
+        ),
+        (
+            "all streamed",
+            r#"{"message":"child","task_name":"child_all","fork_turns":"all"}"#,
+            true,
+        ),
+        (
+            "omitted nonstreamed",
+            r#"{"message":"child","task_name":"child_default"}"#,
+            false,
+        ),
+    ] {
+        let upstream = FakeServer::start(move |_| {
+            let item = serde_json::json!({"type": "function_call", "call_id": "call_spawn", "name": "spawn_agent", "arguments": args});
+            if stream {
+                sse_response(&[
+                    sse("response.output_item.added", &serde_json::json!({"type": "response.output_item.added", "item": item}).to_string()),
+                    sse(
+                        "response.completed",
+                        &serde_json::json!({"type": "response.completed", "response": {"id": "resp_spawn", "output": [item]}}).to_string(),
+                    ),
+                ])
+            } else {
+                FakeResponse::json(200, &serde_json::json!({"id": "resp_spawn", "object": "response", "output": [item]}).to_string())
+            }
+        })
+        .await;
+        let (app, _dir) = arc_app(vec![provider(
+            "provider",
+            100,
+            &format!("{}/v1", upstream.url),
+            "provider-key",
+        )]);
+        let body = serde_json::json!({"model": "gpt-test", "input": child_history, "tools": [spawn_tool], "stream": stream, "prompt_cache_key": "native-thread-key"});
+        let result = serve(&app, post("/v1/responses", &body.to_string())).await;
+        assert_eq!(result.code(), 200, "{name}: {}", result.body_string());
+        let sent = upstream.requests().pop().unwrap_or_default().json();
+        assert_eq!(
+            sent["tools"],
+            serde_json::json!([spawn_tool]),
+            "{name}: spawn_agent schema changed"
+        );
+        assert_eq!(
+            sent["input"], child_history,
+            "{name}: child history changed"
+        );
+        let got = if stream {
+            result
+                .body_string()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+                .find_map(|event| event["item"]["arguments"].as_str().map(str::to_string))
+                .unwrap_or_default()
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&result.body).unwrap_or_default()["output"]
+                [0]["arguments"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(got, args, "{name}: fork_turns arguments changed");
+    }
+}
+
+// ---- the account's credential ----
+
+fn refresh_app(accounts: Vec<Account>, refresh_url: &str) -> (Arc<App>, TempDir) {
+    let refresh_url = refresh_url.to_string();
+    let (app, dir) =
+        super::testing::test_app_with(accounts, |settings| settings.refresh_url = refresh_url);
+    (Arc::new(app), dir)
+}
+
+// Go TestResponsesProxyRefreshesExpiringCodexToken.
+#[tokio::test]
+async fn responses_proxy_refreshes_expiring_codex_token() {
+    let new_access = super::testing::fake_jwt(Timestamp::now().add(hours(1)));
+    let reply =
+        format!(r#"{{"access_token":"{new_access}","refresh_token":"<new-refresh-token>"}}"#);
+    let refresh = FakeServer::start(move |_| FakeResponse::json(200, &reply)).await;
+    let upstream = FakeServer::start(ok_named("resp_test")).await;
+    let (app, _dir) = refresh_app(
+        vec![device_at(
+            "codex-refresh",
+            "",
+            100,
+            &format!("{}/backend-api", upstream.url),
+        )],
+        &refresh.url,
+    );
+    let expired = super::testing::fake_jwt(Timestamp::now().add(-minutes(1)));
+    write_auth(
+        &app,
+        "codex-refresh",
+        &format!(
+            r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{expired}","refresh_token":"<old-refresh-token>","account_id":"acct-chatgpt"}}}}"#
+        ),
+    );
+    let result = serve(
+        &app,
+        post("/v1/responses", r#"{"model":"gpt-test","input":"hello"}"#),
+    )
+    .await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let asked = refresh.requests().pop().unwrap_or_default().json();
+    assert!(
+        asked["client_id"].as_str().is_some_and(|id| !id.is_empty())
+            && asked["grant_type"] == "refresh_token"
+            && asked["refresh_token"] == "<old-refresh-token>",
+        "unexpected refresh request: {asked}"
+    );
+    assert_eq!(
+        upstream
+            .requests()
+            .pop()
+            .unwrap_or_default()
+            .header("authorization"),
+        format!("Bearer {new_access}")
+    );
+    let persisted = std::fs::read_to_string(
+        app.read()
+            .account_codex_home("codex-refresh")
+            .join("auth.json"),
+    )
+    .unwrap_or_default();
+    let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap_or_default();
+    assert_eq!(
+        persisted["tokens"]["refresh_token"], "<new-refresh-token>",
+        "refreshed auth was not persisted"
+    );
+}
+
+// Go TestConcurrentCodexAuthRefreshUsesOneTokenRequest.
+#[tokio::test]
+async fn concurrent_codex_auth_refresh_uses_one_token_request() {
+    let new_access = super::testing::fake_jwt(Timestamp::now().add(hours(1)));
+    let reply =
+        format!(r#"{{"access_token":"{new_access}","refresh_token":"<new-refresh-token>"}}"#);
+    let refresh = FakeServer::start(move |_| FakeResponse {
+        chunks: vec![(Duration::from_millis(50), bytes::Bytes::from(reply.clone()))],
+        ..FakeResponse::json(200, "")
+    })
+    .await;
+    let (app, _dir) = refresh_app(vec![device_account("codex-lock", "", 0)], &refresh.url);
+    let expired = super::testing::fake_jwt(Timestamp::now().add(-minutes(1)));
+    write_auth(
+        &app,
+        "codex-lock",
+        &format!(
+            r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{expired}","refresh_token":"<old-refresh-token>"}}}}"#
+        ),
+    );
+    let item = account(&app, 0);
+    let (first, second) = tokio::join!(
+        app.refreshed_codex_auth(&item),
+        app.refreshed_codex_auth(&item)
+    );
+    for auth in [first, second] {
+        let auth = auth.unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(auth.access_token, new_access);
+    }
+    assert_eq!(refresh.count(), 1, "refresh endpoint calls");
+}
+
+// Go TestCodexTokenRefreshBoundaries.
+#[tokio::test]
+async fn codex_token_refresh_boundaries() {
+    let failing = FakeServer::start(|_| FakeResponse::status(500)).await;
+    let (app, _dir) = refresh_app(vec![device_account("codex-valid", "", 0)], &failing.url);
+    let valid = super::testing::fake_jwt(Timestamp::now().add(hours(1)));
+    write_auth(
+        &app,
+        "codex-valid",
+        &format!(
+            r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{valid}","refresh_token":"<refresh-token>"}}}}"#
+        ),
+    );
+    assert!(app.refreshed_codex_auth(&account(&app, 0)).await.is_ok());
+    assert_eq!(failing.count(), 0, "valid access token triggered refresh");
+
+    let unauthorized = FakeServer::start(|_| FakeResponse::status(401)).await;
+    let (expired_app, _expired_dir) = refresh_app(
+        vec![device_account("codex-expired", "", 0)],
+        &unauthorized.url,
+    );
+    let expired = super::testing::fake_jwt(Timestamp::now().add(-minutes(1)));
+    write_auth(
+        &expired_app,
+        "codex-expired",
+        &format!(
+            r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{expired}","refresh_token":"<refresh-token>"}}}}"#
+        ),
+    );
+    assert!(
+        expired_app
+            .refreshed_codex_auth(&account(&expired_app, 0))
+            .await
+            .is_err(),
+        "expired access token with failed refresh returned no error"
+    );
+}
+
+// Go TestCodexAuthRetriesDuringAuthFileRewrite: Codex CLI rewrites auth.json
+// outside the pool's locks; a request landing on the partial write waits
+// briefly and uses the completed file.
+#[test]
+fn codex_auth_retries_during_auth_file_rewrite() {
+    let (app, _dir) = test_app(vec![device_account("acct-auth", "", 0)]);
+    let path = app.read().account_codex_home("acct-auth").join("auth.json");
+    write_auth(&app, "acct-auth", r#"{"auth_mode":"chatgpt","tokens":"#);
+    let writer = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            let _ = std::fs::write(
+                path,
+                r#"{"auth_mode":"chatgpt","tokens":{"access_token":"<access-token>","refresh_token":"<refresh-token>","account_id":"acct-chatgpt"}}"#,
+            );
+        })
+    };
+    let auth = app.read().codex_auth(&account(&app, 0));
+    let _ = writer.join();
+    let auth = auth.unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        (auth.access_token.as_str(), auth.account_id.as_str()),
+        ("<access-token>", "acct-chatgpt")
+    );
+}
+
+// Go TestCodexAuthUsesAccountNameInsteadOfProfileName.
+#[test]
+fn codex_auth_uses_account_name_instead_of_profile_name() {
+    let (app, _dir) = test_app(vec![device_account("acct-auth", "", 0)]);
+    let id_token = super::testing::fake_jwt_claims(&serde_json::json!({
+        "email": "user@example.test",
+        "name": "Example Person",
+        "https://api.openai.com/profile": {"email": "user@example.test", "display_name": "Example Person"},
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acct-chatgpt", "chatgpt_account_name": "Example Workspace", "chatgpt_plan_type": "team"},
+    }));
+    write_auth(
+        &app,
+        "acct-auth",
+        &serde_json::json!({"auth_mode": "chatgpt", "tokens": {"id_token": id_token, "access_token": "<access-token>", "refresh_token": "<refresh-token>"}}).to_string(),
+    );
+    let auth = app
+        .read()
+        .codex_auth(&account(&app, 0))
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(auth.organization_name, "Example Workspace");
+}
+
+// ---- routing gates on the account's allowance ----
+
+// Go TestModelMeterRestrictsRoutingToEntitledAccounts.
+#[test]
+fn model_meter_restricts_routing_to_entitled_accounts() {
+    let (app, _dir) = test_app(vec![
+        api_slot("plain", "", 100, "https://plain.example.test"),
+        api_slot("entitled", "", 100, "https://entitled.example.test"),
+    ]);
+    let quota = AccountQuota {
+        additional_limits: vec![super::state::QuotaLimit {
+            limit_id: "codex_bengalfox".into(),
+            limit_name: "GPT-5.3-Codex-Spark".into(),
+            ..super::state::QuotaLimit::default()
+        }],
+        ..AccountQuota::default()
+    };
+    set_quota(&app, "entitled", "", quota);
+    let inner = app.read();
+    let (plain, entitled) = (
+        inner.account("plain").cloned().unwrap_or_default(),
+        inner.account("entitled").cloned().unwrap_or_default(),
+    );
+    assert!(
+        !inner.model_meter_allows(&plain, "gpt-5.3-codex-spark"),
+        "an account without the meter must not receive the metered model"
+    );
+    assert!(
+        inner.model_meter_allows(&entitled, "gpt-5.3-codex-spark"),
+        "the account holding the meter must receive the metered model"
+    );
+    // An ordinary subscription model is metered by nobody and stays
+    // unrestricted.
+    for item in [&plain, &entitled] {
+        assert!(
+            inner.model_meter_allows(item, "gpt-6-astra"),
+            "{} was excluded from an unmetered model",
+            item.id
+        );
+    }
+}
+
+// Go TestModelMeterWithoutEvidenceDoesNotRestrict.
+#[test]
+fn model_meter_without_evidence_does_not_restrict() {
+    let (app, _dir) = test_app(vec![
+        api_slot("one", "", 100, "https://one.example.test"),
+        api_slot("two", "", 100, "https://two.example.test"),
+    ]);
+    let inner = app.read();
+    for id in ["one", "two"] {
+        let item = inner.account(id).cloned().unwrap_or_default();
+        assert!(
+            inner.model_meter_allows(&item, "gpt-5.3-codex-spark"),
+            "{id} was excluded with no meter evidence anywhere"
+        );
+    }
+}
+
+fn week_window(remaining: f64, now: Timestamp) -> QuotaWindow {
+    QuotaWindow {
+        role: "primary".into(),
+        label: "Week".into(),
+        present: true,
+        remaining_percent: Some(remaining),
+        window_minutes: Some(super::quota::WEEKLY_WINDOW_MINUTES),
+        reset_at: Some(now.add(hours(48)).unix()),
+        ..QuotaWindow::default()
+    }
+}
+
+// Go TestQuotaFloorStopsRoutingBeforeCreditsAreCharged (routing and status;
+// the capacity bar joins with the dashboard in 4.5).
+#[test]
+fn quota_floor_stops_routing_before_credits_are_charged() {
+    let now = Timestamp::now();
+    let (app, _dir) = test_app(vec![device_account("acct", "", 100)]);
+    for (remaining, blocked) in [
+        (0.0, true),
+        (0.5, true),
+        (1.0, true),
+        (1.5, false),
+        (40.0, false),
+    ] {
+        let quota = AccountQuota {
+            windows: vec![week_window(remaining, now)],
+            ..AccountQuota::default()
+        };
+        assert_eq!(
+            super::quota::quota_explicitly_blocks_routing(
+                &quota,
+                "",
+                now,
+                app.tuning.quota_floor_percent
+            ),
+            blocked,
+            "remaining {remaining}%"
+        );
+    }
+    // The account must also read as exhausted rather than merely low, or an
+    // operator would go looking for why a "low" account takes no traffic.
+    super::testing::write_test_codex_auth_tokens(&app, "acct", "<access-token>", "<refresh-token>");
+    set_quota(
+        &app,
+        "acct",
+        "",
+        AccountQuota {
+            windows: vec![week_window(1.0, now)],
+            ..AccountQuota::default()
+        },
+    );
+    let item = account(&app, 0);
+    let (status, reason) = app.read().account_status(&item, now);
+    assert_eq!(status, "exhausted", "status at the floor ({reason})");
+}
+
+// Go TestQuotaProtectionRoutingAndConfigurationArePerSlot (routing; the
+// admin action joins with the admin API in 4.5).
+#[test]
+fn quota_protection_routing_is_per_slot() {
+    let now = Timestamp::now();
+    let protected = Account {
+        quota_protection_enabled: true,
+        quota_protection_threshold: 20,
+        ..device_account("protected", "upstream-protected", 100)
+    };
+    let (app, _dir) = test_app(vec![
+        protected,
+        api_slot("backup", "", 10, "https://backup.example.test"),
+    ]);
+    write_codex_device_auth(
+        &app,
+        "protected",
+        "upstream-protected",
+        "protected@example.test",
+    );
+    app.write().state.quotas_mut().insert(
+        "protected".into(),
+        QuotaSnapshot {
+            last_successful_refresh_at: now,
+            quota: Some(AccountQuota {
+                windows: vec![QuotaWindow {
+                    present: true,
+                    observed: true,
+                    percentage: 20,
+                    remaining_percent: Some(20.0),
+                    window_minutes: Some(300),
+                    reset_at: Some(now.add(hours(1)).unix()),
+                    ..QuotaWindow::default()
+                }],
+                ..AccountQuota::default()
+            }),
+            ..QuotaSnapshot::default()
+        },
+    );
+    let selected = app.select_account(
+        "gpt-test:protected-route",
+        "gpt-test",
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(
+        selected.map(|item| item.id).unwrap_or_default(),
+        "backup",
+        "threshold-blocked slot selected"
+    );
+}
+
+// Go TestProTiersFollowCodexPlanNames.
+#[test]
+fn pro_tiers_follow_codex_plan_names() {
+    use super::app::PRO_TIER_LITE;
+    use super::app::PRO_TIER_PRO;
+    use super::plan::PRO_DEFAULT_WEIGHT;
+    use super::plan::PRO_LITE_WEIGHT;
+    use super::plan::PRO_MAX_WEIGHT;
+    let (app, _dir) = test_app(Vec::new());
+    for (raw, family, display, weight, tier) in [
+        (
+            "chatgptprolite",
+            "pro_lite",
+            "Pro 100",
+            PRO_LITE_WEIGHT,
+            PRO_TIER_LITE,
+        ),
+        (
+            "chatgptpro",
+            "pro",
+            "Pro 200",
+            PRO_DEFAULT_WEIGHT,
+            PRO_TIER_PRO,
+        ),
+        ("promax", "pro_max", "Pro 500", PRO_MAX_WEIGHT, PRO_TIER_PRO),
+    ] {
+        assert_eq!(super::plan::plan_family_from_raw(raw), family, "{raw}");
+        let item = Account {
+            id: "slot".into(),
+            raw_plan_type: raw.into(),
+            plan_family: family.into(),
+            plan_type: family.into(),
+            ..Account::default()
+        };
+        assert_eq!(
+            super::plan::account_plan_display_name(&item, false),
+            display,
+            "{raw}"
+        );
+        assert_eq!(
+            super::plan::account_weekly_weight(family, "", "", app.tuning.premium_seat_weight),
+            (weight, true),
+            "{raw}"
+        );
+        assert_eq!(app.read().pro_tier(&item), tier, "{raw}: Use Pro last tier");
+    }
+    assert_eq!(
+        super::plan::account_weekly_weight("pro", "20x", "", app.tuning.premium_seat_weight).0,
+        20.0,
+        "a reported multiplier must still win over the assumed tier"
+    );
+}
+
+// Go TestRoutingIdentityAndCapacityAllowanceAgree (the routing identity half;
+// the capacity allowance key joins with the dashboard in 4.5).
+#[test]
+fn routing_identity_keeps_logins_and_members_apart() {
+    let member = |id: &str, workspace: &str, email: &str| Account {
+        email: email.into(),
+        ..device_account(id, workspace, 0)
+    };
+    let (app, _dir) = test_app(vec![
+        member("member-a", "workspace-1", "a@example.test"),
+        member("member-b", "workspace-1", "b@example.test"),
+        member("copy-of-a", "workspace-1", "A@example.test"),
+        member("personal", "personal-1", "p@example.test"),
+        member("other-workspace", "workspace-2", "a@example.test"),
+    ]);
+    for id in [
+        "member-a",
+        "member-b",
+        "copy-of-a",
+        "personal",
+        "other-workspace",
+    ] {
+        super::testing::write_test_codex_auth_tokens(&app, id, "<access-token>", "<refresh-token>");
+    }
+    let inner = app.read();
+    let accounts = inner.config.accounts().to_vec();
+    let key = |index: usize| inner.upstream_identity_key(&accounts[index]);
+    assert_eq!(
+        key(0),
+        key(2),
+        "two slots from one login must stay one identity"
+    );
+    assert_ne!(
+        key(0),
+        key(1),
+        "two members of one workspace must be separate identities"
+    );
+    assert_ne!(
+        key(0),
+        key(4),
+        "one person in two workspaces is two identities"
+    );
+}
