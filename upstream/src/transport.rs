@@ -233,14 +233,6 @@ pub fn named_order_headers(incoming: &HeaderMap, order: &str) -> (HeaderMap, Hea
     (pick(first), pick(second))
 }
 
-pub fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
 /// Splits the pool's headers into the three groups Codex builds a request
 /// from, each in native order.
 pub fn ordered_headers(incoming: &HeaderMap) -> (HeaderMap, HeaderMap) {
