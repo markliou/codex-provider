@@ -52,6 +52,7 @@ pub mod routes;
 pub mod routing;
 #[cfg(test)]
 mod routing_tests;
+pub mod serve;
 pub mod server;
 pub mod settings;
 pub mod state;

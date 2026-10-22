@@ -41,18 +41,47 @@ pub type ResponseBody =
     StreamBody<futures::stream::BoxStream<'static, Result<Frame<Bytes>, Infallible>>>;
 
 /// Serves one accepted connection until it closes. Upgrades (the Responses
-/// WebSocket) are handed to the handler.
-pub async fn serve_connection(app: Arc<App>, stream: tokio::net::TcpStream, peer: SocketAddr) {
+/// WebSocket) are handed to the handler. When `shutdown` fires the connection
+/// finishes the request it is serving and then closes, and an idle
+/// keep-alive connection closes at once (Go http.Server.Shutdown).
+pub async fn serve_connection(
+    app: Arc<App>,
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    shutdown: Cancel,
+) {
+    serve_http1(
+        stream,
+        move |request| handle(app.clone(), request, peer),
+        shutdown,
+    )
+    .await;
+}
+
+/// One HTTP/1 connection with the pool's header timeout and upgrades, closed
+/// gracefully on `shutdown`. `handler` answers each request.
+pub async fn serve_http1<F, Fut>(stream: tokio::net::TcpStream, handler: F, shutdown: Cancel)
+where
+    F: Fn(hyper::Request<Incoming>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = hyper::Response<ResponseBody>> + Send + 'static,
+{
+    let handler = Arc::new(handler);
     let service = hyper::service::service_fn(move |request| {
-        let app = app.clone();
-        async move { Ok::<_, Infallible>(handle(app, request, peer).await) }
+        let handler = handler.clone();
+        async move { Ok::<_, Infallible>(handler(request).await) }
     });
-    let _ = hyper::server::conn::http1::Builder::new()
+    let connection = hyper::server::conn::http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-        .with_upgrades()
-        .await;
+        .with_upgrades();
+    tokio::pin!(connection);
+    tokio::select! {
+        _ = connection.as_mut() => return,
+        () = shutdown.cancelled() => {}
+    }
+    connection.as_mut().graceful_shutdown();
+    let _ = connection.await;
 }
 
 /// The remote address the handlers judge a request by (Go withFrontPeer):

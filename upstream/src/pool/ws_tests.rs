@@ -283,6 +283,7 @@ async fn ws_test_pool(behavior: Behavior, prepare: impl FnOnce(&App)) -> Pool {
                 served.clone(),
                 stream,
                 peer,
+                super::http_io::Cancel::default(),
             ));
         }
     });
