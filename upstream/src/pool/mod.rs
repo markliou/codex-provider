@@ -13,6 +13,7 @@ pub mod crypto;
 pub mod gojson;
 pub mod gosort;
 pub mod hash;
+pub mod http_io;
 pub mod installation_id;
 pub mod log;
 pub mod metadata;
@@ -27,6 +28,7 @@ pub mod routing;
 mod routing_tests;
 pub mod settings;
 pub mod state;
+pub mod stream;
 #[cfg(test)]
 pub mod testing;
 pub mod time;

@@ -38,6 +38,15 @@ pub struct Tuning {
     pub overload_retry_backoff: Duration,
     /// The first same-account transport retry wait; each retry doubles it.
     pub transport_retry_backoff: Duration,
+    /// The timed commit for writers that are not an early stream writer
+    /// (chat-completion streams). They cannot send early headers without
+    /// committing, so they keep the earlier 5s bound rather than the 1s header
+    /// hold, which would close their retry window almost at once.
+    pub unmanaged_precommit_commit_after: Duration,
+    /// The longest a streaming response may go without a byte, and how often
+    /// the keepalive task checks (see stream::EarlyStreamWriter).
+    pub stream_keepalive_interval: Duration,
+    pub stream_keepalive_tick: Duration,
 }
 
 /// How many times an overload is retried on the same account (after 1s, 2s
@@ -67,6 +76,9 @@ impl Default for Tuning {
             precommit_max_hold: Duration::from_secs(1),
             overload_retry_backoff: Duration::from_secs(1),
             transport_retry_backoff: Duration::from_millis(500),
+            unmanaged_precommit_commit_after: Duration::from_secs(5),
+            stream_keepalive_interval: Duration::from_millis(1500),
+            stream_keepalive_tick: Duration::from_millis(250),
         }
     }
 }
