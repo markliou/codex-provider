@@ -1872,8 +1872,7 @@ fn project_request(
     )
 }
 
-// Go TestPromptCacheMetricsSeparateMainSubagentAndAffinity (the stored
-// counters; the dashboard window over them joins with the dashboard in 4.5).
+// Go TestPromptCacheMetricsSeparateMainSubagentAndAffinity.
 #[test]
 fn prompt_cache_metrics_separate_main_subagent_and_affinity() {
     let (app, _dir) = test_app(vec![provider_account("acct", 0)]);
@@ -1967,6 +1966,15 @@ fn prompt_cache_metrics_separate_main_subagent_and_affinity() {
         ),
         (1, 1, 1),
         "affinity metrics"
+    );
+    let window = inner.prompt_cache_window();
+    assert!(
+        window["main"]["requestCount"] == 1
+            && window["subagent"]["requestCount"] == 2
+            && window["parentAffinityHitCount"] == 1
+            && window["parentAffinityFallbackCount"] == 1
+            && window["lineageFailoverCount"] == 1,
+        "agent cache window = {window}"
     );
 }
 

@@ -1,8 +1,7 @@
 //! The Go tests of the pool's own upstream work (main_test.go quota refresh,
 //! reset_credit_test.go, refused_credential_test.go, quota_schedule_test.go
 //! and the priming tests), one by one. Each keeps its Go name in a comment;
-//! the assertions are Go's. Parts that read the dashboard join with the
-//! dashboard port (step 4.5) and are marked where they are left out.
+//! the assertions are Go's.
 
 use super::app::App;
 use super::proxy_tests::account;
@@ -45,12 +44,22 @@ fn json(body: String) -> FakeResponse {
     FakeResponse::json(200, &body)
 }
 
+/// Go's GET /admin/api/public-dashboard, through the router.
+async fn public_dashboard(app: &Arc<App>) -> String {
+    let result = super::proxy_tests::serve(
+        app,
+        super::routes::Request::test(http::Method::GET, "/admin/api/public-dashboard", ""),
+    )
+    .await;
+    assert_eq!(result.code(), 200, "public dashboard");
+    result.body_string()
+}
+
 fn by_path(request: &RecordedRequest, path: &str) -> bool {
     request.path == path
 }
 
-// Go TestCodexQuotaRefreshUpdatesDashboardState (the dashboard reads join
-// with the dashboard in 4.5).
+// Go TestCodexQuotaRefreshUpdatesDashboardState.
 #[tokio::test]
 async fn codex_quota_refresh_updates_dashboard_state() {
     let reset_at = Timestamp::now().add(hours(7)).unix();
@@ -112,6 +121,11 @@ async fn codex_quota_refresh_updates_dashboard_state() {
         (item.organization_name.as_str(), item.label.as_str()),
         ("Acme Workspace", "codex-quota")
     );
+    let body = public_dashboard(&app).await;
+    assert!(
+        body.contains("Credential 1") && body.contains("Business · Acme Workspace"),
+        "public dashboard omitted team organization label: {body}"
+    );
     let quota = snapshot.quota.clone().unwrap_or_default();
     assert!(
         quota.hourly.percentage == 70 && quota.hourly.window_minutes == Some(300),
@@ -168,6 +182,17 @@ async fn codex_quota_refresh_updates_dashboard_state() {
         status == "low" && reason.contains("Quota window"),
         "quota status = {status}/{reason}"
     );
+    let body = public_dashboard(&app).await;
+    assert!(
+        body.contains(r#""hourly""#)
+            && body.contains(r#""weekly""#)
+            && body.contains(&format!(r#""expiresAt":{}"#, credit_expires.unix())),
+        "public dashboard did not include quota windows: {body}"
+    );
+    assert!(
+        !body.contains("acct-chatgpt") && !body.contains("<refresh-token>"),
+        "public dashboard exposed credential/account internals: {body}"
+    );
 }
 
 // Go TestCodexQuotaRefreshClearsStoredPersonalOrganizationName.
@@ -204,8 +229,7 @@ async fn codex_quota_refresh_clears_stored_personal_organization_name() {
     );
 }
 
-// Go TestCodexQuotaRefreshDoesNotInferProPlanLimit (the dashboard read joins
-// with the dashboard in 4.5).
+// Go TestCodexQuotaRefreshDoesNotInferProPlanLimit.
 #[tokio::test]
 async fn codex_quota_refresh_does_not_infer_pro_plan_limit() {
     let server = FakeServer::start(|request| match request.path.as_str() {
@@ -260,10 +284,17 @@ async fn codex_quota_refresh_does_not_infer_pro_plan_limit() {
         item.plan_limit.is_empty() && item.label == "codex-pro",
         "account inferred a generic Pro plan limit"
     );
+    let body = public_dashboard(&app).await;
+    assert!(
+        body.contains("Credential 1")
+            && body.contains("Pro")
+            && !body.contains("Pro 20x")
+            && !body.contains(r#""planLimit":"20x""#),
+        "public dashboard inferred Pro plan limit: {body}"
+    );
 }
 
-// Go TestCodexQuotaErrorDoesNotPersistUpstreamBody (the dashboard read joins
-// with the dashboard in 4.5).
+// Go TestCodexQuotaErrorDoesNotPersistUpstreamBody.
 #[tokio::test]
 async fn codex_quota_error_does_not_persist_upstream_body() {
     let server = FakeServer::start(|_| {
@@ -314,6 +345,13 @@ async fn codex_quota_error_does_not_persist_upstream_body() {
         status == "error" && reason.contains("invalid_token"),
         "quota refresh failure status = {status}/{reason}"
     );
+    let body = public_dashboard(&app).await;
+    for internal in ["invalid_token", "secret-body-token", "acct-chatgpt"] {
+        assert!(
+            !body.contains(internal),
+            "public dashboard exposed quota failure internals: {body}"
+        );
+    }
 }
 
 // Go TestQuotaRefreshDoesNotPerpetuateStoredPlanLimit.
@@ -537,12 +575,20 @@ async fn reset_credit_app(server: &FakeServer) -> (Arc<App>, TempDir) {
     (app, dir)
 }
 
-/// Go pressResetCredit (the admin session check joins with the admin API in
-/// 4.5).
-async fn press_reset_credit(app: &App) -> (u16, serde_json::Value) {
-    let mut recorder = super::http_io::Recorder::new();
-    super::reset_credit::handle_reset_credit(app, "acct", &mut recorder).await;
-    let result = recorder.result();
+/// Go pressResetCredit: the owner's button, through the admin route with a
+/// signed-in session.
+async fn press_reset_credit(app: &Arc<App>) -> (u16, serde_json::Value) {
+    let session = super::admin_tests::admin_session(app);
+    let result = super::proxy_tests::serve(
+        app,
+        super::admin_tests::admin_request(
+            &session,
+            http::Method::POST,
+            "/admin/api/accounts/acct/quota/reset-credit",
+            "",
+        ),
+    )
+    .await;
     (
         result.code(),
         serde_json::from_slice(&result.body).unwrap_or_default(),
@@ -673,8 +719,7 @@ async fn reset_app_with_credits(server: &FakeServer, credits: i64) -> (Arc<App>,
     (app, dir)
 }
 
-// Go TestAdminResetCreditConsumesAndRefreshes (the admin session check joins
-// with the admin API in 4.5).
+// Go TestAdminResetCreditConsumesAndRefreshes.
 #[tokio::test]
 async fn admin_reset_credit_consumes_and_refreshes() {
     let server = FakeServer::start(|request| match request.path.as_str() {

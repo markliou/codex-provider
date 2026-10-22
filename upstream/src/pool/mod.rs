@@ -13,6 +13,8 @@ pub mod admin_api;
 #[cfg(test)]
 mod admin_tests;
 pub mod app;
+#[cfg(test)]
+mod asset_tests;
 pub mod catalog;
 pub mod credentials;
 pub mod crypto;

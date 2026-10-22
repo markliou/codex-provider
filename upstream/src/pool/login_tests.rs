@@ -691,8 +691,7 @@ async fn device_auth_login_rechecks_identity_after_quota_metadata() {
     );
 }
 
-// Go TestDeviceAuthLoginJobCancel (cancelled through the job API directly;
-// the admin route joins with the admin API in 4.5).
+// Go TestDeviceAuthLoginJobCancel.
 #[tokio::test]
 async fn device_auth_login_job_cancel() {
     let bin = TempDir::new();
@@ -702,8 +701,18 @@ async fn device_auth_login_job_cancel() {
         .start_login_job("acct-cancel")
         .unwrap_or_else(|error| panic!("{error}"));
     wait_for_job(&app, &job.id, |job| job.status == "waiting_for_user").await;
-    app.cancel_login_job(&job.id)
-        .unwrap_or_else(|error| panic!("{error}"));
+    let session = super::admin_tests::admin_session(&app);
+    let cancel = super::proxy_tests::serve(
+        &app,
+        super::admin_tests::admin_request(
+            &session,
+            http::Method::POST,
+            &format!("/admin/api/jobs/{}/cancel", job.id),
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(cancel.code(), 200, "cancel: {}", cancel.body_string());
     let current = wait_for_job(&app, &job.id, |job| job.status == "cancelled").await;
     assert!(
         current.error.is_empty(),
@@ -900,8 +909,7 @@ fn completed_device_auth_changed_or_unverifiable_identity_resets_history() {
     }
 }
 
-// Go TestDeviceAuthLoginInProgressPausesRoutingWithoutClearingAffinity (the
-// dashboard summary and health item join with the dashboard in 4.5).
+// Go TestDeviceAuthLoginInProgressPausesRoutingWithoutClearingAffinity.
 #[test]
 fn device_auth_login_in_progress_pauses_routing_without_clearing_affinity() {
     let now = Timestamp::now();
@@ -950,14 +958,26 @@ fn device_auth_login_in_progress_pauses_routing_without_clearing_affinity() {
         "active repair status = {status}/{reason}"
     );
     assert_eq!(
+        inner.dashboard_summary(now).get("authenticating").copied(),
+        Some(1),
+        "dashboard did not count active repair"
+    );
+    assert_eq!(
         inner.state.sticky_sessions().len(),
         1,
         "routing pause cleared sticky affinity"
     );
+    let health = inner.account_health_item(&item, now);
+    let job = &health["loginJob"];
+    assert!(
+        job["jobId"] == "job-login"
+            && job["status"] == "waiting_for_user"
+            && job["reauthentication"] == true,
+        "management health did not expose the active login job: {job}"
+    );
 }
 
-// Go TestPersistedAuthVerificationGateSurvivesRestart (the public dashboard
-// half joins with the dashboard in 4.5).
+// Go TestPersistedAuthVerificationGateSurvivesRestart.
 #[test]
 fn persisted_auth_verification_gate_survives_restart() {
     let now = Timestamp::now();
@@ -992,5 +1012,18 @@ fn persisted_auth_verification_gate_survives_restart() {
     assert!(
         status == "missing_auth" && reason.contains("completed"),
         "persisted repair status = {status}/{reason}"
+    );
+    let public = inner.public_dashboard_account(&item, 0, now);
+    assert_eq!(
+        public["poolAction"], "repair",
+        "public dashboard action during persisted repair"
+    );
+    assert_eq!(
+        public["poolActionLabel"], "Repair",
+        "public dashboard repair label"
+    );
+    assert_eq!(
+        super::dashboard::public_pool_label(&item),
+        "Verification pending"
     );
 }

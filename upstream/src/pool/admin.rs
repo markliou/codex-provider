@@ -21,16 +21,20 @@ const ADMIN_MANIFEST: &str = include_str!("../../../cmd/codex-pool/web/manifest.
 /// The build's version and commit, set at build time like Go's ldflags
 /// (CODEX_POOL_BUILD_VERSION, CODEX_POOL_BUILD_COMMIT).
 pub fn admin_display_version() -> String {
-    let mut version = option_env!("CODEX_POOL_BUILD_VERSION")
-        .unwrap_or("dev")
-        .trim()
-        .to_string();
+    format_display_version(
+        option_env!("CODEX_POOL_BUILD_VERSION").unwrap_or("dev"),
+        option_env!("CODEX_POOL_BUILD_COMMIT").unwrap_or("unknown"),
+    )
+}
+
+/// The version with the short commit appended unless it is already part of
+/// it (Go adminDisplayVersion).
+pub fn format_display_version(version: &str, commit: &str) -> String {
+    let mut version = version.trim().to_string();
     if version.is_empty() {
         version = "dev".to_string();
     }
-    let commit = option_env!("CODEX_POOL_BUILD_COMMIT")
-        .unwrap_or("unknown")
-        .trim();
+    let commit = commit.trim();
     if !commit.is_empty() && commit != "unknown" && !version.contains(commit) {
         let short: String = commit.chars().take(8).collect();
         version.push('+');
@@ -38,6 +42,9 @@ pub fn admin_display_version() -> String {
     }
     version
 }
+
+/// The placeholder the HTML carries for the version.
+pub const VERSION_PLACEHOLDER: &str = ADMIN_VERSION_PLACEHOLDER;
 
 pub fn admin_page() -> String {
     ADMIN_PAGE_HTML.replace(ADMIN_VERSION_PLACEHOLDER, &admin_display_version())

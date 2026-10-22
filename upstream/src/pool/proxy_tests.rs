@@ -335,8 +335,7 @@ async fn current_status_returns_session_account_quota() {
     }
 }
 
-// Go TestUnifiedRootAndProtectedProviderEndpoints (the provider half; the
-// admin page alias joins with the admin API in step 4.5).
+// Go TestUnifiedRootAndProtectedProviderEndpoints.
 #[tokio::test]
 async fn unified_root_and_protected_provider_endpoints() {
     let (app, _dir) = arc_app(Vec::new());
@@ -356,6 +355,13 @@ async fn unified_root_and_protected_provider_endpoints() {
     let health = Request::test(Method::GET, "/healthz", "")
         .with_header("authorization", "Bearer client-key");
     assert_eq!(serve(&app, health).await.code(), 200);
+    let admin = serve(&app, Request::test(Method::GET, "/admin", "")).await;
+    assert_eq!(admin.code(), 200, "combined admin page");
+    let body = admin.body_string();
+    assert!(
+        body.contains(r#"id="dashboard-view""#) && body.contains(r#"id="login-view""#),
+        "combined admin page did not serve dashboard shell"
+    );
 }
 
 // Go TestInFlightEndpointIsLoopbackOnly.
@@ -4551,8 +4557,7 @@ fn terminal_failure_log_carries_codex_verdict() {
     }
 }
 
-// Go TestUnrecognizedUpstreamFailuresAreCounted (the stored counter; Go read
-// it through the dashboard window).
+// Go TestUnrecognizedUpstreamFailuresAreCounted.
 #[test]
 fn unrecognized_upstream_failures_are_counted() {
     let (app, _dir) = test_app(vec![device_account("first", "", 0)]);
@@ -4571,14 +4576,11 @@ fn unrecognized_upstream_failures_are_counted() {
             true,
         );
     }
-    let total: u64 = app
-        .read()
-        .state
-        .prompt_cache()
-        .values()
-        .map(|stat| stat.unrecognized_failure_count)
-        .sum();
-    assert_eq!(total, 1, "the unknown code counts, not the passthrough one");
+    let window = app.read().prompt_cache_window();
+    assert_eq!(
+        window["unrecognizedFailureCount"], 1,
+        "the unknown code counts, not the passthrough one"
+    );
 }
 
 // Go TestCodexUpstreamShapesClassifyAsCodexReadsThem: every recorded Codex
@@ -5133,8 +5135,7 @@ fn week_window(remaining: f64, now: Timestamp) -> QuotaWindow {
     }
 }
 
-// Go TestQuotaFloorStopsRoutingBeforeCreditsAreCharged (routing and status;
-// the capacity bar joins with the dashboard in 4.5).
+// Go TestQuotaFloorStopsRoutingBeforeCreditsAreCharged.
 #[test]
 fn quota_floor_stops_routing_before_credits_are_charged() {
     let now = Timestamp::now();
@@ -5176,19 +5177,37 @@ fn quota_floor_stops_routing_before_credits_are_charged() {
     let item = account(&app, 0);
     let (status, reason) = app.read().account_status(&item, now);
     assert_eq!(status, "exhausted", "status at the floor ({reason})");
+    // And the capacity bar must not promise what routing refuses to spend.
+    app.write().state.quotas_mut().insert(
+        "acct".into(),
+        QuotaSnapshot {
+            account_id: "acct".into(),
+            plan_family: "business".into(),
+            quota: Some(AccountQuota {
+                windows: vec![week_window(1.0, now)],
+                ..AccountQuota::default()
+            }),
+            ..QuotaSnapshot::default()
+        },
+    );
+    for bar in app.read().pool_capacity(now) {
+        assert!(
+            bar.spendable_percent <= 0.0,
+            "a window held back by the floor was reported as spendable: {bar:?}"
+        );
+    }
 }
 
-// Go TestQuotaProtectionRoutingAndConfigurationArePerSlot (routing; the
-// admin action joins with the admin API in 4.5).
-#[test]
-fn quota_protection_routing_is_per_slot() {
+// Go TestQuotaProtectionRoutingAndConfigurationArePerSlot.
+#[tokio::test]
+async fn quota_protection_routing_and_configuration_are_per_slot() {
     let now = Timestamp::now();
     let protected = Account {
         quota_protection_enabled: true,
         quota_protection_threshold: 20,
         ..device_account("protected", "upstream-protected", 100)
     };
-    let (app, _dir) = test_app(vec![
+    let (app, _dir) = arc_app(vec![
         protected,
         api_slot("backup", "", 10, "https://backup.example.test"),
     ]);
@@ -5226,6 +5245,32 @@ fn quota_protection_routing_is_per_slot() {
         selected.map(|item| item.id).unwrap_or_default(),
         "backup",
         "threshold-blocked slot selected"
+    );
+    let session = super::admin_tests::admin_session(&app);
+    let update = serve(
+        &app,
+        super::admin_tests::admin_request(
+            &session,
+            Method::POST,
+            "/admin/api/accounts/protected/quota-protection/set",
+            r#"{"enabled":false,"threshold":15}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        update.code(),
+        200,
+        "quota protection update: {}",
+        update.body_string()
+    );
+    let (protected, backup) = (account(&app, 0), account(&app, 1));
+    assert!(
+        !protected.quota_protection_enabled && protected.quota_protection_threshold == 15,
+        "slot protection was not updated"
+    );
+    assert!(
+        !backup.quota_protection_enabled && backup.quota_protection_threshold == 0,
+        "one slot update mutated another slot"
     );
 }
 
@@ -5282,10 +5327,10 @@ fn pro_tiers_follow_codex_plan_names() {
     );
 }
 
-// Go TestRoutingIdentityAndCapacityAllowanceAgree (the routing identity half;
-// the capacity allowance key joins with the dashboard in 4.5).
+// Go TestRoutingIdentityAndCapacityAllowanceAgree: routing and the capacity
+// bar must share one definition of an allowance.
 #[test]
-fn routing_identity_keeps_logins_and_members_apart() {
+fn routing_identity_and_capacity_allowance_agree() {
     let member = |id: &str, workspace: &str, email: &str| Account {
         email: email.into(),
         ..device_account(id, workspace, 0)
@@ -5308,6 +5353,19 @@ fn routing_identity_keeps_logins_and_members_apart() {
     }
     let inner = app.read();
     let accounts = inner.config.accounts().to_vec();
+    for (index, left) in accounts.iter().enumerate() {
+        for right in &accounts[index + 1..] {
+            let same_route =
+                inner.upstream_identity_key(left) == inner.upstream_identity_key(right);
+            let same_allowance =
+                inner.capacity_allowance_key(left) == inner.capacity_allowance_key(right);
+            assert_eq!(
+                same_route, same_allowance,
+                "{} and {}: same routing identity vs same allowance",
+                left.id, right.id
+            );
+        }
+    }
     let key = |index: usize| inner.upstream_identity_key(&accounts[index]);
     assert_eq!(
         key(0),
@@ -5437,8 +5495,7 @@ async fn codex_model_catalog_advertises_reasoning_capabilities() {
     );
 }
 
-// Go TestFrontPeerRestoresTheClientAddress (the in-flight half; the admin
-// login key behind a trusted proxy joins with the admin API in 4.5).
+// Go TestFrontPeerRestoresTheClientAddress.
 #[tokio::test]
 async fn front_peer_restores_the_client_address() {
     let (app, _dir) = arc_app(Vec::new());
@@ -5465,4 +5522,26 @@ async fn front_peer_restores_the_client_address() {
             "{peer} via {remote}"
         );
     }
+    // Behind Caddy and the front door: the door restores Caddy's address, and
+    // Caddy is a trusted proxy, so the login key is the client Caddy saw.
+    let networks =
+        super::settings::trusted_proxies("172.18.0.0/16").unwrap_or_else(|error| panic!("{error}"));
+    let (app, _dir) =
+        super::testing::test_app_with(Vec::new(), |settings| settings.trusted_proxies = networks);
+    let mut request = Request::test(Method::POST, "/admin/api/login", "")
+        .with_header("x-codex-pool-peer", "172.18.0.5:41000")
+        .with_header("x-forwarded-for", "203.0.113.9");
+    let socket: std::net::SocketAddr = "127.0.0.1:50000"
+        .parse()
+        .unwrap_or_else(|error| panic!("{error}"));
+    request.remote_addr = super::listener::remote_address(&mut request.headers, socket);
+    assert!(
+        request.headers.get("x-codex-pool-peer").is_none(),
+        "the peer header was left for the handler"
+    );
+    assert_eq!(
+        super::admin_api::admin_login_key(&app, &request),
+        "203.0.113.9",
+        "behind Caddy and the door the login key"
+    );
 }

@@ -1270,3 +1270,107 @@ fn prompt_cache_window_per_account_reset() {
         "account b window after pool-wide reset"
     );
 }
+
+// ---- public account rows ----
+
+// Go TestPublicDashboardExposesSeatTier.
+#[test]
+fn public_dashboard_exposes_seat_tier() {
+    let (app, _dir) = test_app(vec![Account {
+        plan_family: "business".into(),
+        plan_type: "business".into(),
+        organization_name: "acme".into(),
+        seat_type: "premium".into(),
+        seat_type_inferred: true,
+        ..device_account("biz", "", 100)
+    }]);
+    let inner = app.read();
+    let payload = inner.public_dashboard_account(&inner.config.accounts()[0], 0, Timestamp::now());
+    assert_eq!(
+        payload["seatType"], "premium",
+        "public dashboard dropped the seat tier"
+    );
+    assert_eq!(
+        payload["seatTypeInferred"], true,
+        "public dashboard dropped the inferred marker"
+    );
+    let detail = payload["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        !detail.contains("premium"),
+        "inferred seat leaked into the plan detail: {detail}"
+    );
+}
+
+// Go TestPublicDashboardOmitsUnknownSeatTier.
+#[test]
+fn public_dashboard_omits_unknown_seat_tier() {
+    let (app, _dir) = test_app(vec![Account {
+        plan_family: "plus".into(),
+        plan_type: "plus".into(),
+        ..device_account("plus", "", 100)
+    }]);
+    let inner = app.read();
+    let payload = inner.public_dashboard_account(&inner.config.accounts()[0], 0, Timestamp::now());
+    assert!(
+        payload["seatType"] == "" && payload["seatTypeInferred"] == false,
+        "non-business account reported a seat: {payload}"
+    );
+}
+
+// Go TestQuotaOrganizationControlsTeamDisplayName.
+#[test]
+fn quota_organization_controls_team_display_name() {
+    let (app, _dir) = test_app(vec![Account {
+        email: "user@example.test".into(),
+        plan_type: "team".into(),
+        ..device_account("acct-team", "", 0)
+    }]);
+    app.write().state.quotas_mut().insert(
+        "acct-team".into(),
+        QuotaSnapshot {
+            account_id: "acct-team".into(),
+            organization_name: "Example Workspace".into(),
+            plan_type: "team".into(),
+            ..QuotaSnapshot::default()
+        },
+    );
+    let inner = app.read();
+    let dashboard =
+        inner.public_dashboard_account(&inner.config.accounts()[0], 0, Timestamp::now());
+    assert_eq!(
+        dashboard["detail"], "Team · Example Workspace",
+        "quota organization was not used in team display"
+    );
+}
+
+// Go TestOrganizationSetActionIsNotAvailable.
+#[tokio::test]
+async fn organization_set_action_is_not_available() {
+    use super::admin_tests::admin_request;
+    use super::admin_tests::admin_session;
+    let (app, _dir) = super::proxy_tests::arc_app(vec![Account {
+        email: "user@example.test".into(),
+        plan_type: "team".into(),
+        ..device_account("acct-team", "", 0)
+    }]);
+    let session = admin_session(&app);
+    let result = super::proxy_tests::serve(
+        &app,
+        admin_request(
+            &session,
+            http::Method::POST,
+            "/admin/api/accounts/acct-team/organization/set",
+            r#"{"organizationName":"Example Workspace"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        result.code(),
+        404,
+        "organization override action: {}",
+        result.body_string()
+    );
+}

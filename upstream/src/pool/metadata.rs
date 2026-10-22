@@ -479,6 +479,148 @@ mod tests {
         );
     }
 
+    fn team(account: Value) -> Value {
+        json!({"account": account, "entitlement": {"subscription_plan": "chatgptteamplan"}})
+    }
+
+    fn pro() -> Value {
+        json!({"account": {"account_id": "acct-pro", "plan_type": "pro"}, "entitlement": {"subscription_plan": "chatgptpro"}})
+    }
+
+    // Go TestSubscriptionMetadataFromAccountCheckUsesExplicitWorkspaceName.
+    #[test]
+    fn account_check_uses_explicit_workspace_name() {
+        let answer = json!({
+            "accounts": {
+                "acct-team": team(json!({"account_id": "acct-team", "name": "Example Person", "workspace_name": "Example Workspace", "plan_type": "team"})),
+                "acct-pro": pro(),
+            },
+            "account_ordering": ["acct-team"],
+        });
+        let metadata = subscription_metadata_from_value(&answer, "acct-team").unwrap_or_default();
+        assert_eq!(
+            (
+                metadata.account_id.as_str(),
+                metadata.organization_name.as_str(),
+                metadata.raw_plan_type.as_str(),
+                metadata.plan_type.as_str()
+            ),
+            (
+                "acct-team",
+                "Example Workspace",
+                "chatgptteamplan",
+                "business"
+            ),
+            "unexpected team metadata"
+        );
+        // A personal account name is not a workspace name.
+        let answer = json!({
+            "accounts": {"acct-team": team(json!({"account_id": "acct-team", "name": "Example Person", "plan_type": "team"}))},
+            "account_ordering": ["acct-team"],
+        });
+        let metadata = subscription_metadata_from_value(&answer, "acct-team").unwrap_or_default();
+        assert_eq!(
+            (
+                metadata.account_id.as_str(),
+                metadata.organization_name.as_str(),
+                metadata.plan_type.as_str()
+            ),
+            ("acct-team", "", "business"),
+            "personal account name was used as team organization metadata"
+        );
+        let answer = json!({
+            "accounts": {"acct-team": team(json!({"account_id": "acct-team", "name": "Example Workspace", "structure": "workspace", "plan_type": "team"}))},
+            "account_ordering": ["acct-team"],
+        });
+        let metadata = subscription_metadata_from_value(&answer, "acct-team").unwrap_or_default();
+        assert_eq!(
+            (
+                metadata.account_id.as_str(),
+                metadata.organization_name.as_str(),
+                metadata.plan_type.as_str()
+            ),
+            ("acct-team", "Example Workspace", "business"),
+            "workspace account name was not used as team organization metadata"
+        );
+        let answer = json!({"accounts": {
+            "acct-team": team(json!({"account_id": "acct-team", "name": "Example Workspace", "plan_type": "team"})),
+            "acct-pro": pro(),
+        }});
+        let metadata = subscription_metadata_from_value(&answer, "acct-pro").unwrap_or_default();
+        assert_eq!(
+            (
+                metadata.account_id.as_str(),
+                metadata.plan_type.as_str(),
+                metadata.plan_limit.as_str()
+            ),
+            ("acct-pro", "pro", ""),
+            "unexpected Pro metadata"
+        );
+    }
+
+    // Go TestSubscriptionMetadataRejectsUnmatchedWorkspace.
+    #[test]
+    fn rejects_unmatched_workspace() {
+        let answer = json!({
+            "accounts": {
+                "acct-team": team(json!({"account_id": "acct-team", "name": "Example Workspace", "structure": "workspace", "plan_type": "team"})),
+                "acct-pro": pro(),
+            },
+            "account_ordering": ["acct-pro", "acct-team"],
+        });
+        assert_eq!(
+            subscription_metadata_from_value(&answer, "acct-missing"),
+            None,
+            "unmatched workspace reported foreign metadata"
+        );
+        // account_ordering names only the login default, not this slot.
+        assert_eq!(
+            subscription_metadata_from_value(&answer, ""),
+            None,
+            "ambiguous multi-workspace login reported metadata"
+        );
+        let metadata = subscription_metadata_from_value(&answer, "acct-team").unwrap_or_default();
+        assert_eq!(
+            (
+                metadata.account_id.as_str(),
+                metadata.plan_type.as_str(),
+                metadata.organization_name.as_str()
+            ),
+            ("acct-team", "business", "Example Workspace"),
+            "preferred team workspace resolved incorrectly"
+        );
+        // An unmatched preference against a sole accessible workspace still
+        // resolves; the caller reports it as an upstream identity change.
+        let moved = json!({
+            "accounts": {"acct-moved": team(json!({"account_id": "acct-moved", "workspace_name": "Different Workspace", "plan_type": "team"}))},
+            "account_ordering": ["acct-moved"],
+        });
+        let metadata = subscription_metadata_from_value(&moved, "acct-team").unwrap_or_default();
+        assert_eq!(
+            (metadata.account_id.as_str(), metadata.plan_type.as_str()),
+            ("acct-moved", "business"),
+            "sole remaining workspace"
+        );
+    }
+
+    // Go TestSubscriptionMetadataResolvesSoleWorkspaceWithoutPreference.
+    #[test]
+    fn resolves_sole_workspace_without_preference() {
+        let answer = json!({"accounts": {
+            "acct-team": team(json!({"account_id": "acct-team", "name": "Example Workspace", "structure": "workspace", "plan_type": "team"})),
+        }});
+        let metadata = subscription_metadata_from_value(&answer, "").unwrap_or_default();
+        assert_eq!(
+            (
+                metadata.account_id.as_str(),
+                metadata.plan_type.as_str(),
+                metadata.organization_name.as_str()
+            ),
+            ("acct-team", "business", "Example Workspace"),
+            "sole workspace resolved incorrectly"
+        );
+    }
+
     #[test]
     fn reads_the_credentials_claims() {
         let id_token = fake_jwt(&json!({
