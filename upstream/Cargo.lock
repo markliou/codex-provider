@@ -742,6 +742,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "openssl-sys",
  "pretty_assertions",
  "regex-lite",

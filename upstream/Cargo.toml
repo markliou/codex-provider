@@ -54,6 +54,8 @@ url = "2"
 # The native endpoint decodes the zstd request bodies a native Codex sends
 # (same version as Codex's own request compression).
 zstd = "0.13.3"
+# kill(2) on a sign-in's process group (login.rs), at the lock's version.
+libc = "0.2.186"
 
 [dev-dependencies]
 assert_matches = "1.5.0"

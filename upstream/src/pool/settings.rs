@@ -67,6 +67,10 @@ pub struct Settings {
     pub reset_credit_consume_url: String,
     pub reset_credits_url: String,
     pub accounts_check_url: String,
+    /// The bundled Codex CLI the pool signs slots in and primes windows with
+    /// (`codex` on PATH; tests point it at a stand-in script, since PATH is
+    /// one per process and tests run in parallel).
+    pub codex_cli: String,
 }
 
 impl Settings {
@@ -103,6 +107,7 @@ impl Settings {
             reset_credit_consume_url: String::new(),
             reset_credits_url: String::new(),
             accounts_check_url: String::new(),
+            codex_cli: "codex".to_string(),
         }
     }
 
@@ -263,6 +268,7 @@ impl Settings {
             accounts_check_url: get("CODEX_POOL_CODEX_ACCOUNTS_CHECK_URL")
                 .trim()
                 .to_string(),
+            codex_cli: "codex".to_string(),
         })
     }
 }

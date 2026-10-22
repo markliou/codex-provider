@@ -132,8 +132,13 @@ pub fn codex_child_environment(
 /// Runs one ephemeral, read-only `codex exec` turn. Its output is the model's
 /// answer and Codex's own diagnostics; neither is kept, and an error reports
 /// only the exit status. The whole process group is killed on timeout.
-pub async fn run_codex_exec_prime(home: &Path, workdir: &Path, model: &str) -> Result<(), String> {
-    let mut command = tokio::process::Command::new("codex");
+pub async fn run_codex_exec_prime(
+    cli: &str,
+    home: &Path,
+    workdir: &Path,
+    model: &str,
+) -> Result<(), String> {
+    let mut command = tokio::process::Command::new(cli);
     command
         .args([
             "exec",
@@ -171,9 +176,14 @@ pub async fn run_codex_exec_prime(home: &Path, workdir: &Path, model: &str) -> R
     }
 }
 
-fn codex_on_path() -> bool {
+/// Whether the CLI exists: a path as given, or a name on PATH (Go
+/// exec.LookPath).
+fn codex_cli_available(cli: &str) -> bool {
+    if cli.contains('/') {
+        return Path::new(cli).is_file();
+    }
     std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("codex").is_file()))
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(cli).is_file()))
 }
 
 /// The prime-grace bookkeeping: when each account's wait ends. In memory:
@@ -400,7 +410,7 @@ impl App {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if runner.is_none() && !codex_on_path() {
+        if runner.is_none() && !codex_cli_available(&self.settings.codex_cli) {
             return Err("bundled Codex CLI is unavailable; quota prime skipped".to_string());
         }
         let auth = self
@@ -456,8 +466,13 @@ impl App {
         let run = match runner {
             Some(runner) => runner(&home, &workdir, model),
             None => {
-                let (home, workdir, model) = (home.clone(), workdir.clone(), model.to_string());
-                Box::pin(async move { run_codex_exec_prime(&home, &workdir, &model).await })
+                let (cli, home, workdir, model) = (
+                    self.settings.codex_cli.clone(),
+                    home.clone(),
+                    workdir.clone(),
+                    model.to_string(),
+                );
+                Box::pin(async move { run_codex_exec_prime(&cli, &home, &workdir, &model).await })
             }
         };
         tokio::time::timeout(QUOTA_PRIME_TIMEOUT, run)

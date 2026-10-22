@@ -152,6 +152,10 @@
   - 程式：`pool/routes.rs`（路由表，照 Go ServeMux 回 404／405）、`pool/native.rs`（原生端點：路徑金鑰、zstd、passthrough）、`pool/responses_ws.rs`（WebSocket：握手時選帳號、預先緩衝內的過載重試、turn state 只交給簽發的帳號）、`pool/listener.rs`（hyper 連線轉成路由請求：前門 peer header、用戶端斷線即取消、panic 回 500）、`pool/admin.rs`（管理頁靜態檔）。
   - 測試：`pool/proxy_tests.rs`、`pool/ws_tests.rs`、`pool/routing_tests.rs` 逐一對應 Go 測試（註解寫 Go 名稱）。上游假伺服器經由真正的 Codex transport；WebSocket 測試的上游是真的 WebSocket 伺服器。Codex 判讀改成在程式內呼叫 Codex 的分類器，日誌內容和 Go 測試預期的一字不差。
   - 留到後段的 Go 測試：吞吐量與儀表板視窗（`TestThroughput*`、`TestManagementThroughputProjection`、prompt cache 視窗與重設）、容量條（`poolCapacity`）、管理動作（額度保護設定、`adminLoginKey`）屬 4.5；`TestStopSignalDrain*` 屬 4.6；額度更新、預熱、重置額度、裝置登入、被拒憑證屬 4.4。
+- 4.4 進度（2026-10-22）：帳號的上游工作已翻完。
+  - 程式：`pool/quota_refresh.rs`（額度更新、工作區與方案、重置額度到期日、輪詢迴圈）、`pool/reset_credit.rs`（照 Codex 的選單選重置額度、重試沿用同一個 redeem key）、`pool/prime.rs`（未開始的視窗等使用者 5–30 分鐘後，用內附的 Codex CLI 跑一輪啟動）、`pool/login.rs`（`codex login --device-auth` 登入工作、身分驗證閘門、取消時整個 process group 一起結束）。
+  - 測試：`pool/quota_tests.rs`、`pool/login_tests.rs`。Go 的登入測試把假的 `codex` 放在 PATH；Rust 測試平行執行、PATH 全程式共用，所以改用設定 `Settings::codex_cli` 指向假腳本，正式環境仍是 PATH 上的 `codex`。
+  - 管理動作的 HTTP 外殼（重置額度、更新額度、登入、取消工作）的邏輯已在上述模組，路由與 session 檢查屬 4.5。
 
 ### 第 5 步：管理介面
 

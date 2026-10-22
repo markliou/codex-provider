@@ -20,6 +20,9 @@ pub mod http_io;
 pub mod installation_id;
 pub mod listener;
 pub mod log;
+pub mod login;
+#[cfg(test)]
+mod login_tests;
 pub mod metadata;
 pub mod native;
 pub mod outcome;

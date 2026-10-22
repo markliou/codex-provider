@@ -153,6 +153,8 @@ pub struct App {
     pub prime_grace: super::prime::PrimeGrace,
     /// Stands in for the bundled Codex CLI in tests (prime.rs).
     pub prime_runner: std::sync::Mutex<Option<Arc<super::prime::PrimeRunner>>>,
+    /// The cancel handle of each running sign-in (login.rs).
+    pub login_cancels: super::login::LoginCancels,
     inner: RwLock<Inner>,
 }
 
@@ -197,6 +199,7 @@ impl App {
             reset_attempts: super::reset_credit::ResetCreditAttempts::default(),
             prime_grace: super::prime::PrimeGrace::default(),
             prime_runner: std::sync::Mutex::new(None),
+            login_cancels: super::login::LoginCancels::default(),
             inner: RwLock::new(inner),
         }
     }
