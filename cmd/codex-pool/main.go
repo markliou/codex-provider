@@ -2297,6 +2297,14 @@ func (a *app) forwardOnce(ctx context.Context, candidate account, endpoint strin
 	if viaTransport {
 		target = a.codexTransportURL + "/forward"
 	}
+	// The account presents its own installation id, not the client's
+	// (installation_id.go).
+	installationID, presentID := "", false
+	if candidate.UpstreamAPIKey == "" && a.usesCodexBackendDirectly(candidate) {
+		if installationID, presentID = a.presentedInstallationID(candidate); presentID {
+			body = withInstallationID(body, installationID)
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -2306,6 +2314,9 @@ func (a *app) forwardOnce(ctx context.Context, candidate account, endpoint strin
 		req.Header.Set("Accept", accept)
 	}
 	forwardCodexMetadataHeaders(req.Header, inbound)
+	if presentID {
+		setTurnMetadataInstallationID(req.Header, installationID)
+	}
 	if candidate.UpstreamAPIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+candidate.UpstreamAPIKey)
 	} else if a.usesCodexBackendDirectly(candidate) {

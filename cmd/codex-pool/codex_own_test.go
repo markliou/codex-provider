@@ -60,6 +60,12 @@ func TestQuotaPrimeRunsCodexWithoutTheRefreshToken(t *testing.T) {
 		if model != "gpt-test" || workdir == "" {
 			t.Fatalf("prime model %q workdir %q", model, workdir)
 		}
+		// The prime's Codex presents the account's installation id, not one
+		// made up for the throwaway home.
+		seenID, _ := os.ReadFile(filepath.Join(home, codexInstallationIDFile))
+		if want, _ := a.accountInstallationID(a.config.Accounts[0]); string(seenID) != want || want == "" {
+			t.Fatalf("prime installation id = %q, want the account's %q", seenID, want)
+		}
 		return nil
 	}
 	if err := a.sendQuotaPrimeRequest(context.Background(), a.config.Accounts[0], "gpt-test"); err != nil {
