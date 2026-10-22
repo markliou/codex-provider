@@ -79,6 +79,13 @@
                 <input id="lineage-affinity-switch" type="checkbox" role="switch">
                 <span class="switch-ui" aria-hidden="true"></span>
               </label>
+              <!-- Off by default: a prime is a request no native Codex sends,
+                   made only to start an idle account's quota window early. -->
+              <label class="switch-row" for="quota-prime-switch" title="Send one small request to start an idle account's quota window">
+                <span class="switch-label">Prime idle accounts</span>
+                <input id="quota-prime-switch" type="checkbox" role="switch">
+                <span class="switch-ui" aria-hidden="true"></span>
+              </label>
               <button id="add-account-button" class="button primary" type="button">Add account</button>
             </div>
           </header>

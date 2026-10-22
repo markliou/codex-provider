@@ -217,6 +217,7 @@ func (a *app) nativeCodexPassthroughAccount(r *http.Request) (account, bool) {
 // the client's Codex headers as forwardOnce does for a conversation.
 func (a *app) sendCodexBackend(ctx context.Context, item account, auth codexAuthInfo, method, target, order string, body []byte, inbound http.Header) (*http.Response, error) {
 	a.noteClientAgent(item.ID, inbound)
+	a.noteAccountActivity(item.ID)
 	viaTransport := a.codexTransportURL != ""
 	endpoint := target
 	if viaTransport {

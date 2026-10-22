@@ -83,10 +83,11 @@ const (
 	// reset time that slides forward with the wall clock instead of counting
 	// down, so the window never actually elapses. quotaWindowAnchorSlack is how
 	// much closer than a full window the reset may sit and still be read as
-	// unanchored. It must exceed the longest refresh interval
-	// (quotaRefreshMaxInterval), because the reported reset
-	// is only as fresh as the snapshot that carried it, and stay far below the
-	// smallest anchored gap observed in practice.
+	// unanchored. It must exceed the age of the snapshot it is judged on,
+	// because the reported reset is only as fresh as the snapshot that carried
+	// it, and stay far below the smallest anchored gap observed in practice.
+	// A snapshot is judged as soon as its poll returns, so the longer poll
+	// interval of an idle account does not age it.
 	quotaWindowAnchorSlack = 10 * time.Minute
 	// quotaPrimeMinInterval floors the spacing between priming attempts on one
 	// account. A successful prime anchors the window and stops the detector on
@@ -102,10 +103,12 @@ const (
 	// routing evidence. Refresh it far less often than quota windows so the
 	// dashboard can show the date without doubling five-minute upstream polling.
 	resetCreditDetailsRefreshInterval = 6 * time.Hour
-	// Quota telemetry is refreshed every four to six minutes. Give one missed poll a
-	// grace interval for display, but do not use freshness itself as a routing
+	// Quota telemetry is refreshed every four to six minutes for an account in
+	// use and every 20 to 30 for an idle one (quota_schedule.go), so fresh
+	// covers the idle cadence plus a grace interval; read sooner it would mark
+	// every idle account stale. Do not use freshness itself as a routing
 	// gate: SPEC section 6.4 deliberately keeps telemetry failures fail-open.
-	quotaTelemetryFreshness  = 10 * time.Minute
+	quotaTelemetryFreshness  = 35 * time.Minute
 	codexAuthReadAttempts    = 20
 	codexAuthReadRetryDelay  = 50 * time.Millisecond
 	upstreamFirstByteTimeout = 45 * time.Second
@@ -167,6 +170,7 @@ type config struct {
 	Accounts         []account         `json:"accounts"`
 	PreserveProQuota *bool             `json:"preserveProQuota,omitempty"`
 	LineageAffinity  *bool             `json:"lineageAffinity,omitempty"`
+	QuotaPrime       *bool             `json:"quotaPrime,omitempty"`
 	CreatedAt        time.Time         `json:"createdAt"`
 	UpdatedAt        time.Time         `json:"updatedAt"`
 }
@@ -612,7 +616,11 @@ type app struct {
 	resetAttempts resetCreditAttempts
 	// refusedCredentials remembers tokens upstream refused for good, so
 	// background work stops asking with them (refused_credential.go).
-	refusedCredentials   refusedCredentials
+	refusedCredentials refusedCredentials
+	// accountActivity is when a request last went to each account; it sets
+	// the account's quota poll cadence (quota_schedule.go).
+	accountActivityMu    sync.Mutex
+	accountActivity      map[string]time.Time
 	config               config
 	state                state
 	dataDir              string
@@ -630,6 +638,7 @@ type app struct {
 	promptCacheRetention string
 	preserveProQuota     bool
 	lineageAffinity      bool
+	quotaPrime           bool
 	listenAddress        string
 	publicDashboard      bool
 	codexBaseURL         string
@@ -770,6 +779,13 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Quota priming defaults off. A prime is a request no native Codex sends,
+	// made only to start an idle account's quota window early; the owner turns
+	// it on from the Console when that trade is wanted (SPEC.md, quota prime).
+	quotaPrime, err := boolFromEnv("CODEX_POOL_QUOTA_PRIME")
+	if err != nil {
+		return nil, err
+	}
 	// Product contract: the combined-port root is a public control page, while
 	// management actions require password auth. A previous hardening pass flipped
 	// this default and broke the expected landing page, so keep the default true
@@ -800,6 +816,7 @@ func newAppFromEnv() (*app, error) {
 		promptCacheRetention: promptCacheRetention,
 		preserveProQuota:     preserveProQuota,
 		lineageAffinity:      lineageAffinity,
+		quotaPrime:           quotaPrime,
 		listenAddress:        listenAddress,
 		publicDashboard:      publicDashboard,
 		codexBaseURL:         strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
@@ -871,6 +888,9 @@ func (a *app) load() error {
 	}
 	if a.config.LineageAffinity != nil {
 		a.lineageAffinity = *a.config.LineageAffinity
+	}
+	if a.config.QuotaPrime != nil {
+		a.quotaPrime = *a.config.QuotaPrime
 	}
 	if configuredDefault := strings.TrimSpace(os.Getenv("CODEX_POOL_DEFAULT_MODEL")); configuredDefault != "" {
 		a.config.DefaultModel = configuredDefault
@@ -1236,6 +1256,11 @@ func (a *app) primeUnanchoredQuotaWindow(ctx context.Context, accountID string, 
 		return
 	}
 	candidate := *item
+	// Off unless the owner turned priming on (newApp, quotaPrime).
+	if !a.quotaPrime {
+		a.mu.Unlock()
+		return
+	}
 	// Pool membership is not a condition. A slot kept out of the pool still owns a
 	// quota window that has to start counting down, and if it never does the
 	// window is still pinned whenever that slot is put back into rotation.
@@ -2292,6 +2317,7 @@ func (a *app) retryCodexBackendAfterRejection(ctx context.Context, candidate acc
 
 func (a *app) forwardOnce(ctx context.Context, candidate account, endpoint string, body []byte, inbound http.Header, auth codexAuthInfo) (*http.Response, error) {
 	a.noteClientAgent(candidate.ID, inbound)
+	a.noteAccountActivity(candidate.ID)
 	viaTransport := a.codexTransportURL != "" && a.usesCodexBackendDirectly(candidate)
 	target := endpoint
 	if viaTransport {
@@ -3933,6 +3959,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		PreserveProQuota *bool `json:"preserveProQuota"`
 		LineageAffinity  *bool `json:"lineageAffinity"`
+		QuotaPrime       *bool `json:"quotaPrime"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&request); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid settings JSON")
@@ -3940,8 +3967,8 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	// Each Console switch posts only its own field, so an omitted field must
 	// leave that setting untouched rather than reset it.
-	if request.PreserveProQuota == nil && request.LineageAffinity == nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "preserveProQuota or lineageAffinity is required")
+	if request.PreserveProQuota == nil && request.LineageAffinity == nil && request.QuotaPrime == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "preserveProQuota, lineageAffinity or quotaPrime is required")
 		return
 	}
 	a.mu.Lock()
@@ -3956,6 +3983,11 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		value := a.lineageAffinity
 		a.config.LineageAffinity = &value
 	}
+	if request.QuotaPrime != nil {
+		a.quotaPrime = *request.QuotaPrime
+		value := a.quotaPrime
+		a.config.QuotaPrime = &value
+	}
 	if err := a.saveLocked(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "storage_error", "unable to persist settings")
 		return
@@ -3964,7 +3996,7 @@ func (a *app) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) adminStateLocked(now time.Time) map[string]any {
-	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "lineageAffinity": a.lineageAffinity, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now), "quotaFloorPercent": quotaExhaustionFloorPercent}
+	return map[string]any{"running": true, "routingStrategy": a.effectiveRoutingStrategy(), "defaultModel": a.config.DefaultModel, "preserveProQuota": a.preserveProQuota, "lineageAffinity": a.lineageAffinity, "quotaPrime": a.quotaPrime, "promptCacheKeyMode": envOrValue(a.promptCacheKeyMode, "auto"), "promptCacheKeyScope": envOrValue(a.promptCacheKeyScope, "auto"), "promptCacheKeyPolicy": envOrValue(a.promptCacheKeyPolicy, "preserve"), "promptCacheBuckets": a.promptCacheBuckets, "promptCacheRetention": a.promptCacheRetention, "promptCache": a.state.PromptCache, "promptCacheWindow": a.promptCacheWindowLocked(), "throughput": a.throughputSnapshotLocked("", now), "routingCacheEvents": a.routingCacheEventViewsLocked(now), "threadBindings": a.state.ThreadBindings, "accounts": publicAccounts(a.config.Accounts), "requestCount": a.state.RequestCount, "successCount": a.state.SuccessCount, "failureCount": a.state.FailureCount, "upstreamResponseFailedCount": a.state.UpstreamResponseFailedCount, "streamIncompleteCount": a.state.StreamIncompleteCount, "summary": a.dashboardSummaryLocked(now), "poolCapacity": a.poolCapacityLocked(now), "quotaFloorPercent": quotaExhaustionFloorPercent}
 }
 
 func (a *app) handlePublicDashboard(w http.ResponseWriter, _ *http.Request) {

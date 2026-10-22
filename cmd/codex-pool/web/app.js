@@ -671,6 +671,12 @@
       lineageSwitch.checked = serviceState?.lineageAffinity !== false;
       lineageSwitch.disabled = false;
     }
+    const primeSwitch = $("#quota-prime-switch");
+    if (primeSwitch) {
+      // Missing means an older server; the product default is off.
+      primeSwitch.checked = serviceState?.quotaPrime === true;
+      primeSwitch.disabled = false;
+    }
     const routingPill = $("#routing-strategy-pill");
     if (routingPill) {
       const balanced = serviceState?.routingStrategy === "sticky_balanced";
@@ -1391,6 +1397,7 @@
   };
   const updatePreserveProQuota = updateSetting("preserveProQuota", false);
   const updateLineageAffinity = updateSetting("lineageAffinity", true);
+  const updateQuotaPrime = updateSetting("quotaPrime", false);
 
   async function watchLoginJob(jobId) {
     let attempts = 0;
@@ -1511,6 +1518,7 @@
   $("#add-account-button").addEventListener("click", createAccountAndStartLogin);
   $("#preserve-pro-quota-switch").addEventListener("change", updatePreserveProQuota);
   $("#lineage-affinity-switch").addEventListener("change", updateLineageAffinity);
+  $("#quota-prime-switch").addEventListener("change", updateQuotaPrime);
   $("#close-device-auth-button").addEventListener("click", () => closeDeviceAuth(true));
   $("#device-auth-dialog").addEventListener("click", (event) => {
     const button = event.target.closest("[data-copy-target]");

@@ -477,6 +477,12 @@ func TestQuotaWindowPrimeSpendsAndLeavesNoRoutingTrace(t *testing.T) {
 	snapshot := quotaSnapshot{AccountID: "only", Quota: &accountQuota{Windows: []quotaWindow{
 		{Label: "Week", WindowMinutes: func() *int64 { v := int64(10080); return &v }(), ResetAt: &resetAt, RemainingPercent: &full, Present: true, Observed: true},
 	}}}
+	// Priming is off until the owner turns it on.
+	a.primeUnanchoredQuotaWindow(context.Background(), "only", snapshot)
+	if hits != 0 || len(a.state.QuotaWindowPrimes) != 0 {
+		t.Fatalf("a prime was sent with priming off: hits=%d", hits)
+	}
+	a.quotaPrime = true
 	a.primeUnanchoredQuotaWindow(context.Background(), "only", snapshot)
 
 	if hits != 1 {
@@ -519,6 +525,7 @@ func TestQuotaWindowPrimeCoversOutOfPoolSlots(t *testing.T) {
 		{Label: "Week", WindowMinutes: func() *int64 { v := int64(10080); return &v }(), ResetAt: &resetAt, RemainingPercent: &full, Present: true, Observed: true},
 	}}}
 	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: false, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
+	a.quotaPrime = true
 	a.primeUnanchoredQuotaWindow(context.Background(), "only", snapshot)
 	if hits != 1 {
 		t.Fatalf("out-of-pool slot was not primed: hits=%d", hits)
@@ -581,6 +588,7 @@ func TestQuotaWindowPrimeSkipsAnchoredAndIneligibleAccounts(t *testing.T) {
 	}
 
 	a := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
+	a.quotaPrime = true
 	a.primeUnanchoredQuotaWindow(context.Background(), "only", snapshotFor(anchored))
 	if hits != 0 {
 		t.Fatalf("anchored window was primed: hits=%d", hits)
@@ -588,6 +596,7 @@ func TestQuotaWindowPrimeSkipsAnchoredAndIneligibleAccounts(t *testing.T) {
 
 	// A disabled slot is not in service at all, so nothing may be spent on it.
 	off := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: false, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
+	off.quotaPrime = true
 	off.primeUnanchoredQuotaWindow(context.Background(), "only", snapshotFor(unanchored))
 	if hits != 0 {
 		t.Fatalf("disabled slot was primed: hits=%d", hits)
@@ -597,6 +606,7 @@ func TestQuotaWindowPrimeSkipsAnchoredAndIneligibleAccounts(t *testing.T) {
 	errored := snapshotFor(unanchored)
 	errored.QuotaError = &quotaErrorInfo{Code: "token_expired"}
 	broken := testApp(t, []account{{ID: "only", AuthType: "provider_api_key", Enabled: true, InPool: true, Priority: 100, UpstreamBaseURL: upstream.URL, AllowedModels: []string{"gpt-test"}}})
+	broken.quotaPrime = true
 	broken.primeUnanchoredQuotaWindow(context.Background(), "only", errored)
 	if hits != 0 {
 		t.Fatalf("errored refresh was primed: hits=%d", hits)
@@ -3093,6 +3103,38 @@ func TestAdminSettingsToggleLineageAffinityKeepsOtherSettings(t *testing.T) {
 	}
 	if recorder := post(`{}`); recorder.Code != http.StatusBadRequest {
 		t.Fatalf("empty settings update returned %d, want 400", recorder.Code)
+	}
+}
+
+func TestAdminSettingsToggleQuotaPrimeKeepsOtherSettings(t *testing.T) {
+	a := testApp(t, nil)
+	cookies, csrf := adminSession(t, a)
+	if a.quotaPrime {
+		t.Fatal("quota priming must be off by default")
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(body))
+		for _, cookie := range cookies {
+			request.AddCookie(cookie)
+		}
+		request.Header.Set("X-CSRF-Token", csrf)
+		recorder := httptest.NewRecorder()
+		a.adminMux().ServeHTTP(recorder, request)
+		return recorder
+	}
+	recorder := post(`{"quotaPrime":true}`)
+	if recorder.Code != http.StatusOK || !a.quotaPrime || !a.lineageAffinity {
+		t.Fatalf("quota prime enable returned %d, prime=%v lineage=%v", recorder.Code, a.quotaPrime, a.lineageAffinity)
+	}
+	if !strings.Contains(recorder.Body.String(), `"quotaPrime":true`) {
+		t.Fatalf("settings response did not include quotaPrime: %s", recorder.Body.String())
+	}
+	var saved config
+	if err := readJSON(filepath.Join(a.dataDir, "config.json"), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.QuotaPrime == nil || !*saved.QuotaPrime {
+		t.Fatalf("settings update did not persist quotaPrime: %#v", saved.QuotaPrime)
 	}
 }
 

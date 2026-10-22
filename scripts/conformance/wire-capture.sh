@@ -82,9 +82,11 @@ CODEX_POOL_IMAGE=$image sh scripts/build-local-image.sh -q >/dev/null
 
 docker network create --internal "$net" >/dev/null
 docker volume create "$volume" >/dev/null
+# Priming is off by default in the pool; the capture turns it on so the prime
+# phase can measure it.
 docker run --rm -v "$volume:/data" -v "$work:/w:ro" alpine:3.21 sh -ceu "
   mkdir -p /data/accounts/conformance/.codex
-  printf '%s' '{\"defaultModel\":\"$model\",\"modelAliases\":{},\"accounts\":[{\"id\":\"conformance\",\"authType\":\"codex_device_auth\",\"enabled\":true,\"inPool\":true,\"priority\":100}]}' > /data/config.json
+  printf '%s' '{\"defaultModel\":\"$model\",\"modelAliases\":{},\"quotaPrime\":true,\"accounts\":[{\"id\":\"conformance\",\"authType\":\"codex_device_auth\",\"enabled\":true,\"inPool\":true,\"priority\":100}]}' > /data/config.json
   # About to expire, so the pool's first use of it is a token refresh.
   cp /w/auth-expiring.json /data/accounts/conformance/.codex/auth.json
   chmod 700 /data/accounts/conformance/.codex
