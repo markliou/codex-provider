@@ -146,6 +146,9 @@ pub struct App {
     /// The distinct sets of native-endpoint client headers already logged as
     /// not relayed (native.rs), bounded at 256.
     pub unrelayed_header_sets: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Reset-credit spends that failed without an upstream verdict, kept for
+    /// a retry to resend (reset_credit.rs).
+    pub reset_attempts: super::reset_credit::ResetCreditAttempts,
     inner: RwLock<Inner>,
 }
 
@@ -187,6 +190,7 @@ impl App {
             in_flight: std::sync::atomic::AtomicI64::new(0),
             turn_state_issuers: std::sync::Mutex::new(HashMap::new()),
             unrelayed_header_sets: std::sync::Mutex::new(std::collections::HashSet::new()),
+            reset_attempts: super::reset_credit::ResetCreditAttempts::default(),
             inner: RwLock::new(inner),
         }
     }

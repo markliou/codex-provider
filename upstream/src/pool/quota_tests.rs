@@ -436,3 +436,339 @@ async fn repair_refresh_refuses_another_upstream_account() {
         "a refused repair wrote quota state"
     );
 }
+
+// ---- reset credits (reset_credit_test.go) ----
+
+// Go TestNativeResetCreditChoiceIsThePickersFirst: available only, soonest
+// expiry first, one without an expiry last, ties in upstream's order (tui
+// reset_credits.rs reset_credit_options).
+#[test]
+fn native_reset_credit_choice_is_the_pickers_first() {
+    use super::reset_credit::ResetCreditListing;
+    use super::reset_credit::native_reset_credit_choice;
+    for (name, raw, want) in [
+        (
+            "soonest expiry first",
+            r#"{"available_count":3,"credits":[{"id":"late","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-11-30T00:00:00Z"},{"id":"never","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":null},{"id":"soon","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-10-22T00:00:00Z"}]}"#,
+            "soon",
+        ),
+        (
+            "only available credits",
+            r#"{"available_count":1,"credits":[{"id":"spent","status":"redeemed","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-10-21T00:00:00Z"},{"id":"busy","status":"redeeming","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-10-21T00:00:00Z"},{"id":"left","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-12-01T00:00:00Z"}]}"#,
+            "left",
+        ),
+        (
+            "ties keep upstream order",
+            r#"{"available_count":2,"credits":[{"id":"first","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-11-01T00:00:00Z"},{"id":"second","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-11-01T00:00:00Z"}]}"#,
+            "first",
+        ),
+        // app-server rejects a listing with a timestamp it cannot parse, and
+        // the picker falls back to an option without an id.
+        (
+            "unparsable expiry names none",
+            r#"{"available_count":1,"credits":[{"id":"odd","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"tomorrow"}]}"#,
+            "",
+        ),
+        (
+            "unparsable grant names none",
+            r#"{"available_count":1,"credits":[{"id":"odd","status":"available","granted_at":"","expires_at":"2026-11-01T00:00:00Z"}]}"#,
+            "",
+        ),
+        (
+            "no available count names none",
+            r#"{"available_count":0,"credits":[{"id":"x","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":null}]}"#,
+            "",
+        ),
+    ] {
+        let listing: ResetCreditListing =
+            serde_json::from_str(raw).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(native_reset_credit_choice(&listing), want, "{name}");
+    }
+}
+
+/// Go resetCreditUpstream: the listing, the consume answers in order (the
+/// last repeats), and a usage read for the refresh after a verdict.
+fn reset_credit_upstream(
+    answers: Vec<FakeResponse>,
+) -> impl Fn(&RecordedRequest) -> FakeResponse + Send + Sync + 'static {
+    let answers = std::sync::Mutex::new(answers);
+    move |request| {
+        match request.path.as_str() {
+        "/backend-api/wham/rate-limit-reset-credits" => json(
+            r#"{"available_count":2,"credits":[{"id":"credit-late","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-12-01T00:00:00Z"},{"id":"credit-soon","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-10-22T00:00:00Z"}]}"#.to_string(),
+        ),
+        "/backend-api/wham/rate-limit-reset-credits/consume" => {
+            let mut answers = answers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let answer = &answers[0];
+            let copy = FakeResponse {
+                status: answer.status,
+                headers: answer.headers.clone(),
+                chunks: answer.chunks.clone(),
+            };
+            if answers.len() > 1 {
+                answers.remove(0);
+            }
+            copy
+        }
+        _ => json(
+            r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000}},"rate_limit_reset_credits":{"available_count":1}}"#.to_string(),
+        ),
+    }
+    }
+}
+
+async fn reset_credit_app(server: &FakeServer) -> (Arc<App>, TempDir) {
+    let (app, dir) = backend_app(server, vec![device_account("acct", "", 100)]);
+    super::testing::write_test_codex_auth_tokens(&app, "acct", "<access-token>", "<refresh-token>");
+    app.write().state.quotas_mut().insert(
+        "acct".into(),
+        super::state::QuotaSnapshot {
+            account_id: "acct".into(),
+            quota: Some(AccountQuota {
+                reset_credits: Some(QuotaResetCredits {
+                    available_count: Some(2),
+                    ..QuotaResetCredits::default()
+                }),
+                ..AccountQuota::default()
+            }),
+            ..super::state::QuotaSnapshot::default()
+        },
+    );
+    (app, dir)
+}
+
+/// Go pressResetCredit (the admin session check joins with the admin API in
+/// 4.5).
+async fn press_reset_credit(app: &App) -> (u16, serde_json::Value) {
+    let mut recorder = super::http_io::Recorder::new();
+    super::reset_credit::handle_reset_credit(app, "acct", &mut recorder).await;
+    let result = recorder.result();
+    (
+        result.code(),
+        serde_json::from_slice(&result.body).unwrap_or_default(),
+    )
+}
+
+/// The consume bodies, and how many listings came before each: a resend must
+/// not list again, while a new spend does.
+fn consumes(server: &FakeServer) -> (Vec<String>, Vec<usize>) {
+    let mut listings = 0;
+    let mut bodies = Vec::new();
+    let mut listings_at = Vec::new();
+    for request in server.requests() {
+        match request.path.as_str() {
+            "/backend-api/wham/rate-limit-reset-credits" => listings += 1,
+            "/backend-api/wham/rate-limit-reset-credits/consume" => {
+                bodies.push(request.body_string());
+                listings_at.push(listings);
+            }
+            _ => {}
+        }
+    }
+    (bodies, listings_at)
+}
+
+// Go TestResetCreditSpendsTheSoonestExpiringCredit (with Go
+// TestConsumeResetCreditBodyIsCodexs's field order on the wire).
+#[tokio::test]
+async fn reset_credit_spends_the_soonest_expiring_credit() {
+    let server = FakeServer::start(reset_credit_upstream(vec![json(
+        r#"{"code":"reset"}"#.to_string(),
+    )]))
+    .await;
+    let (app, _dir) = reset_credit_app(&server).await;
+    let (code, body) = press_reset_credit(&app).await;
+    assert!(
+        code == 200 && body["consumed"] == true,
+        "reset returned {code} {body}"
+    );
+    let (bodies, listings_at) = consumes(&server);
+    assert!(
+        listings_at[0] > 0,
+        "the spend did not list the credits first"
+    );
+    let sent: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap_or_default();
+    assert!(
+        sent["credit_id"] == "credit-soon"
+            && sent["redeem_request_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+        "consume body {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].starts_with(r#"{"redeem_request_id":"#),
+        "consume body must keep Codex's field order: {}",
+        bodies[0]
+    );
+    // The credit id is upstream's identifier: it goes to the consume request
+    // and nowhere else.
+    assert!(
+        !body.to_string().contains("credit-soon"),
+        "the credit id reached the admin response"
+    );
+}
+
+// Go TestResetCreditRetryResendsTheFailedAttempt: a failed spend is resent
+// unchanged by the next press, as Codex's "Try again" resends it.
+#[tokio::test]
+async fn reset_credit_retry_resends_the_failed_attempt() {
+    let server = FakeServer::start(reset_credit_upstream(vec![
+        FakeResponse::status(502),
+        json(r#"{"code":"already_redeemed"}"#.to_string()),
+        json(r#"{"code":"reset"}"#.to_string()),
+    ]))
+    .await;
+    let (app, _dir) = reset_credit_app(&server).await;
+    assert_eq!(press_reset_credit(&app).await.0, 502, "failed spend");
+    let (code, body) = press_reset_credit(&app).await;
+    assert!(
+        code == 200 && body["consumed"] == true,
+        "resent spend returned {code} {body}"
+    );
+    let (bodies, listings_at) = consumes(&server);
+    assert!(
+        bodies.len() == 2 && bodies[0] == bodies[1] && listings_at[1] == listings_at[0],
+        "retry was not a resend: {listings_at:?} {bodies:?}"
+    );
+    // The verdict ended that attempt: the next press is a new spend.
+    assert_eq!(press_reset_credit(&app).await.0, 200, "next spend");
+    let (bodies, listings_at) = consumes(&server);
+    assert!(
+        listings_at[2] > listings_at[1] && bodies[2] != bodies[1],
+        "a spend after a verdict reused the old attempt: {listings_at:?}"
+    );
+}
+
+// Go TestResetCreditNamedCreditGone: no_credit for a named credit means that
+// credit is gone, not that the account has none.
+#[tokio::test]
+async fn reset_credit_named_credit_gone() {
+    let server = FakeServer::start(reset_credit_upstream(vec![json(
+        r#"{"code":"no_credit"}"#.to_string(),
+    )]))
+    .await;
+    let (app, _dir) = reset_credit_app(&server).await;
+    let (code, body) = press_reset_credit(&app).await;
+    assert!(
+        code == 200
+            && body["consumed"] == false
+            && body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("no longer available")),
+        "named no_credit returned {code} {body}"
+    );
+}
+
+async fn reset_app_with_credits(server: &FakeServer, credits: i64) -> (Arc<App>, TempDir) {
+    let (app, dir) = reset_credit_app(server).await;
+    if let Some(snapshot) = app.write().state.quotas_mut().get_mut("acct")
+        && let Some(reset) = snapshot
+            .quota
+            .as_mut()
+            .and_then(|quota| quota.reset_credits.as_mut())
+    {
+        reset.available_count = Some(credits);
+    }
+    (app, dir)
+}
+
+// Go TestAdminResetCreditConsumesAndRefreshes (the admin session check joins
+// with the admin API in 4.5).
+#[tokio::test]
+async fn admin_reset_credit_consumes_and_refreshes() {
+    let server = FakeServer::start(|request| match request.path.as_str() {
+        "/backend-api/wham/rate-limit-reset-credits/consume" => {
+            // Upstream reads redeem_request_id and rejects the request when it
+            // is absent; only the name upstream actually reads passes here.
+            if request.json()["redeem_request_id"].as_str().unwrap_or_default().is_empty() {
+                return FakeResponse::json(400, r#"{"detail":"redeem_request_id must not be empty"}"#);
+            }
+            json(r#"{"code":"reset","windows_reset":1}"#.to_string())
+        }
+        "/backend-api/wham/usage" => json(
+            r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000}},"rate_limit_reset_credits":{"available_count":2}}"#.to_string(),
+        ),
+        _ => json("{}".to_string()),
+    })
+    .await;
+    let (app, _dir) = reset_app_with_credits(&server, 3).await;
+    let (code, body) = press_reset_credit(&app).await;
+    assert_eq!(code, 200, "reset credit: {body}");
+    assert!(
+        body["outcome"] == "reset"
+            && body["consumed"] == true
+            && body["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+        "outcome not reported: {body}"
+    );
+    let requests = server.requests();
+    let consumed: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path == "/backend-api/wham/rate-limit-reset-credits/consume")
+        .collect();
+    assert_eq!(
+        consumed.len(),
+        1,
+        "one credit spent means exactly one upstream consume"
+    );
+    // An id upstream rejects is indistinguishable from one it never saw, so a
+    // retry could spend a second credit. Upstream documents a UUID.
+    let key = consumed[0].json()["redeem_request_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let parts: Vec<&str> = key.split('-').collect();
+    assert!(
+        parts.iter().map(|part| part.len()).collect::<Vec<_>>() == [8, 4, 4, 4, 12]
+            && key.chars().all(|character| character == '-'
+                || character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+            && parts[2].starts_with('4')
+            && parts[3].starts_with(['8', '9', 'a', 'b']),
+        "consume request key {key:?} is not a version 4 UUID"
+    );
+    // The reset changes the windows the dashboard shows, so it must re-read
+    // them.
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path == "/backend-api/wham/usage"),
+        "quota was not refreshed after the reset"
+    );
+}
+
+// Go TestAdminResetCreditReportsARefusalHonestly.
+#[tokio::test]
+async fn admin_reset_credit_reports_a_refusal_honestly() {
+    let server = FakeServer::start(|request| {
+        if request.path == "/backend-api/wham/rate-limit-reset-credits/consume" {
+            return json(r#"{"code":"nothing_to_reset"}"#.to_string());
+        }
+        json(r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000}}}"#.to_string())
+    })
+    .await;
+    let (app, _dir) = reset_app_with_credits(&server, 1).await;
+    let (code, body) = press_reset_credit(&app).await;
+    assert_eq!(code, 200, "declined reset: {body}");
+    // The pool sanitizes metadata to lowercase; upstream's spelling is
+    // snake_case.
+    assert!(
+        body["outcome"] == "nothing_to_reset" && body["consumed"] == false,
+        "a refusal was reported as a spend: {body}"
+    );
+}
+
+// Go TestAdminResetCreditRefusesWithoutCredits.
+#[tokio::test]
+async fn admin_reset_credit_refuses_without_credits() {
+    let server = FakeServer::start(|_| json(r#"{"code":"reset"}"#.to_string())).await;
+    let (app, _dir) = reset_app_with_credits(&server, 0).await;
+    let (code, _) = press_reset_credit(&app).await;
+    assert_eq!(code, 409, "reset without credits");
+    assert_eq!(
+        server.count(),
+        0,
+        "upstream was called with no credit available"
+    );
+}

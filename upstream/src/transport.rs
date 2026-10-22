@@ -405,6 +405,16 @@ pub enum SendFailure {
     Prepare(String),
 }
 
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("request timed out"),
+            Self::Connection(detail) => write!(f, "connection failed: {detail}"),
+            Self::Prepare(detail) => write!(f, "request could not be prepared: {detail}"),
+        }
+    }
+}
+
 /// Assembles a request as Codex's request type does: the headers set before
 /// the body step in native order (`order` names them for a non-Responses
 /// request, see UPSTREAM_HEADER_ORDER), the body step, and the headers a
