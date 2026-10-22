@@ -478,3 +478,20 @@ pub async fn send_request(
         Err(error) => Err(SendFailure::Connection(error.to_string())),
     }
 }
+
+/// Assembles one of the pool's own calls, as composed by own_call.rs: the
+/// headers before the body step, the JSON body (the body step adds its
+/// content-type), and the headers a client adds after it.
+pub fn build_own_call(
+    composed: crate::pool::own_call::Composed,
+) -> Result<(CodexRequest, HeaderMap), String> {
+    let mut codex_request = CodexRequest::new(composed.method, composed.url);
+    codex_request.headers = composed.before_body;
+    if let Some(json) = composed.json_body {
+        let raw = serde_json::from_slice::<&serde_json::value::RawValue>(&json)
+            .map_err(|error| error.to_string())?;
+        let encoded = EncodedJsonBody::encode(raw).map_err(|error| error.to_string())?;
+        codex_request.body = Some(RequestBody::EncodedJson(encoded));
+    }
+    Ok((codex_request, composed.after_body))
+}

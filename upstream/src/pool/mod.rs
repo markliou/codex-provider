@@ -9,6 +9,7 @@
 //! Keep a single copy of them there; a second copy here could drift.
 
 pub mod app;
+pub mod credentials;
 pub mod crypto;
 pub mod gojson;
 pub mod gosort;

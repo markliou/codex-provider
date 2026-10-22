@@ -57,6 +57,16 @@ pub struct Settings {
     /// CODEX_POOL_QUOTA_PRIME_GRACE: a fixed grace for tests; None draws one
     /// at random (codex_prime.go, quota prime grace).
     pub quota_prime_grace: Option<Duration>,
+    /// Codex's token endpoint and OAuth client (CODEX_REFRESH_TOKEN_URL_OVERRIDE
+    /// and CODEX_APP_SERVER_LOGIN_CLIENT_ID, the variables Codex itself reads).
+    pub refresh_url: String,
+    pub oauth_client_id: String,
+    /// Endpoint overrides for the pool's own calls (tests, wire-capture);
+    /// empty means the Codex backend's path under codex_base_url.
+    pub usage_url: String,
+    pub reset_credit_consume_url: String,
+    pub reset_credits_url: String,
+    pub accounts_check_url: String,
 }
 
 impl Settings {
@@ -87,7 +97,50 @@ impl Settings {
             lineage_affinity: true,
             quota_prime: false,
             quota_prime_grace: Some(Duration::ZERO),
+            refresh_url: CODEX_REFRESH_URL_DEFAULT.to_string(),
+            oauth_client_id: CODEX_OAUTH_CLIENT_ID_DEFAULT.to_string(),
+            usage_url: String::new(),
+            reset_credit_consume_url: String::new(),
+            reset_credits_url: String::new(),
+            accounts_check_url: String::new(),
         }
+    }
+
+    pub fn codex_url(&self, override_url: &str, path: &str) -> String {
+        if override_url.trim().is_empty() {
+            format!("{}{path}", self.codex_base_url.trim_end_matches('/'))
+        } else {
+            override_url.trim().to_string()
+        }
+    }
+
+    pub fn codex_usage_url(&self) -> String {
+        self.codex_url(&self.usage_url, "/wham/usage")
+    }
+
+    /// The upstream endpoint that spends one earned reset credit and clears
+    /// the account's eligible rate-limit windows.
+    pub fn codex_reset_credit_consume_url(&self) -> String {
+        self.codex_url(
+            &self.reset_credit_consume_url,
+            "/wham/rate-limit-reset-credits/consume",
+        )
+    }
+
+    pub fn codex_reset_credits_url(&self) -> String {
+        self.codex_url(&self.reset_credits_url, "/wham/rate-limit-reset-credits")
+    }
+
+    pub fn codex_accounts_check_url(&self) -> String {
+        self.codex_url(&self.accounts_check_url, "/wham/accounts/check")
+    }
+
+    /// Where a native Codex CLI signed in with ChatGPT sends Responses
+    /// requests: the Codex backend under /codex. The bare backend-api root is
+    /// only for quota, account, and subscription endpoints; sending inference
+    /// there instead reaches a different API.
+    pub fn codex_responses_base_url(&self) -> String {
+        format!("{}/codex", self.codex_base_url.trim_end_matches('/'))
     }
 
     pub fn from_env(env: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
@@ -194,6 +247,22 @@ impl Settings {
             lineage_affinity,
             quota_prime,
             quota_prime_grace,
+            refresh_url: env_or(
+                &get("CODEX_REFRESH_TOKEN_URL_OVERRIDE"),
+                CODEX_REFRESH_URL_DEFAULT,
+            ),
+            oauth_client_id: env_or(
+                &get("CODEX_APP_SERVER_LOGIN_CLIENT_ID"),
+                CODEX_OAUTH_CLIENT_ID_DEFAULT,
+            ),
+            usage_url: get("CODEX_POOL_CODEX_USAGE_URL").trim().to_string(),
+            reset_credit_consume_url: get("CODEX_POOL_CODEX_RESET_CREDIT_CONSUME_URL")
+                .trim()
+                .to_string(),
+            reset_credits_url: get("CODEX_POOL_CODEX_RESET_CREDITS_URL").trim().to_string(),
+            accounts_check_url: get("CODEX_POOL_CODEX_ACCOUNTS_CHECK_URL")
+                .trim()
+                .to_string(),
         })
     }
 }

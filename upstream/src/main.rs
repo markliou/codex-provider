@@ -30,9 +30,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use codex_http_client::EncodedJsonBody;
 use codex_http_client::Request as CodexRequest;
-use codex_http_client::RequestBody;
 use codex_http_client::RequestCompression;
 use codex_vendor::pool::own_call;
 use codex_vendor::pool::own_call::OwnCall;
@@ -185,20 +183,13 @@ async fn own(
             return plain(StatusCode::BAD_REQUEST, None, format!("own call: {error}"));
         }
     };
-    let mut codex_request = CodexRequest::new(composed.method, composed.url);
-    codex_request.headers = composed.before_body;
-    if let Some(json) = composed.json_body {
-        let encoded = serde_json::from_slice::<&serde_json::value::RawValue>(&json)
-            .map_err(|error| error.to_string())
-            .and_then(|raw| EncodedJsonBody::encode(raw).map_err(|error| error.to_string()));
-        match encoded {
-            Ok(encoded) => codex_request.body = Some(RequestBody::EncodedJson(encoded)),
-            Err(error) => {
-                return plain(StatusCode::BAD_REQUEST, None, format!("own call: {error}"));
-            }
+    let (codex_request, after) = match build_own_call(composed) {
+        Ok(built) => built,
+        Err(error) => {
+            return plain(StatusCode::BAD_REQUEST, None, format!("own call: {error}"));
         }
-    }
-    send(&transports, codex_request, &composed.after_body).await
+    };
+    send(&transports, codex_request, &after).await
 }
 
 /// Opens the upstream Responses WebSocket for one pool connection and, once it

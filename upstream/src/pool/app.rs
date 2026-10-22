@@ -126,6 +126,13 @@ pub struct App {
     pub settings: Arc<Settings>,
     pub tuning: Tuning,
     pub logger: Arc<Logger>,
+    /// Codex's own HTTP and WebSocket clients (crate::transport).
+    pub transports: Arc<crate::transport::Transports>,
+    /// One per account: a token refresh holds it across the network call, so
+    /// two requests never spend the same rotating refresh token.
+    pub auth_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Credentials upstream refused for good (credentials.rs).
+    pub refused: super::credentials::RefusedCredentials,
     inner: RwLock<Inner>,
 }
 
@@ -136,6 +143,7 @@ impl App {
         config: Config,
         state: RuntimeState,
         logger: Logger,
+        transports: Arc<crate::transport::Transports>,
     ) -> Self {
         let settings = Arc::new(settings);
         let logger = Arc::new(logger);
@@ -159,6 +167,9 @@ impl App {
             settings,
             tuning,
             logger,
+            transports,
+            auth_locks: std::sync::Mutex::new(HashMap::new()),
+            refused: super::credentials::RefusedCredentials::default(),
             inner: RwLock::new(inner),
         }
     }
@@ -199,6 +210,10 @@ impl App {
             config,
             initialized_state(RuntimeState::default()),
             Logger::discard(),
+            Arc::new(
+                crate::transport::Transports::new()
+                    .unwrap_or_else(|error| panic!("Codex transport: {error}")),
+            ),
         )
     }
 
@@ -220,6 +235,7 @@ impl App {
         settings: Settings,
         tuning: Tuning,
         logger: Logger,
+        transports: Arc<crate::transport::Transports>,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
         let data_dir = settings.data_dir.clone();
@@ -238,7 +254,14 @@ impl App {
             .map_err(|error| format!("read runtime state: {error}"))?
             .unwrap_or_default();
         config.model_aliases_mut();
-        let app = Self::new(settings, tuning, config, initialized_state(state), logger);
+        let app = Self::new(
+            settings,
+            tuning,
+            config,
+            initialized_state(state),
+            logger,
+            transports,
+        );
         {
             let mut inner = app.write();
             let now = Timestamp::now();
@@ -1271,6 +1294,7 @@ mod tests {
             Settings::for_test(dir.path().to_path_buf()),
             Tuning::default(),
             Logger::discard(),
+            Arc::new(crate::transport::Transports::new().unwrap_or_else(|error| panic!("{error}"))),
             |_| None,
         )
         .unwrap_or_else(|error| panic!("{error}"));
