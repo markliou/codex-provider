@@ -21,14 +21,17 @@ pub mod metadata;
 pub mod outcome;
 pub mod own_call;
 pub mod plan;
+pub mod proxy;
 pub mod quota;
 pub mod quota_schedule;
 pub mod response_info;
 pub mod routing;
 #[cfg(test)]
 mod routing_tests;
+pub mod server;
 pub mod settings;
 pub mod state;
+pub mod status;
 pub mod stream;
 #[cfg(test)]
 pub mod testing;

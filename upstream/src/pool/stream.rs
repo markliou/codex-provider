@@ -219,7 +219,7 @@ pub fn precommit_lifecycle_sse_block(block: &str) -> bool {
 }
 
 /// Writes the response headers when the retry window commits.
-pub type BeforeCommit = dyn FnMut(&mut dyn ResponseWriter) + Send;
+pub type BeforeCommit<'a> = dyn FnMut(&mut dyn ResponseWriter) + Send + 'a;
 
 #[derive(Debug, Default)]
 pub struct StreamingProxyResult {
@@ -237,7 +237,7 @@ pub async fn copy_streaming_proxy_response_with_precommit(
     reader: &mut SseReader,
     max_bytes: usize,
     tuning: &Tuning,
-    mut before_commit: Option<&mut BeforeCommit>,
+    mut before_commit: Option<&mut BeforeCommit<'_>>,
 ) -> StreamingProxyResult {
     let mut info = ProxyResponseInfo::default();
     let mut buffered: Vec<u8> = Vec::new();

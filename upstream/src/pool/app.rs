@@ -133,6 +133,13 @@ pub struct App {
     pub auth_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Credentials upstream refused for good (credentials.rs).
     pub refused: super::credentials::RefusedCredentials,
+    /// When a request last went to each account; it sets the account's quota
+    /// poll cadence (quota_schedule.rs).
+    pub account_activity: std::sync::Mutex<HashMap<String, Timestamp>>,
+    /// Provider requests (responses, compact, chat) whose handler has not
+    /// returned, streams included. The shutdown drain and the deploy script's
+    /// idle wait both read it.
+    pub in_flight: std::sync::atomic::AtomicI64,
     inner: RwLock<Inner>,
 }
 
@@ -170,6 +177,8 @@ impl App {
             transports,
             auth_locks: std::sync::Mutex::new(HashMap::new()),
             refused: super::credentials::RefusedCredentials::default(),
+            account_activity: std::sync::Mutex::new(HashMap::new()),
+            in_flight: std::sync::atomic::AtomicI64::new(0),
             inner: RwLock::new(inner),
         }
     }

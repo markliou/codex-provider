@@ -86,6 +86,126 @@ pub fn write_streaming_bytes(writer: &mut dyn ResponseWriter, data: &[u8]) {
     writer.flush();
 }
 
+// ---- the caller going away ----
+
+/// Go's request context: cancelled when the client disconnects, so the
+/// request path stops instead of spending upstream capacity on a caller that
+/// already gave up.
+#[derive(Clone, Default)]
+pub struct Cancel {
+    inner: Arc<(std::sync::atomic::AtomicBool, tokio::sync::Notify)>,
+}
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.inner
+            .0
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.1.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.inner.1.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Waits out `delay`; false when the caller went away first (Go
+    /// sleepForRetry).
+    pub async fn sleep(&self, delay: std::time::Duration) -> bool {
+        tokio::select! {
+            () = tokio::time::sleep(delay) => true,
+            () = self.cancelled() => false,
+        }
+    }
+}
+
+/// Go's http.Header: canonical names (textproto.CanonicalMIMEHeaderKey), each
+/// with its values in order. Go writes a request's headers sorted by name, and
+/// the hop to codex-upstream carried them in that order, which decides where
+/// the Codex headers that no native order names land; keeping the map sorted
+/// keeps that order.
+#[derive(Clone, Debug, Default)]
+pub struct GoHeader(pub std::collections::BTreeMap<String, Vec<String>>);
+
+pub fn canonical_header_key(name: &str) -> String {
+    let token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    if !name.chars().all(token) {
+        return name.to_string();
+    }
+    let mut upper = true;
+    name.chars()
+        .map(|c| {
+            let out = if upper {
+                c.to_ascii_uppercase()
+            } else {
+                c.to_ascii_lowercase()
+            };
+            upper = c == '-';
+            out
+        })
+        .collect()
+}
+
+impl GoHeader {
+    pub fn from_map(headers: &HeaderMap) -> Self {
+        let mut out = Self::default();
+        for (name, value) in headers {
+            if let Ok(value) = value.to_str() {
+                out.add(name.as_str(), value);
+            }
+        }
+        out
+    }
+
+    pub fn get(&self, name: &str) -> &str {
+        self.0
+            .get(&canonical_header_key(name))
+            .and_then(|values| values.first())
+            .map_or("", String::as_str)
+    }
+
+    pub fn set(&mut self, name: &str, value: &str) {
+        self.0
+            .insert(canonical_header_key(name), vec![value.to_string()]);
+    }
+
+    pub fn add(&mut self, name: &str, value: &str) {
+        self.0
+            .entry(canonical_header_key(name))
+            .or_default()
+            .push(value.to_string());
+    }
+
+    pub fn del(&mut self, name: &str) {
+        self.0.remove(&canonical_header_key(name));
+    }
+
+    /// The headers in the order Go writes them.
+    pub fn to_map(&self) -> HeaderMap {
+        let mut out = HeaderMap::new();
+        for (name, values) in &self.0 {
+            let Ok(name) = HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()) else {
+                continue;
+            };
+            for value in values {
+                if let Ok(value) = HeaderValue::from_str(value) {
+                    out.append(name.clone(), value);
+                }
+            }
+        }
+        out
+    }
+}
+
 // ---- a real connection ----
 
 pub struct ChannelWriter {
