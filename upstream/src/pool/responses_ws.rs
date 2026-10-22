@@ -159,19 +159,16 @@ struct WsResponse {
     account_id: String,
     warmup: bool,
     finished: AtomicBool,
-    /// The fields below belong to the upstream relay. message is the request
-    /// as sent, kept so an overload can be retried with the same bytes;
-    /// buffered holds the lifecycle preamble Codex has not been shown yet.
+    /// The fields below belong to the upstream relay. buffered holds the
+    /// lifecycle preamble Codex has not been shown yet.
     state: Mutex<ResponseState>,
 }
 
 struct ResponseState {
     info: ProxyResponseInfo,
     throughput: Option<ThroughputMeasurement>,
-    message: Bytes,
     buffered: Vec<Bytes>,
     committed: bool,
-    overload_retries: u32,
 }
 
 struct SessionState {
@@ -531,10 +528,8 @@ async fn start_response(
         state: Mutex::new(ResponseState {
             info: ProxyResponseInfo::default(),
             throughput,
-            message: message.clone(),
             buffered: Vec::new(),
             committed: false,
-            overload_retries: 0,
         }),
     });
     let upstream = {
@@ -851,13 +846,20 @@ fn start_relay(session: &Arc<Session>, socket: crate::transport::UpstreamSocket)
 /// HTTP stream. Lifecycle events are held until the first event carrying
 /// content, because a native Codex does not retry an overload that arrives
 /// without retry advice: it shows "Selected model is at capacity" and stops
-/// the turn. While nothing has reached Codex, an overload is retried on this
-/// socket, so on this account and against the same connection state, by
-/// resending the identical request after the same-account backoff, which is
-/// exactly what a Codex retry would send. When that schedule is spent, or the
-/// account's allowance or credential failed, the account is cooled and the
-/// socket closed without showing the failure: Codex treats a dropped socket as
-/// retryable, reconnects and resends in full, and routing moves the whole
+/// the turn. A capacity, transient or authentication failure before content
+/// is never shown to Codex and never retried on this socket: a native Codex
+/// drops a socket on any failed response ("A terminal stream error should
+/// reach the caller immediately", codex-api endpoint/responses_websocket.rs
+/// stream_request) and its retry opens a new one and resends in full. A resend
+/// on the failed socket was not what Codex sends: it went out while upstream
+/// was still finishing the failed response, read that response's trailing
+/// response.failed as its own, resent again, and upstream then closed the
+/// socket, so one turn reached upstream four times instead of twice. The pool
+/// closes the upstream socket at once and Codex's socket after the
+/// same-account backoff, so Codex makes the retry itself. An overload inside
+/// the same-account schedule leaves the account uncooled, and Codex's
+/// reconnect lands on it again; past the schedule, or when the allowance or
+/// credential failed, the account is cooled and routing moves the whole
 /// lineage. A failure after content has reached Codex is relayed as it is.
 async fn relay_upstream<S>(
     session: Arc<Session>,
@@ -918,49 +920,36 @@ async fn relay_upstream<S>(
                 continue;
             }
         }
-        if !info.terminal_event.is_empty() && info.terminal_event != "response.completed" {
-            let retries = lock(&response.state).overload_retries;
-            if transient_overload_code(&info.terminal_error_code)
-                && retries < OVERLOAD_SAME_ACCOUNT_RETRY_LIMIT
-            {
-                let resend = {
-                    let mut state = lock(&response.state);
-                    state.overload_retries += 1;
-                    state.buffered.clear();
-                    state.info = ProxyResponseInfo::default();
-                    state.message.clone()
-                };
-                app.mark_retryable_terminal_response_failure(
-                    &response.account_id,
-                    &response.model,
-                    &info,
-                    false,
-                );
-                let backoff = app.tuning.overload_retry_backoff * (1 << retries);
+        if !info.terminal_event.is_empty()
+            && info.terminal_event != "response.completed"
+            && (retryable_terminal_failure_class(&info.terminal_failure_class)
+                || info.terminal_failure_class == "authentication")
+        {
+            // Some(n): the nth overload in a row on this account and model,
+            // still inside the same-account schedule.
+            let retry = transient_overload_code(&info.terminal_error_code)
+                .then(|| app.note_ws_overload_drop(&response.account_id, &response.model))
+                .filter(|drops| *drops <= OVERLOAD_SAME_ACCOUNT_RETRY_LIMIT);
+            app.mark_retryable_terminal_response_failure(
+                &response.account_id,
+                &response.model,
+                &info,
+                retry.is_none(),
+            );
+            session.state().active = None;
+            finish(&session, &response, false, true);
+            upstream.close(1000, "");
+            if let Some(drops) = retry {
+                // The backoff a retry on this account waited before, kept so
+                // Codex's reconnect does not reach upstream sooner than the
+                // pool's own resend did.
+                let backoff = app.tuning.overload_retry_backoff * (1 << (drops - 1));
                 if !session.closed.sleep(backoff).await {
                     return;
                 }
-                if !upstream.send(Frame::Text(resend)) {
-                    upstream_gone(&session, &upstream);
-                    return;
-                }
-                continue;
             }
-            if retryable_terminal_failure_class(&info.terminal_failure_class)
-                || info.terminal_failure_class == "authentication"
-            {
-                app.mark_retryable_terminal_response_failure(
-                    &response.account_id,
-                    &response.model,
-                    &info,
-                    true,
-                );
-                session.state().active = None;
-                finish(&session, &response, false, true);
-                session.close_client(1012, "upstream account unavailable");
-                upstream.close(1000, "");
-                return;
-            }
+            session.close_client(1012, "upstream account unavailable");
+            return;
         }
         // First content, or a failure that is the caller's own: release the
         // held preamble and stream from here on.
@@ -1054,6 +1043,7 @@ fn finish(session: &Arc<Session>, response: &Arc<WsResponse>, delivered: bool, c
             app.finish_throughput_measurement(&mut measurement);
         } else if info.terminal_event == "response.completed" {
             measurement.success = true;
+            app.clear_ws_overload_drops(&response.account_id, &response.model);
             app.mark_success_with_measurement(
                 &response.route,
                 &response.model,
@@ -1209,6 +1199,34 @@ fn mark_websocket_terminal(info: &mut ProxyResponseInfo) {
 }
 
 impl App {
+    /// Counts an overload that closed a socket before content, per account
+    /// and model, and returns the count. Each one hands the retry to Codex's
+    /// reconnect, a new socket, so the same-account schedule is kept here
+    /// rather than on the socket; the count past the schedule cools the
+    /// account and starts over.
+    pub fn note_ws_overload_drop(&self, account_id: &str, model: &str) -> u32 {
+        let mut drops = self
+            .ws_overload_drops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = format!("{account_id}\n{model}");
+        let count = drops.entry(key.clone()).or_insert(0);
+        *count += 1;
+        let count = *count;
+        if count > OVERLOAD_SAME_ACCOUNT_RETRY_LIMIT {
+            drops.remove(&key);
+        }
+        count
+    }
+
+    /// A completed response ends the account's run of overloads.
+    pub fn clear_ws_overload_drops(&self, account_id: &str, model: &str) {
+        self.ws_overload_drops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&format!("{account_id}\n{model}"));
+    }
+
     pub fn note_turn_state_issuer(&self, value: &str, account_id: &str) {
         if value.is_empty() || account_id.is_empty() {
             return;

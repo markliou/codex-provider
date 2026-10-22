@@ -143,6 +143,9 @@ pub struct App {
     /// Which account issued each turn state seen on a socket, so a message
     /// presenting it reaches only that account (responses_ws.rs).
     pub turn_state_issuers: std::sync::Mutex<HashMap<String, (String, Timestamp)>>,
+    /// Overloads in a row that closed a socket before content, per account
+    /// and model: the WebSocket same-account schedule (responses_ws.rs).
+    pub ws_overload_drops: std::sync::Mutex<HashMap<String, u32>>,
     /// The distinct sets of native-endpoint client headers already logged as
     /// not relayed (native.rs), bounded at 256.
     pub unrelayed_header_sets: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -197,6 +200,7 @@ impl App {
             account_activity: std::sync::Mutex::new(HashMap::new()),
             in_flight: std::sync::atomic::AtomicI64::new(0),
             turn_state_issuers: std::sync::Mutex::new(HashMap::new()),
+            ws_overload_drops: std::sync::Mutex::new(HashMap::new()),
             unrelayed_header_sets: std::sync::Mutex::new(std::collections::HashSet::new()),
             reset_attempts: super::reset_credit::ResetCreditAttempts::default(),
             prime_grace: super::prime::PrimeGrace::default(),
