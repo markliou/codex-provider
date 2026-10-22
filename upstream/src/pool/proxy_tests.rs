@@ -5325,3 +5325,144 @@ fn routing_identity_keeps_logins_and_members_apart() {
         "one person in two workspaces is two identities"
     );
 }
+
+// Go TestCodexModelCatalogAdvertisesReasoningCapabilities: Codex
+// deserializes these fields without serde defaults, so the raw keys are
+// checked; an omitted required field restarts Codex's model refresh loop.
+#[tokio::test]
+async fn codex_model_catalog_advertises_reasoning_capabilities() {
+    let (app, _dir) = arc_app(Vec::new());
+    app.write().config.default_model = "gpt-5.5(xhigh)".into();
+    let request = Request::test(Method::GET, "/v1/models?client_version=0.142.4", "")
+        .with_header("authorization", "Bearer client-key");
+    let result = serve(&app, request).await;
+    assert_eq!(
+        result.code(),
+        200,
+        "Codex model catalog: {}",
+        result.body_string()
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&result.body).unwrap_or_default();
+    let models = payload["models"].as_array().cloned().unwrap_or_default();
+    assert!(!models.is_empty(), "Codex model catalog is empty");
+    let model = models
+        .iter()
+        .find(|model| model["slug"] == "gpt-5.5")
+        .cloned()
+        .unwrap_or_else(|| panic!("catalog omitted gpt-5.5"));
+    for field in [
+        "slug",
+        "display_name",
+        "description",
+        "supported_reasoning_levels",
+        "shell_type",
+        "visibility",
+        "supported_in_api",
+        "priority",
+        "availability_nux",
+        "upgrade",
+        "base_instructions",
+        "supports_reasoning_summaries",
+        "supports_reasoning_summary_parameter",
+        "support_verbosity",
+        "default_verbosity",
+        "apply_patch_tool_type",
+        "truncation_policy",
+        "supports_parallel_tool_calls",
+        "experimental_supported_tools",
+    ] {
+        assert!(
+            model.get(field).is_some(),
+            "model metadata missing required field {field:?}"
+        );
+    }
+    assert!(
+        model["id"] == "gpt-5.5"
+            && model["context_window"] == 272000
+            && model["default_reasoning_level"] == "xhigh",
+        "{model}"
+    );
+    assert_eq!(model["priority"], 0, "default model priority");
+    assert!(
+        model["shell_type"] == "shell_command"
+            && model["visibility"] == "list"
+            && model["supported_in_api"] == true
+    );
+    assert!(
+        model["base_instructions"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+            && model["apply_patch_tool_type"] == "freeform"
+            && model["supports_parallel_tool_calls"] == true
+    );
+    assert!(
+        model["supports_reasoning_summaries"] == true
+            && model["supports_reasoning_summary_parameter"] == true
+    );
+    assert!(
+        model["truncation_policy"]["mode"] == "tokens"
+            && model["truncation_policy"]["limit"] == 10000
+    );
+    assert_eq!(
+        model["input_modalities"],
+        serde_json::json!(["text", "image"])
+    );
+    let levels = model["supported_reasoning_levels"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(levels.len(), 4);
+    for (index, effort) in ["low", "medium", "high", "xhigh"].iter().enumerate() {
+        assert!(
+            levels[index]["effort"] == *effort
+                && levels[index]["description"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty()),
+            "reasoning level {index}"
+        );
+    }
+    assert!(
+        !result.body_string().contains("gpt-5.5(xhigh)"),
+        "Codex model catalog exposed legacy reasoning suffix"
+    );
+    let generic = serve(
+        &app,
+        Request::test(Method::GET, "/v1/models", "")
+            .with_header("authorization", "Bearer client-key"),
+    )
+    .await;
+    assert!(
+        generic.body_string().contains("gpt-5.5(xhigh)"),
+        "generic model list lost legacy reasoning alias compatibility"
+    );
+}
+
+// Go TestFrontPeerRestoresTheClientAddress (the in-flight half; the admin
+// login key behind a trusted proxy joins with the admin API in 4.5).
+#[tokio::test]
+async fn front_peer_restores_the_client_address() {
+    let (app, _dir) = arc_app(Vec::new());
+    app.in_flight.store(3, std::sync::atomic::Ordering::SeqCst);
+    for (remote, peer, want) in [
+        ("127.0.0.1:50000", "192.168.3.1:41000", 404),
+        ("127.0.0.1:50000", "[2001:db8::1]:41000", 404),
+        ("127.0.0.1:50000", "127.0.0.1:41000", 200),
+        // A client claiming loopback from the network is not believed.
+        ("192.168.3.1:41000", "127.0.0.1:1", 404),
+        ("127.0.0.1:50000", "not-an-address", 200),
+    ] {
+        let mut request = Request::test(Method::GET, "/internal/inflight", "")
+            .with_header("x-codex-pool-peer", peer);
+        let socket: std::net::SocketAddr = remote.parse().unwrap_or_else(|error| panic!("{error}"));
+        request.remote_addr = super::listener::remote_address(&mut request.headers, socket);
+        assert!(
+            request.headers.get("x-codex-pool-peer").is_none(),
+            "the peer header must not reach a handler"
+        );
+        assert_eq!(
+            serve(&app, request).await.code(),
+            want,
+            "{peer} via {remote}"
+        );
+    }
+}

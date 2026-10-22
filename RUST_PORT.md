@@ -148,6 +148,10 @@
   - 4.4 帳號的上游工作：讀寫 `auth.json`、refresh、額度輪詢、預熱、重置額度、被拒憑證、裝置登入。
   - 4.5 管理介面與儀表板 API、登入與 session（原第 5 步）。
   - 4.6 切換：前門改為本地處理，移除轉給 Go 的路徑。
+- 4.3 進度（2026-10-22）：請求流程已翻完，前門尚未接上。
+  - 程式：`pool/routes.rs`（路由表，照 Go ServeMux 回 404／405）、`pool/native.rs`（原生端點：路徑金鑰、zstd、passthrough）、`pool/responses_ws.rs`（WebSocket：握手時選帳號、預先緩衝內的過載重試、turn state 只交給簽發的帳號）、`pool/listener.rs`（hyper 連線轉成路由請求：前門 peer header、用戶端斷線即取消、panic 回 500）、`pool/admin.rs`（管理頁靜態檔）。
+  - 測試：`pool/proxy_tests.rs`、`pool/ws_tests.rs`、`pool/routing_tests.rs` 逐一對應 Go 測試（註解寫 Go 名稱）。上游假伺服器經由真正的 Codex transport；WebSocket 測試的上游是真的 WebSocket 伺服器。Codex 判讀改成在程式內呼叫 Codex 的分類器，日誌內容和 Go 測試預期的一字不差。
+  - 留到後段的 Go 測試：吞吐量與儀表板視窗（`TestThroughput*`、`TestManagementThroughputProjection`、prompt cache 視窗與重設）、容量條（`poolCapacity`）、管理動作（額度保護設定、`adminLoginKey`）屬 4.5；`TestStopSignalDrain*` 屬 4.6；額度更新、預熱、重置額度、裝置登入、被拒憑證屬 4.4。
 
 ### 第 5 步：管理介面
 

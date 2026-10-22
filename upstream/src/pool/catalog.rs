@@ -421,4 +421,50 @@ mod tests {
             );
         }
     }
+
+    // Go TestCodexModelCatalogAdvertisesGPT6.
+    #[test]
+    fn catalog_advertises_gpt6() {
+        let (app, _dir) = test_app(Vec::new());
+        app.write().config.default_model = "gpt-5.5(xhigh)".into();
+        let inner = app.read();
+        let models = inner.codex_model_catalog(&inner.models());
+        let by_slug = |slug: &str| models.iter().find(|model| model.slug == slug).cloned();
+        let astra = by_slug("gpt-6-astra").unwrap_or_else(|| panic!("catalog missing gpt-6-astra"));
+        let efforts: Vec<&str> = astra
+            .supported_reasoning_levels
+            .iter()
+            .map(|level| level.effort)
+            .collect();
+        assert_eq!(
+            efforts.join(","),
+            "low,medium,high,xhigh,max,ultra",
+            "gpt-6 reasoning levels"
+        );
+        let sol = by_slug("gpt-5.6-sol").unwrap_or_else(|| panic!("catalog missing gpt-5.6-sol"));
+        assert!(
+            astra.priority < sol.priority,
+            "gpt-6 must outrank the gpt-5.6 family"
+        );
+    }
+
+    // Go TestCodexModelCatalogKeepsExtendedDefaultReasoningTierOn56.
+    #[test]
+    fn catalog_keeps_extended_default_reasoning_tier_on_56() {
+        let (app, _dir) = test_app(Vec::new());
+        app.write().config.default_model = "gpt-5.6-sol(ultra)".into();
+        let inner = app.read();
+        let models = inner.codex_model_catalog(&inner.models());
+        assert!(
+            models[0].slug == "gpt-5.6-sol" && models[0].default_reasoning_level == "ultra",
+            "gpt-5.6 default reasoning tier was not preserved"
+        );
+        let aliases = inner.models().join("\n");
+        for expected in ["gpt-5.6-sol(max)", "gpt-5.6-sol(ultra)"] {
+            assert!(
+                aliases.contains(expected),
+                "generic model list missing {expected}"
+            );
+        }
+    }
 }

@@ -1335,4 +1335,82 @@ mod tests {
         assert_eq!(written.accounts()[0].email, "owner@example.test");
         assert!(dir.path().join("state").join("runtime.json").exists());
     }
+
+    fn load_from(
+        dir: &crate::pool::testing::TempDir,
+        configure: impl FnOnce(&mut Settings),
+    ) -> App {
+        let mut settings = Settings::for_test(dir.path().to_path_buf());
+        configure(&mut settings);
+        App::load(
+            settings,
+            Tuning::default(),
+            Logger::discard(),
+            Arc::new(crate::transport::Transports::new().unwrap_or_else(|error| panic!("{error}"))),
+            |_| None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    // Go TestDefaultModelEnvOverridesPersistedConfig.
+    #[test]
+    fn default_model_env_overrides_persisted_config() {
+        let dir = crate::pool::testing::TempDir::new();
+        let config = serde_json::json!({"defaultModel": "gpt-5.4", "modelAliases": {}});
+        if let Err(error) = std::fs::write(dir.path().join("config.json"), config.to_string()) {
+            panic!("{error}");
+        }
+        let app = load_from(&dir, |settings| {
+            settings.default_model_override = Some("gpt-5.5(xhigh)".into())
+        });
+        assert_eq!(app.read().config.default_model, "gpt-5.5(xhigh)");
+    }
+
+    // Go TestLoadMigratesLegacyThroughputBucketsIntoMemoryOnly.
+    #[test]
+    fn load_migrates_legacy_throughput_buckets_into_memory_only() {
+        let dir = crate::pool::testing::TempDir::new();
+        let _ = std::fs::create_dir_all(dir.path().join("state"));
+        let bucket_at = Timestamp::now()
+            .truncate(crate::pool::time::minutes(30))
+            .add(-crate::pool::time::minutes(5));
+        let legacy = serde_json::json!({
+            "throughputBuckets": [{
+                "bucketAt": bucket_at,
+                "accountId": "legacy-slot",
+                "requestCount": 3,
+                "inputTokens": 900,
+                "cachedTokens": 600,
+            }],
+        });
+        if let Err(error) = std::fs::write(
+            dir.path().join("state").join("runtime.json"),
+            legacy.to_string(),
+        ) {
+            panic!("{error}");
+        }
+        let app = load_from(&dir, |_| {});
+        {
+            let inner = app.read();
+            assert!(
+                inner.throughput_buckets.len() == 1
+                    && inner.throughput_buckets[0].account_id == "legacy-slot",
+                "legacy throughput was not imported into memory"
+            );
+            assert!(
+                inner
+                    .state
+                    .throughput_buckets
+                    .as_ref()
+                    .is_none_or(Vec::is_empty),
+                "legacy persisted throughput field was retained"
+            );
+        }
+        let persisted = std::fs::read_to_string(dir.path().join("state").join("runtime.json"))
+            .unwrap_or_default();
+        assert!(
+            !persisted.contains("throughputBuckets"),
+            "migrated throughput was written back to runtime.json: {persisted}"
+        );
+    }
 }
