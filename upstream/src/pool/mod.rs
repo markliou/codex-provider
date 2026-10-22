@@ -29,7 +29,10 @@ pub mod proxy;
 #[cfg(test)]
 mod proxy_tests;
 pub mod quota;
+pub mod quota_refresh;
 pub mod quota_schedule;
+#[cfg(test)]
+mod quota_tests;
 pub mod response_info;
 pub mod responses_ws;
 pub mod routes;

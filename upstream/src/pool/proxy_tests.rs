@@ -2074,7 +2074,7 @@ pub(super) fn codex_app(server_url: &str, slots: &[(&str, &str, i64)]) -> (Arc<A
     (Arc::new(fast_overload(app)), dir)
 }
 
-fn account(app: &App, index: usize) -> Account {
+pub(super) fn account(app: &App, index: usize) -> Account {
     app.read().config.accounts()[index].clone()
 }
 
@@ -2909,7 +2909,7 @@ async fn responses_proxy_injects_prompt_cache_controls_and_tracks_usage() {
 
 // ---- chat completions, routing events and device-auth failover ----
 
-fn write_auth(app: &App, id: &str, auth: &str) {
+pub(super) fn write_auth(app: &App, id: &str, auth: &str) {
     let home = app.read().account_codex_home(id);
     std::fs::create_dir_all(&home).unwrap_or_else(|error| panic!("{error}"));
     std::fs::write(home.join("auth.json"), auth).unwrap_or_else(|error| panic!("{error}"));
