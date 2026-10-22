@@ -171,6 +171,14 @@ pub enum ForwardError {
     Transport(String),
 }
 
+impl std::fmt::Display for ForwardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auth(detail) | Self::Transport(detail) => f.write_str(detail),
+        }
+    }
+}
+
 pub fn parse_model(value: &str) -> (String, String) {
     if let (Some(start), Some(end)) = (value.rfind('('), value.rfind(')'))
         && start > 0

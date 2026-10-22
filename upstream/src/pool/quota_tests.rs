@@ -772,3 +772,540 @@ async fn admin_reset_credit_refuses_without_credits() {
         "upstream was called with no credit available"
     );
 }
+
+// ---- the poll and the quota prime ----
+
+use super::state::QuotaSnapshot;
+use super::state::QuotaWindow;
+
+fn week_window(reset_at: Option<i64>, remaining: f64) -> QuotaWindow {
+    QuotaWindow {
+        label: "Week".into(),
+        window_minutes: Some(10080),
+        reset_at,
+        remaining_percent: Some(remaining),
+        present: true,
+        observed: true,
+        ..QuotaWindow::default()
+    }
+}
+
+fn windows_quota(windows: Vec<QuotaWindow>) -> AccountQuota {
+    AccountQuota {
+        windows,
+        ..AccountQuota::default()
+    }
+}
+
+// Go TestUnanchoredBudgetWindowDetection.
+#[test]
+fn unanchored_budget_window_detection() {
+    use super::prime::unanchored_budget_window;
+    use super::time::minutes;
+    let now = Timestamp::parse("2026-09-08T02:00:00Z").unwrap_or_else(|error| panic!("{error}"));
+    let at = |delta: chrono::TimeDelta| Some(now.add(delta).unix());
+    for (name, quota, want) in [
+        (
+            "full window ahead and untouched",
+            windows_quota(vec![week_window(at(hours(7 * 24)), 100.0)]),
+            true,
+        ),
+        (
+            "snapshot age stays within the slack",
+            windows_quota(vec![week_window(at(hours(7 * 24) - minutes(4)), 100.0)]),
+            true,
+        ),
+        (
+            "already counting down",
+            windows_quota(vec![week_window(at(hours(7 * 24) - minutes(50)), 100.0)]),
+            false,
+        ),
+        (
+            "untouched but well into the window",
+            windows_quota(vec![week_window(at(hours(3 * 24)), 100.0)]),
+            false,
+        ),
+        (
+            "already spent against",
+            windows_quota(vec![week_window(at(hours(7 * 24)), 96.0)]),
+            false,
+        ),
+        (
+            "no reset reported",
+            windows_quota(vec![week_window(None, 100.0)]),
+            false,
+        ),
+        ("nothing reported", AccountQuota::default(), false),
+    ] {
+        assert_eq!(
+            unanchored_budget_window(&quota, now).is_some(),
+            want,
+            "{name}"
+        );
+    }
+}
+
+// Go TestUnanchoredBudgetWindowPrefersTheLongestWindow.
+#[test]
+fn unanchored_budget_window_prefers_the_longest_window() {
+    let now = Timestamp::parse("2026-09-08T02:00:00Z").unwrap_or_else(|error| panic!("{error}"));
+    let five_hours = QuotaWindow {
+        label: "5h".into(),
+        window_minutes: Some(300),
+        ..week_window(Some(now.add(hours(5)).unix()), 100.0)
+    };
+    let quota = windows_quota(vec![
+        five_hours,
+        week_window(Some(now.add(hours(7 * 24)).unix()), 100.0),
+    ]);
+    assert_eq!(
+        super::prime::unanchored_budget_window(&quota, now).map(|window| window.label),
+        Some("Week".to_string())
+    );
+}
+
+fn unanchored_snapshot() -> QuotaSnapshot {
+    QuotaSnapshot {
+        account_id: "only".into(),
+        quota: Some(windows_quota(vec![week_window(
+            Some(Timestamp::now().add(hours(7 * 24)).unix()),
+            100.0,
+        )])),
+        ..QuotaSnapshot::default()
+    }
+}
+
+fn anchored_snapshot() -> QuotaSnapshot {
+    QuotaSnapshot {
+        account_id: "only".into(),
+        quota: Some(windows_quota(vec![week_window(
+            Some(Timestamp::now().add(hours(7 * 24 - 1)).unix()),
+            100.0,
+        )])),
+        ..QuotaSnapshot::default()
+    }
+}
+
+/// Go's provider slot that a prime reaches over HTTP: {ID: "only", AuthType:
+/// provider_api_key, AllowedModels: [gpt-test]}.
+fn prime_slot(server: &FakeServer, enabled: bool, in_pool: bool) -> Account {
+    Account {
+        enabled,
+        in_pool,
+        allowed_models: vec!["gpt-test".into()],
+        ..super::proxy_tests::api_slot("only", "", 100, &server.url)
+    }
+}
+
+/// Go testApp with the prime grace fixed at zero, as Go's testApp sets it.
+fn prime_app(accounts: Vec<Account>, grace: std::time::Duration) -> (Arc<App>, TempDir) {
+    let (app, dir) = super::testing::test_app_with(accounts, |settings| {
+        settings.quota_prime_grace = Some(grace)
+    });
+    (Arc::new(app), dir)
+}
+
+// Go TestQuotaWindowPrimeSpendsAndLeavesNoRoutingTrace.
+#[tokio::test]
+async fn quota_window_prime_spends_and_leaves_no_routing_trace() {
+    let server =
+        FakeServer::start(|_| FakeResponse::json(200, r#"{"id":"resp_prime","output":[]}"#)).await;
+    let (app, _dir) = prime_app(
+        vec![prime_slot(&server, true, true)],
+        std::time::Duration::ZERO,
+    );
+    let snapshot = unanchored_snapshot();
+    // Nothing is primed while the owner has priming off.
+    app.write().quota_prime = false;
+    app.prime_unanchored_quota_window("only", &snapshot).await;
+    assert!(
+        server.count() == 0 && app.read().state.quota_window_primes().is_empty(),
+        "a prime was sent with priming off"
+    );
+    app.write().quota_prime = true;
+    app.prime_unanchored_quota_window("only", &snapshot).await;
+    assert_eq!(server.count(), 1, "prime request count");
+    assert_eq!(
+        server.requests()[0].json()["model"],
+        "gpt-test",
+        "prime must name the slot's allowed model"
+    );
+    {
+        let inner = app.read();
+        let state = &inner.state;
+        assert!(
+            state.sticky_sessions().is_empty()
+                && state.response_bindings().is_empty()
+                && state.routing_cache_events().is_empty(),
+            "prime left routing state behind"
+        );
+        assert_eq!(
+            (
+                state.request_count,
+                state.success_count,
+                state.failure_count
+            ),
+            (0, 0, 0),
+            "prime counted as a client request"
+        );
+        let health = state.health().get("only").cloned().unwrap_or_default();
+        assert!(
+            health.last_success_at.is_zero() && health.consecutive_failure == 0,
+            "prime touched account health"
+        );
+    }
+    // The interval floor must stop a second prime on the same window.
+    app.prime_unanchored_quota_window("only", &snapshot).await;
+    assert_eq!(
+        server.count(),
+        1,
+        "prime repeated inside the interval floor"
+    );
+}
+
+// Go TestQuotaWindowPrimeCoversOutOfPoolSlots.
+#[tokio::test]
+async fn quota_window_prime_covers_out_of_pool_slots() {
+    let server =
+        FakeServer::start(|_| FakeResponse::json(200, r#"{"id":"resp_prime","output":[]}"#)).await;
+    let (app, _dir) = prime_app(
+        vec![prime_slot(&server, true, false)],
+        std::time::Duration::ZERO,
+    );
+    app.write().quota_prime = true;
+    app.prime_unanchored_quota_window("only", &unanchored_snapshot())
+        .await;
+    assert_eq!(server.count(), 1, "out-of-pool slot was not primed");
+}
+
+// Go TestQuotaPrimeIdentityOwnerIsStableAcrossPoolMembership.
+#[test]
+fn quota_prime_identity_owner_is_stable_across_pool_membership() {
+    let slot = |id: &str, workspace: &str, email: &str, in_pool: bool| Account {
+        email: email.into(),
+        in_pool,
+        ..device_account(id, workspace, 100)
+    };
+    let (app, _dir) = super::testing::test_app(vec![
+        slot("slot-b", "workspace-1", "a@example.test", true),
+        slot("slot-a", "workspace-1", "a@example.test", false),
+        slot("slot-c", "workspace-2", "b@example.test", true),
+    ]);
+    for id in ["slot-a", "slot-b", "slot-c"] {
+        super::testing::write_test_codex_auth_tokens(&app, id, "<access-token>", "<refresh-token>");
+    }
+    let inner = app.read();
+    // The out-of-pool copy still competes for ownership, which the routing
+    // duplicate guard would not have allowed.
+    for id in ["slot-a", "slot-b"] {
+        let item = inner.account(id).cloned().unwrap_or_default();
+        assert_eq!(
+            inner.quota_prime_identity_owner(&item),
+            "slot-a",
+            "identity owner for {id}"
+        );
+    }
+    let other = inner.account("slot-c").cloned().unwrap_or_default();
+    assert_eq!(inner.quota_prime_identity_owner(&other), "slot-c");
+}
+
+// Go TestQuotaWindowPrimeSkipsAnchoredAndIneligibleAccounts.
+#[tokio::test]
+async fn quota_window_prime_skips_anchored_and_ineligible_accounts() {
+    let server =
+        FakeServer::start(|_| FakeResponse::json(200, r#"{"id":"resp_prime","output":[]}"#)).await;
+    let (app, _dir) = prime_app(
+        vec![prime_slot(&server, true, true)],
+        std::time::Duration::ZERO,
+    );
+    app.write().quota_prime = true;
+    app.prime_unanchored_quota_window("only", &anchored_snapshot())
+        .await;
+    assert_eq!(server.count(), 0, "anchored window was primed");
+    // A disabled slot is not in service at all, so nothing may be spent on it.
+    let (off, _off_dir) = prime_app(
+        vec![prime_slot(&server, false, true)],
+        std::time::Duration::ZERO,
+    );
+    off.write().quota_prime = true;
+    off.prime_unanchored_quota_window("only", &unanchored_snapshot())
+        .await;
+    assert_eq!(server.count(), 0, "disabled slot was primed");
+    // A failed refresh carries no evidence about the window.
+    let mut errored = unanchored_snapshot();
+    errored.quota_error = Some(super::state::QuotaErrorInfo {
+        code: "token_expired".into(),
+        ..super::state::QuotaErrorInfo::default()
+    });
+    let (broken, _broken_dir) = prime_app(
+        vec![prime_slot(&server, true, true)],
+        std::time::Duration::ZERO,
+    );
+    broken.write().quota_prime = true;
+    broken.prime_unanchored_quota_window("only", &errored).await;
+    assert_eq!(server.count(), 0, "errored refresh was primed");
+}
+
+// Go TestQuotaPrimeWaitsForTheUserFirst.
+#[tokio::test]
+async fn quota_prime_waits_for_the_user_first() {
+    let server =
+        FakeServer::start(|_| FakeResponse::json(200, r#"{"id":"resp_prime","output":[]}"#)).await;
+    let (app, _dir) = prime_app(
+        vec![prime_slot(&server, true, true)],
+        std::time::Duration::from_secs(600),
+    );
+    app.write().quota_prime = true;
+    app.prime_unanchored_quota_window("only", &unanchored_snapshot())
+        .await;
+    app.prime_unanchored_quota_window("only", &unanchored_snapshot())
+        .await;
+    assert_eq!(server.count(), 0, "primed inside the grace");
+    let due = app
+        .prime_grace_due("only")
+        .unwrap_or_else(|| panic!("no grace is waiting"));
+    let left = due.sub(&Timestamp::now());
+    assert!(
+        left >= super::time::minutes(9) && left <= super::time::minutes(10),
+        "grace due in {left:?}"
+    );
+    // The user used the account: the window anchored and the wait is dropped.
+    app.prime_unanchored_quota_window("only", &anchored_snapshot())
+        .await;
+    assert!(
+        app.prime_grace_due("only").is_none() && server.count() == 0,
+        "an anchored window kept its wait or was primed"
+    );
+    // Untouched again, and this time the grace runs out.
+    app.prime_unanchored_quota_window("only", &unanchored_snapshot())
+        .await;
+    app.prime_grace
+        .set("only", Timestamp::now().add(-super::time::seconds(1)));
+    app.prime_unanchored_quota_window("only", &unanchored_snapshot())
+        .await;
+    assert_eq!(
+        server.count(),
+        1,
+        "an untouched window was not primed after the grace"
+    );
+    assert!(
+        app.prime_grace_due("only").is_none(),
+        "the wait outlived its prime"
+    );
+}
+
+// Go TestQuotaPrimeGraceIsRandomUnlessFixedForTests (the random draw; the
+// fixed override's parsing is settings.rs quota_prime_grace).
+#[test]
+fn quota_prime_grace_is_random_unless_fixed_for_tests() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..50 {
+        let grace = super::prime::random_quota_prime_grace();
+        assert!(
+            grace >= std::time::Duration::from_secs(300)
+                && grace <= std::time::Duration::from_secs(1800),
+            "grace {grace:?} outside [5m, 30m]"
+        );
+        seen.insert(grace);
+    }
+    assert!(
+        seen.len() >= 40,
+        "the grace is not random: {} distinct in 50",
+        seen.len()
+    );
+    assert_eq!(
+        super::settings::quota_prime_grace("0s"),
+        Ok(Some(std::time::Duration::ZERO)),
+        "a fixed grace was not honored"
+    );
+    assert!(
+        super::settings::quota_prime_grace("soon").is_err(),
+        "an invalid grace was accepted"
+    );
+}
+
+/// What a stand-in prime runner saw: its home, the auth.json, config.toml
+/// and installation id written there, and the model.
+type SeenPrime = (std::path::PathBuf, String, String, String, String);
+
+// Go TestQuotaPrimeRunsCodexWithoutTheRefreshToken.
+#[tokio::test]
+async fn quota_prime_runs_codex_without_the_refresh_token() {
+    let (app, _dir) = super::testing::test_app(vec![device_account("device", "acct-device", 0)]);
+    super::testing::write_codex_device_auth(&app, "device", "acct-device", "device@example.test");
+    let auth_path = app.read().account_codex_home("device").join("auth.json");
+    let before = std::fs::read(&auth_path).unwrap_or_default();
+    let item = account(&app, 0);
+    let current = app
+        .read()
+        .codex_auth(&item)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let installation = app.presented_installation_id(&item).unwrap_or_default();
+    let seen: Arc<std::sync::Mutex<Option<SeenPrime>>> = Arc::default();
+    let record = seen.clone();
+    app.set_prime_runner(Arc::new(
+        move |home: &std::path::Path, workdir: &std::path::Path, model: &str| {
+            let auth = std::fs::read_to_string(home.join("auth.json")).unwrap_or_default();
+            let config = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+            let id = std::fs::read_to_string(home.join("installation_id")).unwrap_or_default();
+            let workdir_ok = if workdir.as_os_str().is_empty() {
+                String::new()
+            } else {
+                model.to_string()
+            };
+            if let Ok(mut seen) = record.lock() {
+                *seen = Some((home.to_path_buf(), auth, config, id, workdir_ok));
+            }
+            Box::pin(async { Ok(()) })
+        },
+    ));
+    app.send_quota_prime_request(&item, "gpt-test")
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    let (home, auth, config, id, model) = seen
+        .lock()
+        .ok()
+        .and_then(|seen| seen.clone())
+        .unwrap_or_else(|| panic!("a Codex account was not primed by Codex"));
+    let file: serde_json::Value = serde_json::from_str(&auth).unwrap_or_default();
+    assert_eq!(
+        file["tokens"]["refresh_token"], "",
+        "the prime's Codex must have no refresh token: refreshing would revoke the pool's copy"
+    );
+    assert!(
+        file["auth_mode"] == "chatgpt"
+            && file["tokens"]["access_token"] == current.access_token.as_str()
+            && file["tokens"]["account_id"] == "acct-device"
+            && file["last_refresh"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+        "prime credential = {auth}"
+    );
+    assert!(
+        config.contains(r#"model = "gpt-test""#)
+            && config.contains(r#"cli_auth_credentials_store = "file""#),
+        "prime config = {config}"
+    );
+    assert_eq!(model, "gpt-test", "prime model or workdir");
+    // The prime's Codex presents the account's installation id, not one made
+    // up for the throwaway home.
+    assert!(
+        !installation.is_empty() && id == installation,
+        "prime installation id"
+    );
+    assert!(
+        !home.exists(),
+        "the prime's home must be removed afterwards"
+    );
+    assert_eq!(
+        std::fs::read(&auth_path).unwrap_or_default(),
+        before,
+        "the prime changed the account's own credential"
+    );
+}
+
+// Go TestCodexChildEnvironmentCarriesNoPoolSecrets.
+#[test]
+fn codex_child_environment_carries_no_pool_secrets() {
+    let environment = |name: &str| match name {
+        "CODEX_POOL_API_KEY" => Some("<pool-key>".to_string()),
+        "CODEX_POOL_ADMIN_PASSWORD_HASH" => Some("<admin-hash>".to_string()),
+        "SSL_CERT_FILE" => Some("/certs/ca.pem".to_string()),
+        _ => None,
+    };
+    let env =
+        super::prime::codex_child_environment(std::path::Path::new("/tmp/prime/home"), environment);
+    let joined: Vec<String> = env
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    assert!(
+        !joined.iter().any(|line| line.contains("CODEX_POOL_")),
+        "Codex child saw pool secrets: {joined:?}"
+    );
+    assert!(
+        joined.contains(&"CODEX_HOME=/tmp/prime/home".to_string())
+            && joined.contains(&"SSL_CERT_FILE=/certs/ca.pem".to_string()),
+        "{joined:?}"
+    );
+}
+
+// Go TestRevokedCredentialStopsQuotaPollingUntilLoginChangesIt.
+#[tokio::test]
+async fn revoked_credential_stops_quota_polling_until_login_changes_it() {
+    let revoked = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let flag = revoked.clone();
+    let server = FakeServer::start(move |_| {
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            // The code upstream answered for a deactivated account (production
+            // log, 2026-10-21); Codex has no fixture for it.
+            return FakeResponse::json(401, r#"{"error":{"code":"token_revoked"}}"#);
+        }
+        json(r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":18000}}}"#.to_string())
+    })
+    .await;
+    let (app, _dir) = backend_app(&server, vec![device_account("gone", "", 100)]);
+    super::testing::write_test_codex_auth_tokens(&app, "gone", "<access-token>", "<refresh-token>");
+    app.refresh_all_codex_quotas().await;
+    let first = server.count();
+    assert!(first > 0, "the first poll did not ask upstream");
+    assert!(
+        app.credential_refused(&account(&app, 0)),
+        "a 401 token_revoked was not recorded as a refused credential"
+    );
+    for _ in 0..3 {
+        app.refresh_all_codex_quotas().await;
+    }
+    assert_eq!(
+        server.count(),
+        first,
+        "polls after the refusal asked upstream again"
+    );
+    // Someone logs in again: new tokens, and the next poll asks.
+    revoked.store(false, std::sync::atomic::Ordering::SeqCst);
+    super::testing::write_test_codex_auth_tokens(
+        &app,
+        "gone",
+        "<new-access-token>",
+        "<new-refresh-token>",
+    );
+    app.refresh_all_codex_quotas().await;
+    assert!(server.count() > first, "a new login was not polled");
+    assert!(
+        !app.credential_refused(&account(&app, 0)),
+        "the refusal outlived the login that replaced its tokens"
+    );
+}
+
+// Go TestTransientQuotaFailureKeepsPolling.
+#[tokio::test]
+async fn transient_quota_failure_keeps_polling() {
+    let server = FakeServer::start(|_| FakeResponse::status(502)).await;
+    let (app, _dir) = backend_app(&server, vec![device_account("busy", "", 100)]);
+    super::testing::write_test_codex_auth_tokens(&app, "busy", "<access-token>", "<refresh-token>");
+    app.refresh_all_codex_quotas().await;
+    app.refresh_all_codex_quotas().await;
+    assert!(server.count() >= 2, "a 502 stopped polling");
+}
+
+// Go TestAccountActivitySetsTheCadence.
+#[test]
+fn account_activity_sets_the_cadence() {
+    let (app, _dir) = super::testing::test_app(Vec::new());
+    assert!(
+        !app.account_in_use("acct", Timestamp::now()),
+        "an account nothing went to is in use"
+    );
+    app.note_account_activity("acct");
+    assert!(
+        app.account_in_use("acct", Timestamp::now()),
+        "a request did not put the account in use"
+    );
+    let later = Timestamp::now()
+        .add(chrono::TimeDelta::from_std(super::quota_schedule::ACTIVE_WINDOW).unwrap_or_default())
+        .add(super::time::seconds(1));
+    assert!(
+        !app.account_in_use("acct", later),
+        "the account stayed in use past the active window"
+    );
+}

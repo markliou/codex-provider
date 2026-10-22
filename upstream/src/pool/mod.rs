@@ -25,6 +25,7 @@ pub mod native;
 pub mod outcome;
 pub mod own_call;
 pub mod plan;
+pub mod prime;
 pub mod proxy;
 #[cfg(test)]
 mod proxy_tests;

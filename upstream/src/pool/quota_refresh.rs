@@ -527,3 +527,76 @@ fn choose(value: Option<&str>, fallback: Option<&str>) -> String {
         _ => fallback.unwrap_or_default().to_string(),
     }
 }
+
+impl App {
+    /// The accounts the poller reads: every Codex device-auth slot, in or out
+    /// of the pool.
+    pub fn quota_poll_accounts(&self) -> Vec<super::state::Account> {
+        self.read()
+            .config
+            .accounts()
+            .iter()
+            .filter(|item| plan::is_codex_device_auth(item))
+            .cloned()
+            .collect()
+    }
+
+    /// Polls every account once, in order. The background poll does not use
+    /// it: it asks one account at a time on its own schedule.
+    pub async fn refresh_all_codex_quotas(&self) {
+        for item in self.quota_poll_accounts() {
+            self.poll_account_quota(&item).await;
+        }
+    }
+
+    pub async fn poll_account_quota(&self, item: &super::state::Account) {
+        // Upstream refused these tokens for good; asking again with them is a
+        // request a native Codex would not send (credentials.rs).
+        if self.credential_refused(item) {
+            return;
+        }
+        match self.refresh_account_quota(&item.id).await {
+            Ok(snapshot) => {
+                self.prime_unanchored_quota_window(&item.id, &snapshot)
+                    .await
+            }
+            Err(error) => self
+                .logger
+                .printf(&format!("quota refresh skipped for {}: {error}", item.id)),
+        }
+    }
+
+    /// The background poll (Go startQuotaRefresher): one account at a time,
+    /// each on its own randomized cadence (quota_schedule.rs), never a fixed
+    /// beat a backend could recognize. It stops when `stop` is cancelled.
+    pub fn start_quota_refresher(
+        self: &std::sync::Arc<Self>,
+        stop: super::http_io::Cancel,
+    ) -> tokio::task::JoinHandle<()> {
+        let app = self.clone();
+        tokio::spawn(async move {
+            let mut schedule = super::quota_schedule::QuotaPollSchedule::new(|| {
+                f64::from(u32::from_le_bytes(super::crypto::random_bytes::<4>()))
+                    / f64::from(u32::MAX)
+            });
+            loop {
+                let accounts = app.quota_poll_accounts();
+                let ids: Vec<String> = accounts.iter().map(|item| item.id.clone()).collect();
+                let (instant, now) = (std::time::Instant::now(), Timestamp::now());
+                if let Some(id) = schedule.due(instant, &ids, |id| app.account_in_use(id, now)) {
+                    if let Some(item) = accounts.iter().find(|item| item.id == id) {
+                        app.poll_account_quota(item).await;
+                    }
+                    schedule.polled(&id, std::time::Instant::now());
+                    if let Some(at) = app.prime_grace_due(&id) {
+                        let wait = at.sub(&Timestamp::now()).to_std().unwrap_or_default();
+                        schedule.poll_by(&id, std::time::Instant::now() + wait);
+                    }
+                }
+                if !stop.sleep(schedule.pause()).await {
+                    return;
+                }
+            }
+        })
+    }
+}

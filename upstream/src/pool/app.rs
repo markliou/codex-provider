@@ -149,6 +149,10 @@ pub struct App {
     /// Reset-credit spends that failed without an upstream verdict, kept for
     /// a retry to resend (reset_credit.rs).
     pub reset_attempts: super::reset_credit::ResetCreditAttempts,
+    /// When each account's prime grace ends (prime.rs).
+    pub prime_grace: super::prime::PrimeGrace,
+    /// Stands in for the bundled Codex CLI in tests (prime.rs).
+    pub prime_runner: std::sync::Mutex<Option<Arc<super::prime::PrimeRunner>>>,
     inner: RwLock<Inner>,
 }
 
@@ -191,6 +195,8 @@ impl App {
             turn_state_issuers: std::sync::Mutex::new(HashMap::new()),
             unrelayed_header_sets: std::sync::Mutex::new(std::collections::HashSet::new()),
             reset_attempts: super::reset_credit::ResetCreditAttempts::default(),
+            prime_grace: super::prime::PrimeGrace::default(),
+            prime_runner: std::sync::Mutex::new(None),
             inner: RwLock::new(inner),
         }
     }
