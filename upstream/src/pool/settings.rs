@@ -71,6 +71,15 @@ pub struct Settings {
     /// (`codex` on PATH; tests point it at a stand-in script, since PATH is
     /// one per process and tests run in parallel).
     pub codex_cli: String,
+    /// CODEX_POOL_COOKIE_SECURE=true marks the owner's cookies Secure even
+    /// without a forwarded https.
+    pub cookie_secure: bool,
+    /// CODEX_POOL_TRUSTED_PROXIES: the networks of reverse proxies whose
+    /// X-Forwarded-For names the real client. Behind a proxy every connection
+    /// comes from the proxy, so a lockout keyed on it would make everyone
+    /// share one failure count; a forwarded address from anywhere else is the
+    /// client's own claim and is ignored.
+    pub trusted_proxies: Vec<(std::net::IpAddr, u8)>,
 }
 
 impl Settings {
@@ -108,6 +117,8 @@ impl Settings {
             reset_credits_url: String::new(),
             accounts_check_url: String::new(),
             codex_cli: "codex".to_string(),
+            cookie_secure: false,
+            trusted_proxies: Vec::new(),
         }
     }
 
@@ -269,7 +280,65 @@ impl Settings {
                 .trim()
                 .to_string(),
             codex_cli: "codex".to_string(),
+            cookie_secure: get("CODEX_POOL_COOKIE_SECURE") == "true",
+            trusted_proxies: trusted_proxies(&get("CODEX_POOL_TRUSTED_PROXIES"))?,
         })
+    }
+}
+
+/// Parses CODEX_POOL_TRUSTED_PROXIES: addresses or CIDR networks, comma
+/// separated (Go applyTrustedProxiesEnv). A bare IPv4 address is a /32, any
+/// other bare address a /128.
+pub fn trusted_proxies(raw: &str) -> Result<Vec<(std::net::IpAddr, u8)>, String> {
+    let mut networks = Vec::new();
+    for part in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let invalid = || format!("CODEX_POOL_TRUSTED_PROXIES: {part:?} is not an address or CIDR");
+        let (address, bits) = match part.split_once('/') {
+            Some((address, bits)) => (address, Some(bits.parse::<u8>().map_err(|_| invalid())?)),
+            None => (part, None),
+        };
+        let address: std::net::IpAddr = address.parse().map_err(|_| invalid())?;
+        let max = if address.is_ipv4() { 32 } else { 128 };
+        let bits = bits.unwrap_or(max);
+        if bits > max {
+            return Err(invalid());
+        }
+        networks.push((address, bits));
+    }
+    Ok(networks)
+}
+
+fn prefix_matches(network: &[u8], address: &[u8], bits: u8) -> bool {
+    let (whole, rest) = (usize::from(bits / 8), bits % 8);
+    if network[..whole] != address[..whole] {
+        return false;
+    }
+    rest == 0 || (network[whole] ^ address[whole]) & (0xff_u8 << (8 - rest)) == 0
+}
+
+impl Settings {
+    /// Whether the host is a configured reverse proxy (Go trustedProxy). An
+    /// IPv4 address in IPv6 form counts as the IPv4 address, as in Go.
+    pub fn trusted_proxy(&self, host: &str) -> bool {
+        let Ok(address) = host.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        let address = address.to_canonical();
+        self.trusted_proxies
+            .iter()
+            .any(|(network, bits)| match (network.to_canonical(), address) {
+                (std::net::IpAddr::V4(network), std::net::IpAddr::V4(address)) => {
+                    prefix_matches(&network.octets(), &address.octets(), *bits)
+                }
+                (std::net::IpAddr::V6(network), std::net::IpAddr::V6(address)) => {
+                    prefix_matches(&network.octets(), &address.octets(), *bits)
+                }
+                _ => false,
+            })
     }
 }
 

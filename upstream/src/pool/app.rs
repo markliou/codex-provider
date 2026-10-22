@@ -155,6 +155,8 @@ pub struct App {
     pub prime_runner: std::sync::Mutex<Option<Arc<super::prime::PrimeRunner>>>,
     /// The cancel handle of each running sign-in (login.rs).
     pub login_cancels: super::login::LoginCancels,
+    /// Failed owner logins per client, for the lockout (admin_api.rs).
+    pub login_failures: super::admin_api::LoginFailures,
     inner: RwLock<Inner>,
 }
 
@@ -200,6 +202,7 @@ impl App {
             prime_grace: super::prime::PrimeGrace::default(),
             prime_runner: std::sync::Mutex::new(None),
             login_cancels: super::login::LoginCancels::default(),
+            login_failures: super::admin_api::LoginFailures::default(),
             inner: RwLock::new(inner),
         }
     }

@@ -9,10 +9,12 @@
 //! Keep a single copy of them there; a second copy here could drift.
 
 pub mod admin;
+pub mod admin_api;
 pub mod app;
 pub mod catalog;
 pub mod credentials;
 pub mod crypto;
+pub mod dashboard;
 pub mod gojson;
 pub mod gosort;
 pub mod hash;

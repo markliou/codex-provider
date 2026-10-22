@@ -51,6 +51,7 @@ fn serve(writer: &mut dyn ResponseWriter, content_type: &str, body: &str) {
 }
 
 pub fn handle_admin_page(writer: &mut dyn ResponseWriter) {
+    set_header(writer, "cache-control", "no-store");
     set_header(
         writer,
         "content-security-policy",

@@ -74,8 +74,11 @@ impl Request {
 const NATIVE_PREFIX: &str = "/k/";
 const NATIVE_INFIX: &str = "/backend-api/codex/";
 
-enum Route {
-    Root,
+/// What a matched pattern serves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Handler {
+    AdminPage,
+    AdminAsset,
     Healthz,
     Status,
     Models,
@@ -83,71 +86,382 @@ enum Route {
     ResponsesWebSocket,
     Compact,
     Chat,
+    Native,
     InFlight,
-    Native { key: String, rest: String },
+    PublicDashboard,
+    PublicAccountAction,
+    AdminLogin,
+    AdminLogout,
+    AdminState,
+    AdminSettings,
+    Accounts,
+    AccountHealth,
+    RefreshAllQuota,
+    ResetPromptCacheWindow,
+    Job,
+    JobCancel,
+    StickySessions,
+    StickySessionDelete,
+    AccountAction,
+    AccountDelete,
 }
 
-enum Miss {
-    NotFound,
-    MethodNotAllowed(&'static str),
+/// How a pattern's path matches (Go 1.22 ServeMux).
+#[derive(Clone, Copy)]
+enum PathPattern {
+    /// "/a/b": exactly this path; "/{$}" is Exact("/").
+    Exact(&'static str),
+    /// "/a/": this path and everything under it.
+    Subtree(&'static str),
+    /// "/k/{key}/backend-api/codex/{rest...}".
+    Native,
 }
 
-fn route(method: &Method, path: &str) -> Result<Route, Miss> {
-    let get = *method == Method::GET || *method == Method::HEAD;
-    let post = *method == Method::POST;
-    let only = |allowed: bool, route: Route, allow: &'static str| {
-        if allowed {
-            Ok(route)
-        } else {
-            Err(Miss::MethodNotAllowed(allow))
+impl PathPattern {
+    fn matches(self, path: &str) -> bool {
+        match self {
+            Self::Exact(pattern) => path == pattern,
+            Self::Subtree(prefix) => path.starts_with(prefix),
+            Self::Native => native_parts(path).is_some(),
         }
-    };
-    match path {
-        "/" => only(get, Route::Root, "GET, HEAD"),
-        "/healthz" => only(get, Route::Healthz, "GET, HEAD"),
-        "/v1/codex-pool/status" => only(get, Route::Status, "GET, HEAD"),
-        "/v1/models" => only(get, Route::Models, "GET, HEAD"),
-        "/v1/responses" if post => Ok(Route::Responses),
-        "/v1/responses" if get => Ok(Route::ResponsesWebSocket),
-        "/v1/responses" => Err(Miss::MethodNotAllowed("GET, HEAD, POST")),
-        "/v1/responses/compact" => only(post, Route::Compact, "POST"),
-        "/v1/chat/completions" => only(post, Route::Chat, "POST"),
-        "/internal/inflight" => only(get, Route::InFlight, "GET, HEAD"),
-        _ => {
-            // "/k/{key}/backend-api/codex/{rest...}": the key is one segment.
-            let rest = path.strip_prefix(NATIVE_PREFIX).ok_or(Miss::NotFound)?;
-            let (key, rest) = rest.split_once('/').ok_or(Miss::NotFound)?;
-            let rest = format!("/{rest}");
-            let rest = rest
-                .strip_prefix(NATIVE_INFIX.trim_end_matches('/'))
-                .ok_or(Miss::NotFound)?;
-            let rest = rest.strip_prefix('/').ok_or(Miss::NotFound)?;
-            if key.is_empty() {
-                return Err(Miss::NotFound);
-            }
-            Ok(Route::Native {
-                key: key.to_string(),
-                rest: rest.to_string(),
-            })
+    }
+
+    /// Go's precedence for these patterns: an exact path beats any subtree,
+    /// a longer subtree beats a shorter one.
+    fn specificity(self) -> (u8, usize) {
+        match self {
+            Self::Exact(pattern) => (2, pattern.len()),
+            Self::Native => (1, usize::MAX),
+            Self::Subtree(prefix) => (1, prefix.len()),
         }
     }
 }
 
-/// Answers one request. A panic in a handler is answered 500, as Go's
-/// recovery middleware does, when nothing was written yet.
+/// The pool's route table (Go mux()). `None` as the method matches every
+/// method; "GET" also matches HEAD.
+///
+/// Surface contract: one listener serves both machine clients and humans.
+/// Provider routes stay under /v1 and require the client API key; the
+/// control page stays at /admin (and the root alias), visible without a
+/// password, while owner-only actions keep their session and CSRF checks.
+/// The unauthenticated chrome deliberately uses low-key wording: do not
+/// "clarify" the visible title or login copy into obvious Codex, pool or
+/// provider terms without owner approval. That is only passive exposure
+/// reduction; require_admin remains the security boundary.
+const ROUTES: &[(Option<&str>, PathPattern, Handler)] = &[
+    (Some("GET"), PathPattern::Exact("/"), Handler::AdminPage),
+    (
+        Some("GET"),
+        PathPattern::Exact("/healthz"),
+        Handler::Healthz,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/v1/codex-pool/status"),
+        Handler::Status,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/v1/models"),
+        Handler::Models,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Exact("/v1/responses"),
+        Handler::Responses,
+    ),
+    // A Responses WebSocket stays open across turns, so it is not counted as
+    // in flight; each response running on it is.
+    (
+        Some("GET"),
+        PathPattern::Exact("/v1/responses"),
+        Handler::ResponsesWebSocket,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Exact("/v1/responses/compact"),
+        Handler::Compact,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Exact("/v1/chat/completions"),
+        Handler::Chat,
+    ),
+    (None, PathPattern::Native, Handler::Native),
+    (
+        Some("GET"),
+        PathPattern::Exact("/internal/inflight"),
+        Handler::InFlight,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/admin"),
+        Handler::AdminPage,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/admin/assets/app.css"),
+        Handler::AdminAsset,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/admin/assets/app.js"),
+        Handler::AdminAsset,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/admin/assets/logo.svg"),
+        Handler::AdminAsset,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/admin/manifest.webmanifest"),
+        Handler::AdminAsset,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/admin/api/public-dashboard"),
+        Handler::PublicDashboard,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Subtree("/admin/api/public-dashboard/accounts/"),
+        Handler::PublicAccountAction,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Subtree("/admin/api/public-dashboard/accounts/"),
+        Handler::PublicAccountAction,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Exact("/admin/api/login"),
+        Handler::AdminLogin,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Exact("/admin/api/logout"),
+        Handler::AdminLogout,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/admin/api/state"),
+        Handler::AdminState,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Exact("/admin/api/settings"),
+        Handler::AdminSettings,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/admin/api/accounts"),
+        Handler::Accounts,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Exact("/admin/api/accounts"),
+        Handler::Accounts,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/admin/api/accounts/health"),
+        Handler::AccountHealth,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Exact("/admin/api/accounts/quota/refresh-all"),
+        Handler::RefreshAllQuota,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Exact("/admin/api/cache/reset"),
+        Handler::ResetPromptCacheWindow,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Subtree("/admin/api/jobs/"),
+        Handler::Job,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Subtree("/admin/api/jobs/"),
+        Handler::JobCancel,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/admin/api/sticky-sessions"),
+        Handler::StickySessions,
+    ),
+    (
+        Some("DELETE"),
+        PathPattern::Subtree("/admin/api/sticky-sessions/"),
+        Handler::StickySessionDelete,
+    ),
+    (
+        Some("POST"),
+        PathPattern::Subtree("/admin/api/accounts/"),
+        Handler::AccountAction,
+    ),
+    (
+        Some("DELETE"),
+        PathPattern::Subtree("/admin/api/accounts/"),
+        Handler::AccountDelete,
+    ),
+];
+
+fn method_matches(pattern: Option<&str>, method: &Method) -> bool {
+    match pattern {
+        None => true,
+        Some("GET") => *method == Method::GET || *method == Method::HEAD,
+        Some(pattern) => method.as_str() == pattern,
+    }
+}
+
+/// The most specific pattern for the path and method.
+fn find(method: &Method, path: &str) -> Option<Handler> {
+    ROUTES
+        .iter()
+        .filter(|(pattern_method, pattern, _)| {
+            method_matches(*pattern_method, method) && pattern.matches(path)
+        })
+        .max_by_key(|(_, pattern, _)| pattern.specificity())
+        .map(|(_, _, handler)| *handler)
+}
+
+/// Whether the path matches a pattern exactly rather than as part of a
+/// subtree (Go exactMatch).
+fn exact_match(method: &Method, path: &str) -> bool {
+    ROUTES.iter().any(|(pattern_method, pattern, _)| {
+        method_matches(*pattern_method, method)
+            && match pattern {
+                PathPattern::Exact(exact) | PathPattern::Subtree(exact) => *exact == path,
+                PathPattern::Native => false,
+            }
+    })
+}
+
+/// Methods some pattern serves for the path (or the path with a trailing
+/// slash), sorted, with HEAD wherever GET is (Go matchingMethods).
+fn matching_methods(path: &str) -> Vec<&'static str> {
+    let mut methods: Vec<&'static str> = Vec::new();
+    for candidate in [path.to_string(), format!("{path}/")] {
+        if candidate != path && path.ends_with('/') {
+            continue;
+        }
+        for (method, pattern, _) in ROUTES {
+            if let Some(method) = method
+                && pattern.matches(&candidate)
+            {
+                methods.push(method);
+                if *method == "GET" {
+                    methods.push("HEAD");
+                }
+            }
+        }
+    }
+    methods.sort_unstable();
+    methods.dedup();
+    methods
+}
+
+/// Go's cleanPath: path.Clean, keeping a trailing slash.
+fn clean_path(path: &str) -> String {
+    if path.is_empty() {
+        return "/".to_string();
+    }
+    let rooted = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rooted.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    let mut cleaned = format!("/{}", parts.join("/"));
+    if rooted.ends_with('/') && cleaned != "/" {
+        cleaned.push('/');
+    }
+    cleaned
+}
+
+/// "/k/{key}/backend-api/codex/{rest...}": the key and the rest.
+fn native_parts(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix(NATIVE_PREFIX)?;
+    let (key, rest) = rest.split_once('/')?;
+    let rest = format!("/{rest}");
+    let rest = rest.strip_prefix(NATIVE_INFIX.trim_end_matches('/'))?;
+    let rest = rest.strip_prefix('/')?;
+    if key.is_empty() {
+        return None;
+    }
+    Some((key.to_string(), rest.to_string()))
+}
+
+fn not_found(writer: &mut dyn ResponseWriter) {
+    set_header(writer, "content-type", "text/plain; charset=utf-8");
+    set_header(writer, "x-content-type-options", "nosniff");
+    writer.write_header(StatusCode::NOT_FOUND);
+    writer.write(b"404 page not found\n");
+}
+
+/// Go http.Redirect with 301 Moved Permanently.
+fn redirect(writer: &mut dyn ResponseWriter, method: &Method, path: &str, query: &str) {
+    let location = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    };
+    set_header(writer, "location", &location);
+    if *method == Method::GET || *method == Method::HEAD {
+        set_header(writer, "content-type", "text/html; charset=utf-8");
+    }
+    writer.write_header(StatusCode::MOVED_PERMANENTLY);
+    if *method == Method::GET {
+        let escaped = location
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&#34;")
+            .replace('\'', "&#39;");
+        writer.write(format!("<a href=\"{escaped}\">Moved Permanently</a>.\n\n").as_bytes());
+    }
+}
+
+/// Answers one request. A panic in a handler is answered 500 by the
+/// listener when nothing was written yet (Go's recovery middleware).
 pub async fn serve(app: &Arc<App>, request: Request, writer: Box<dyn ResponseWriter>) {
     let mut writer = writer;
-    let route = match route(&request.method, &request.path) {
-        Ok(route) => route,
-        Err(Miss::NotFound) => {
-            set_header(writer.as_mut(), "content-type", "text/plain; charset=utf-8");
-            set_header(writer.as_mut(), "x-content-type-options", "nosniff");
-            writer.write_header(StatusCode::NOT_FOUND);
-            writer.write(b"404 page not found\n");
-            return;
+    if request.method != Method::CONNECT {
+        let cleaned = clean_path(&request.path);
+        if cleaned != request.path {
+            return redirect(writer.as_mut(), &request.method, &cleaned, &request.query);
         }
-        Err(Miss::MethodNotAllowed(allow)) => {
-            set_header(writer.as_mut(), "allow", allow);
+    }
+    let handler = match find(&request.method, &request.path) {
+        Some(handler) => handler,
+        None => {
+            // A subtree root named without its trailing slash is redirected
+            // to it.
+            let slashed = format!("{}/", request.path);
+            if !request.path.ends_with('/')
+                && !exact_match(&request.method, &request.path)
+                && exact_match(&request.method, &slashed)
+            {
+                return redirect(writer.as_mut(), &request.method, &slashed, &request.query);
+            }
+            let allowed = matching_methods(&request.path);
+            if allowed.is_empty() {
+                return not_found(writer.as_mut());
+            }
+            set_header(writer.as_mut(), "allow", &allowed.join(", "));
             set_header(writer.as_mut(), "content-type", "text/plain; charset=utf-8");
             set_header(writer.as_mut(), "x-content-type-options", "nosniff");
             writer.write_header(StatusCode::METHOD_NOT_ALLOWED);
@@ -157,34 +471,76 @@ pub async fn serve(app: &Arc<App>, request: Request, writer: Box<dyn ResponseWri
     };
     let api_key_ok =
         |request: &Request| app.valid_api_key(&request_api_key(&request.headers, &request.query));
-    match route {
-        Route::Root => super::admin::handle_admin_page(writer.as_mut()),
-        Route::InFlight => handle_in_flight(app, &request, writer.as_mut()),
-        Route::Native { key, rest } => {
-            super::native::handle_native(app, request, key, rest, writer).await
+    let unauthorized = |writer: &mut dyn ResponseWriter| {
+        write_openai_error(
+            writer,
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "invalid or missing API key",
+        )
+    };
+    use super::admin_api as admin;
+    match handler {
+        Handler::AdminPage => super::admin::handle_admin_page(writer.as_mut()),
+        Handler::AdminAsset => {
+            super::admin::handle_admin_asset(writer.as_mut(), &request.path);
         }
-        _ if !api_key_ok(&request) => {
-            write_openai_error(
-                writer.as_mut(),
-                StatusCode::UNAUTHORIZED,
-                "invalid_api_key",
-                "invalid or missing API key",
-            );
+        Handler::InFlight => handle_in_flight(app, &request, writer.as_mut()),
+        Handler::Native => {
+            let Some((key, rest)) = native_parts(&request.path) else {
+                return not_found(writer.as_mut());
+            };
+            super::native::handle_native(app, request, key, rest, writer).await;
         }
-        Route::Healthz => write_json(
+        Handler::Healthz
+        | Handler::Status
+        | Handler::Models
+        | Handler::Responses
+        | Handler::ResponsesWebSocket
+        | Handler::Compact
+        | Handler::Chat
+            if !api_key_ok(&request) =>
+        {
+            unauthorized(writer.as_mut());
+        }
+        Handler::Healthz => write_json(
             writer.as_mut(),
             StatusCode::OK,
             &serde_json::json!({"ok": true}),
         ),
-        Route::Status => handle_current_status(app, &request, writer.as_mut()),
-        Route::Models => handle_models(app, &request, writer.as_mut()),
-        Route::ResponsesWebSocket => {
+        Handler::Status => handle_current_status(app, &request, writer.as_mut()),
+        Handler::Models => handle_models(app, &request, writer.as_mut()),
+        Handler::ResponsesWebSocket => {
             super::responses_ws::handle_responses_websocket(app, request, false, writer).await
         }
-        Route::Responses | Route::Compact | Route::Chat => {
-            let chat = matches!(route, Route::Chat);
-            serve_provider(app, request, false, writer, chat).await;
+        Handler::Responses | Handler::Compact | Handler::Chat => {
+            serve_provider(app, request, false, writer, handler == Handler::Chat).await;
         }
+        Handler::PublicDashboard => admin::handle_public_dashboard(app, writer.as_mut()),
+        Handler::PublicAccountAction => {
+            admin::handle_public_account_action(app, &request, writer.as_mut())
+        }
+        Handler::AdminLogin => admin::handle_admin_login(app, &request, writer.as_mut()),
+        _ if !admin::require_admin(app, &request, writer.as_mut()) => {}
+        Handler::AdminLogout => admin::handle_admin_logout(app, &request, writer.as_mut()),
+        Handler::AdminState => admin::handle_admin_state(app, writer.as_mut()),
+        Handler::AdminSettings => admin::handle_admin_settings(app, &request, writer.as_mut()),
+        Handler::Accounts => admin::handle_accounts(app, &request, writer.as_mut()),
+        Handler::AccountHealth => admin::handle_account_health(app, writer.as_mut()),
+        Handler::RefreshAllQuota => admin::handle_refresh_all_quota(app, writer.as_mut()).await,
+        Handler::ResetPromptCacheWindow => {
+            admin::handle_reset_prompt_cache_window(app, writer.as_mut())
+        }
+        Handler::Job => admin::handle_job(app, &request, writer.as_mut()),
+        Handler::JobCancel => admin::handle_job_cancel(app, &request, writer.as_mut()),
+        Handler::StickySessions => admin::handle_sticky_sessions(app, writer.as_mut()),
+        Handler::StickySessionDelete => {
+            admin::handle_sticky_session_delete(app, &request, writer.as_mut())
+        }
+        Handler::AccountAction => {
+            admin::handle_account_action(app, &request, writer.as_mut()).await
+        }
+        Handler::AccountDelete => admin::handle_account_delete(app, &request, writer.as_mut()),
     }
 }
 

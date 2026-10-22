@@ -327,7 +327,7 @@ pub async fn handle_native(
         serve_provider(app, request, true, writer, false).await;
         return;
     }
-    if responses && request.method == Method::GET {
+    if responses && (request.method == Method::GET || request.method == Method::HEAD) {
         // As on /v1, the socket is not in flight; each response running on
         // it is.
         request.path = "/v1/responses".into();
