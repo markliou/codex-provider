@@ -5,7 +5,7 @@
 //! newer pool before this Rust port knows their meaning.  The fixture tests
 //! intentionally exercise both top-level and nested unknown fields.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -56,48 +56,7 @@ impl<'de> Deserialize<'de> for Unknown {
     }
 }
 
-/// RFC 3339 timestamp as emitted by Go's `time.Time.MarshalJSON`.
-///
-/// Keeping the source text preserves nanosecond precision and the original
-/// offset during a read/write migration.  Values are validated on read so a
-/// malformed state file fails closed just as Go's `time.Time` decoder does.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct Timestamp(pub String);
-
-impl Timestamp {
-    pub fn new(value: impl Into<String>) -> Result<Self, chrono::ParseError> {
-        let value = value.into();
-        chrono::DateTime::parse_from_rfc3339(&value)?;
-        Ok(Self(value))
-    }
-}
-
-impl Default for Timestamp {
-    fn default() -> Self {
-        Self("0001-01-01T00:00:00Z".to_owned())
-    }
-}
-
-impl Serialize for Timestamp {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for Timestamp {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        chrono::DateTime::parse_from_rfc3339(&value)
-            .map_err(serde::de::Error::custom)
-            .map(|_| Self(value))
-    }
-}
+pub use super::time::Timestamp;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -831,16 +790,9 @@ mod tests {
         let runtime: RuntimeState =
             serde_json::from_value(documents["runtime"]["full"].clone()).expect("decode");
         // Nanoseconds and the +08:00 offset survive as written, not as UTC.
-        assert!(
-            runtime.updated_at.0.ends_with("+08:00"),
-            "{}",
-            runtime.updated_at.0
-        );
-        assert!(
-            runtime.updated_at.0.contains('.'),
-            "{}",
-            runtime.updated_at.0
-        );
+        let text = runtime.updated_at.to_string();
+        assert!(text.ends_with("+08:00"), "{text}");
+        assert!(text.contains('.'), "{text}");
         assert!(serde_json::from_value::<Timestamp>(Value::from("yesterday")).is_err());
     }
 }
