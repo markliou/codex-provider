@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mathrand "math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -132,4 +134,74 @@ func codexChildEnvironment(home string) []string {
 		}
 	}
 	return env
+}
+
+// A window that reset is not primed at once. Its owner may be about to use
+// the account, and that first request anchors the window the way it would for
+// a native Codex, with no prime at all. The pool waits a random 5 to 30
+// minutes from when it first saw the window unanchored, polls the account
+// again when the wait ends (quota_schedule.go pollBy), and primes only if the
+// window is still untouched; a request in between anchors it and the next poll
+// drops the wait. The wait is in memory: after a restart the window is seen
+// again and gets a new one.
+const (
+	quotaPrimeGraceMin = 5 * time.Minute
+	quotaPrimeGraceMax = 30 * time.Minute
+)
+
+func randomQuotaPrimeGrace() time.Duration {
+	return quotaPrimeGraceMin + time.Duration(mathrand.Float64()*float64(quotaPrimeGraceMax-quotaPrimeGraceMin))
+}
+
+// quotaPrimeGraceFromEnv is the grace: random by default, or the fixed
+// CODEX_POOL_QUOTA_PRIME_GRACE, a test override (wire-capture.sh sets 0s so
+// its prime phase need not wait).
+func quotaPrimeGraceFromEnv() (func() time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv("CODEX_POOL_QUOTA_PRIME_GRACE"))
+	if value == "" {
+		return randomQuotaPrimeGrace, nil
+	}
+	fixed, err := time.ParseDuration(value)
+	if err != nil || fixed < 0 {
+		return nil, fmt.Errorf("CODEX_POOL_QUOTA_PRIME_GRACE must be a duration such as 0s or 10m, got %q", value)
+	}
+	return func() time.Duration { return fixed }, nil
+}
+
+// primeGraceElapsed starts the account's grace the first time its window is
+// seen unanchored and reports whether it has run out.
+func (a *app) primeGraceElapsed(accountID string, now time.Time) bool {
+	a.primeGraceMu.Lock()
+	defer a.primeGraceMu.Unlock()
+	if a.primeGraceUntil == nil {
+		a.primeGraceUntil = map[string]time.Time{}
+	}
+	until, ok := a.primeGraceUntil[accountID]
+	if !ok {
+		grace := randomQuotaPrimeGrace
+		if a.quotaPrimeGrace != nil {
+			grace = a.quotaPrimeGrace
+		}
+		until = now.Add(grace())
+		a.primeGraceUntil[accountID] = until
+	}
+	if now.Before(until) {
+		return false
+	}
+	delete(a.primeGraceUntil, accountID)
+	return true
+}
+
+func (a *app) clearPrimeGrace(accountID string) {
+	a.primeGraceMu.Lock()
+	defer a.primeGraceMu.Unlock()
+	delete(a.primeGraceUntil, accountID)
+}
+
+// primeGraceDue is when the account must be polled again to decide its prime.
+func (a *app) primeGraceDue(accountID string) (time.Time, bool) {
+	a.primeGraceMu.Lock()
+	defer a.primeGraceMu.Unlock()
+	until, ok := a.primeGraceUntil[accountID]
+	return until, ok
 }

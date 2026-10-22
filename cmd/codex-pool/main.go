@@ -619,8 +619,13 @@ type app struct {
 	refusedCredentials refusedCredentials
 	// accountActivity is when a request last went to each account; it sets
 	// the account's quota poll cadence (quota_schedule.go).
-	accountActivityMu    sync.Mutex
-	accountActivity      map[string]time.Time
+	accountActivityMu sync.Mutex
+	accountActivity   map[string]time.Time
+	// primeGraceUntil is when each unanchored window may be primed if no
+	// request has anchored it first (codex_prime.go, quota prime grace).
+	primeGraceMu         sync.Mutex
+	primeGraceUntil      map[string]time.Time
+	quotaPrimeGrace      func() time.Duration
 	config               config
 	state                state
 	dataDir              string
@@ -786,6 +791,10 @@ func newAppFromEnv() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
+	quotaPrimeGrace, err := quotaPrimeGraceFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	// Product contract: the combined-port root is a public control page, while
 	// management actions require password auth. A previous hardening pass flipped
 	// this default and broke the expected landing page, so keep the default true
@@ -817,6 +826,7 @@ func newAppFromEnv() (*app, error) {
 		preserveProQuota:     preserveProQuota,
 		lineageAffinity:      lineageAffinity,
 		quotaPrime:           quotaPrime,
+		quotaPrimeGrace:      quotaPrimeGrace,
 		listenAddress:        listenAddress,
 		publicDashboard:      publicDashboard,
 		codexBaseURL:         strings.TrimRight(envOr("CODEX_POOL_CODEX_BASE_URL", codexBaseURLDefault), "/"),
@@ -1276,6 +1286,13 @@ func (a *app) primeUnanchoredQuotaWindow(ctx context.Context, accountID string, 
 	}
 	window, unanchored := unanchoredBudgetWindow(*snapshot.Quota, now)
 	if !unanchored {
+		a.clearPrimeGrace(accountID)
+		a.mu.Unlock()
+		return
+	}
+	// The user gets the first chance to start the window by using the
+	// account; only a window still untouched after the grace is primed.
+	if !a.primeGraceElapsed(accountID, now) {
 		a.mu.Unlock()
 		return
 	}

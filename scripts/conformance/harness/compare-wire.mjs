@@ -394,8 +394,42 @@ function compareInstallationIDs() {
   else notes.push(`installation id: ${sent} sent by the pool, all its accounts' own (${used.size} of ${accounts.size} accounts)`);
 }
 
+// A reset credit is spent as Codex's /usage reset spends it (reset_credit.go):
+// the pool's redemption from the Console against a native Codex app-server's
+// (account/rateLimitResetCredit/consume, which the TUI picker calls): the same
+// header set and order, the body Codex's keys in Codex's order, the listed
+// credit named, a UUID redeem request id, and one request, not a retry.
+function compareReset() {
+  const poolIP = read("pool-ip.txt").trim();
+  const consume = (entry) => entry.kind === "http-other" && /\/rate-limit-reset-credits\/consume$/.test(String(entry.path).split("?")[0]);
+  const entries = load("reset.jsonl").filter(consume);
+  const native = entries.find((entry) => entry.from !== poolIP);
+  const pool = entries.filter((entry) => entry.from === poolIP);
+  const tail = (name) => { try { return read(name).trim().slice(-300); } catch { return ""; } };
+  if (!native) { fail(`reset: the native Codex spent no credit (${tail("native-reset.codex.log")})`); return; }
+  if (!pool.length) { fail(`reset: the pool spent no credit (${tail("reset-pool.log")})`); return; }
+  if (pool.length !== 1) fail(`reset: the pool sent ${pool.length} redemptions for one press`);
+  const order = (entry) => (entry.rawHeaderOrder || []).map((name) => name.toLowerCase()).filter((name) => !name.startsWith(":") && name !== "host" && name !== "content-length").join(" ");
+  if (order(native) !== order(pool[0])) fail(`reset: header order differs\n    native: ${order(native)}\n    pool:   ${order(pool[0])}`);
+  for (const name of ["content-type", "accept", "chatgpt-account-id"]) {
+    if (native.headers[name] !== pool[0].headers[name]) fail(`reset: ${name} native=${native.headers[name]} pool=${pool[0].headers[name]}`);
+  }
+  if (!/^codex[a-z_-]*\/\d+\.\d+\.\d+ \(.+\)/i.test(String(pool[0].headers["user-agent"] || ""))) fail(`reset: the pool does not present a Codex agent: ${pool[0].headers["user-agent"]}`);
+  const parse = (entry) => { try { return JSON.parse(entry.rawBody); } catch { return null; } };
+  const nativeBody = parse(native);
+  const poolBody = parse(pool[0]);
+  if (!nativeBody || !poolBody) { fail("reset: a redemption body is not JSON"); return; }
+  if (Object.keys(nativeBody).join(",") !== Object.keys(poolBody).join(",")) fail(`reset: body keys differ: native ${Object.keys(nativeBody)} pool ${Object.keys(poolBody)}`);
+  if (poolBody.credit_id !== "credit-capture") fail(`reset: the pool named credit ${poolBody.credit_id}, not the one listed`);
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  if (!uuid.test(String(poolBody.redeem_request_id))) fail(`reset: the pool's redeem request id is not a v4 UUID as Codex's: ${poolBody.redeem_request_id}`);
+  if (mask(native.rawBody) !== mask(pool[0].rawBody)) fail(`reset: body differs\n    native: ${mask(native.rawBody)}\n    pool:   ${mask(pool[0].rawBody)}`);
+  else notes.push("reset: the pool's credit redemption equal to a native Codex's");
+}
+
 compareOwn();
 compareTLS("tls-own.txt");
+compareReset();
 compareInstallationIDs();
 comparePrime();
 compareTLS("tls-prime.txt", ["tls-own.txt", "tls-http.txt", "tls-ws.txt"]);

@@ -83,7 +83,7 @@ CODEX_POOL_IMAGE=$image sh scripts/build-local-image.sh -q >/dev/null
 docker network create --internal "$net" >/dev/null
 docker volume create "$volume" >/dev/null
 # Priming is off by default in the pool; the capture turns it on so the prime
-# phase can measure it.
+# phase can measure it, and sets its grace to zero so the phase need not wait.
 docker run --rm -v "$volume:/data" -v "$work:/w:ro" alpine:3.21 sh -ceu "
   mkdir -p /data/accounts/conformance/.codex
   printf '%s' '{\"defaultModel\":\"$model\",\"modelAliases\":{},\"quotaPrime\":true,\"accounts\":[{\"id\":\"conformance\",\"authType\":\"codex_device_auth\",\"enabled\":true,\"inPool\":true,\"priority\":100}]}' > /data/config.json
@@ -123,7 +123,7 @@ wait_until() {
 
 start_fake() {
   docker rm -f "$fake" >/dev/null 2>&1 || true
-  docker run -d --name "$fake" --network "$net" -e REJECT_WS="$1" -e PRIME_WINDOW="${PRIME_WINDOW:-0}" \
+  docker run -d --name "$fake" --network "$net" -e REJECT_WS="$1" -e PRIME_WINDOW="${PRIME_WINDOW:-0}" -e RESET_CREDITS="${RESET_CREDITS:-0}" \
     -e SCENARIO="${SCENARIO:-}" -e FAIL_FROM="${FAIL_FROM:-}" -e CAPTURE_LOG=/logs/capture.jsonl \
     --network-alias chatgpt.com --network-alias auth.openai.com --network-alias api.openai.com --network-alias ab.chatgpt.com \
     --network-alias conformance-direct \
@@ -185,6 +185,7 @@ docker run -d --name "$pool" --network "$net" --network-alias conformance-pool \
   -e SSL_CERT_FILE=/certs/ca.pem -e CODEX_CA_CERTIFICATE=/certs/ca.pem \
   -e CODEX_POOL_API_KEY="$CLIENT_KEY" -e CODEX_POOL_ADMIN_PASSWORD_HASH="$admin_hash" \
   -e CODEX_POOL_ADDR=0.0.0.0:8317 -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
+  -e CODEX_POOL_QUOTA_PRIME_GRACE=0s \
   -e CODEX_POOL_PROMPT_CACHE_RETENTION="${CONFORMANCE_PROMPT_CACHE_RETENTION:-passthrough}" \
   -e CODEX_POOL_PROMPT_CACHE_KEY_MODE="${CONFORMANCE_PROMPT_CACHE_KEY_MODE:-passthrough}" \
   "$image" >/dev/null
@@ -211,6 +212,28 @@ sleep 2
 cp "$work/logs/capture.jsonl" "$work/prime.jsonl"
 docker logs "$pool" 2>&1 | grep -i 'quota window prime' | tail -3 > "$work/prime.log" || true
 stop_fake prime
+
+echo "Reset: the pool spends a reset credit from the Console, then a native Codex's app-server spends one"
+RESET_CREDITS=1 start_fake 0 reset
+: > "$work/logs/capture.jsonl"
+docker restart "$pool" >/dev/null
+wait_for_pool
+# The pool learns of the credit from its first quota poll after the start.
+wait_until 200 "reset-credit listing from the pool" grep -q 'rate-limit-reset-credits"' "$work/logs/capture.jsonl"
+sleep 2
+docker run --rm --network "$net" -e ADMIN_PASSWORD="$ADMIN_PASSWORD" node:22-alpine node -e '
+  const base = "http://conformance-pool:8317/admin/api";
+  (async () => {
+    const login = await fetch(base + "/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: process.env.ADMIN_PASSWORD }) });
+    const cookies = (login.headers.getSetCookie?.() || []).map((c) => c.split(";")[0]).join("; ");
+    const { csrfToken } = await login.json();
+    const spend = await fetch(base + "/accounts/conformance/quota/reset-credit", { method: "POST", headers: { cookie: cookies, "x-csrf-token": csrfToken } });
+    console.log("pool reset:", spend.status, (await spend.text()).slice(0, 200));
+  })().catch((error) => { console.log("pool reset failed:", error.message); });' > "$work/reset-pool.log" 2>&1 || true
+docker run --rm --network "$net" -v "$work:/harness:ro" -v "$work/certs:/certs:ro" -v "$codex_vendor:/codex:ro" \
+  alpine:3.21 sh /harness/run-codex.sh native-reset "$model" > "$work/native-reset.codex.log" 2>&1 || true
+cp "$work/logs/capture.jsonl" "$work/reset.jsonl"
+stop_fake reset
 
 echo "HTTP: native Codex, then Codex through the pool"
 start_fake 1 http

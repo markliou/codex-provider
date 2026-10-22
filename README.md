@@ -325,7 +325,9 @@ The pool's own calls also go out the way Codex makes them. Token refresh, usage,
 account check and reset-credit reads use Codex's endpoints and header order, with
 the identity of the Codex that last used the account. A quota-window prime is one
 read-only turn of the bundled Codex CLI that holds no refresh token; no native
-Codex sends one, so it is off until **Prime idle accounts** is turned on.
+Codex sends one, so it is off until **Prime idle accounts** is turned on, and
+even then a window that reset waits a random 5 to 30 minutes for a real request
+to start it before it is primed.
 
 A bundled CLIProxyAPI sidecar used to be the gateway; it rewrote what Codex
 sent and was removed (issue #32). Setting `CODEX_POOL_CODEX_GATEWAY_MODE=sidecar`

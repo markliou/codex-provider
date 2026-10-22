@@ -237,6 +237,15 @@ const server = http2.createSecureServer({ allowHTTP1: true, key: fs.readFileSync
     // PRIME_WINDOW=1 reports a five-hour window that has just reset and not
     // started counting, which the pool primes.
     if (process.env.PRIME_WINDOW === "1" && /\/wham\/usage$/.test(req.url.split("?")[0])) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ plan_type: "pro", rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 0, limit_window_seconds: 18000, reset_after_seconds: 18000, reset_at: Math.floor(Date.now() / 1000) + 18000 } } })); return; }
+    // RESET_CREDITS=1 lists the reset credit that usage below reports and
+    // answers its redemption, for the reset phase: the listing and the consume
+    // answer are Codex's own shapes (backend-client client/rate_limit_resets_tests.rs and app-server
+    // tests/suite/v2/rate_limit_reset_credits.rs, verbatim).
+    if (process.env.RESET_CREDITS === "1") {
+      const route = req.url.split("?")[0];
+      if (/\/wham\/rate-limit-reset-credits$/.test(route)) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ credits: [{ id: "credit-capture", reset_type: "codex_rate_limits", status: "available", granted_at: "2026-06-17T00:00:00Z", expires_at: "2026-07-17T00:00:00Z" }], available_count: 1, total_earned_count: 1 })); return; }
+      if (/\/wham\/rate-limit-reset-credits\/consume$/.test(route)) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ code: "reset", windows_reset: 2 })); return; }
+    }
     // Otherwise anchored windows (used and with a reset time), so the pool has
     // no window to prime while the capture runs.
     if (/\/wham\/usage$/.test(req.url.split("?")[0])) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ plan_type: "pro", rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 10, limit_window_seconds: 18000, reset_after_seconds: 3600, reset_at: Math.floor(Date.now() / 1000) + 3600 }, secondary_window: { used_percent: 20, limit_window_seconds: 604800, reset_after_seconds: 86400, reset_at: Math.floor(Date.now() / 1000) + 86400 } }, rate_limit_reset_credits: { available_count: 1 } })); return; }
