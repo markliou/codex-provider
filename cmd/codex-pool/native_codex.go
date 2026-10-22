@@ -222,6 +222,12 @@ func (a *app) sendCodexBackend(ctx context.Context, item account, auth codexAuth
 	if viaTransport {
 		endpoint = a.codexTransportURL + "/forward"
 	}
+	// Whatever Codex request this is, the account presents its own
+	// installation id (installation_id.go).
+	installationID, presentID := a.presentedInstallationID(item)
+	if presentID && len(body) > 0 {
+		body = withInstallationID(body, installationID)
+	}
 	var reader io.Reader
 	if len(body) > 0 {
 		reader = bytes.NewReader(body)
@@ -236,6 +242,9 @@ func (a *app) sendCodexBackend(ctx context.Context, item account, auth codexAuth
 		}
 	}
 	forwardCodexMetadataHeaders(req.Header, inbound)
+	if presentID {
+		setTurnMetadataInstallationID(req.Header, installationID)
+	}
 	if auth.AccountID == "" {
 		auth.AccountID = item.AccountID
 	}

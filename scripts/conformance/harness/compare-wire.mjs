@@ -92,7 +92,9 @@ function bodyDifference(left, right) {
   return `${order} in ${differing.join(", ") || "key order only"}`;
 }
 
-// The pool must forward exactly what Codex gave it.
+// The pool must forward exactly what Codex gave it. The one value it changes,
+// the installation id, is a UUID and so masked here; compareInstallationIDs
+// checks it.
 function compareForwarded(label, client, pool) {
   const difference = bodyDifference(client, pool);
   if (difference) fail(`${label}: the pool changed the body${difference}`);
@@ -357,8 +359,44 @@ function compareScenario(label, { requireChild = false, requireCompaction = fals
   notes.push(`${label}: ${poolRequests.length} requests equal to a native Codex's${children ? ` (${children} from the subagent)` : ""}`);
 }
 
+// Each pool account presents its own installation id in place of the
+// client's (installation_id.go, SPEC.md 2.3.2): every id the pool sent is one
+// of its accounts', and no id a Codex sent on its own is.
+function compareInstallationIDs() {
+  const poolIP = read("pool-ip.txt").trim();
+  const accounts = new Set(read("account-installation-ids.txt").split("\n").map((line) => line.trim()).filter(Boolean));
+  if (!accounts.size) { fail("installation id: the pool's accounts have none"); return; }
+  const fromTurnMetadata = (value) => { try { return JSON.parse(value).installation_id; } catch { return undefined; } };
+  const idsIn = (entry) => {
+    const meta = entry.body && typeof entry.body === "object" ? entry.body.client_metadata : null;
+    return [
+      meta?.["x-codex-installation-id"],
+      meta && fromTurnMetadata(meta["x-codex-turn-metadata"]),
+      entry.headers && fromTurnMetadata(entry.headers["x-codex-turn-metadata"]),
+    ].filter(Boolean);
+  };
+  let sent = 0;
+  const used = new Set();
+  for (const name of fs.readdirSync(dir).filter((file) => file.endsWith(".jsonl"))) {
+    for (const entry of load(name)) {
+      for (const id of idsIn(entry)) {
+        if (entry.from === poolIP) {
+          sent++;
+          used.add(id);
+          if (!accounts.has(id)) fail(`installation id: ${name}: the pool sent ${id}, which is no account's`);
+        } else if (accounts.has(id)) {
+          fail(`installation id: ${name}: a Codex of its own sent an account's id ${id}`);
+        }
+      }
+    }
+  }
+  if (!sent) fail("installation id: the pool sent none");
+  else notes.push(`installation id: ${sent} sent by the pool, all its accounts' own (${used.size} of ${accounts.size} accounts)`);
+}
+
 compareOwn();
 compareTLS("tls-own.txt");
+compareInstallationIDs();
 comparePrime();
 compareTLS("tls-prime.txt", ["tls-own.txt", "tls-http.txt", "tls-ws.txt"]);
 compareHTTP();
@@ -387,4 +425,4 @@ if (problems.length) {
   console.log(`\n${problems.length} difference(s) introduced by the pool.`);
   process.exit(1);
 }
-console.log("\nThe pool changes nothing: transport and headers match a native Codex, and bodies are forwarded as Codex sent them.");
+console.log("\nThe pool changes nothing: transport and headers match a native Codex, and bodies are forwarded as Codex sent them, apart from each account presenting its own installation id.");

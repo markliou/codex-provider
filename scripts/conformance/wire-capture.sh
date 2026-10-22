@@ -260,6 +260,10 @@ for transport in http ws; do
 done
 
 docker logs "$pool" > "$work/pool.log" 2>&1 || true
+# The installation ids the pool's accounts present (installation_id.go); the
+# report checks that the pool sent only these, and no client's.
+docker run --rm -v "$volume:/data:ro" alpine:3.21 sh -c '
+  for f in /data/accounts/*/.codex/installation_id; do [ -f "$f" ] && { cat "$f"; echo; }; done' > "$work/account-installation-ids.txt"
 status=0
 docker run --rm -v "$work:/w:ro" -v "$repo_root/scripts/conformance/harness:/h:ro" node:22-alpine \
   node /h/compare-wire.mjs /w > "$work/report.txt" || status=$?
