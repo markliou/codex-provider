@@ -34,15 +34,35 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 }
 
 pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, key_length: usize) -> Vec<u8> {
+    // HMAC with the key absorbed once: each round clones the keyed inner and
+    // outer states instead of re-padding the key and hashing two more blocks,
+    // as Go's crypto/pbkdf2 does through its hmac.Reset.
+    let mut key_block = [0u8; BLOCK];
+    if password.len() > BLOCK {
+        key_block[..32].copy_from_slice(&Sha256::digest(password));
+    } else {
+        key_block[..password.len()].copy_from_slice(password);
+    }
+    let mut keyed_inner = Sha256::new();
+    keyed_inner.update(key_block.map(|byte| byte ^ 0x36));
+    let mut keyed_outer = Sha256::new();
+    keyed_outer.update(key_block.map(|byte| byte ^ 0x5c));
+    let mac = |message: &[u8]| -> [u8; 32] {
+        let mut inner = keyed_inner.clone();
+        inner.update(message);
+        let mut outer = keyed_outer.clone();
+        outer.update(inner.finalize());
+        outer.finalize().into()
+    };
     let blocks = key_length.div_ceil(32);
     let mut derived = Vec::with_capacity(blocks * 32);
     for block in 1..=u32::try_from(blocks).unwrap_or(u32::MAX) {
         let mut message = salt.to_vec();
         message.extend_from_slice(&block.to_be_bytes());
-        let mut u = hmac_sha256(password, &message);
+        let mut u = mac(&message);
         let mut result = u;
         for _ in 1..iterations {
-            u = hmac_sha256(password, &u);
+            u = mac(&u);
             for (out, byte) in result.iter_mut().zip(u) {
                 *out ^= byte;
             }

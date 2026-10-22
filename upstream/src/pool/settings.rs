@@ -82,6 +82,27 @@ pub struct Settings {
     pub trusted_proxies: Vec<(std::net::IpAddr, u8)>,
 }
 
+/// The test fixture's admin password hash: "admin-password" with a fixed
+/// salt at the minimum iteration count (Go testApp's
+/// newPasswordHash("admin-password")). Computed once per process: a hash
+/// literal in the source would be one more password hash in the repository,
+/// which the pre-commit audit rightly refuses.
+fn test_admin_password_hash() -> String {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::STANDARD_NO_PAD;
+        let salt = [3u8; 16];
+        let derived = crypto::pbkdf2_sha256(b"admin-password", &salt, 100_000, 32);
+        format!(
+            "pbkdf2-sha256:100000:{}:{}",
+            engine.encode(salt),
+            engine.encode(derived)
+        )
+    })
+    .clone()
+}
+
 impl Settings {
     /// The Go tests' testApp fixture: failover routing (most routing tests
     /// assert strict account order; balanced ones opt in), lineage affinity,
@@ -91,7 +112,7 @@ impl Settings {
             data_dir,
             api_keys: vec!["client-key".to_string()],
             admin_user: "admin".to_string(),
-            admin_hash: String::new(),
+            admin_hash: test_admin_password_hash(),
             session_key: b"01234567890123456789012345678901".to_vec(),
             session_affinity_ttl: TimeDelta::hours(SESSION_AFFINITY_TTL_DEFAULT_HOURS),
             max_retry_accounts: 0,

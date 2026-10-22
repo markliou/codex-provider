@@ -31,7 +31,7 @@ use super::time::minutes;
 use std::sync::Arc;
 
 /// A stand-in Codex CLI: `body` runs under `set -eu` with CODEX_HOME set.
-fn fake_codex(dir: &TempDir, body: &str) -> String {
+pub(super) fn fake_codex(dir: &TempDir, body: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.path().join("codex");
     let script = format!("#!/bin/sh\nset -eu\nmkdir -p \"$CODEX_HOME\"\n{body}");
@@ -41,15 +41,20 @@ fn fake_codex(dir: &TempDir, body: &str) -> String {
     path.display().to_string()
 }
 
-const PROMPT: &str = "printf '%s\\n' 'Open https://auth.openai.com/activate' 'ABCD-EFGH'\n";
+pub(super) const PROMPT: &str =
+    "printf '%s\\n' 'Open https://auth.openai.com/activate' 'ABCD-EFGH'\n";
 
-fn writes_auth(id_token: &str) -> String {
+pub(super) fn writes_auth(id_token: &str) -> String {
     format!(
         "{PROMPT}cat > \"$CODEX_HOME/auth.json\" <<EOF\n{{\"auth_mode\":\"chatgpt\",\"tokens\":{{\"id_token\":\"{id_token}\",\"access_token\":\"<access-token>\",\"refresh_token\":\"<refresh-token>\"}}}}\nEOF\n"
     )
 }
 
-fn login_app(accounts: Vec<Account>, cli: &str, base_url: Option<&str>) -> (Arc<App>, TempDir) {
+pub(super) fn login_app(
+    accounts: Vec<Account>,
+    cli: &str,
+    base_url: Option<&str>,
+) -> (Arc<App>, TempDir) {
     let (cli, base) = (cli.to_string(), base_url.map(str::to_string));
     let (app, dir) = super::testing::test_app_with(accounts, |settings| {
         settings.codex_cli = cli;
@@ -60,7 +65,11 @@ fn login_app(accounts: Vec<Account>, cli: &str, base_url: Option<&str>) -> (Arc<
     (Arc::new(app), dir)
 }
 
-async fn wait_for_job(app: &App, job_id: &str, done: impl Fn(&LoginJob) -> bool) -> LoginJob {
+pub(super) async fn wait_for_job(
+    app: &App,
+    job_id: &str,
+    done: impl Fn(&LoginJob) -> bool,
+) -> LoginJob {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let job = app.read().jobs.get(job_id).cloned().unwrap_or_default();
@@ -75,12 +84,12 @@ async fn wait_for_job(app: &App, job_id: &str, done: impl Fn(&LoginJob) -> bool)
     }
 }
 
-fn terminal(job: &LoginJob) -> bool {
+pub(super) fn terminal(job: &LoginJob) -> bool {
     matches!(job.status.as_str(), "completed" | "failed" | "cancelled")
 }
 
 /// Go seedDeviceAuthIdentityHistory.
-fn seed_device_auth_identity_history(app: &App, account_id: &str, now: Timestamp) {
+pub(super) fn seed_device_auth_identity_history(app: &App, account_id: &str, now: Timestamp) {
     let cache_key = format!("{account_id}:gpt-test:subagent");
     let stat = PromptCacheStat {
         account_id: account_id.into(),
@@ -189,7 +198,7 @@ fn seed_device_auth_identity_history(app: &App, account_id: &str, now: Timestamp
     );
 }
 
-fn history_sizes(app: &App) -> (usize, usize, usize, usize, usize) {
+pub(super) fn history_sizes(app: &App) -> (usize, usize, usize, usize, usize) {
     let inner = app.read();
     let state = &inner.state;
     (

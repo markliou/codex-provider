@@ -10,6 +10,8 @@
 
 pub mod admin;
 pub mod admin_api;
+#[cfg(test)]
+mod admin_tests;
 pub mod app;
 pub mod catalog;
 pub mod credentials;

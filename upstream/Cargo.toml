@@ -109,6 +109,12 @@ unnecessary_sort_by = "deny"
 unnecessary_to_owned = "deny"
 unwrap_used = "deny"
 
+# The admin password is verified with 100,000 PBKDF2-SHA256 rounds; with an
+# unoptimized sha2 every test login takes seconds. Only debug builds (the
+# tests) change; release is optimized anyway.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 lto = "fat"
