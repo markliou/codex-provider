@@ -17,6 +17,8 @@ pub mod catalog;
 pub mod credentials;
 pub mod crypto;
 pub mod dashboard;
+#[cfg(test)]
+mod dashboard_tests;
 pub mod gojson;
 pub mod gosort;
 pub mod hash;
