@@ -269,6 +269,25 @@ mod tests {
             composed.json_body.as_deref(),
             Some(br#"{"redeem_request_id":"fake-redeem"}"#.as_slice())
         );
+        // Go TestConsumeResetCreditBodyIsCodexs: Codex's
+        // ConsumeRateLimitResetCreditRequest field order, with credit_id
+        // after the request id when a credit is named.
+        let named: OwnCall = serde_json::from_value(serde_json::json!({
+            "call": "consume_reset_credit",
+            "url": "https://chatgpt.example.test/backend-api/wham/rate-limit-reset-credits/consume",
+            "user_agent": "codex_exec/0.163.0",
+            "access_token": "replace-access",
+            "redeem_request_id": "key",
+            "credit_id": "credit",
+        }))
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            compose(&named)
+                .unwrap_or_else(|error| panic!("{error}"))
+                .json_body
+                .as_deref(),
+            Some(br#"{"redeem_request_id":"key","credit_id":"credit"}"#.as_slice())
+        );
 
         let call: OwnCall = serde_json::from_value(serde_json::json!({
             "call": "token_refresh",

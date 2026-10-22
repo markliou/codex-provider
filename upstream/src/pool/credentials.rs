@@ -750,4 +750,66 @@ mod tests {
         headers.insert("user-agent", http::HeaderValue::from_static("curl/8.0"));
         assert_eq!(codex_client_version(&headers), "");
     }
+
+    /// A repository file, read at test time (never compiled in).
+    fn repository_file(path: &str) -> String {
+        let full = format!("{}/../{path}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&full).unwrap_or_else(|error| panic!("{full}: {error}"))
+    }
+
+    fn fixture_release() -> String {
+        let fixture: serde_json::Value = serde_json::from_str(&repository_file(
+            "cmd/codex-pool/testdata/codex-upstream-failures.json",
+        ))
+        .unwrap_or_default();
+        fixture["codexRelease"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    // Go TestBundledCodexMatchesThePinnedRelease: one Codex release, named in
+    // three places: the crates codex-upstream is built from, the CLI bundled
+    // for sign-in and priming, and the version the pool's own calls present.
+    // The bundled CLI once stayed at 0.141.0 while the rest moved to 0.163.0,
+    // so sign-in traffic came from an older Codex than everything else.
+    #[test]
+    fn bundled_codex_matches_the_pinned_release() {
+        assert_eq!(
+            fixture_release(),
+            format!("rust-v{PINNED_CODEX_VERSION}"),
+            "PINNED_CODEX_VERSION does not match the pinned Codex tag"
+        );
+        let dockerfile = repository_file("Dockerfile");
+        let bundled = dockerfile
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("ARG CODEX_CLI_VERSION="))
+            .map(str::trim);
+        assert_eq!(
+            bundled,
+            Some(PINNED_CODEX_VERSION),
+            "the Dockerfile bundles another Codex"
+        );
+    }
+
+    // Go TestCodexShapeFixtureTracksThePinnedCodexRelease: bumping the Codex
+    // tag without revisiting the shapes that release parses is exactly how
+    // the pool drifts from Codex.
+    #[test]
+    fn codex_shape_fixture_tracks_the_pinned_codex_release() {
+        let release = fixture_release();
+        let cargo = repository_file("upstream/Cargo.toml");
+        let tags: Vec<&str> = cargo
+            .split(r#"openai/codex", tag = ""#)
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert!(!tags.is_empty(), "upstream/Cargo.toml names no Codex tag");
+        for tag in tags {
+            assert_eq!(
+                tag, release,
+                "upstream/Cargo.toml pins Codex {tag} but the shape fixture describes {release}; re-run scripts/conformance/codex-conformance.sh and update the fixture"
+            );
+        }
+    }
 }

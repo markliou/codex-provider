@@ -156,6 +156,11 @@
   - 程式：`pool/quota_refresh.rs`（額度更新、工作區與方案、重置額度到期日、輪詢迴圈）、`pool/reset_credit.rs`（照 Codex 的選單選重置額度、重試沿用同一個 redeem key）、`pool/prime.rs`（未開始的視窗等使用者 5–30 分鐘後，用內附的 Codex CLI 跑一輪啟動）、`pool/login.rs`（`codex login --device-auth` 登入工作、身分驗證閘門、取消時整個 process group 一起結束）。
   - 測試：`pool/quota_tests.rs`、`pool/login_tests.rs`。Go 的登入測試把假的 `codex` 放在 PATH；Rust 測試平行執行、PATH 全程式共用，所以改用設定 `Settings::codex_cli` 指向假腳本，正式環境仍是 PATH 上的 `codex`。
   - 管理動作的 HTTP 外殼（重置額度、更新額度、登入、取消工作）的邏輯已在上述模組，路由與 session 檢查屬 4.5。
+- 4.5 進度（2026-10-22）：管理介面與儀表板 API 已翻完，前門尚未接上。
+  - 程式：`pool/admin_api.rs`（登入、登出、失敗 5 次鎖 15 分鐘、CSRF、信任的 proxy、所有 `/admin/api` 動作）、`pool/dashboard.rs`（狀態卡、摘要、容量條、吞吐量、prompt cache 視窗、公開儀表板與公開帳號代號）。路由表改成照 Go 1.22 ServeMux：最具體的規則優先、GET 也接 HEAD、405 附 `Allow`、子樹根目錄 301、路徑清理。
+  - 測試：`pool/admin_tests.rs`、`pool/dashboard_tests.rs`、`pool/asset_tests.rs`（管理頁、script、style 的必要與禁止字串），以及 4.3、4.4 留下的儀表板部分（公開儀表板內容、容量條、額度保護動作、經由路由取消登入工作、Caddy 後方的登入 key）。測試直接簽 admin session，不跑 PBKDF2 登入；只有登入測試本身會跑。
+  - 只對 Go 有意義、不翻的 Go 測試：`TestHashVectorsMatchTheGoCode`、`TestStateVectorsMatchTheGoTypes`、`TestOwnCallVectorsMatchTheGoCode`（Go 產生、Rust 讀的對照檔；Rust 端的讀取測試保留）、`TestPoolOwnCallsGoToCodexUpstreamAsCalls`、`TestNoCodexVerdictWithoutTransport`（Go 呼叫 Rust transport 的介面，切換後不存在）、`TestMain`（Go 的測試等待時間；Rust 用設定）。`TestBundledCodexMatchesThePinnedRelease`、`TestCodexShapeFixtureTracksThePinnedCodexRelease`、`TestConsumeResetCreditBodyIsCodexs` 已翻成 Rust，移除 Go 後仍檢查。
+  - 剩下 4.6：前門改為本地處理（`listener.rs` 接上、啟動額度輪詢）、`TestStopSignalDrain*`、完整驗證。
 
 ### 第 5 步：管理介面
 
