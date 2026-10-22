@@ -520,17 +520,29 @@ async fn responses_websocket_closes_after_a_capacity_failure() {
     }
 }
 
-// Go TestResponsesWebSocketKeepsTheSocketThroughAnOverload: an overload stays
-// on the socket, retried on the same connection and account, and the account
-// is not cooled while it is inside the same-account schedule.
+// An overload before content is never resent on the failed socket: a native
+// Codex drops a socket on any failed response and resends on a new one
+// (codex-api endpoint/responses_websocket.rs stream_request). The pool closes
+// both sockets without showing the failure, the account stays uncooled inside
+// the same-account schedule, and Codex's reconnect resends in full on the same
+// account. Upstream sends the failed response's own trailing response.failed
+// after the error event, as it did live; it must not be read as a second
+// failure. (Replaces Go TestResponsesWebSocketKeepsTheSocketThroughAnOverload,
+// which asserted the resend on the same socket.)
 #[tokio::test]
-async fn responses_websocket_keeps_the_socket_through_an_overload() {
+async fn responses_websocket_hands_an_overload_to_codex_on_a_new_socket() {
     for code in ["server_is_overloaded", "server_error"] {
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let pool = ws_test_pool(
             Behavior::scripted(move |_| {
                 if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                    failing_events(&format!(r#"{{"type":"error","status":503,"error":{{"code":"{code}","message":"busy"}}}}"#))
+                    let mut events = failing_events(&format!(
+                        r#"{{"type":"error","status":500,"error":{{"code":"{code}","message":"busy"}}}}"#
+                    ));
+                    events.push(format!(
+                        r#"{{"type":"response.failed","response":{{"id":"resp_busy","error":{{"code":"{code}","message":"busy"}}}}}}"#
+                    ));
+                    events
                 } else {
                     completed_events("resp_ok")
                 }
@@ -538,58 +550,89 @@ async fn responses_websocket_keeps_the_socket_through_an_overload() {
             |_| {},
         )
         .await;
-        let mut socket = dial_pool(&pool.url).await;
         let turn = r#"{"type":"response.create","model":"gpt-test","previous_response_id":"resp_prev","input":[]}"#;
-        for round in 0..2 {
-            send(&mut socket, turn).await;
-            let events = read_until_terminal(&mut socket).await;
-            assert!(
-                events.len() == completed_events("x").len() && !events.concat().contains(code),
-                "round {round}: the {code} must be retried before Codex sees it: {events:?}"
-            );
-        }
-        wait_in_flight_zero(&pool.app).await;
-        let messages = pool.upstream.messages();
+        let mut socket = dial_pool(&pool.url).await;
+        send(&mut socket, turn).await;
+        let events = read_until_terminal(&mut socket).await;
         assert!(
-            pool.upstream.identities().len() == 1
-                && messages.len() == 3
-                && messages[0] == turn
-                && messages[1] == turn,
-            "the retry must resend the same request on the same socket: {messages:?}"
+            events.is_empty(),
+            "the {code} must not reach Codex; its socket closes instead: {events:?}"
+        );
+        wait_in_flight_zero(&pool.app).await;
+        assert_eq!(
+            pool.upstream.messages().len(),
+            1,
+            "nothing may be resent on the socket that failed"
         );
         assert!(
             !cooled(&pool.app, "first"),
             "an overload inside the same-account schedule must not cool the account"
         );
+        // Codex reconnects and resends in full, as after any dropped socket.
+        let full = r#"{"type":"response.create","model":"gpt-test","input":[{"type":"message","role":"user","content":[]}]}"#;
+        let mut socket = dial_pool(&pool.url).await;
+        send(&mut socket, full).await;
+        let events = read_until_terminal(&mut socket).await;
+        assert_eq!(events.len(), completed_events("x").len(), "{events:?}");
+        wait_in_flight_zero(&pool.app).await;
+        assert_eq!(
+            pool.upstream.identities(),
+            ["first", "first"],
+            "the reconnect stays on the same account, on a new upstream socket"
+        );
+        assert_eq!(pool.upstream.messages(), [turn, full]);
     }
 }
 
-// Go TestResponsesWebSocketMovesOnWhenTheOverloadOutlastsTheSchedule.
+// Go TestResponsesWebSocketMovesOnWhenTheOverloadOutlastsTheSchedule: each
+// overload closes the socket and Codex reconnects; past the same-account
+// schedule the account cools and the next reconnect goes elsewhere.
 #[tokio::test]
 async fn responses_websocket_moves_on_when_the_overload_outlasts_the_schedule() {
     let pool = ws_test_pool(
-        Behavior::scripted(|_| failing_events(r#"{"type":"response.failed","response":{"id":"resp_busy","error":{"code":"server_is_overloaded"}}}"#)),
+        Behavior::scripted(|who| {
+            if who == "first" {
+                failing_events(r#"{"type":"response.failed","response":{"id":"resp_busy","error":{"code":"server_is_overloaded"}}}"#)
+            } else {
+                completed_events("resp_second")
+            }
+        }),
         |_| {},
     )
     .await;
-    let mut socket = dial_pool(&pool.url).await;
-    send(
-        &mut socket,
-        r#"{"type":"response.create","model":"gpt-test","input":[]}"#,
-    )
-    .await;
-    let events = read_until_terminal(&mut socket).await;
-    assert!(
-        events.is_empty(),
-        "the exhausted overload must not reach Codex: {events:?}"
-    );
-    wait_in_flight_zero(&pool.app).await;
+    let turn = r#"{"type":"response.create","model":"gpt-test","input":[]}"#;
     let limit =
         usize::try_from(super::tuning::OVERLOAD_SAME_ACCOUNT_RETRY_LIMIT).unwrap_or_default();
-    assert_eq!(pool.upstream.messages().len(), limit + 1);
+    for attempt in 0..=limit {
+        assert!(
+            !cooled(&pool.app, "first"),
+            "attempt {attempt} is still inside the same-account schedule"
+        );
+        let mut socket = dial_pool(&pool.url).await;
+        send(&mut socket, turn).await;
+        let events = read_until_terminal(&mut socket).await;
+        assert!(
+            events.is_empty(),
+            "the overload must not reach Codex: {events:?}"
+        );
+        wait_in_flight_zero(&pool.app).await;
+    }
     assert!(
         cooled(&pool.app, "first"),
         "the account that kept refusing must cool down"
+    );
+    let mut socket = dial_pool(&pool.url).await;
+    send(&mut socket, turn).await;
+    assert_eq!(
+        read_until_terminal(&mut socket).await.len(),
+        completed_events("x").len()
+    );
+    let mut identities = vec!["first"; limit + 1];
+    identities.push("second");
+    assert_eq!(
+        pool.upstream.identities(),
+        identities,
+        "one upstream socket per attempt, then the next account"
     );
 }
 
