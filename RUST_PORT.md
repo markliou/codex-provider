@@ -165,7 +165,8 @@
   - A（啟動）：`pool/serve.rs` 從環境變數載入設定和資料、啟動額度輪詢、自己綁 `CODEX_POOL_ADDR`；收到 SIGTERM 時關閉 listener，每條連線處理完手上的請求就關，WebSocket 上還在跑的回應用 in-flight 計數等，最多等 `CODEX_POOL_SHUTDOWN_GRACE`，最後存檔。`TestStopSignalDrain*` 兩個已翻。
   - B（容器）：`main.rs` 直接跑 pool（保留 `hash-password`）；刪除 `front.rs` 和給 Go 用的 loopback 介面（`/forward`、`/ws`、`/own`、`/classify`）；Dockerfile 不再建 Go，Rust 執行檔裝成 `/usr/local/bin/codex-pool`，管理頁檔案從 `cmd/codex-pool/web` 編進去；`supervisor.sh` 直接 `exec` pool。SPEC、README、AGENTS 的架構描述已改成單一 Rust process。
   - 隔離容器的煙霧測試通過：首頁、API key、模型清單、in-flight、版本號；`docker stop` 以狀態 0 結束並記錄 drain 完成。
-  - 剩下 C：整合測試、`wire-capture.sh`、部署（需要使用者同意）。回滾：重新部署 main 的上一版 image。
+  - C（驗證，2026-10-22，`547d26f`）：Rust 測試 459 個、`codex-conformance.sh check`、4 個整合測試、`wire-capture.sh` 22 項全部通過。第一次 wire-capture 的 `subagent-ws` 少了子代理的預熱訊息：情境裡主代理一產生子代理就結束、Codex 隨即退出，預熱能否送出差幾毫秒（原生 Codex 自己也時前時後），多一段轉送偶爾趕不上；加診斷記錄重跑確認 pool 收到的每則訊息都有轉送，之後乾淨重跑通過。待改：讓子代理先完成一輪，去掉這個競爭。
+  - 剩下：部署（需要使用者同意；先把 rust-port 合併回 main，從 main 部署，rust-port 不跑 `deploy.sh`）。回滾：重新部署 main 的上一版 image。
 
 ### 第 5 步：管理介面
 
