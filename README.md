@@ -316,10 +316,12 @@ only what a native Codex adds (`ChatGPT-Account-ID`, `X-Codex-Routing-Hint`). It
 refreshes the account's token five minutes before expiry, and once more on a
 `401` before treating the account as signed out.
 
-The last hop is `codex-upstream`, a loopback-only Rust process in the same
-container built from Codex's HTTP client crate at the pinned release
-(`rust-v0.163.0` in [upstream/Cargo.toml](upstream/Cargo.toml)). It opens one
-connection per request, as Codex does.
+The last hop is `codex-upstream`, a Rust process in the same container built
+from Codex's HTTP client crate at the pinned release (`rust-v0.163.0` in
+[upstream/Cargo.toml](upstream/Cargo.toml)). It opens one connection per
+request, as Codex does. It is also the front door on port 8317: it accepts
+every client connection and relays it unchanged to the Go pool, which listens
+only inside the container (a step of the move to Rust, `RUST_PORT.md`).
 
 The pool's own calls also go out the way Codex makes them. Token refresh, usage,
 account check and reset-credit reads use Codex's endpoints and header order, with

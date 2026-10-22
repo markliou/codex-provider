@@ -9,8 +9,15 @@
 //! the upstream connection is opened with Codex's own WebSocket connector and
 //! its permessage-deflate configuration, and messages pass through unchanged,
 //! so prewarm and incremental requests reach upstream exactly as Codex sent
-//! them. Keep it a transport: routing decisions here would split
-//! responsibility with the pool the way the retired CLIProxyAPI sidecar did.
+//! them.
+//!
+//! It is also the pool's front door (RUST_PORT.md step 3, `front`): with
+//! `CODEX_FRONT_ADDR` set it accepts every client connection on the pool's
+//! public address and relays it unchanged to the Go pool, which listens only
+//! inside the container. That is a step of the move to Rust, not a second
+//! router: until routing itself moves here (step 4), nothing in this process
+//! picks an account or decides a retry, because two deciders would split
+//! responsibility the way the retired CLIProxyAPI sidecar did.
 //! `/classify` is no exception: it reports what a native Codex would make of
 //! a failure, read with Codex's own code (codex_vendor::classify), and leaves
 //! every retry and failover decision to the pool. Nor is `/own`: it writes the
@@ -35,6 +42,8 @@ use codex_http_client::ReqwestTransport;
 use codex_http_client::TransportError;
 use codex_vendor::pool::own_call;
 use codex_vendor::pool::own_call::OwnCall;
+
+mod front;
 use codex_websocket_client::WebSocketConnector;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -796,6 +805,26 @@ async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let transports = Arc::new(Transports::new()?);
     eprintln!("codex-upstream listening on {addr}");
+    // Bound before the transport answers, so the supervisor's readiness check
+    // fails rather than passes when the public address cannot be taken.
+    if let Ok(front_addr) = std::env::var("CODEX_FRONT_ADDR") {
+        let pool: SocketAddr = std::env::var("CODEX_FRONT_POOL_ADDR")
+            .map_err(|_| std::io::Error::other("CODEX_FRONT_ADDR needs CODEX_FRONT_POOL_ADDR"))?
+            .parse()
+            .map_err(std::io::Error::other)?;
+        if !pool.ip().is_loopback() {
+            return Err(std::io::Error::other(
+                "CODEX_FRONT_POOL_ADDR must be a loopback address",
+            ));
+        }
+        let allow_remote = std::env::var("CODEX_POOL_ALLOW_REMOTE_ADMIN").as_deref() == Ok("true");
+        let front = front::bind(&front_addr, allow_remote).await?;
+        eprintln!(
+            "codex-upstream front door listening on {}, relaying to the pool at {pool}",
+            front.local_addr()?
+        );
+        tokio::spawn(front::serve(front, pool));
+    }
     loop {
         let (stream, _) = tokio::select! {
             accepted = listener.accept() => accepted?,

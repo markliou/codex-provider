@@ -1038,7 +1038,30 @@ func (a *app) serve() error {
 	a.startQuotaRefresher(context.Background())
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
-	return a.serveUntilStopped(ctx, listener, a.mux())
+	return a.serveUntilStopped(ctx, listener, withFrontPeer(a.mux()))
+}
+
+// frontPeerHeader carries the address codex-upstream's front door accepted a
+// client connection from (RUST_PORT.md step 3; upstream/src/front.rs). In the
+// container every request reaches the pool from that door on loopback, so
+// without it every client would look like loopback: /internal/inflight would
+// answer the network, and the admin login lockout would count every client
+// as one. The door overwrites any copy a client sends; the pool believes the
+// header only on a loopback connection and always removes it, so it is never
+// relayed upstream. X-Forwarded-For stays the trusted proxy's
+// (CODEX_POOL_TRUSTED_PROXIES), judged against the address this restores.
+const frontPeerHeader = "X-Codex-Pool-Peer"
+
+func withFrontPeer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if peer := r.Header.Get(frontPeerHeader); peer != "" {
+			r.Header.Del(frontPeerHeader)
+			if _, _, err := net.SplitHostPort(peer); err == nil && isLoopbackAddress(r.RemoteAddr) {
+				r.RemoteAddr = peer
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // serveUntilStopped serves until ctx is cancelled by a stop signal, then

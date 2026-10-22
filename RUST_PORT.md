@@ -120,6 +120,12 @@
 - 安裝 ID（main `cmd/codex-pool/installation_id.go`，SPEC 2.3.2）：每個帳號在自己的 `.codex/installation_id` 有一組固定的 UUID，送上游時只替換 `client_metadata` 裡和 `x-codex-turn-metadata` 檔頭裡的安裝 ID，其他位元組不動；WebSocket 的握手和每則訊息用該 socket 綁定帳號的 ID，prime 的暫時 home 也放同一組。Rust 的函式已寫好（`upstream/src/pool/installation_id.rs`，測試對應 Go 的 `installation_id_test.go`）；轉送搬到 Rust 時直接用它，`wire-capture.sh` 的 installation id 檢查必須仍然通過。
 - 更新 `upstream/src/main.rs` 開頭「Keep it a transport」的意圖註解、`supervisor.sh` 與 `SPEC.md`。
 
+進度（2026-10-22）：完成，在 `rust-port`，尚未部署。
+- `upstream/src/front.rs`：`codex-upstream` 綁定 pool 的對外位址（`CODEX_POOL_ADDR`，預設 `:8317`，非 loopback 一樣要 `CODEX_POOL_ALLOW_REMOTE_ADMIN=true`），每個請求開一條自己的連線原樣轉給 Go（`127.0.0.1:8318`）：方法、路徑、檔頭（hop-by-hop 除外）、body、串流回應、WebSocket 升級。Go 沒在回應時回 502。
+- 來源位址：所有請求到 Go 都變成 loopback，所以前門把接到的連線位址放在 `X-Codex-Pool-Peer`（覆蓋 client 自己送的），Go 的 `withFrontPeer` 只在 loopback 連線上採信並一律刪掉這個檔頭。`/internal/inflight` 仍只對本機開放，登入鎖定和 `CODEX_POOL_TRUSTED_PROXIES` 照舊看真正的 client。`X-Forwarded-For` 原樣轉送。
+- 停止順序不變：前門在 helper 裡，pool 排空時串流仍經過它；排空期間的新連線改回 502（以前是 pool 關掉 listener 直接拒絕連線）。
+- 對上游送出的內容不變：pool 仍把上游請求交給同一個 process 的 `/forward`、`/ws`、`/own`。安裝 ID 仍由 Go 替換；`installation_id.rs` 等轉送搬到 Rust（第 4 步）時再接上。
+
 ### 第 4 步：路由與狀態檔
 
 - Rust 一次整塊接手：API 金鑰、放置、嚴格 lineage 綁定、搬家、冷卻、重試、Use Pro last、紅框、額度更新與 `runtime.json`／`config.json`／`auth.json` 的寫入。這一步完成後，Go 不再寫入任何狀態。

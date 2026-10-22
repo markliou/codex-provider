@@ -55,10 +55,23 @@ run_pool() {
 # The final hop goes through codex-upstream, Codex's own HTTP client, so the
 # upstream connection is the one a native Codex CLI makes. An explicit
 # CODEX_POOL_CODEX_TRANSPORT_URL (tests) is left alone.
+#
+# codex-upstream is also the front door (RUST_PORT.md step 3): it takes the
+# pool's public address (CODEX_POOL_ADDR, as the pool would have bound it) and
+# relays every client connection to the pool, which is moved to a loopback
+# address inside the container. The stop order above still holds: the door
+# lives in the helper, so it keeps relaying the pool's draining streams until
+# the pool exits.
+POOL_INTERNAL_ADDR=127.0.0.1:8318
 if [ -z "${CODEX_POOL_CODEX_TRANSPORT_URL:-}" ] && [ -x /usr/local/bin/codex-upstream ]; then
-  CODEX_UPSTREAM_ADDR=127.0.0.1:8320 /usr/local/bin/codex-upstream &
+  PUBLIC_ADDR=${CODEX_POOL_ADDR:-${CODEX_POOL_PUBLIC_ADDR:-:8317}}
+  CODEX_UPSTREAM_ADDR=127.0.0.1:8320 \
+    CODEX_FRONT_ADDR="$PUBLIC_ADDR" \
+    CODEX_FRONT_POOL_ADDR="$POOL_INTERNAL_ADDR" \
+    /usr/local/bin/codex-upstream &
   HELPER_PID=$!
   wait_for_helper http://127.0.0.1:8320/
   export CODEX_POOL_CODEX_TRANSPORT_URL=http://127.0.0.1:8320
+  export CODEX_POOL_ADDR="$POOL_INTERNAL_ADDR"
 fi
 run_pool
