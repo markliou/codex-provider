@@ -477,7 +477,7 @@ func TestQuotaWindowPrimeSpendsAndLeavesNoRoutingTrace(t *testing.T) {
 	snapshot := quotaSnapshot{AccountID: "only", Quota: &accountQuota{Windows: []quotaWindow{
 		{Label: "Week", WindowMinutes: func() *int64 { v := int64(10080); return &v }(), ResetAt: &resetAt, RemainingPercent: &full, Present: true, Observed: true},
 	}}}
-	// Priming is off until the owner turns it on.
+	// Nothing is primed while the owner has priming off.
 	a.primeUnanchoredQuotaWindow(context.Background(), "only", snapshot)
 	if hits != 0 || len(a.state.QuotaWindowPrimes) != 0 {
 		t.Fatalf("a prime was sent with priming off: hits=%d", hits)
@@ -3109,9 +3109,6 @@ func TestAdminSettingsToggleLineageAffinityKeepsOtherSettings(t *testing.T) {
 func TestAdminSettingsToggleQuotaPrimeKeepsOtherSettings(t *testing.T) {
 	a := testApp(t, nil)
 	cookies, csrf := adminSession(t, a)
-	if a.quotaPrime {
-		t.Fatal("quota priming must be off by default")
-	}
 	post := func(body string) *httptest.ResponseRecorder {
 		request := httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(body))
 		for _, cookie := range cookies {
@@ -11006,5 +11003,34 @@ func TestQuotaPrimeGraceIsRandomUnlessFixedForTests(t *testing.T) {
 	t.Setenv("CODEX_POOL_QUOTA_PRIME_GRACE", "soon")
 	if _, err := quotaPrimeGraceFromEnv(); err == nil {
 		t.Fatal("an invalid grace was accepted")
+	}
+}
+
+// Priming is on unless the owner turns it off.
+func TestQuotaPrimeDefaultsOn(t *testing.T) {
+	hash, err := newPasswordHash("admin-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{{"", true}, {"false", false}} {
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("CODEX_POOL_DATA_DIR", dir)
+		t.Setenv("CODEX_POOL_API_KEY", "client-key")
+		t.Setenv("CODEX_POOL_ADDR", "127.0.0.1:8317")
+		t.Setenv("CODEX_POOL_ADMIN_PASSWORD_HASH", hash)
+		t.Setenv("CODEX_POOL_QUOTA_PRIME", tc.env)
+		a, err := newAppFromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.quotaPrime != tc.want {
+			t.Fatalf("CODEX_POOL_QUOTA_PRIME=%q: quotaPrime = %v, want %v", tc.env, a.quotaPrime, tc.want)
+		}
 	}
 }
