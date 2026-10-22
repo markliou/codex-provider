@@ -18,7 +18,7 @@ import (
 // than a request the pool composed, which no native Codex sends.
 //
 // The CLI runs against a temporary CODEX_HOME holding the account's current
-// access and ID tokens and no refresh token. Refresh tokens rotate on use: a
+// access and ID tokens and no refresh token, and the account's installation id. Refresh tokens rotate on use: a
 // CLI that refreshed would revoke the pool's own copy and sign the account out,
 // so it is given nothing to refresh with. last_refresh is now, so Codex sees
 // no reason to try. Nothing is written back; the directory is removed after.
@@ -76,6 +76,16 @@ func (a *app) primeWithCodexCLI(ctx context.Context, candidate account, model st
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(home, "auth.json"), encoded, 0o600); err != nil {
+		return err
+	}
+	// The CLI sends the installation id in its home; a temporary home would
+	// make a new one for every prime. It gets the account's own, the one the
+	// account presents on every request (installation_id.go).
+	installationID, err := a.accountInstallationID(candidate)
+	if err != nil {
+		return fmt.Errorf("account installation id: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, codexInstallationIDFile), []byte(installationID), 0o644); err != nil {
 		return err
 	}
 	config := "cli_auth_credentials_store = \"file\"\nmodel = " + fmt.Sprintf("%q", model) + "\n"

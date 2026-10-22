@@ -269,6 +269,9 @@ func (s *wsSession) startResponse(message []byte, payload map[string]any) bool {
 	s.mu.Unlock()
 	a.noteSessionPlacement(route.BalanceKey, bound.ID)
 	message = s.gateTurnState(message, payload, route)
+	if id, ok := a.presentedInstallationID(bound); ok {
+		message = withInstallationID(message, id)
+	}
 
 	s.mu.Lock()
 	response := &wsResponse{route: route, model: model, accountID: s.account.ID, warmup: warmup, message: message}
@@ -672,6 +675,11 @@ func (a *app) dialCodexWebSocketOnce(candidate account, clientHeaders http.Heade
 	headers := http.Header{}
 	forwardCodexMetadataHeaders(headers, clientHeaders)
 	headers.Del("X-Codex-Turn-State")
+	// The socket is the account's, so its handshake and every message on it
+	// present the account's installation id (installation_id.go).
+	if id, ok := a.presentedInstallationID(candidate); ok {
+		setTurnMetadataInstallationID(headers, id)
+	}
 	if auth.AccountID == "" {
 		auth.AccountID = candidate.AccountID
 	}

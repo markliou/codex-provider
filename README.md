@@ -99,7 +99,9 @@ openai_base_url = "https://<pool-host>/k/<pool-api-key>/backend-api/codex"
 Do not set `model_provider`, and use real model names (for example
 `model = "gpt-5.5"` with `model_reasoning_effort`). Codex then sends the pool
 exactly what it sends OpenAI, and the pool forwards it unchanged, replacing only
-the credential with the selected account's. Your own login is still used,
+the credential and the Codex installation id with the selected account's own
+(each account presents one fixed installation id, so upstream sees one Codex
+installation per account). Your own login is still used,
 directly with `chatgpt.com`, for the account, plugin and analytics calls a native
 Codex makes. Responses over HTTP and WebSocket, compaction, models, image
 generation and the other Codex backend paths are served; voice (realtime) is
