@@ -72,3 +72,4 @@ pub(crate) mod endpoint {
 
 // The pool's own code on top of the vendored files.
 pub mod classify;
+pub mod transport;
