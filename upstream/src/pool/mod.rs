@@ -14,11 +14,14 @@ pub mod gojson;
 pub mod gosort;
 pub mod hash;
 pub mod installation_id;
+pub mod log;
 pub mod metadata;
 pub mod own_call;
 pub mod plan;
 pub mod quota;
 pub mod quota_schedule;
+pub mod response_info;
+pub mod routing;
 pub mod settings;
 pub mod state;
 #[cfg(test)]

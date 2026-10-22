@@ -9,6 +9,7 @@
 //! does not poison it: one request's failure must not stop the pool.
 
 use super::gosort::slice_stable;
+use super::log::Logger;
 use super::metadata::CodexAuthFile;
 use super::metadata::CodexAuthInfo;
 use super::metadata::codex_auth_info_from_file;
@@ -111,18 +112,32 @@ pub struct Inner {
     pub lineage_affinity: bool,
     pub quota_prime: bool,
     pub jobs: BTreeMap<String, LoginJob>,
+    /// In-memory placement load: which account each recently active session
+    /// is on (see note_session_placement).
+    pub session_placements: HashMap<String, super::routing::SessionPlacement>,
+    pub logger: Arc<Logger>,
 }
 
 pub struct App {
     pub settings: Arc<Settings>,
     pub tuning: Tuning,
+    pub logger: Arc<Logger>,
     inner: RwLock<Inner>,
 }
 
 impl App {
-    pub fn new(settings: Settings, tuning: Tuning, config: Config, state: RuntimeState) -> Self {
+    pub fn new(
+        settings: Settings,
+        tuning: Tuning,
+        config: Config,
+        state: RuntimeState,
+        logger: Logger,
+    ) -> Self {
         let settings = Arc::new(settings);
+        let logger = Arc::new(logger);
         let inner = Inner {
+            session_placements: HashMap::new(),
+            logger: logger.clone(),
             preserve_pro_quota: config
                 .preserve_pro_quota
                 .unwrap_or(settings.preserve_pro_quota),
@@ -137,6 +152,7 @@ impl App {
         Self {
             settings,
             tuning,
+            logger,
             inner: RwLock::new(inner),
         }
     }
@@ -164,6 +180,7 @@ impl App {
             tuning,
             config,
             initialized_state(RuntimeState::default()),
+            Logger::discard(),
         )
     }
 
@@ -184,6 +201,7 @@ impl App {
     pub fn load(
         settings: Settings,
         tuning: Tuning,
+        logger: Logger,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
         let data_dir = settings.data_dir.clone();
@@ -202,7 +220,7 @@ impl App {
             .map_err(|error| format!("read runtime state: {error}"))?
             .unwrap_or_default();
         config.model_aliases_mut();
-        let app = Self::new(settings, tuning, config, initialized_state(state));
+        let app = Self::new(settings, tuning, config, initialized_state(state), logger);
         {
             let mut inner = app.write();
             let now = Timestamp::now();
@@ -440,11 +458,6 @@ impl Inner {
             &self.state,
         )?;
         write_json_atomic(&self.settings.data_dir.join("config.json"), &self.config)
-    }
-
-    /// Placeholder until the runtime pruning is ported with routing (4.2).
-    pub fn prune_expired_runtime_state(&mut self, _now: Timestamp) -> bool {
-        false
     }
 
     // ---- credentials ----
@@ -697,11 +710,6 @@ impl Inner {
             return left.id < right.id;
         }
         left.priority > right.priority
-    }
-
-    /// Placeholder until the red-outline rule is ported with placement (4.2).
-    pub fn expiring_reset_credit(&self, _item: &Account, _now: Timestamp) -> bool {
-        false
     }
 
     pub fn excluded_upstream_identities(
@@ -1240,6 +1248,7 @@ mod tests {
         let app = App::load(
             Settings::for_test(dir.path().to_path_buf()),
             Tuning::default(),
+            Logger::discard(),
             |_| None,
         )
         .unwrap_or_else(|error| panic!("{error}"));
