@@ -1,7 +1,7 @@
 //! Password hashes, random identifiers and the HMAC behind admin sessions.
 //!
 //! A port of newPasswordHash, verifyPasswordHash, randomUUID and randomID in
-//! cmd/codex-pool/main.go. PBKDF2-HMAC-SHA256 is written here, as Go writes it
+//! the Go pool's main.go. PBKDF2-HMAC-SHA256 is written here, as Go writes it
 //! locally, so the image build depends on no further crate; the hash format
 //! (`pbkdf2-sha256:<iterations>:<salt>:<hash>`, unpadded standard base64) is
 //! the one `CODEX_POOL_ADMIN_PASSWORD_HASH` already holds, so the existing

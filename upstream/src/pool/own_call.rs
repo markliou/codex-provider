@@ -10,8 +10,8 @@
 //! routes on (`limit_reached`, `code_review_rate_limit`, plan names it does not
 //! know), and login's refresh lives in a private module. So the request is
 //! written here from that source, the answer goes back to the pool untouched,
-//! and the tests hold the composition to both the Go side
-//! (cmd/codex-pool/testdata/own-call-vectors.json) and the measured order.
+//! and the tests hold the composition to the vectors the Go pool produced
+//! (upstream/testdata/own-call-vectors.json) and to the measured order.
 //!
 //! A request is returned in three parts, as codex-http-client assembles one:
 //! the headers set before the body step, the JSON body (the body step adds its
@@ -216,10 +216,9 @@ mod tests {
     // codex-upstream) and this one write every call the same way.
     #[test]
     fn composes_every_call_as_the_go_side_does() {
-        let vectors: Vec<Vector> = serde_json::from_str(include_str!(
-            "../../../cmd/codex-pool/testdata/own-call-vectors.json"
-        ))
-        .unwrap_or_else(|error| panic!("own-call-vectors.json: {error}"));
+        let vectors: Vec<Vector> =
+            serde_json::from_str(include_str!("../../testdata/own-call-vectors.json"))
+                .unwrap_or_else(|error| panic!("own-call-vectors.json: {error}"));
         assert!(vectors.len() >= 7);
         for vector in vectors {
             let call: OwnCall = serde_json::from_value(vector.input.clone())
@@ -236,8 +235,8 @@ mod tests {
         }
     }
 
-    // The orders measured from a native Codex 0.163.0 (cmd/codex-pool
-    // codex_own.go codexBackendHeaderOrder, codexTokenRefreshHeaderOrder).
+    // The orders measured from a native Codex 0.163.0 (recorded in the Go
+    // pool's codexBackendHeaderOrder and codexTokenRefreshHeaderOrder).
     #[test]
     fn keeps_the_measured_orders() {
         let call: OwnCall = serde_json::from_value(serde_json::json!({

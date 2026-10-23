@@ -2,7 +2,7 @@
 # Runtime guard for the dashboard renderers.
 #
 # `node --check` only parses; it cannot see an undeclared identifier inside a
-# template literal, and the Go suite never executes the browser bundle. A
+# template literal, and the Rust tests never execute the browser bundle. A
 # ReferenceError there is not cosmetic: refreshPublic() catches it, returns
 # false, and the control page falls back to the login screen, so one bad
 # reference takes the whole status page down. This script executes each renderer

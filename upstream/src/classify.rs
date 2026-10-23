@@ -141,8 +141,8 @@ mod tests {
             .collect()
     }
 
-    // Every failure shape the pool's Go classification is tested with
-    // (cmd/codex-pool/testdata/codex-upstream-failures.json), read by Codex's
+    // Every failure shape the pool's classification is tested with
+    // (upstream/testdata/codex-upstream-failures.json), read by Codex's
     // code along the path its source file names. The fixture's `codex` column
     // was written by hand from Codex's source; this holds it to what that
     // source concludes, by ApiError variant or by the CodexErr kind it maps to.
@@ -150,10 +150,9 @@ mod tests {
     // which Codex reads as a stream error, not as an overload.
     #[test]
     fn fixture_shapes_read_as_their_codex_column_says() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../cmd/codex-pool/testdata/codex-upstream-failures.json"
-        ))
-        .expect("fixture");
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/codex-upstream-failures.json"))
+                .expect("fixture");
         let mut mismatches = Vec::new();
         for failure in fixture["failures"].as_array().expect("failures") {
             let source = failure["source"].as_str().unwrap_or_default();

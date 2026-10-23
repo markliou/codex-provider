@@ -8,10 +8,10 @@
 // undeclared identifier made the page look like it was demanding a password.
 //
 // `node --check` only parses and cannot see an undeclared identifier inside a
-// template literal, and the Go suite never executes this bundle, so without
+// template literal, and the Rust tests never execute this bundle, so without
 // this script nothing in the pipeline executes browser code at all.
 const fs = require("fs");
-const source = fs.readFileSync("cmd/codex-pool/web/app.js", "utf8");
+const source = fs.readFileSync("upstream/web/app.js", "utf8");
 
 // Every top-level declaration inside the bundle IIFE, in source order, so a
 // renderer can reach any helper it calls without hand-maintaining a list.

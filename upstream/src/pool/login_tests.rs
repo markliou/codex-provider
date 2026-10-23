@@ -260,7 +260,7 @@ fn device_auth_prompt_parsing() {
 fn device_auth_prompt_of_the_pinned_codex_parses() {
     use super::login::parse_device_auth_prompt;
     use super::login::strip_ansi;
-    let raw = include_str!("../../../cmd/codex-pool/testdata/codex-device-auth-output.txt");
+    let raw = include_str!("../../testdata/codex-device-auth-output.txt");
     assert_eq!(
         parse_device_auth_prompt(&strip_ansi(raw)),
         (

@@ -2,7 +2,7 @@
 //! the admin session.
 //!
 //! A port of requireAPIKey, requestAPIKey, signSession and validSession in
-//! cmd/codex-pool/main.go. The route table and handlers come with the server
+//! the Go pool's main.go. The route table and handlers come with the server
 //! (step 4.5).
 
 use super::app::App;

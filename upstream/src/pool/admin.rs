@@ -1,8 +1,8 @@
 //! The control page and its static assets.
 //!
-//! A port of admin_assets.go. The files are the Go pool's own web assets
-//! (cmd/codex-pool/web), compiled in unchanged, so the page the browser gets
-//! does not change with the move to Rust. The visible version is tied to
+//! The files in upstream/web are compiled in unchanged: they are the Go
+//! pool's own web assets, so the page the browser got did not change with the
+//! move to Rust. The visible version is tied to
 //! build metadata: the HTML holds a placeholder instead of a hand-edited
 //! release string, because stale manual footer bumps made it hard to tell
 //! which fix was actually deployed.
@@ -12,11 +12,11 @@ use super::http_io::set_header;
 use http::StatusCode;
 
 const ADMIN_VERSION_PLACEHOLDER: &str = "{{CODEX_POOL_VERSION}}";
-const ADMIN_PAGE_HTML: &str = include_str!("../../../cmd/codex-pool/web/admin.html");
-const ADMIN_CSS: &str = include_str!("../../../cmd/codex-pool/web/app.css");
-const ADMIN_JS: &str = include_str!("../../../cmd/codex-pool/web/app.js");
-const ADMIN_LOGO_SVG: &str = include_str!("../../../cmd/codex-pool/web/logo.svg");
-const ADMIN_MANIFEST: &str = include_str!("../../../cmd/codex-pool/web/manifest.webmanifest");
+const ADMIN_PAGE_HTML: &str = include_str!("../../web/admin.html");
+const ADMIN_CSS: &str = include_str!("../../web/app.css");
+const ADMIN_JS: &str = include_str!("../../web/app.js");
+const ADMIN_LOGO_SVG: &str = include_str!("../../web/logo.svg");
+const ADMIN_MANIFEST: &str = include_str!("../../web/manifest.webmanifest");
 
 /// The build's version and commit, set at build time like Go's ldflags
 /// (CODEX_POOL_BUILD_VERSION, CODEX_POOL_BUILD_COMMIT).

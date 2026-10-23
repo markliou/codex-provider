@@ -4,7 +4,7 @@
 //! handed to the caller.
 //!
 //! A port of handleProxy, prepareUpstreamRequest, forward/forwardOnce and
-//! their helpers in cmd/codex-pool/main.go. The order of the rules in the
+//! their helpers in the Go pool's main.go. The order of the rules in the
 //! attempt loop is the point of most of them, and their comments say why.
 
 use super::app::App;

@@ -1,6 +1,6 @@
 //! The pool's one listener: its route table and the provider handlers.
 //!
-//! A port of mux() in cmd/codex-pool/main.go. Surface contract: one listener
+//! A port of mux() in the Go pool's main.go. Surface contract: one listener
 //! serves both machine clients and humans. Provider routes stay under /v1 and
 //! require the client API key; the control page stays at /admin (and the
 //! convenient root alias), while owner-only actions keep their session and

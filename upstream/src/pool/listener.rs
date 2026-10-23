@@ -30,8 +30,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The address the front door accepted a relayed connection from (front.rs
-/// PEER_HEADER in the binary; the same name on both sides).
+/// The header the removed front door used to pass on the client's address. A
+/// client's copy is stripped from every request and believed only from a
+/// loopback connection (SPEC.md 2.3), so no client can claim to be local.
 pub const FRONT_PEER_HEADER: &str = "x-codex-pool-peer";
 
 /// Go's http.Server ReadHeaderTimeout for the pool.

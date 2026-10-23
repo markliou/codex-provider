@@ -1,7 +1,7 @@
 //! The control page's API: owner login and session, the owner's management
 //! actions, and the public dashboard.
 //!
-//! A port of the /admin/api handlers in cmd/codex-pool/main.go. Owner actions
+//! A port of the /admin/api handlers in the Go pool's main.go. Owner actions
 //! require the signed session cookie, and every non-GET one also the CSRF
 //! token (Go requireAdmin); the public dashboard is deliberately
 //! unauthenticated and acts only through opaque per-process references, never

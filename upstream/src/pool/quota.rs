@@ -1,7 +1,7 @@
 //! Reading Codex's usage answer into the pool's quota snapshot, and the quota
 //! rules routing and the dashboard share.
 //!
-//! A port of quotaFromUsage and its neighbours in cmd/codex-pool/main.go. The
+//! A port of quotaFromUsage and its neighbours in the Go pool's main.go. The
 //! wire types decode the way Go's do: a wrong type in a typed field fails the
 //! whole read (the caller records decode_failed), a null leaves the field
 //! empty, and the few fields Go reads leniently (`used_percent`,

@@ -759,7 +759,7 @@ mod tests {
 
     fn fixture_release() -> String {
         let fixture: serde_json::Value = serde_json::from_str(&repository_file(
-            "cmd/codex-pool/testdata/codex-upstream-failures.json",
+            "upstream/testdata/codex-upstream-failures.json",
         ))
         .unwrap_or_default();
         fixture["codexRelease"]

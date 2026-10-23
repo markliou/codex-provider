@@ -4590,7 +4590,7 @@ fn unrecognized_upstream_failures_are_counted() {
 fn codex_upstream_shapes_classify_as_codex_reads_them() {
     use super::response_info::response_info_from_sse_block;
     use super::stream::precommit_lifecycle_sse_block;
-    let raw = include_str!("../../../cmd/codex-pool/testdata/codex-upstream-failures.json");
+    let raw = include_str!("../../testdata/codex-upstream-failures.json");
     let fixture: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
     let failures = fixture["failures"].as_array().cloned().unwrap_or_default();
     let lifecycle = fixture["lifecycle"].as_array().cloned().unwrap_or_default();

@@ -1,9 +1,9 @@
 //! Go's `time.Time` as the pool's state files carry it.
 //!
-//! `runtime.json` and `config.json` are written by Go's `time.Time.MarshalJSON`
-//! (RFC 3339 with up to nine fractional digits, trailing zeros dropped, `Z`
-//! for UTC, the value's own offset otherwise) and the zero time is written
-//! too (`0001-01-01T00:00:00Z`), since `omitempty` never omits a struct. A
+//! `runtime.json` and `config.json` keep the format Go's `time.Time.MarshalJSON`
+//! wrote (RFC 3339 with up to nine fractional digits, trailing zeros dropped,
+//! `Z` for UTC, the value's own offset otherwise), since the files the Go pool
+//! left are still read, and the zero time is written too (`0001-01-01T00:00:00Z`), since `omitempty` never omits a struct. A
 //! Timestamp keeps the parsed instant with its offset, so routing can compare
 //! times and the file is written back the way Go writes it, offset and
 //! nanoseconds included.

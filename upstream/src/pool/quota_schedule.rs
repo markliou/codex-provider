@@ -1,7 +1,6 @@
 //! When the background quota poll asks upstream about each account.
 //!
-//! A port of cmd/codex-pool/quota_schedule.go; keep the two in step until the
-//! Go poller is retired. The poll once asked about every account in one burst,
+//! The poll once asked about every account in one burst,
 //! within the same second, every five minutes exactly. From one address,
 //! several accounts swept together on a fixed beat is what an automated client
 //! looks like, and it ties the accounts to each other for anyone watching. Each

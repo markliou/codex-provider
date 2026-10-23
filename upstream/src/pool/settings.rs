@@ -1,6 +1,6 @@
 //! The pool's startup settings, read from the environment once.
 //!
-//! A port of newAppFromEnv's environment handling in cmd/codex-pool/main.go.
+//! A port of newAppFromEnv's environment handling in the Go pool's main.go.
 //! Every invalid value is a startup error, never a silent fallback, and the
 //! defaults are the product contract SPEC.md records (balanced routing,
 //! lineage affinity on, priming on, the public dashboard on).

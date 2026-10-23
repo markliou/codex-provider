@@ -1,8 +1,8 @@
-# Rust 搬遷計畫（rust-port 分支）
+# Rust 搬遷計畫（已完成，歷史紀錄）
 
 追蹤 issue：https://github.com/markliou/codex-provider/issues/33
 
-這份文件是 `rust-port` 分支的工作說明。在這個分支工作的 agent 開始前必須讀完本文件、`AGENTS.md` 與 `SPEC.md` 的相關章節。`AGENTS.md` 的所有規則在這個分支一樣有效。
+**搬遷已完成（2026-10-23）**：pool 只剩 Rust，Go 程式碼已刪除。本文件保留為搬遷的紀錄，程式碼註解引用的步驟編號（例如「step 4.6」）指的是這裡。以下的分工、限制與指令是當時 `rust-port` 分支的規則，不再適用；現在的規則看 `AGENTS.md`，測試指令看 `README.md`。
 
 ## 1. 目標
 
@@ -179,10 +179,12 @@
 - 刪除 Go 程式碼、`go.mod`、Dockerfile 的 Go 建置階段；mock upstream 與整合測試腳本改用 Rust 或 Node 實作。
 - 更新 `SPEC.md`、`README.md`、`AGENTS.md`（包括 Go 測試指令），並刪除本文件或改為歷史紀錄。
 - 進度（2026-10-23）：整合測試的假上游從 Go（`test/mock-upstream/main.go`）逐行翻成 Node（`test/mock-upstream/server.mjs`，不用任何套件），回應內容與原本相同；`test/Dockerfile.mock` 改用 `node:22-alpine`，不再需要 `go.mod`。整合測試腳本本來就只用 shell 和 Node。
+- 完成（2026-10-23）：刪除 `cmd/codex-pool` 的 Go 程式碼（24 個檔案，約 2.9 萬行）、`go.mod`、`go.sum`。Rust 仍在用的檔案移進 crate：管理頁 `upstream/web/`、測試資料 `upstream/testdata/`（Codex 回應樣本、雜湊／狀態／自有呼叫對照檔、裝置登入輸出）。對照檔是 Go 版留下的量測結果，正式環境的狀態檔仍是這個格式，所以保留。Dockerfile、`deploy.sh`、一致性檢查腳本、README、SPEC、AGENTS 改用新路徑並拿掉 Go 測試指令；`AGENTS.md` 的 rust-port 段落移除。
+- 留待之後：wire-capture 的 `subagent-ws` 偶發失敗（第 4.6 步 C 的說明）要讓子代理先完成一輪；Rust 程式碼的精簡。
 
 ## 7. 指令
 
-Go 測試（約 4 分鐘）：
+Go 測試（約 4 分鐘；Go 已刪除，僅供紀錄）：
 
 ```sh
 docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm sh -c 'test -z "$(/usr/local/go/bin/gofmt -l ./cmd ./test)" && /usr/local/go/bin/go vet ./... && /usr/local/go/bin/go test -p 1 -buildvcs=false ./...'

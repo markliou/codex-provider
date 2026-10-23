@@ -2,10 +2,9 @@
 //! loaded, the quota poll started, and one listener for the provider API and
 //! the control UI, served until a stop signal and then drained.
 //!
-//! A port of main, newAppFromEnv, serve and serveUntilStopped in
-//! cmd/codex-pool/main.go (RUST_PORT.md step 4.6). With this the Rust process
-//! is the pool itself: there is no Go process behind a front door any more,
-//! and no loopback hop between them.
+//! A port of the Go pool's main, newAppFromEnv, serve and serveUntilStopped.
+//! The Rust process is the pool itself: there is no second process behind a
+//! front door and no loopback hop between them (SPEC.md 2.3).
 
 use super::app::App;
 use super::http_io::Cancel;

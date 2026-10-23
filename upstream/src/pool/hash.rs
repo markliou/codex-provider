@@ -1,6 +1,6 @@
 //! Hashes used by routing and bounded operational identifiers.
 //!
-//! The formulas mirror `cmd/codex-pool/main.go`: SHA-256 is truncated only for
+//! The formulas mirror the Go pool's main.go: SHA-256 is truncated only for
 //! display/cache identifiers, while placement consumes the first 53 bits of
 //! the full digest. Keep the NUL separator and base64 alphabet unchanged;
 //! changing either silently moves existing sticky sessions.
@@ -250,10 +250,8 @@ mod tests {
     }
 
     fn vectors() -> Vec<HashVector> {
-        serde_json::from_str(include_str!(
-            "../../../cmd/codex-pool/testdata/hash-vectors.json"
-        ))
-        .expect("Go hash vectors must be valid JSON")
+        serde_json::from_str(include_str!("../../testdata/hash-vectors.json"))
+            .expect("Go hash vectors must be valid JSON")
     }
 
     #[test]

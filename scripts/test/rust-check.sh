@@ -6,8 +6,8 @@
 #
 # The cargo registry and target directory live in Docker volumes so Codex's
 # dependency tree is compiled once, not on every run. The names are test-only;
-# never point them at codex-pool-data. The repository is mounted read-only (the
-# Rust tests read the Go side's Codex failure fixture): a check
+# never point them at codex-pool-data. The repository is mounted read-only (a
+# test reads the Dockerfile's pinned Codex CLI version): a check
 # must not rewrite files (run `cargo fmt` yourself) or Cargo.lock, which is
 # seeded from the pinned Codex release (--locked).
 set -eu
