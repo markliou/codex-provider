@@ -166,7 +166,7 @@
   - B（容器）：`main.rs` 直接跑 pool（保留 `hash-password`）；刪除 `front.rs` 和給 Go 用的 loopback 介面（`/forward`、`/ws`、`/own`、`/classify`）；Dockerfile 不再建 Go，Rust 執行檔裝成 `/usr/local/bin/codex-pool`，管理頁檔案從 `cmd/codex-pool/web` 編進去；`supervisor.sh` 直接 `exec` pool。SPEC、README、AGENTS 的架構描述已改成單一 Rust process。
   - 隔離容器的煙霧測試通過：首頁、API key、模型清單、in-flight、版本號；`docker stop` 以狀態 0 結束並記錄 drain 完成。
   - C（驗證，2026-10-22，`547d26f`）：Rust 測試 459 個、`codex-conformance.sh check`、4 個整合測試、`wire-capture.sh` 22 項全部通過。第一次 wire-capture 的 `subagent-ws` 少了子代理的預熱訊息：情境裡主代理一產生子代理就結束、Codex 隨即退出，預熱能否送出差幾毫秒（原生 Codex 自己也時前時後），多一段轉送偶爾趕不上；加診斷記錄重跑確認 pool 收到的每則訊息都有轉送，之後乾淨重跑通過。待改：讓子代理先完成一輪，去掉這個競爭。
-  - 剩下：部署（需要使用者同意；先把 rust-port 合併回 main，從 main 部署，rust-port 不跑 `deploy.sh`）。回滾：重新部署 main 的上一版 image。
+  - 部署（2026-10-22）：rust-port 合併回 main（`f6359fc`），從 main 部署，正式環境從此只跑 Rust。部署後沒有 `class=unknown`，帳號狀態與部署前相同。回滾用的舊 image 標為 `codex-pool:rollback-58a853d`（Go 版）。
 
 ### 第 5 步：管理介面
 
@@ -178,6 +178,7 @@
 
 - 刪除 Go 程式碼、`go.mod`、Dockerfile 的 Go 建置階段；mock upstream 與整合測試腳本改用 Rust 或 Node 實作。
 - 更新 `SPEC.md`、`README.md`、`AGENTS.md`（包括 Go 測試指令），並刪除本文件或改為歷史紀錄。
+- 進度（2026-10-23）：整合測試的假上游從 Go（`test/mock-upstream/main.go`）逐行翻成 Node（`test/mock-upstream/server.mjs`，不用任何套件），回應內容與原本相同；`test/Dockerfile.mock` 改用 `node:22-alpine`，不再需要 `go.mod`。整合測試腳本本來就只用 shell 和 Node。
 
 ## 7. 指令
 
