@@ -52,8 +52,12 @@ function hasToolOutput(body) {
 
 // SCENARIO selects how the fake answers, for wire-capture.sh's scenario
 // phases:
-//   subagent  the parent is told to spawn one child (spawn_agent), the child
-//             answers, and the parent then finishes
+//   subagent  the parent is told to spawn one child (spawn_agent), then to
+//             wait for it (wait_agent), the child answers, and the parent
+//             then finishes. Without the wait the parent finished as soon as
+//             the spawn returned and Codex exited while the child was still
+//             starting, so whether the child's prewarm went out at all was a
+//             race of a few milliseconds, and the comparison failed by chance
 //   compact   every answer reports a large usage, so Codex compacts mid-turn;
 //             a compaction request is answered with a compaction item
 //   failover  the first account the pool (FAIL_FROM, its address) sends a
@@ -79,20 +83,39 @@ function isCompaction(body) {
 }
 // Codex 0.163 offers spawn_agent inside the collaboration namespace tool.
 function offersSpawnAgent(body) {
-  return (body.tools || []).some((tool) => tool && (tool.name === "spawn_agent" || (tool.type === "namespace" && (tool.tools || []).some((inner) => inner && inner.name === "spawn_agent"))));
+  return offeredTool(body, "spawn_agent") !== null;
+}
+// Where a tool is offered: { namespace } (null at the top level), or null
+// when the request does not offer it.
+function offeredTool(body, name) {
+  for (const tool of body.tools || []) {
+    if (tool && tool.name === name) return { namespace: null };
+    if (tool && tool.type === "namespace" && (tool.tools || []).some((inner) => inner && inner.name === name)) return { namespace: tool.name };
+  }
+  return null;
 }
 function hasCompacted(body) {
   return (body.input || []).some((item) => item && (item.type === "compaction" || item.type === "compaction_summary"));
 }
-// The spawn_agent calls this fake has issued. Over the WebSocket Codex sends
-// only the new items after previous_response_id, so the call's output arrives
-// without the call itself; without this record the parent was told to spawn
-// again after every answer and never finished.
-const spawnCalls = new Set();
+// The spawn_agent and wait_agent calls this fake has issued, by name, and the
+// call ids whose output has come back in any request. Over the WebSocket
+// Codex sends only the new items after previous_response_id, so a call's
+// output arrives without the call itself, and a later request carries neither;
+// without this record the parent was told to spawn again after every answer
+// (once to wait, and then again after the wait) and never finished.
+const issuedCalls = new Map();
+const answeredCalls = new Set();
 function hasCallOutput(body, name) {
   const calls = new Set((body.input || []).filter((item) => item && item.type === "function_call" && item.name === name).map((item) => item.call_id));
-  if (name === "spawn_agent") for (const id of spawnCalls) calls.add(id);
-  return (body.input || []).some((item) => item && /_output$/.test(item.type || "") && calls.has(item.call_id));
+  for (const id of issuedCalls.get(name) || []) calls.add(id);
+  for (const item of body.input || []) {
+    if (item && /_output$/.test(item.type || "") && calls.has(item.call_id)) answeredCalls.add(item.call_id);
+  }
+  return [...calls].some((id) => answeredCalls.has(id));
+}
+function issueCall(name, id) {
+  if (!issuedCalls.has(name)) issuedCalls.set(name, new Set());
+  issuedCalls.get(name).add(id);
 }
 // Whether the pool's request for this account must be refused (failover).
 function refuseForFailover(remoteAddress, account) {
@@ -118,8 +141,18 @@ function events(body, headers) {
     item = { type: "message", id: `msg_${n}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "CHILD_OK", annotations: [] }] };
   } else if (SCENARIO === "subagent" && offersSpawnAgent(body) && !hasCallOutput(body, "spawn_agent")) {
     const namespaced = !tools.includes("spawn_agent");
-    spawnCalls.add(`call_${n}`);
+    issueCall("spawn_agent", `call_${n}`);
     item = { type: "function_call", id: `fc_${n}`, call_id: `call_${n}`, name: "spawn_agent", ...(namespaced ? { namespace: "collaboration" } : {}), arguments: JSON.stringify({ message: "Reply with CHILD_OK.", task_name: "child_probe", fork_turns: "none" }), status: "completed" };
+  } else if (SCENARIO === "subagent" && offeredTool(body, "wait_agent") && !hasCallOutput(body, "wait_agent")) {
+    // The call shape of Codex's own tests (codex-rs/core/tests/suite/
+    // agent_mailbox.rs: ev_function_call_with_namespace("wait-note",
+    // MULTI_AGENT_V2_NAMESPACE, "wait_agent", r#"{"timeout_ms":1}"#)), with
+    // the default timeout (core/src/config/mod.rs
+    // DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS = 30_000); the wait ends
+    // as soon as the child's final status reaches the parent's mailbox.
+    const { namespace } = offeredTool(body, "wait_agent");
+    issueCall("wait_agent", `call_${n}`);
+    item = { type: "function_call", id: `fc_${n}`, call_id: `call_${n}`, name: "wait_agent", ...(namespace ? { namespace } : {}), arguments: JSON.stringify({ timeout_ms: 30000 }), status: "completed" };
   } else if (SCENARIO === "subagent") {
     item = { type: "message", id: `msg_${n}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "PARENT_OK", annotations: [] }] };
   } else if (!hasToolOutput(body) && pickTool(body)) {
@@ -204,7 +237,8 @@ const server = http2.createSecureServer({ allowHTTP1: true, key: fs.readFileSync
   if (req.url === "/__conformance/reset") {
     seq = 0;
     failedAccount = "";
-    spawnCalls.clear();
+    issuedCalls.clear();
+    answeredCalls.clear();
     res.writeHead(204);
     res.end();
     return;
