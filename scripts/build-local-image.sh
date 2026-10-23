@@ -17,15 +17,16 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   dirty_suffix="-dirty.$(date -u +%m%d%H%M)"
 fi
 
+# Every build of one commit passes the same arguments, so the image
+# wire-capture.sh and the integration tests built is reused from the build
+# cache when deploy.sh builds codex-pool:local (see the Dockerfile).
 image="${CODEX_POOL_IMAGE:-codex-pool:local}"
 version="v${commit_date}-${commit_short}${dirty_suffix}"
-built_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 printf 'Building %s as %s (%s)\n' "$image" "$version" "$commit_full"
 docker build \
   --build-arg CODEX_POOL_VERSION="$version" \
   --build-arg CODEX_POOL_COMMIT="$commit_full" \
-  --build-arg CODEX_POOL_BUILT_AT="$built_at" \
   -t "$image" \
   "$@" \
   .

@@ -23,8 +23,11 @@ trap cleanup EXIT INT TERM
 # Keep integration tags separate from codex-pool:local: the latter is the live
 # provider image used by this development session and must not be retagged by a
 # test build.
-docker build -t "$POOL_IMAGE" .
-docker build -t "$MOCK_IMAGE" -f test/Dockerfile.mock .
+# integration-all.sh builds both images once and sets ITEST_SKIP_BUILD.
+if [ "${ITEST_SKIP_BUILD:-}" != 1 ]; then
+  CODEX_POOL_IMAGE="$POOL_IMAGE" sh scripts/build-local-image.sh -q >/dev/null
+  docker build -q -t "$MOCK_IMAGE" -f test/Dockerfile.mock . >/dev/null
+fi
 ADMIN_HASH=$(docker run --rm -e CODEX_POOL_ADMIN_PASSWORD="$ADMIN_PASSWORD" "$POOL_IMAGE" hash-password)
 
 docker network create --internal "$NETWORK" >/dev/null
