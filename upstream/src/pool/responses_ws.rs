@@ -542,7 +542,7 @@ async fn start_response(
     // HTTP request; an idle socket between turns does not.
     app.in_flight.fetch_add(1, Ordering::SeqCst);
     if upstream.is_none_or(|upstream| !upstream.send(Frame::Text(message))) {
-        finish(session, &response, false, true);
+        finish(session, &response, false, true, "upstream_send_failed");
         return false;
     }
     true
@@ -937,7 +937,13 @@ async fn relay_upstream<S>(
                 retry.is_none(),
             );
             session.state().active = None;
-            finish(&session, &response, false, true);
+            finish(
+                &session,
+                &response,
+                false,
+                true,
+                "handed_to_codex_reconnect",
+            );
             upstream.close(1000, "");
             if retry.is_some() {
                 // The same-account backoff, so Codex's reconnect does not
@@ -1007,7 +1013,7 @@ fn record(session: &Arc<Session>, response: &Arc<WsResponse>, message: &[u8]) ->
     }
     let failed = terminal != "response.completed";
     let overloaded = failed && transient_overload_code(&merged.terminal_error_code);
-    finish(session, response, true, !overloaded);
+    finish(session, response, true, !overloaded, "");
     if failed
         && !overloaded
         && (retryable_terminal_failure_class(&merged.terminal_failure_class)
@@ -1022,10 +1028,17 @@ fn record(session: &Arc<Session>, response: &Arc<WsResponse>, message: &[u8]) ->
 }
 
 /// Records a response exactly once. `delivered` is false when the request
-/// never reached upstream or the socket died before a terminal event;
+/// never reached upstream or the socket died before a terminal event, and
+/// `reason` then names why for the interrupted-request log line;
 /// `cool_down` false keeps an overload inside the same-account schedule from
 /// cooling the account.
-fn finish(session: &Arc<Session>, response: &Arc<WsResponse>, delivered: bool, cool_down: bool) {
+fn finish(
+    session: &Arc<Session>,
+    response: &Arc<WsResponse>,
+    delivered: bool,
+    cool_down: bool,
+    reason: &'static str,
+) {
     if response.finished.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -1040,8 +1053,10 @@ fn finish(session: &Arc<Session>, response: &Arc<WsResponse>, delivered: bool, c
         let mut measurement = measurement.unwrap_or_default();
         measurement.completed_at = info.completed_at;
         measurement.usage = info.usage.clone();
+        measurement.model.clone_from(&response.model);
         if !delivered {
             measurement.cancelled = true;
+            measurement.cancel_reason = reason;
             app.finish_throughput_measurement(&mut measurement);
         } else if info.terminal_event == "response.completed" {
             measurement.success = true;
@@ -1096,7 +1111,7 @@ fn upstream_gone(session: &Arc<Session>, upstream: &Upstream) {
             "upstream_transport_error",
             chrono::TimeDelta::zero(),
         );
-        finish(session, &response, false, true);
+        finish(session, &response, false, true, "upstream_closed");
     }
     upstream.close(1000, "");
     session.close_client(1011, "upstream closed");
@@ -1109,7 +1124,7 @@ fn shutdown(session: &Arc<Session>) {
         (state.upstream.take(), state.active.take())
     };
     if let Some(response) = response {
-        finish(session, &response, false, true);
+        finish(session, &response, false, true, "client_closed");
     }
     if let Some(upstream) = upstream {
         upstream.close(1000, "");

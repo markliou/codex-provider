@@ -2168,6 +2168,13 @@ For streaming responses:
   stays in the service log — it must never enter runtime state, a routing event,
   or any admin or client response, which keeps the sanitized-code contract for
   every surface intact.
+- A request that ends without an answer is logged once as `request interrupted`
+  with the account, model, elapsed time and a reason: the client closed while
+  the pool waited for upstream or between same-account retries, the upstream
+  socket closed, a pre-content failure was handed to Codex's reconnect, or an
+  HTTP stream stopped before a terminal event. Before this line such a request
+  only raised the dashboard's cancelled count, and a turn that broke off left
+  nothing to trace. The line carries no request content.
 - Beside the pool's own class, each such line carries Codex's verdict on the
   same failure, `codex=<kind>/<api> retry=yes|no` (and `codex_skips` when Codex
   itself does not act on that message, leaving the stream's end to decide). An

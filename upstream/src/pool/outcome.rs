@@ -66,6 +66,9 @@ pub struct ThroughputMeasurement {
     pub cancelled: bool,
     pub finished: bool,
     pub usage: PromptCacheUsage,
+    /// The model and why a cancelled request ended, for its log line.
+    pub model: String,
+    pub cancel_reason: &'static str,
 }
 
 /// Prices the cooldown for a retryable terminal failure. Overload,
@@ -309,8 +312,27 @@ impl App {
         if measurement.finished {
             return;
         }
+        if measurement.cancelled {
+            self.log_interrupted_request(measurement);
+        }
         self.write()
             .finish_throughput_measurement(Some(measurement), Timestamp::now());
+    }
+
+    /// One line for a request that ended without an answer: the client left,
+    /// the upstream socket closed, or a failure was handed to Codex's
+    /// reconnect. Before this line such a request only raised the dashboard's
+    /// cancelled count, so a turn that broke off left nothing in the log to
+    /// say why.
+    fn log_interrupted_request(&self, measurement: &ThroughputMeasurement) {
+        let elapsed = Timestamp::now().sub(&measurement.started_at);
+        self.logger.printf(&format!(
+            "request interrupted: account={} model={} after={:.1}s reason={}",
+            or_dash(&measurement.account_id),
+            or_dash(&measurement.model),
+            elapsed.num_milliseconds() as f64 / 1000.0,
+            or_dash(measurement.cancel_reason),
+        ));
     }
 
     /// Returns the account's consecutive failures, counting this one.
