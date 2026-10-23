@@ -1,6 +1,6 @@
 {
   "_comment": "Upstream event shapes as Codex itself parses them, at codexRelease. Every entry names the Codex file it comes from and a marker string that appears in that file verbatim; scripts/conformance/codex-conformance.sh check verifies the markers against the Codex source, and TestCodexUpstreamShapesClassifyAsCodexReadsThem verifies the pool's reading. Payloads are copied from Codex's own tests where one exists; entries with a note are built from Codex's parser where it has no test fixture. When codexRelease changes (it must equal the tag in upstream/Cargo.toml), re-run the check and add the shapes the new release parses.",
-  "codexRelease": "rust-v0.163.0",
+  "codexRelease": "rust-v0.164.0",
   "_ignoredComment": "Snake-case literals the conformance check finds in Codex's error parsers that are not error codes. Anything else it finds must appear as a failure code above.",
   "ignoredCodexLiterals": {
     "safety_buffering": "a response.metadata payload type, not an error; response.metadata is held before the commit point (see lifecycle)"

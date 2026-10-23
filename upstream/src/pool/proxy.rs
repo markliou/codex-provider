@@ -1191,6 +1191,7 @@ async fn attempts(
             }
         };
         throughput.account_id.clone_from(&candidate.id);
+        throughput.model = model.to_string();
         app.note_session_placement(&route.balance_key, &candidate.id);
         let (mut endpoint, out_body, convert_response) =
             match app.prepare_upstream_request(&candidate, &updated_body, chat) {
@@ -1218,6 +1219,7 @@ async fn attempts(
             // confirmed, and persisting one makes later unrelated requests
             // slower.
             throughput.cancelled = true;
+            throughput.cancel_reason = "client_closed_waiting_for_upstream";
             return;
         };
         let response = match forwarded {
@@ -1236,6 +1238,7 @@ async fn attempts(
                         .await
                     {
                         throughput.cancelled = true;
+                        throughput.cancel_reason = "client_closed_during_transport_retry";
                         return;
                     }
                     continue;
@@ -1379,6 +1382,7 @@ async fn attempts(
                     .await;
                     if !waited {
                         throughput.cancelled = true;
+                        throughput.cancel_reason = "client_closed_during_capacity_wait";
                         return;
                     }
                     attempt += 1 - i64::try_from(restored).unwrap_or(0);
@@ -1471,6 +1475,7 @@ async fn attempts(
                 app.mark_retryable_terminal_response_failure(&candidate.id, model, &info, false);
                 if !cancel.sleep(tuning.overload_retry_backoff).await {
                     throughput.cancelled = true;
+                    throughput.cancel_reason = "client_closed_during_overload_retry";
                     return;
                 }
                 continue;
@@ -1538,6 +1543,7 @@ async fn attempts(
                     .await;
                     if !waited {
                         throughput.cancelled = true;
+                        throughput.cancel_reason = "client_closed_during_capacity_wait";
                         return;
                     }
                     // Give back the attempts this capacity round consumed. The
@@ -1577,6 +1583,16 @@ async fn attempts(
         info.failover_outcome.clone_from(&failover_outcome);
         throughput.completed_at = info.completed_at;
         throughput.usage = info.usage.clone();
+        if info.terminal_event.is_empty() && is_streaming(&response_headers) {
+            // The stream stopped before a terminal event: upstream or the
+            // client went away mid-answer, which Codex reads as "stream closed
+            // before response.completed". It is still recorded as before; this
+            // line only makes the break visible in the log.
+            app.logger.printf(&format!(
+                "request interrupted: account={} model={model} reason=stream_ended_before_terminal_event",
+                candidate.id
+            ));
+        }
         if matches!(
             info.terminal_event.as_str(),
             "error" | "response.failed" | "response.incomplete"

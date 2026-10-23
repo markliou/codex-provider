@@ -1032,6 +1032,36 @@ async fn native_codex_endpoint_passes_models_through_with_a_pool_account() {
     );
 }
 
+// A request that ends without an answer leaves one log line naming the
+// account, the model and why, and nothing from the request itself; before it,
+// such a turn only raised the dashboard's cancelled count.
+#[test]
+fn an_interrupted_request_is_logged_with_its_reason() {
+    let (app, _dir) = super::testing::test_app(Vec::new());
+    let (app, logged) = super::testing::capture_logs(app);
+    let mut measurement = app.begin_throughput_measurement(true);
+    measurement.account_id = "acct-a".to_string();
+    measurement.model = "gpt-test".to_string();
+    measurement.cancelled = true;
+    measurement.cancel_reason = "upstream_closed";
+    app.finish_throughput_measurement(&mut measurement);
+    app.finish_throughput_measurement(&mut measurement);
+    let out = logged
+        .lock()
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_default();
+    assert_eq!(
+        out.matches("request interrupted").count(),
+        1,
+        "log = {out:?}"
+    );
+    assert!(
+        out.contains("account=acct-a model=gpt-test after=")
+            && out.contains("reason=upstream_closed"),
+        "log = {out:?}"
+    );
+}
+
 // Go TestNativeEndpointReportsHeadersItDoesNotRelay: a native client's header
 // the relay does not carry is reported by name, once.
 #[test]
