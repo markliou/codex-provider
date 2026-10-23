@@ -6,7 +6,7 @@
 # this list rather than dropping the entry.
 #
 # Format: <direction> <path> <what the pool must match>
-#   send    = what the pool (through codex-upstream) puts on the wire
+#   send    = what the pool puts on the wire
 #   receive = how the pool reads what upstream sends back
 #   policy  = what Codex does about it (retry, reconnect, give up)
 
@@ -16,8 +16,8 @@ send    codex-rs/codex-api/src/requests/                             request bod
 send    codex-rs/codex-api/src/auth.rs                               credential and ChatGPT-Account-ID headers
 send    codex-rs/codex-api/src/provider.rs                           base URLs, routing hint and per-provider headers
 send    codex-rs/codex-api/src/common.rs                             shared request types (prompt_cache_key, client_metadata)
-send    codex-rs/http-client/                                        HTTP client: TLS, HTTP/2, header order (codex-upstream links it)
-send    codex-rs/websocket-client/                                   WebSocket client (codex-upstream links it)
+send    codex-rs/http-client/                                        HTTP client: TLS, HTTP/2, header order (the pool links it)
+send    codex-rs/websocket-client/                                   WebSocket client (the pool links it)
 receive codex-rs/codex-api/src/sse/responses.rs                      SSE event types, lifecycle and terminal events
 receive codex-rs/codex-api/src/sse/responses_error.rs                error codes inside response.failed
 receive codex-rs/codex-api/src/api_bridge.rs                         HTTP status and error.type mapping (usage limits, quota)

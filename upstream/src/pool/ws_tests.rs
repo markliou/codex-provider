@@ -2,7 +2,7 @@
 //! native_codex_test.go), one by one. Each keeps its Go name in a comment;
 //! the assertions are Go's.
 //!
-//! Go's fake stood in for codex-upstream's `/ws`; the transport is in-process
+//! Go's fake stood in for the Rust transport's old `/ws` hop; the transport is in-process
 //! now, so the fake here is the Codex backend itself: a WebSocket server the
 //! pool reaches with Codex's own connector. Where Go read the account from
 //! X-Codex-Upstream-Identity, this fake reads it from ChatGPT-Account-ID

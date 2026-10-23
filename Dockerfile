@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     CODEX_POOL_BUILD_VERSION="${CODEX_POOL_VERSION}" \
     CODEX_POOL_BUILD_COMMIT="${CODEX_POOL_COMMIT}" \
     cargo build --release --locked && \
-    mkdir -p /out && cp target/release/codex-upstream /out/codex-pool
+    mkdir -p /out && cp target/release/codex-pool /out/codex-pool
 
 FROM node:22-bookworm-slim AS codex-cli
 

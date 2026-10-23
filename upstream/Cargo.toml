@@ -1,5 +1,5 @@
 [package]
-name = "codex-upstream"
+name = "codex-pool"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -9,11 +9,11 @@ publish = false
 # src/lib.rs and scripts/conformance/codex-vendor.sh); the binary is the
 # transport.
 [lib]
-name = "codex_vendor"
+name = "codex_pool"
 path = "src/lib.rs"
 
 [[bin]]
-name = "codex-upstream"
+name = "codex-pool"
 path = "src/main.rs"
 
 # The upstream request must be the one a native Codex CLI sends, so the

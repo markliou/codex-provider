@@ -1,4 +1,4 @@
-# Codex source files compiled into codex-upstream unchanged (see
+# Codex source files compiled into the pool unchanged (see
 # codex-vendor.sh). Paths are relative to the Codex repository root.
 #
 # The Responses stream reader and its failure classification (codex-api sse/),

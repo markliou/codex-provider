@@ -73,7 +73,7 @@ case "${1:-}" in
     tag=${2:-$pinned}
     echo "Checking the pool's Codex shapes against $tag"
     check "$tag"
-    # The Codex files codex-upstream compiles must be the pinned release's.
+    # The Codex files the pool compiles must be the pinned release's.
     sh scripts/conformance/codex-vendor.sh check
     ;;
   diff)

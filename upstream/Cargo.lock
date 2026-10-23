@@ -724,7 +724,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-upstream"
+name = "codex-pool"
 version = "0.1.0"
 dependencies = [
  "assert_matches",
