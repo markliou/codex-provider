@@ -1,7 +1,7 @@
 //! Reading an account's allowance from upstream, as a native Codex reads it.
 //!
 //! A port of refreshAccountQuotaWithExpectedIdentity and its helpers in
-//! cmd/codex-pool/main.go. Every upstream call here is one of the pool's own
+//! the Go pool's main.go. Every upstream call here is one of the pool's own
 //! calls composed as Codex composes it (own_call.rs): the usage read is
 //! backend-client rate_limit_resets.rs get_rate_limit_status, the workspace
 //! lookup is client.rs get_accounts_check, and the credit listing is

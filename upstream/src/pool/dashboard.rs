@@ -1,7 +1,7 @@
 //! What the control page shows: account rows, summary cards, the pool
 //! capacity bars, throughput and prompt-cache windows.
 //!
-//! A port of the dashboard projections in cmd/codex-pool/main.go
+//! A port of the dashboard projections in the Go pool's main.go
 //! (poolCapacityLocked, dashboardSummaryLocked, throughputSnapshotLocked,
 //! promptCacheWindowFilteredLocked, accountHealthItemLocked,
 //! publicDashboardAccountLocked and their helpers). The public projections are

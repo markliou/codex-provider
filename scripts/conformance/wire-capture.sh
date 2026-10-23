@@ -104,7 +104,7 @@ wait_for_pool() {
   fi
 }
 
-# The pool's background quota poll has no fixed beat (quota_schedule.go): its
+# The pool's background quota poll has no fixed beat (upstream/src/pool/quota_schedule.rs): its
 # first round after a start is spread over two minutes, one account at a time,
 # so a phase waits for the call it needs instead of a fixed time.
 #   wait_until <seconds> <what> <command...>
@@ -286,7 +286,7 @@ for transport in http ws; do
 done
 
 docker logs "$pool" > "$work/pool.log" 2>&1 || true
-# The installation ids the pool's accounts present (installation_id.go); the
+# The installation ids the pool's accounts present (upstream/src/pool/installation_id.rs); the
 # report checks that the pool sent only these, and no client's.
 docker run --rm -v "$volume:/data:ro" alpine:3.21 sh -c '
   for f in /data/accounts/*/.codex/installation_id; do [ -f "$f" ] && { cat "$f"; echo; }; done' > "$work/account-installation-ids.txt"

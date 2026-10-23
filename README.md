@@ -386,10 +386,6 @@ It rotates at 20 MiB, keeping three older files.
 All tooling runs in Docker.
 
 ```bash
-# Go formatting, vet and tests (about four minutes)
-docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm sh -c \
-  'test -z "$(/usr/local/go/bin/gofmt -l ./cmd ./test)" && /usr/local/go/bin/go vet ./... && /usr/local/go/bin/go test -p 1 -buildvcs=false ./...'
-
 # The control page's JavaScript renderers
 sh scripts/test/render-web-assets.sh
 
@@ -420,7 +416,7 @@ sh scripts/conformance/codex-conformance.sh diff <tag>   # every change to the w
 ```
 
 - `check` confirms that every upstream shape in
-  `cmd/codex-pool/testdata/codex-upstream-failures.json` is still in the Codex
+  `upstream/testdata/codex-upstream-failures.json` is still in the Codex
   source it was copied from, and that every error code Codex parses has a shape
   there.
 - `wire-capture.sh` runs the same turns from a native Codex CLI and through a pool

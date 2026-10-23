@@ -360,7 +360,7 @@ function compareScenario(label, { requireChild = false, requireCompaction = fals
 }
 
 // Each pool account presents its own installation id in place of the
-// client's (installation_id.go, SPEC.md 2.3.2): every id the pool sent is one
+// client's (upstream/src/pool/installation_id.rs, SPEC.md 2.3.2): every id the pool sent is one
 // of its accounts', and no id a Codex sent on its own is.
 function compareInstallationIDs() {
   const poolIP = read("pool-ip.txt").trim();
@@ -394,7 +394,7 @@ function compareInstallationIDs() {
   else notes.push(`installation id: ${sent} sent by the pool, all its accounts' own (${used.size} of ${accounts.size} accounts)`);
 }
 
-// A reset credit is spent as Codex's /usage reset spends it (reset_credit.go):
+// A reset credit is spent as Codex's /usage reset spends it (upstream/src/pool/reset_credit.rs):
 // the pool's redemption from the Console against a native Codex app-server's
 // (account/rateLimitResetCredit/consume, which the TUI picker calls): the same
 // header set and order, the body Codex's keys in Codex's order, the listed

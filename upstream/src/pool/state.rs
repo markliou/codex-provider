@@ -1,4 +1,4 @@
-//! Serde models for the Go pool's persistent `config.json` and `runtime.json`.
+//! Serde models for the pool's persistent `config.json` and `runtime.json`.
 //!
 //! Every known field keeps Go's JSON name and omission rule.  Each object also
 //! has a flattened `extra` map: upgrades must not discard fields written by a
@@ -816,12 +816,11 @@ mod tests {
         UNKNOWN.with(|seen| std::mem::take(&mut *seen.borrow_mut()))
     }
 
-    // Written by cmd/codex-pool/hash_state_vectors_test.go from the Go types.
+    // Written from the Go pool's types before it was removed; the state files
+    // on disk still have that shape.
     fn documents() -> Value {
-        serde_json::from_str(include_str!(
-            "../../../cmd/codex-pool/testdata/state-vectors.json"
-        ))
-        .expect("Go state vectors must be valid JSON")
+        serde_json::from_str(include_str!("../../testdata/state-vectors.json"))
+            .expect("Go state vectors must be valid JSON")
     }
 
     // JSON equality with numbers compared by value: Go writes a whole float

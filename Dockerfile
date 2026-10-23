@@ -1,4 +1,4 @@
-# The pool (RUST_PORT.md step 4.6): one Rust binary that routes and sends
+# The pool: one Rust binary that routes and sends
 # upstream with Codex's own HTTP and WebSocket clients. Alpine's native musl
 # target and Rust 1.95 match how the official Codex Linux release is built,
 # and --locked keeps the Codex-seeded lock.
@@ -12,13 +12,11 @@ ARG CODEX_POOL_COMMIT=unknown
 ARG CODEX_POOL_BUILT_AT=unknown
 
 RUN apk add --no-cache musl-dev perl make gcc linux-headers git
-# The control page is compiled in from cmd/codex-pool/web (pool/admin.rs
-# reads it at ../../../cmd/codex-pool/web), so the crate sits one level below
-# a copy of that directory, as in the repository.
 WORKDIR /build/upstream
-COPY cmd/codex-pool/web /build/cmd/codex-pool/web
 COPY upstream/Cargo.toml upstream/Cargo.lock ./
 COPY upstream/src ./src
+# The control page, compiled into the binary (pool/admin.rs).
+COPY upstream/web ./web
 # Codex's stream reader and failure classifier, vendored unchanged (src/lib.rs).
 COPY upstream/vendor ./vendor
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

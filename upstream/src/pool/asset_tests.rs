@@ -1,7 +1,6 @@
 //! The Go control-page asset tests (main_test.go TestAdminDashboardAssets and
 //! TestAdminAssets*), through the Rust listener. The page, script, style
-//! sheet, logo and manifest are the Go pool's own files compiled in
-//! unchanged; these checks keep what the page must and must not say.
+//! sheet, logo and manifest (upstream/web) are compiled in unchanged; these checks keep what the page must and must not say.
 
 use super::proxy_tests::arc_app;
 use super::proxy_tests::serve;

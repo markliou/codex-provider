@@ -1,7 +1,7 @@
 //! The model catalog the pool advertises on /v1/models.
 //!
 //! A port of modelsLocked, codexModelCatalogLocked and the reasoning-level
-//! rules in cmd/codex-pool/main.go. Codex reads the catalog with its
+//! rules in the Go pool's main.go. Codex reads the catalog with its
 //! remote-model schema and treats it as authoritative for a ChatGPT-backed
 //! provider, so every field it requires is present, and a model is advertised
 //! only while upstream still serves it.

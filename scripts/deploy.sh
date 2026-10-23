@@ -35,7 +35,7 @@ fi
 # Any tracked change blocks the deploy, and so does an untracked file in a
 # path the Dockerfile copies into the image. Untracked files elsewhere
 # (.claude/, scratch notes) never reach the image and are ignored.
-build_inputs="Dockerfile go.mod go.sum cmd upstream docker-entrypoint.sh supervisor.sh"
+build_inputs="Dockerfile upstream docker-entrypoint.sh supervisor.sh"
 # shellcheck disable=SC2086
 dirty=$( { git status --porcelain --untracked-files=no; git status --porcelain -- $build_inputs; } | sort -u)
 if [ -n "$dirty" ]; then

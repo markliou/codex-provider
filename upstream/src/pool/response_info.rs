@@ -2,7 +2,7 @@
 //! and how a stream ended (its terminal event and failure class).
 //!
 //! A port of proxyResponseInfo, responseInfoFromSSEBlock and
-//! terminalFailureClass in cmd/codex-pool/main.go. The failure classes decide
+//! terminalFailureClass in the Go pool's main.go. The failure classes decide
 //! retry, failover and cooldown, so the code table keeps Go's comments on why
 //! each code sits where it does.
 

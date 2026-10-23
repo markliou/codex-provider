@@ -2,9 +2,8 @@
 //! the native header orders, the per-request client, the WebSocket connector
 //! and the relay of an open socket.
 //!
-//! Used by codex-upstream's `/forward`, `/ws` and `/own` (the Go pool's hop)
-//! and by the ported pool itself, which sends in process. Moved here from
-//! main.rs unchanged; see main.rs for the hop's own rules.
+//! Used by the pool, which sends in process. It was first the loopback hop a
+//! Go pool sent through (removed with the Go code); the rules came unchanged.
 
 use bytes::Bytes;
 use codex_http_client::EncodedJsonBody;

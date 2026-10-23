@@ -1,7 +1,7 @@
 //! An account's status as the dashboard and the response headers show it.
 //!
 //! A port of accountStatusLocked and addCurrentAccountResponseHeaders in
-//! cmd/codex-pool/main.go. The order of the checks is the point: each comment
+//! the Go pool's main.go. The order of the checks is the point: each comment
 //! says which status must win over which.
 
 use super::app::App;

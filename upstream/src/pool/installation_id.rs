@@ -1,7 +1,6 @@
 //! Each upstream account presents one fixed Codex installation id.
 //!
-//! A port of cmd/codex-pool/installation_id.go; keep the two in step until the
-//! Go forwarder is retired. A native Codex keeps a random UUID in
+//! A native Codex keeps a random UUID in
 //! CODEX_HOME/installation_id and sends it with every Responses request, as
 //! `client_metadata["x-codex-installation-id"]` and as `installation_id` in
 //! the `x-codex-turn-metadata` JSON, in the body's client_metadata and in the

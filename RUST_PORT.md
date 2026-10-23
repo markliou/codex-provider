@@ -1,8 +1,8 @@
-# Rust 搬遷計畫（rust-port 分支）
+# Rust 搬遷計畫（已完成，歷史紀錄）
 
 追蹤 issue：https://github.com/markliou/codex-provider/issues/33
 
-這份文件是 `rust-port` 分支的工作說明。在這個分支工作的 agent 開始前必須讀完本文件、`AGENTS.md` 與 `SPEC.md` 的相關章節。`AGENTS.md` 的所有規則在這個分支一樣有效。
+**搬遷已完成（2026-10-23）**：pool 只剩 Rust，Go 程式碼已刪除。本文件保留為搬遷的紀錄，程式碼註解引用的步驟編號（例如「step 4.6」）指的是這裡。以下的分工、限制與指令是當時 `rust-port` 分支的規則，不再適用；現在的規則看 `AGENTS.md`，測試指令看 `README.md`。
 
 ## 1. 目標
 
@@ -166,7 +166,7 @@
   - B（容器）：`main.rs` 直接跑 pool（保留 `hash-password`）；刪除 `front.rs` 和給 Go 用的 loopback 介面（`/forward`、`/ws`、`/own`、`/classify`）；Dockerfile 不再建 Go，Rust 執行檔裝成 `/usr/local/bin/codex-pool`，管理頁檔案從 `cmd/codex-pool/web` 編進去；`supervisor.sh` 直接 `exec` pool。SPEC、README、AGENTS 的架構描述已改成單一 Rust process。
   - 隔離容器的煙霧測試通過：首頁、API key、模型清單、in-flight、版本號；`docker stop` 以狀態 0 結束並記錄 drain 完成。
   - C（驗證，2026-10-22，`547d26f`）：Rust 測試 459 個、`codex-conformance.sh check`、4 個整合測試、`wire-capture.sh` 22 項全部通過。第一次 wire-capture 的 `subagent-ws` 少了子代理的預熱訊息：情境裡主代理一產生子代理就結束、Codex 隨即退出，預熱能否送出差幾毫秒（原生 Codex 自己也時前時後），多一段轉送偶爾趕不上；加診斷記錄重跑確認 pool 收到的每則訊息都有轉送，之後乾淨重跑通過。待改：讓子代理先完成一輪，去掉這個競爭。
-  - 剩下：部署（需要使用者同意；先把 rust-port 合併回 main，從 main 部署，rust-port 不跑 `deploy.sh`）。回滾：重新部署 main 的上一版 image。
+  - 部署（2026-10-22）：rust-port 合併回 main（`f6359fc`），從 main 部署，正式環境從此只跑 Rust。部署後沒有 `class=unknown`，帳號狀態與部署前相同。回滾用的舊 image 標為 `codex-pool:rollback-58a853d`（Go 版）。
 
 ### 第 5 步：管理介面
 
@@ -178,10 +178,13 @@
 
 - 刪除 Go 程式碼、`go.mod`、Dockerfile 的 Go 建置階段；mock upstream 與整合測試腳本改用 Rust 或 Node 實作。
 - 更新 `SPEC.md`、`README.md`、`AGENTS.md`（包括 Go 測試指令），並刪除本文件或改為歷史紀錄。
+- 進度（2026-10-23）：整合測試的假上游從 Go（`test/mock-upstream/main.go`）逐行翻成 Node（`test/mock-upstream/server.mjs`，不用任何套件），回應內容與原本相同；`test/Dockerfile.mock` 改用 `node:22-alpine`，不再需要 `go.mod`。整合測試腳本本來就只用 shell 和 Node。
+- 完成（2026-10-23）：刪除 `cmd/codex-pool` 的 Go 程式碼（24 個檔案，約 2.9 萬行）、`go.mod`、`go.sum`。Rust 仍在用的檔案移進 crate：管理頁 `upstream/web/`、測試資料 `upstream/testdata/`（Codex 回應樣本、雜湊／狀態／自有呼叫對照檔、裝置登入輸出）。對照檔是 Go 版留下的量測結果，正式環境的狀態檔仍是這個格式，所以保留。Dockerfile、`deploy.sh`、一致性檢查腳本、README、SPEC、AGENTS 改用新路徑並拿掉 Go 測試指令；`AGENTS.md` 的 rust-port 段落移除。
+- 留待之後：wire-capture 的 `subagent-ws` 偶發失敗（第 4.6 步 C 的說明）要讓子代理先完成一輪；Rust 程式碼的精簡。
 
 ## 7. 指令
 
-Go 測試（約 4 分鐘）：
+Go 測試（約 4 分鐘；Go 已刪除，僅供紀錄）：
 
 ```sh
 docker run --rm -v "$PWD:/src" -w /src golang:1.24-bookworm sh -c 'test -z "$(/usr/local/go/bin/gofmt -l ./cmd ./test)" && /usr/local/go/bin/go vet ./... && /usr/local/go/bin/go test -p 1 -buildvcs=false ./...'

@@ -5,7 +5,7 @@
 //!
 //! A port of markFailure, markSuccess*, markTerminalResponseFailure,
 //! recordLineageSuccessLocked, appendRoutingCacheEventLocked and the
-//! throughput recording in cmd/codex-pool/main.go, and of codex_verdict.go.
+//! throughput recording in the Go pool's main.go, and of codex_verdict.go.
 //! The verdict is Codex's code compiled into this process
 //! (crate::classify), so it is asked directly rather than over loopback.
 

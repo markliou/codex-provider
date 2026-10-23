@@ -13,7 +13,7 @@
 # Moving to a new Codex release: run `diff <tag>`, read every hunk, match the
 # pool to it (or note why it does not apply), update the tag in
 # upstream/Cargo.toml, reseed upstream/Cargo.lock, update codexRelease and the
-# shapes in cmd/codex-pool/testdata/codex-upstream-failures.json, re-copy the
+# shapes in upstream/testdata/codex-upstream-failures.json, re-copy the
 # vendored Codex files (scripts/conformance/codex-vendor.sh sync), then run
 # `check` and scripts/conformance/wire-capture.sh. See AGENTS.md.
 set -eu
@@ -26,7 +26,7 @@ if [ -z "$pinned" ]; then
   echo "cannot read the pinned Codex tag from upstream/Cargo.toml" >&2
   exit 1
 fi
-fixture=cmd/codex-pool/testdata/codex-upstream-failures.json
+fixture=upstream/testdata/codex-upstream-failures.json
 watchlist=scripts/conformance/codex-watchlist.txt
 out_dir=scripts/conformance/out
 mkdir -p "$out_dir"

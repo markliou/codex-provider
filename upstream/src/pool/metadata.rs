@@ -2,7 +2,7 @@
 //! (`/wham/accounts/check`) and the claims in an account's `auth.json`.
 //!
 //! A port of subscriptionMetadataFromValue, codexAuthInfoFromFile and the JWT
-//! helpers in cmd/codex-pool/main.go. These answers are loose JSON whose shape
+//! helpers in the Go pool's main.go. These answers are loose JSON whose shape
 //! upstream has changed before, so they are read as values, field by field,
 //! the way Go reads them as `map[string]any`.
 

@@ -1,7 +1,7 @@
 //! Account plan metadata: plan families, Pro tiers, weekly weights, the
 //! sanitizers for upstream metadata, and the names the dashboard shows.
 //!
-//! A port of the plan helpers in cmd/codex-pool/main.go (normalizePlanType,
+//! A port of the plan helpers in the Go pool's main.go (normalizePlanType,
 //! planFamilyFromRaw, accountWeeklyWeight and their neighbours). The comments
 //! that explain why a mapping exists are carried over with it: each one records
 //! an account that was once weighed or named wrongly.

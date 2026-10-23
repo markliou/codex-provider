@@ -3,7 +3,7 @@
 //! lineage binding, balanced placement, the red outline and Use Pro last).
 //!
 //! A port of routingDecision, selectAccount* and pickBalancedAccountLocked in
-//! cmd/codex-pool/main.go. The comments that say why a rule exists come with
+//! the Go pool's main.go. The comments that say why a rule exists come with
 //! it: most record a session that was once split, stranded or moved wrongly.
 
 use super::app::App;

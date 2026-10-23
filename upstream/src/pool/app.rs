@@ -1,7 +1,7 @@
 //! The pool: its settings, its state under one lock, and the rules every
 //! routing decision reads.
 //!
-//! A port of the `app` type in cmd/codex-pool/main.go. Go guards config and
+//! A port of the `app` type in the Go pool's main.go. Go guards config and
 //! runtime state with one RWMutex and names every method that expects it held
 //! `...Locked`; here that state is `Inner`, reached through `App::read` and
 //! `App::write`, and the `...Locked` methods are methods of `Inner`. The lock
@@ -42,7 +42,7 @@ use std::time::Duration;
 const CODEX_AUTH_READ_ATTEMPTS: usize = 20;
 const CODEX_AUTH_READ_RETRY_DELAY: Duration = Duration::from_millis(50);
 
-/// A device-auth login (cmd/codex-pool loginJob). Only what routing reads is
+/// A device-auth login (the Go pool's loginJob). Only what routing reads is
 /// here yet; the login flow itself is ported with the account work (4.4).
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]

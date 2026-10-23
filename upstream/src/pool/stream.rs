@@ -2,7 +2,7 @@
 //! early stream writer that keeps a waiting client connected.
 //!
 //! A port of copyStreamingProxyResponseWithPrecommit, readSSEBlock,
-//! precommitLifecycleSSEBlock and earlyStreamWriter in cmd/codex-pool/main.go.
+//! precommitLifecycleSSEBlock and earlyStreamWriter in the Go pool's main.go.
 //! The comments that explain each rule come with it: every one records a
 //! production stream that committed too early (so a capacity refusal reached
 //! Codex as final) or held the client too long (so it was cut and resent the

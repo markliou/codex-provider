@@ -1,12 +1,11 @@
-//! Pool-owned compatibility primitives used by the later routing migration.
+//! The pool: routing, accounts, quota, the control page and the server.
 //!
 //! These modules intentionally sit outside `vendor/codex`: the vendored tree
 //! is a byte-for-byte copy of Codex, while hashes and persistent pool state are
-//! this service's contracts. The Go implementation remains the writer until
-//! migration step 4, so the fixtures (cmd/codex-pool/testdata, written by
-//! hash_state_vectors_test.go from the production Go code) are the measured
-//! interchange format rather than a second, independently invented schema.
-//! Keep a single copy of them there; a second copy here could drift.
+//! this service's contracts. The fixtures in upstream/testdata (hash, state
+//! and own-call vectors) were written from the Go pool this replaced, so the
+//! hashes and files the running pool already holds keep their meaning; they
+//! are the measured format, not a schema to rewrite. Keep a single copy.
 
 pub mod admin;
 pub mod admin_api;
