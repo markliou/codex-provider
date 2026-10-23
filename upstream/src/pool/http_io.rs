@@ -129,10 +129,11 @@ impl Cancel {
 }
 
 /// Go's http.Header: canonical names (textproto.CanonicalMIMEHeaderKey), each
-/// with its values in order. Go writes a request's headers sorted by name, and
-/// the hop to codex-upstream carried them in that order, which decides where
-/// the Codex headers that no native order names land; keeping the map sorted
-/// keeps that order.
+/// with its values in order. Go wrote a request's headers sorted by name, and
+/// the Go pool's hop to the transport carried them in that order, which
+/// decides where the Codex headers that no native order names land; keeping
+/// the map sorted keeps that order, which wire-capture.sh holds to a native
+/// Codex. Do not replace it with an unordered map.
 #[derive(Clone, Debug, Default)]
 pub struct GoHeader(pub std::collections::BTreeMap<String, Vec<String>>);
 
@@ -179,7 +180,7 @@ impl GoHeader {
         self.0.remove(&canonical_header_key(name));
     }
 
-    /// The headers in the order Go writes them.
+    /// The headers in sorted order (see GoHeader).
     pub fn to_map(&self) -> HeaderMap {
         let mut out = HeaderMap::new();
         for (name, values) in &self.0 {

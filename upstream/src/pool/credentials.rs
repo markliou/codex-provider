@@ -34,8 +34,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 /// The Codex release the pool is held to. It must equal the tag in
-/// upstream/Cargo.toml and the bundled CLI in the Dockerfile; a Go test keeps
-/// the three together.
+/// upstream/Cargo.toml and the bundled CLI in the Dockerfile; a test
+/// (bundled_codex_matches_the_pinned_release) keeps the three together.
 pub const PINNED_CODEX_VERSION: &str = "0.163.0";
 /// A token is refreshed this long before it expires.
 pub const CODEX_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;
@@ -769,7 +769,7 @@ mod tests {
     }
 
     // Go TestBundledCodexMatchesThePinnedRelease: one Codex release, named in
-    // three places: the crates codex-upstream is built from, the CLI bundled
+    // three places: the crates the pool is built from, the CLI bundled
     // for sign-in and priming, and the version the pool's own calls present.
     // The bundled CLI once stayed at 0.141.0 while the rest moved to 0.163.0,
     // so sign-in traffic came from an older Codex than everything else.

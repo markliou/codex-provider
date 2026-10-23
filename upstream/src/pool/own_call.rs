@@ -212,10 +212,10 @@ mod tests {
         headers
     }
 
-    // The Go side's composition (codexOwnCall.request, used without
-    // codex-upstream) and this one write every call the same way.
+    // The vectors record the Go pool's composition of every call
+    // (codexOwnCall.request); this one must still write each the same way.
     #[test]
-    fn composes_every_call_as_the_go_side_does() {
+    fn composes_every_call_as_the_recorded_vectors() {
         let vectors: Vec<Vector> =
             serde_json::from_str(include_str!("../../testdata/own-call-vectors.json"))
                 .unwrap_or_else(|error| panic!("own-call-vectors.json: {error}"));

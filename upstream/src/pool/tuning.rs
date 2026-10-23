@@ -1,6 +1,6 @@
-//! Operator-tunable numbers that Go keeps in package variables
+//! Operator-tunable numbers that the Go pool kept in package variables
 //! (quotaExhaustionFloorPercent, premiumSeatWeight, the capacity retry
-//! schedule and the pre-commit hold) and retunes once at startup from the
+//! schedule and the pre-commit hold) and retuned once at startup from the
 //! environment. Here they are one value the app owns and hands to the code
 //! that needs them, so tests can set them without touching each other.
 //!
