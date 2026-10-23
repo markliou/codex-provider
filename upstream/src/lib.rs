@@ -12,6 +12,7 @@
 //! point is that upstream is read with Codex's.
 
 // Root re-exports the vendored files name as `crate::...` (codex-api lib.rs).
+pub(crate) use auth::AuthError;
 pub(crate) use codex_client::TransportError;
 pub(crate) use error::ApiError;
 pub(crate) use telemetry::WebsocketTelemetry;

@@ -23,8 +23,8 @@ path = "src/main.rs"
 # moving to a new Codex release, change the tag and reseed the lock together
 # (see README "Codex Gateway").
 [dependencies]
-codex-http-client = { git = "https://github.com/openai/codex", tag = "rust-v0.163.0" }
-codex-websocket-client = { git = "https://github.com/openai/codex", tag = "rust-v0.163.0" }
+codex-http-client = { git = "https://github.com/openai/codex", tag = "rust-v0.164.0" }
+codex-websocket-client = { git = "https://github.com/openai/codex", tag = "rust-v0.164.0" }
 bytes = "1"
 futures = "0.3"
 http = "1"
@@ -40,8 +40,8 @@ tokio-tungstenite = { version = "0.28.0", features = ["proxy", "rustls-tls-nativ
 tungstenite = { version = "0.27.0", features = ["deflate", "proxy"] }
 # What the vendored codex-api files use, at the Codex workspace's versions and
 # features (codex-rs/Cargo.toml and codex-api/Cargo.toml).
-codex-client = { git = "https://github.com/openai/codex", tag = "rust-v0.163.0" }
-codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.163.0" }
+codex-client = { git = "https://github.com/openai/codex", tag = "rust-v0.164.0" }
+codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.164.0" }
 base64 = "0.22.1"
 chrono = "0.4.43"
 eventsource-stream = "0.2.3"

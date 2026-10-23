@@ -36,7 +36,24 @@ use std::sync::Mutex;
 /// The Codex release the pool is held to. It must equal the tag in
 /// upstream/Cargo.toml and the bundled CLI in the Dockerfile; a test
 /// (bundled_codex_matches_the_pinned_release) keeps the three together.
-pub const PINNED_CODEX_VERSION: &str = "0.163.0";
+pub const PINNED_CODEX_VERSION: &str = "0.164.0";
+/// Why a token refresh is made, as Codex names it upstream (login
+/// oauth/client.rs RefreshReason::as_str, 0.164.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshReason {
+    ProactiveExpiry,
+    UnauthorizedRecovery,
+}
+
+impl RefreshReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProactiveExpiry => "proactive_expiry",
+            Self::UnauthorizedRecovery => "unauthorized_recovery",
+        }
+    }
+}
+
 /// A token is refreshed this long before it expires.
 pub const CODEX_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;
 /// The reason recorded for a refused token refresh. Only that refusal makes
@@ -413,6 +430,7 @@ impl App {
         &self,
         account_id: &str,
         refresh_token: &str,
+        reason: RefreshReason,
     ) -> Result<RefreshResponse, CredentialError> {
         let agent = self.client_agent_for(account_id);
         let call = OwnCall::TokenRefresh(RefreshCall {
@@ -421,6 +439,7 @@ impl App {
             originator: agent.originator,
             client_id: self.settings.oauth_client_id.clone(),
             refresh_token: refresh_token.to_string(),
+            refresh_reason: Some(reason.as_str().to_string()),
         });
         let response = self.send_own_call(&call).await.map_err(|error| {
             CredentialError::transient(format!("refresh codex token: {error:?}"))
@@ -483,8 +502,18 @@ impl App {
                 _ => return Ok(()),
             }
         }
+        // Codex names the refresh it makes before expiry proactive_expiry and
+        // the one after a 401 unauthorized_recovery (login auth/manager.rs
+        // proactive_refresh_reason and UnauthorizedRecovery). Its scheduled
+        // refresh is for tokens without an expiry; ChatGPT access tokens
+        // always carry one, so the pool never makes it.
+        let reason = if force {
+            RefreshReason::UnauthorizedRecovery
+        } else {
+            RefreshReason::ProactiveExpiry
+        };
         let refreshed = match self
-            .request_codex_token_refresh(&item.id, &refresh_token)
+            .request_codex_token_refresh(&item.id, &refresh_token, reason)
             .await
         {
             Ok(refreshed) => refreshed,
@@ -693,7 +722,9 @@ mod tests {
             http::HeaderValue::from_static("Codex_Desktop"),
         );
         app.note_client_agent("device", &client);
-        let refreshed = app.request_codex_token_refresh("device", "<refresh>").await;
+        let refreshed = app
+            .request_codex_token_refresh("device", "<refresh>", RefreshReason::ProactiveExpiry)
+            .await;
         assert!(refreshed.is_ok(), "{refreshed:?}");
         let request = refresh.requests().remove(0);
         // A native Codex's refresh carries its default client's agent, without
@@ -706,7 +737,7 @@ mod tests {
         assert_eq!(request.header("content-type"), "application/json");
         assert_eq!(
             request.body_string(),
-            r#"{"client_id":"app_EMoamEEZ73f0CkXaXp7hrann","grant_type":"refresh_token","refresh_token":"<refresh>"}"#
+            r#"{"client_id":"app_EMoamEEZ73f0CkXaXp7hrann","grant_type":"refresh_token","refresh_reason":"proactive_expiry","refresh_token":"<refresh>"}"#
         );
         // A foreign client never becomes the identity of the pool's own calls.
         let mut foreign = HeaderMap::new();

@@ -67,6 +67,11 @@ pub struct RefreshCall {
     pub originator: String,
     pub client_id: String,
     pub refresh_token: String,
+    /// Why Codex refreshes (login oauth/client.rs RefreshReason, from 0.164.0):
+    /// sent as `refresh_reason` with the grant. None leaves it out, as Codex
+    /// releases before 0.164.0 did.
+    #[serde(default)]
+    pub refresh_reason: Option<String>,
 }
 
 /// backend-client rate_limit_resets.rs ConsumeRateLimitResetCreditRequest:
@@ -122,18 +127,24 @@ pub fn compose(call: &OwnCall) -> Result<Composed, String> {
             })
         }
         // login oauth/client.rs refresh + exchange with TokenEncoding::Json:
-        // the parameters collected into a BTreeMap (so sorted by key) and
+        // grant_type, client_id, refresh_token, then refresh_reason when the
+        // caller names one (always, from 0.164.0: manager.rs
+        // request_chatgpt_token_refresh passes Some(reason)), collected into a
+        // BTreeMap (so sorted by key) and
         // `.header("Content-Type", "application/json").json(..)`, sent by
         // login's default client, whose default headers (originator, then
         // user-agent) come after the request's own.
         OwnCall::TokenRefresh(refresh) => {
-            let parameters: BTreeMap<&str, &str> = [
+            let mut parameters: BTreeMap<&str, &str> = [
                 ("grant_type", "refresh_token"),
                 ("client_id", refresh.client_id.as_str()),
                 ("refresh_token", refresh.refresh_token.as_str()),
             ]
             .into_iter()
             .collect();
+            if let Some(reason) = &refresh.refresh_reason {
+                parameters.insert("refresh_reason", reason.as_str());
+            }
             let body = serde_json::to_vec(&parameters).map_err(|error| error.to_string())?;
             let mut after_body = HeaderMap::new();
             insert(&mut after_body, "originator", &refresh.originator)?;
@@ -303,6 +314,32 @@ mod tests {
             .map(|(name, _)| name)
             .collect();
         assert_eq!(names, ["content-type", "originator", "user-agent"]);
+    }
+
+    // Codex 0.164.0 names why it refreshes (login oauth/client.rs refresh:
+    // `parameters.push(("refresh_reason", reason.as_str()))`), and the JSON
+    // body is a BTreeMap, so the key sorts between grant_type and
+    // refresh_token.
+    #[test]
+    fn a_token_refresh_names_its_reason_as_codex_does() {
+        let call: OwnCall = serde_json::from_value(serde_json::json!({
+            "call": "token_refresh",
+            "url": "https://auth.example.test/oauth/token",
+            "user_agent": "codex_exec/0.164.0",
+            "originator": "codex_exec",
+            "client_id": "fake-client",
+            "refresh_token": "replace-refresh",
+            "refresh_reason": "proactive_expiry",
+        }))
+        .unwrap_or_else(|error| panic!("{error}"));
+        let composed = compose(&call).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            composed.json_body.as_deref(),
+            Some(
+                br#"{"client_id":"fake-client","grant_type":"refresh_token","refresh_reason":"proactive_expiry","refresh_token":"replace-refresh"}"#
+                    .as_slice()
+            )
+        );
     }
 
     #[test]
