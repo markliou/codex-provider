@@ -2233,7 +2233,7 @@ async fn direct_codex_gateway_sends_compaction_to_the_compact_endpoint() {
 // account's endpoint refuses connections, is retried on that account
 // (TRANSPORT_SAME_ACCOUNT_RETRY_LIMIT), and only then fails over.
 #[tokio::test]
-async fn direct_codex_gateway_sends_through_codex_upstream() {
+async fn direct_codex_gateway_sends_through_codexs_transport() {
     let upstream = FakeServer::start(|_| {
         FakeResponse::json(
             200,

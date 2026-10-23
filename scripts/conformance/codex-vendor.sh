@@ -9,7 +9,7 @@
 #
 # Codex keeps the functions that read a Responses stream and classify its
 # failures crate-private (codex-api sse/, endpoint/responses_websocket.rs), so
-# codex-upstream compiles the files themselves. They are never edited: the
+# the pool compiles the files themselves. They are never edited: the
 # point is that the pool reads upstream with Codex's own code, and a changed
 # copy would be the pool's code again. Anything the pool needs differently is
 # written outside upstream/vendor. Paths keep their place in the Codex

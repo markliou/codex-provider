@@ -4,15 +4,15 @@
 //! public dashboard on the combined address, picks the account, and sends
 //! upstream with Codex's own HTTP and WebSocket clients, so what reaches
 //! upstream is what a native Codex of the pinned release sends
-//! (codex_vendor::pool). Before this step a Go pool made those decisions and
+//! (codex_pool::pool). Before this step a Go pool made those decisions and
 //! this process was only its loopback transport and front door; that split
 //! is gone, and nothing here may grow a second decider again.
 //!
 //! `codex-pool hash-password` (with CODEX_POOL_ADMIN_PASSWORD) prints the
 //! value for CODEX_POOL_ADMIN_PASSWORD_HASH, as the Go binary did.
 
-use codex_vendor::pool::crypto::new_password_hash;
-use codex_vendor::pool::serve;
+use codex_pool::pool::crypto::new_password_hash;
+use codex_pool::pool::serve;
 
 #[tokio::main]
 async fn main() {

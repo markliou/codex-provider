@@ -93,7 +93,7 @@ docker run --rm -v "$volume:/data" -v "$work:/w:ro" alpine:3.21 sh -ceu "
   chmod 700 /data/accounts/conformance/.codex
   chmod 600 /data/accounts/conformance/.codex/auth.json
   chown -R 999:999 /data"
-# The pool only serves once codex-upstream and the account load are up; a
+# The pool only serves once its listener and the account load are up; a
 # Codex started before that spends its turn reconnecting and records nothing.
 wait_for_pool() {
   if ! docker run --rm --network "$net" alpine:3.21 sh -c '
