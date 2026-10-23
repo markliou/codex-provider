@@ -4,14 +4,16 @@
 # and --locked keeps the Codex-seeded lock.
 FROM rust:1.99.1-alpine AS pool
 
+RUN apk add --no-cache musl-dev perl make gcc linux-headers git
 # .dockerignore keeps .git out of the image context, so release identity must be
 # passed in by the build command. The admin UI depends on these args to avoid
-# manual footer edits that can drift from the deployed commit.
+# manual footer edits that can drift from the deployed commit. They come after
+# the toolchain step and carry no build time: every argument in scope is part of
+# the release build's cache key, so a timestamp made wire-capture, the
+# integration tests and the deploy each rebuild the same commit from scratch
+# (several minutes each, with fat LTO). Same commit, same arguments, one build.
 ARG CODEX_POOL_VERSION=dev
 ARG CODEX_POOL_COMMIT=unknown
-ARG CODEX_POOL_BUILT_AT=unknown
-
-RUN apk add --no-cache musl-dev perl make gcc linux-headers git
 WORKDIR /build/upstream
 COPY upstream/Cargo.toml upstream/Cargo.lock ./
 COPY upstream/src ./src

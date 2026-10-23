@@ -398,12 +398,19 @@ sh scripts/test/rust-check.sh
 
 # Integration tests: a real `codex exec` against a mock upstream. They build
 # codex-pool:test, never the live codex-pool:local, and refuse the live
-# container and volume names (scripts/test/isolation.sh).
+# container and volume names (scripts/test/isolation.sh). integration-all.sh
+# builds once and runs the four at the same time; each also runs alone.
+sh scripts/test/integration-all.sh
 sh scripts/test/integration-codex-config.sh
 sh scripts/test/integration-device-auth-failover.sh
 sh scripts/test/integration-codex-subagent.sh
 sh scripts/test/integration-routing-cache-observability.sh
 ```
+
+Run the checks before a deploy on the commit that will be deployed (the merge
+on `main`): every build of one commit passes the same arguments, so the image
+wire-capture and the integration tests built comes back from the build cache
+when `deploy.sh` builds it, instead of another full release build.
 
 ### Codex wire conformance
 
