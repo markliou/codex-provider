@@ -32,9 +32,13 @@ pub struct Tuning {
     /// How long the pre-commit window may keep a streaming client waiting
     /// before headers and keepalives go out (Go streamingPrecommitMaxHold).
     pub precommit_max_hold: Duration,
-    /// The first same-account overload wait; each retry doubles it. Not read
-    /// from the environment: Go keeps it a variable only so tests can shorten
-    /// it, as do these two.
+    /// The wait before each same-account overload retry, the same every
+    /// time. 6s is the retry delay the Codex backend advises with its
+    /// overloads (Codex reads it as ServerOverloaded with a 5999ms or 6999ms
+    /// retry, in the pool's verdict log); the owner chose to wait that long
+    /// before every retry rather than the earlier 1s, 2s, 4s, which retried
+    /// sooner than upstream asked. Not read from the environment: it is a
+    /// field only so tests can shorten it, as are these two.
     pub overload_retry_backoff: Duration,
     /// The first same-account transport retry wait; each retry doubles it.
     pub transport_retry_backoff: Duration,
@@ -49,8 +53,8 @@ pub struct Tuning {
     pub stream_keepalive_tick: Duration,
 }
 
-/// How many times an overload is retried on the same account (after 1s, 2s
-/// and 4s at the default backoff) before the pool moves the lineage to another
+/// How many times an overload is retried on the same account (after 6s each
+/// at the default backoff) before the pool moves the lineage to another
 /// account.
 pub const OVERLOAD_SAME_ACCOUNT_RETRY_LIMIT: u32 = 3;
 
@@ -74,7 +78,7 @@ impl Default for Tuning {
             capacity_retry_backoff: Duration::from_secs(1),
             capacity_retry_max_wait: Duration::from_secs(20),
             precommit_max_hold: Duration::from_secs(1),
-            overload_retry_backoff: Duration::from_secs(1),
+            overload_retry_backoff: Duration::from_secs(6),
             transport_retry_backoff: Duration::from_millis(500),
             unmanaged_precommit_commit_after: Duration::from_secs(5),
             stream_keepalive_interval: Duration::from_millis(1500),
@@ -186,6 +190,16 @@ mod tests {
         for invalid in ["-1", "21", "abc", "100"] {
             assert!(floor(invalid).is_err(), "{invalid} was accepted as a floor");
         }
+    }
+
+    // The same-account overload wait is the 6s the Codex backend advises
+    // with its overloads, every time, on HTTP and on the WebSocket alike.
+    #[test]
+    fn overload_retries_wait_the_advised_six_seconds() {
+        assert_eq!(
+            Tuning::default().overload_retry_backoff,
+            Duration::from_secs(6)
+        );
     }
 
     // Go TestCapacityRetryBackoffEscalatesToACap.

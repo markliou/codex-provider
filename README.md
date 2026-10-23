@@ -258,7 +258,8 @@ The pool keeps trying on the same account before it moves a conversation, as a
 native Codex (which has only one account) would:
 
 - **Overloaded or a server fault** (`server_is_overloaded`, `server_error` and
-  similar): retried on the same account after 1 s, 2 s and 4 s.
+  similar): retried on the same account up to three times, 6 s apart, the
+  delay OpenAI advises with its overloads.
 - **Unreachable** (a connection that fails or drops before an answer): retried on
   the same account after 0.5 s and 1 s. A dropped WebSocket sets no cooldown, so
   Codex's reconnect returns to the same account.
