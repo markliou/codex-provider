@@ -39,22 +39,23 @@ const ACCOUNT_ID_KEYS: &[&str] = &[
     "workspaceId",
 ];
 
+/// Where a subscription record names its plan, in order of precedence. An
+/// entitlement record is read with the subscription plan first instead.
+const PLAN_KEYS: &[&str] = &[
+    "plan_type",
+    "planType",
+    "subscription_plan",
+    "subscriptionPlan",
+    "plan_name",
+    "planName",
+    "sku",
+    "sku_name",
+    "product",
+    "product_name",
+];
+
 pub fn subscription_metadata_from_map(values: &Map<String, Value>) -> SubscriptionMetadata {
-    let raw_plan = clean_raw_plan_type(&first_metadata_string(
-        Some(values),
-        &[
-            "plan_type",
-            "planType",
-            "subscription_plan",
-            "subscriptionPlan",
-            "plan_name",
-            "planName",
-            "sku",
-            "sku_name",
-            "product",
-            "product_name",
-        ],
-    ));
+    let raw_plan = clean_raw_plan_type(&first_metadata_string(Some(values), PLAN_KEYS));
     let family = plan_family_from_raw(&raw_plan);
     let mut metadata = SubscriptionMetadata {
         account_id: first_metadata_string(Some(values), ACCOUNT_ID_KEYS),
@@ -202,21 +203,7 @@ fn subscription_metadata_from_record(record: &Map<String, Value>) -> Subscriptio
         );
     }
     if raw_plan.is_empty() {
-        raw_plan = first_metadata_string(
-            Some(account_record),
-            &[
-                "plan_type",
-                "planType",
-                "subscription_plan",
-                "subscriptionPlan",
-                "plan_name",
-                "planName",
-                "sku",
-                "sku_name",
-                "product",
-                "product_name",
-            ],
-        );
+        raw_plan = first_metadata_string(Some(account_record), PLAN_KEYS);
     }
     let raw_plan = clean_raw_plan_type(&raw_plan);
     let family = plan_family_from_raw(&raw_plan);

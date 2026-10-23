@@ -156,16 +156,6 @@ pub fn canonical_header_key(name: &str) -> String {
 }
 
 impl GoHeader {
-    pub fn from_map(headers: &HeaderMap) -> Self {
-        let mut out = Self::default();
-        for (name, value) in headers {
-            if let Ok(value) = value.to_str() {
-                out.add(name.as_str(), value);
-            }
-        }
-        out
-    }
-
     pub fn get(&self, name: &str) -> &str {
         self.0
             .get(&canonical_header_key(name))

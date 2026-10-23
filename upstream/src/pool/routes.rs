@@ -49,6 +49,7 @@ pub struct Request {
 
 impl Request {
     /// A request built in a test (Go httptest.NewRequest).
+    #[cfg(test)]
     pub fn test(method: Method, target: &str, body: &str) -> Self {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         Self {
@@ -63,6 +64,7 @@ impl Request {
         }
     }
 
+    #[cfg(test)]
     pub fn with_header(mut self, name: &'static str, value: &str) -> Self {
         if let Ok(value) = http::HeaderValue::from_str(value) {
             self.headers.insert(name, value);

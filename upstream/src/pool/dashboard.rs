@@ -951,32 +951,7 @@ impl Inner {
     pub fn public_dashboard_account(&self, item: &Account, index: usize, now: Timestamp) -> Value {
         let (status, _) = self.account_status(item, now);
         let snapshot = quota::quota_snapshot_for_display(&self.quota_snapshot(&item.id), now);
-        let mut display = item.clone();
-        if !snapshot.organization_name.is_empty() {
-            display
-                .organization_name
-                .clone_from(&snapshot.organization_name);
-        }
-        if !snapshot.plan_type.is_empty() {
-            display.plan_type.clone_from(&snapshot.plan_type);
-            display.plan_family.clone_from(&snapshot.plan_family);
-            display.raw_plan_type.clone_from(&snapshot.raw_plan_type);
-            display.plan_rank = plan::plan_rank(&snapshot.plan_type);
-        }
-        if !snapshot.plan_limit.is_empty() {
-            display.plan_limit.clone_from(&snapshot.plan_limit);
-        }
-        // The snapshot is authoritative once it carries a seat, but before the
-        // first successful refresh it carries none; overwriting then would
-        // blank the seat already persisted on the slot.
-        if !snapshot.seat_type.is_empty() {
-            display.seat_type.clone_from(&snapshot.seat_type);
-            display.seat_type_inferred = snapshot.seat_type_inferred;
-        }
-        if !snapshot.seat_type_raw.is_empty() {
-            display.seat_type_raw.clone_from(&snapshot.seat_type_raw);
-        }
-        display.quota_policy.clone_from(&snapshot.quota_policy);
+        let display = super::status::account_for_display(item, &snapshot);
         let (tone, label) = public_dashboard_status(status);
         let remaining = display
             .remaining_quota

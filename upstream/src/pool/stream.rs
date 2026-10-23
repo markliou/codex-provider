@@ -549,12 +549,6 @@ impl EarlyStreamWriter {
         true
     }
 
-    /// Sends the 200 SSE headers and an opening comment now, if nothing has
-    /// been written yet; whether it did.
-    pub fn start_early(&self) -> bool {
-        Self::start_early_locked(&mut lock(&self.state))
-    }
-
     /// Whether headers went out before any response content, and when.
     pub fn headers_sent_early(&self) -> Option<Instant> {
         let state = lock(&self.state);

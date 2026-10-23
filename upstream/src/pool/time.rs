@@ -62,10 +62,6 @@ impl Timestamp {
         self.0.timestamp()
     }
 
-    pub fn unix_millis(&self) -> i64 {
-        self.0.timestamp_millis()
-    }
-
     /// The same instant in UTC (Go's `.UTC()`).
     pub fn utc(&self) -> Self {
         Self(self.0.with_timezone(&Utc).fixed_offset())

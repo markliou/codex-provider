@@ -406,12 +406,7 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
         inner.config.quota_prime = Some(value);
     }
     if inner.save().is_err() {
-        write_openai_error(
-            writer,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage_error",
-            "unable to persist settings",
-        );
+        write_storage_error(writer, "unable to persist settings");
         return;
     }
     let state = inner.admin_state(Timestamp::now());
@@ -545,12 +540,7 @@ pub fn handle_public_account_action(
                         "this credential cannot be repaired from the public page",
                     );
                 }
-                Err(_) => write_openai_error(
-                    writer,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "storage_error",
-                    "unable to start sign-in repair",
-                ),
+                Err(_) => write_storage_error(writer, "unable to start sign-in repair"),
             }
         }
         _ => {
@@ -631,12 +621,7 @@ pub fn handle_public_account_action(
                 } else {
                     "unable to persist account"
                 };
-                write_openai_error(
-                    writer,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "storage_error",
-                    message,
-                );
+                write_storage_error(writer, message);
                 return;
             }
             let current = inner.config.accounts()[index].clone();
@@ -812,12 +797,7 @@ pub fn handle_accounts(app: &App, request: &Request, writer: &mut dyn ResponseWr
     inner.config.accounts_mut().push(input.clone());
     if inner.save().is_err() {
         drop(inner);
-        write_openai_error(
-            writer,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage_error",
-            "unable to persist account",
-        );
+        write_storage_error(writer, "unable to persist account");
         return;
     }
     drop(inner);
@@ -845,7 +825,18 @@ pub fn handle_account_health(app: &App, writer: &mut dyn ResponseWriter) {
     );
 }
 
-fn quota_refresh_fields(snapshot: &super::state::QuotaSnapshot) -> serde_json::Value {
+/// The 500 the admin API answers when the state or an account's files could
+/// not be written.
+fn write_storage_error(writer: &mut dyn ResponseWriter, message: &str) {
+    write_openai_error(
+        writer,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "storage_error",
+        message,
+    );
+}
+
+pub fn quota_refresh_fields(snapshot: &super::state::QuotaSnapshot) -> serde_json::Value {
     json!({
         "quota": super::status::to_value(&snapshot.quota),
         "organizationName": plan::public_organization_name(&snapshot.organization_name),
@@ -931,12 +922,7 @@ pub fn handle_reset_prompt_cache_window(app: &App, writer: &mut dyn ResponseWrit
     inner.reset_prompt_cache_window(Timestamp::now());
     if inner.save().is_err() {
         drop(inner);
-        write_openai_error(
-            writer,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage_error",
-            "unable to persist cache window reset",
-        );
+        write_storage_error(writer, "unable to persist cache window reset");
         return;
     }
     let window = inner.prompt_cache_window();
@@ -991,12 +977,7 @@ pub fn handle_sticky_session_delete(app: &App, request: &Request, writer: &mut d
         .retain(|_, binding| binding.sticky_key != key);
     if inner.save().is_err() {
         drop(inner);
-        write_openai_error(
-            writer,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage_error",
-            "unable to persist state",
-        );
+        write_storage_error(writer, "unable to persist state");
         return;
     }
     drop(inner);
@@ -1061,12 +1042,7 @@ pub async fn handle_account_action(
                         &LoginStartError::AnotherJobInProgress.to_string(),
                     );
                 }
-                Err(_) => write_openai_error(
-                    writer,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "storage_error",
-                    "unable to persist sign-in repair state",
-                ),
+                Err(_) => write_storage_error(writer, "unable to persist sign-in repair state"),
             }
             return;
         }
@@ -1115,12 +1091,7 @@ pub async fn handle_account_action(
             }
             if inner.save().is_err() {
                 drop(inner);
-                write_openai_error(
-                    writer,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "storage_error",
-                    "unable to persist account note",
-                );
+                write_storage_error(writer, "unable to persist account note");
                 return;
             }
             let account = public_account(&inner.config.accounts()[index]);
@@ -1151,12 +1122,7 @@ pub async fn handle_account_action(
             inner.reset_prompt_cache_window_for_account(id, now);
             if inner.save().is_err() {
                 drop(inner);
-                write_openai_error(
-                    writer,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "storage_error",
-                    "unable to persist cache window reset",
-                );
+                write_storage_error(writer, "unable to persist cache window reset");
                 return;
             }
             let window = inner.prompt_cache_window_for_account(id);
@@ -1233,12 +1199,7 @@ pub async fn handle_account_action(
     inner.config.accounts_mut()[index].updated_at = now;
     if inner.save().is_err() {
         drop(inner);
-        write_openai_error(
-            writer,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage_error",
-            "unable to persist account",
-        );
+        write_storage_error(writer, "unable to persist account");
         return;
     }
     let account = public_account(&inner.config.accounts()[index]);
@@ -1272,12 +1233,7 @@ pub fn handle_account_delete(app: &App, request: &Request, writer: &mut dyn Resp
         let root = inner.account_root(&id);
         if root.exists() && std::fs::remove_dir_all(&root).is_err() {
             drop(inner);
-            write_openai_error(
-                writer,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "storage_error",
-                "unable to purge account credentials",
-            );
+            write_storage_error(writer, "unable to purge account credentials");
             return;
         }
     }
@@ -1285,12 +1241,7 @@ pub fn handle_account_delete(app: &App, request: &Request, writer: &mut dyn Resp
     inner.clear_account_identity_scoped_state(&id);
     if inner.save().is_err() {
         drop(inner);
-        write_openai_error(
-            writer,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage_error",
-            "unable to persist account",
-        );
+        write_storage_error(writer, "unable to persist account");
         return;
     }
     drop(inner);

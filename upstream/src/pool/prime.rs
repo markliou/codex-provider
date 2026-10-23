@@ -24,7 +24,6 @@ use super::time::minutes;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -481,7 +480,8 @@ impl App {
     }
 
     /// Sets the prime runner (tests stand in for the bundled CLI).
-    pub fn set_prime_runner(&self, runner: Arc<PrimeRunner>) {
+    #[cfg(test)]
+    pub fn set_prime_runner(&self, runner: std::sync::Arc<PrimeRunner>) {
         *self
             .prime_runner
             .lock()

@@ -11,7 +11,8 @@ use super::http_io::ResponseWriter;
 use super::http_io::set_header;
 use http::StatusCode;
 
-const ADMIN_VERSION_PLACEHOLDER: &str = "{{CODEX_POOL_VERSION}}";
+/// The placeholder the HTML carries for the version.
+pub const VERSION_PLACEHOLDER: &str = "{{CODEX_POOL_VERSION}}";
 const ADMIN_PAGE_HTML: &str = include_str!("../../web/admin.html");
 const ADMIN_CSS: &str = include_str!("../../web/app.css");
 const ADMIN_JS: &str = include_str!("../../web/app.js");
@@ -43,11 +44,8 @@ pub fn format_display_version(version: &str, commit: &str) -> String {
     version
 }
 
-/// The placeholder the HTML carries for the version.
-pub const VERSION_PLACEHOLDER: &str = ADMIN_VERSION_PLACEHOLDER;
-
 pub fn admin_page() -> String {
-    ADMIN_PAGE_HTML.replace(ADMIN_VERSION_PLACEHOLDER, &admin_display_version())
+    ADMIN_PAGE_HTML.replace(VERSION_PLACEHOLDER, &admin_display_version())
 }
 
 fn serve(writer: &mut dyn ResponseWriter, content_type: &str, body: &str) {

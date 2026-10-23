@@ -29,23 +29,14 @@ use tokio_tungstenite::tungstenite::extensions::ExtensionsConfig;
 use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-/// Control headers the pool sets for this hop. They are consumed here and are
-/// never sent upstream.
+/// The control headers the Go pool once set on its loopback hop to this code.
+/// Nothing sets them now; they stay on the not-forwarded lists so a client
+/// that sends one cannot have it reach upstream, where no native Codex sends
+/// it.
 pub const UPSTREAM_URL: &str = "x-codex-upstream-url";
-// Names the pool account a request is for. Nothing is keyed on it: every
-// request gets a fresh client (see Transports::client).
 pub const UPSTREAM_IDENTITY: &str = "x-codex-upstream-identity";
 pub const UPSTREAM_COMPRESSION: &str = "x-codex-upstream-compression";
-// The wire order for a request that is not a Responses request: header names
-// before the body step, `|`, then names after it (for example
-// "user-agent,authorization,chatgpt-account-id|"). The pool's own backend
-// calls and passthrough paths have native orders of their own (captured from
-// a native Codex); the pool's HTTP hop cannot carry an order, so it names it.
 pub const UPSTREAM_HEADER_ORDER: &str = "x-codex-upstream-header-order";
-/// Set on a response this process generated itself because the upstream could
-/// not be reached, so the pool treats it as a transport failure rather than an
-/// upstream answer.
-pub const UPSTREAM_ERROR: &str = "x-codex-upstream-error";
 
 /// Header order of a native Codex 0.163.0 Responses request to the Codex
 /// backend, captured on the wire. Provider headers and turn headers come first,
@@ -149,18 +140,6 @@ pub const WS_NOT_FORWARDED: &[&str] = &[
     UPSTREAM_IDENTITY,
     UPSTREAM_COMPRESSION,
 ];
-/// Upstream handshake headers that belong to that connection, not to the
-/// pool's leg, and are not copied onto the 101 the pool receives.
-pub const WS_UPGRADE_HEADERS: &[&str] = &[
-    "connection",
-    "upgrade",
-    "sec-websocket-accept",
-    "sec-websocket-extensions",
-    "sec-websocket-protocol",
-    "content-length",
-    "transfer-encoding",
-];
-
 pub struct Transports {
     // Codex's default factory (transport default proxy, no PSP cookie), from
     // which each WebSocket connection gets its own connector.
@@ -209,9 +188,13 @@ impl Transports {
     }
 }
 
-/// Splits the pool's headers by an explicit order (see UPSTREAM_HEADER_ORDER).
-/// Headers the order does not name are dropped: the pool names every header
-/// such a request carries, so anything else is not part of the native request.
+/// Splits the pool's headers by an explicit order: header names before the
+/// body step, `|`, then names after it (for example
+/// "user-agent,authorization,chatgpt-account-id|"). The pool's own backend
+/// calls and passthrough paths have native orders of their own, captured from
+/// a native Codex. Headers the order does not name are dropped: the pool names
+/// every header such a request carries, so anything else is not part of the
+/// native request.
 pub fn named_order_headers(incoming: &HeaderMap, order: &str) -> (HeaderMap, HeaderMap) {
     let (first, second) = order.split_once('|').unwrap_or((order, ""));
     let pick = |names: &str| {
@@ -408,7 +391,7 @@ impl std::fmt::Display for SendFailure {
 
 /// Assembles a request as Codex's request type does: the headers set before
 /// the body step in native order (`order` names them for a non-Responses
-/// request, see UPSTREAM_HEADER_ORDER), the body step, and the headers a
+/// request, see named_order_headers), the body step, and the headers a
 /// client adds after it. The bytes are encoded as given: re-serializing a
 /// parsed value would reorder keys. A body that is not JSON cannot be
 /// compressed by Codex's request type and is sent raw.
