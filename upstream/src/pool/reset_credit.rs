@@ -418,25 +418,12 @@ pub async fn handle_quota_refresh(app: &App, id: &str, writer: &mut dyn Response
             return;
         }
     };
-    write_json(
-        writer,
-        StatusCode::OK,
-        &serde_json::json!({
-            "ok": true,
-            "accountId": id,
-            "quota": super::status::to_value(&snapshot.quota),
-            "organizationName": super::plan::public_organization_name(&snapshot.organization_name),
-            "rawPlanType": snapshot.raw_plan_type,
-            "planFamily": snapshot.plan_family,
-            "planType": snapshot.plan_type,
-            "planLimit": snapshot.plan_limit,
-            "seatType": snapshot.seat_type,
-            "seatTypeRaw": snapshot.seat_type_raw,
-            "quotaPolicy": snapshot.quota_policy,
-            "usageUpdatedAt": snapshot.usage_updated_at,
-            "lastSuccessfulRefreshAt": snapshot.last_successful_refresh_at,
-            "freshness": snapshot.freshness,
-            "provenance": snapshot.provenance,
-        }),
-    );
+    write_json(writer, StatusCode::OK, &{
+        // The same fields as a quota refresh answer, so the page reads
+        // both the same way.
+        let mut body = super::admin_api::quota_refresh_fields(&snapshot);
+        body["ok"] = serde_json::json!(true);
+        body["accountId"] = serde_json::json!(id);
+        body
+    });
 }

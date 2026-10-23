@@ -541,8 +541,9 @@ impl App {
             .collect()
     }
 
-    /// Polls every account once, in order. The background poll does not use
-    /// it: it asks one account at a time on its own schedule.
+    /// Polls every account once, in order (tests). The background poll asks
+    /// one account at a time on its own schedule.
+    #[cfg(test)]
     pub async fn refresh_all_codex_quotas(&self) {
         for item in self.quota_poll_accounts() {
             self.poll_account_quota(&item).await;

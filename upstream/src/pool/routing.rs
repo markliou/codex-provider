@@ -1501,6 +1501,7 @@ impl App {
             .is_some()
     }
 
+    #[cfg(test)]
     pub fn select_account(
         &self,
         sticky_key: &str,

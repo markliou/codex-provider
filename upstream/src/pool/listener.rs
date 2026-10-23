@@ -9,9 +9,9 @@
 //! did from Go.
 //!
 //! Two connection facts the handlers need are set here. The remote address:
-//! the peer, or the front door's `PEER_HEADER` when the connection comes from
-//! loopback (the door's own relay); a client's copy of that header is always
-//! removed, or every client could claim to be loopback. And the client going
+//! the peer, or `FRONT_PEER_HEADER` when the connection comes from loopback
+//! (the removed front door relayed it so); a client's copy of that header is
+//! always removed, or every client could claim to be loopback. And the client going
 //! away: when hyper drops the response body before the handler finished, the
 //! request's `Cancel` fires, as Go's request context is cancelled.
 

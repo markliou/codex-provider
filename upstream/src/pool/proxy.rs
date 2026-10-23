@@ -712,9 +712,9 @@ impl App {
     }
 
     /// One send: the account's credential and identity, the client's Codex
-    /// headers, and Codex's client. The headers are gathered as Go's request
-    /// headers and handed over in the order Go wrote them on its hop to
-    /// codex-upstream, then placed in native order by the transport.
+    /// headers, and Codex's client. The headers are gathered in a GoHeader, so
+    /// they reach the transport in the sorted order the Go pool's hop carried
+    /// them, and the transport places them in native order.
     async fn forward_once(
         &self,
         candidate: &Account,

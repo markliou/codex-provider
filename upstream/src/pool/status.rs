@@ -12,6 +12,7 @@ use super::proxy::safe_header_value;
 use super::quota;
 use super::state::Account;
 use super::state::Cooldown;
+use super::state::QuotaSnapshot;
 use super::time::Timestamp;
 
 pub fn active_cooldowns(values: &[Cooldown], now: Timestamp) -> Vec<Cooldown> {
@@ -202,6 +203,40 @@ impl App {
     }
 }
 
+/// A slot as the dashboard and the status API show it: what the latest quota
+/// snapshot learned about its organization, plan and seat laid over what the
+/// slot has persisted. Both views take it from here so they cannot disagree.
+pub fn account_for_display(item: &Account, snapshot: &QuotaSnapshot) -> Account {
+    let mut display = item.clone();
+    if !snapshot.organization_name.is_empty() {
+        display
+            .organization_name
+            .clone_from(&snapshot.organization_name);
+    }
+    if !snapshot.plan_type.is_empty() {
+        display.plan_type.clone_from(&snapshot.plan_type);
+        display.plan_family.clone_from(&snapshot.plan_family);
+        display.raw_plan_type.clone_from(&snapshot.raw_plan_type);
+        display.plan_rank = plan::plan_rank(&snapshot.plan_type);
+    }
+    if !snapshot.plan_limit.is_empty() {
+        display.plan_limit.clone_from(&snapshot.plan_limit);
+    }
+    // The snapshot is authoritative once it carries a seat, but before the
+    // first successful refresh it carries none. Overwriting unconditionally
+    // would then erase the seat already persisted on the slot and blank the
+    // row.
+    if !snapshot.seat_type.is_empty() {
+        display.seat_type.clone_from(&snapshot.seat_type);
+        display.seat_type_inferred = snapshot.seat_type_inferred;
+    }
+    if !snapshot.seat_type_raw.is_empty() {
+        display.seat_type_raw.clone_from(&snapshot.seat_type_raw);
+    }
+    display.quota_policy.clone_from(&snapshot.quota_policy);
+    display
+}
+
 pub fn to_value<T: serde::Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
@@ -217,33 +252,7 @@ impl Inner {
     ) -> serde_json::Value {
         let (status, reason) = self.account_status(item, now);
         let snapshot = quota::quota_snapshot_for_display(&self.quota_snapshot(&item.id), now);
-        let mut display = item.clone();
-        if !snapshot.organization_name.is_empty() {
-            display
-                .organization_name
-                .clone_from(&snapshot.organization_name);
-        }
-        if !snapshot.plan_type.is_empty() {
-            display.plan_type.clone_from(&snapshot.plan_type);
-            display.plan_family.clone_from(&snapshot.plan_family);
-            display.raw_plan_type.clone_from(&snapshot.raw_plan_type);
-            display.plan_rank = plan::plan_rank(&snapshot.plan_type);
-        }
-        if !snapshot.plan_limit.is_empty() {
-            display.plan_limit.clone_from(&snapshot.plan_limit);
-        }
-        // The snapshot is authoritative once it carries a seat, but before the
-        // first successful refresh it carries none. Overwriting
-        // unconditionally would then erase the seat already persisted on the
-        // slot and blank the row.
-        if !snapshot.seat_type.is_empty() {
-            display.seat_type.clone_from(&snapshot.seat_type);
-            display.seat_type_inferred = snapshot.seat_type_inferred;
-        }
-        if !snapshot.seat_type_raw.is_empty() {
-            display.seat_type_raw.clone_from(&snapshot.seat_type_raw);
-        }
-        display.quota_policy.clone_from(&snapshot.quota_policy);
+        let display = account_for_display(item, &snapshot);
         let remaining = display
             .remaining_quota
             .or_else(|| snapshot.quota.as_ref().map(quota::remaining_quota_hint));

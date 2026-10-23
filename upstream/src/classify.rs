@@ -161,7 +161,8 @@ mod tests {
                 ws_message(&event.to_string())
             } else if source.ends_with("api_bridge.rs") {
                 // Codex reads this one from an HTTP 429 body; the fixture holds
-                // the body inside an in-stream shape for the Go side.
+                // the body inside an in-stream shape, as it was first recorded
+                // for the Go pool's tests.
                 http_response(
                     StatusCode::TOO_MANY_REQUESTS,
                     HeaderMap::new(),
