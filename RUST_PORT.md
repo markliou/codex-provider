@@ -180,7 +180,7 @@
 - 更新 `SPEC.md`、`README.md`、`AGENTS.md`（包括 Go 測試指令），並刪除本文件或改為歷史紀錄。
 - 進度（2026-10-23）：整合測試的假上游從 Go（`test/mock-upstream/main.go`）逐行翻成 Node（`test/mock-upstream/server.mjs`，不用任何套件），回應內容與原本相同；`test/Dockerfile.mock` 改用 `node:22-alpine`，不再需要 `go.mod`。整合測試腳本本來就只用 shell 和 Node。
 - 完成（2026-10-23）：刪除 `cmd/codex-pool` 的 Go 程式碼（24 個檔案，約 2.9 萬行）、`go.mod`、`go.sum`。Rust 仍在用的檔案移進 crate：管理頁 `upstream/web/`、測試資料 `upstream/testdata/`（Codex 回應樣本、雜湊／狀態／自有呼叫對照檔、裝置登入輸出）。對照檔是 Go 版留下的量測結果，正式環境的狀態檔仍是這個格式，所以保留。Dockerfile、`deploy.sh`、一致性檢查腳本、README、SPEC、AGENTS 改用新路徑並拿掉 Go 測試指令；`AGENTS.md` 的 rust-port 段落移除。
-- 留待之後：wire-capture 的 `subagent-ws` 偶發失敗（第 4.6 步 C 的說明）要讓子代理先完成一輪；Rust 程式碼的精簡。
+- 留待之後：Rust 程式碼的精簡。wire-capture 的 `subagent-ws` 偶發失敗（第 4.6 步 C 的說明）已於 2026-10-23 修正：假上游在產生子代理後讓主代理呼叫 `wait_agent` 等子代理完成，並記住已回覆的呼叫，連續兩次 22 項全過。
 
 ## 7. 指令
 
