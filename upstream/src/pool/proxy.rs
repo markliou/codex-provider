@@ -1469,10 +1469,7 @@ async fn attempts(
                 // retry.
                 overload_retries += 1;
                 app.mark_retryable_terminal_response_failure(&candidate.id, model, &info, false);
-                if !cancel
-                    .sleep(tuning.overload_retry_backoff * (1 << (overload_retries - 1)))
-                    .await
-                {
+                if !cancel.sleep(tuning.overload_retry_backoff).await {
                     throughput.cancelled = true;
                     return;
                 }
