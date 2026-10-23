@@ -18,6 +18,13 @@ upstream exactly as a native Codex of the pinned release would.
 - **Docker only.** Nothing is installed on the host; build, tests and the
   service all run in containers. All state lives in the `codex-pool-data`
   volume at `/data`.
+- **One controlled way out for company policy.** Every Codex request leaves
+  through the pool, so the company has a single egress point it can govern.
+  There the company's IT/MIS team can check outgoing content against company
+  rules and for secrets that must not leave, and can observe which models each
+  person uses, so model choice follows company guidance and token consumption
+  stays within budget. These checks are run by MIS on their side; the pool
+  itself forwards requests unchanged and does not implement them.
 
 The full product contract is [SPEC.md](SPEC.md); repository rules are in
 [AGENTS.md](AGENTS.md).
