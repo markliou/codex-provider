@@ -948,11 +948,7 @@ async fn relay_upstream<S>(
             if retry.is_some() {
                 // The same-account backoff, so Codex's reconnect does not
                 // reach upstream sooner than the overload's retry advice.
-                if !session
-                    .closed
-                    .sleep(app.tuning.overload_retry_backoff)
-                    .await
-                {
+                if !session.closed.sleep(app.tuning.overload_retry_wait()).await {
                     return;
                 }
             }

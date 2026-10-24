@@ -1473,7 +1473,7 @@ async fn attempts(
                 // retry.
                 overload_retries += 1;
                 app.mark_retryable_terminal_response_failure(&candidate.id, model, &info, false);
-                if !cancel.sleep(tuning.overload_retry_backoff).await {
+                if !cancel.sleep(tuning.overload_retry_wait()).await {
                     throughput.cancelled = true;
                     throughput.cancel_reason = "client_closed_during_overload_retry";
                     return;

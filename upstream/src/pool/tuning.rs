@@ -32,14 +32,22 @@ pub struct Tuning {
     /// How long the pre-commit window may keep a streaming client waiting
     /// before headers and keepalives go out (Go streamingPrecommitMaxHold).
     pub precommit_max_hold: Duration,
-    /// The wait before each same-account overload retry, the same every
-    /// time. 6s is the retry delay the Codex backend advises with its
-    /// overloads (Codex reads it as ServerOverloaded with a 5999ms or 6999ms
-    /// retry, in the pool's verdict log); the owner chose to wait that long
-    /// before every retry rather than the earlier 1s, 2s, 4s, which retried
-    /// sooner than upstream asked. Not read from the environment: it is a
-    /// field only so tests can shorten it, as are these two.
+    /// The shortest wait before each same-account overload retry. 6s is the
+    /// retry delay the Codex backend advises with its overloads (Codex reads
+    /// it as ServerOverloaded with a 5999ms or 6999ms retry, in the pool's
+    /// verdict log); the owner chose to wait at least that long before every
+    /// retry rather than the earlier 1s, 2s, 4s, which retried sooner than
+    /// upstream asked. Not read from the environment: it is a field only so
+    /// tests can shorten it, as are these three.
     pub overload_retry_backoff: Duration,
+    /// The random extra on top of overload_retry_backoff, drawn anew for every
+    /// retry (overload_retry_wait), so each wait falls between 6s and 8s. A
+    /// fixed wait lines every overloaded request up to return at the same
+    /// instant, as a burst; Codex jitters its own retries for the same reason
+    /// (codex-client/src/retry.rs `backoff`, `random_range(0.9..1.1)`). The
+    /// jitter only adds: a wait below 6s would return sooner than upstream
+    /// advised.
+    pub overload_retry_jitter: Duration,
     /// The first same-account transport retry wait; each retry doubles it.
     pub transport_retry_backoff: Duration,
     /// The timed commit for writers that are not an early stream writer
@@ -53,8 +61,8 @@ pub struct Tuning {
     pub stream_keepalive_tick: Duration,
 }
 
-/// How many times an overload is retried on the same account (after 6s each
-/// at the default backoff) before the pool moves the lineage to another
+/// How many times an overload is retried on the same account (after 6s to 8s
+/// each at the defaults) before the pool moves the lineage to another
 /// account.
 pub const OVERLOAD_SAME_ACCOUNT_RETRY_LIMIT: u32 = 3;
 
@@ -79,6 +87,7 @@ impl Default for Tuning {
             capacity_retry_max_wait: Duration::from_secs(20),
             precommit_max_hold: Duration::from_secs(1),
             overload_retry_backoff: Duration::from_secs(6),
+            overload_retry_jitter: Duration::from_secs(2),
             transport_retry_backoff: Duration::from_millis(500),
             unmanaged_precommit_commit_after: Duration::from_secs(5),
             stream_keepalive_interval: Duration::from_millis(1500),
@@ -88,6 +97,15 @@ impl Default for Tuning {
 }
 
 impl Tuning {
+    /// One same-account overload retry wait: the advised 6s plus a fresh
+    /// random share of the jitter, never less than the advised delay.
+    pub fn overload_retry_wait(&self) -> Duration {
+        self.overload_retry_backoff
+            + self
+                .overload_retry_jitter
+                .mul_f64(super::crypto::random_unit())
+    }
+
     /// Go capacityRetryBackoff: doubles each round up to the cap, so an early
     /// blip costs a second while a sustained refusal is not retried in a tight
     /// loop. A round below one is the first.
@@ -195,10 +213,18 @@ mod tests {
     // The same-account overload wait is the 6s the Codex backend advises
     // with its overloads, every time, on HTTP and on the WebSocket alike.
     #[test]
-    fn overload_retries_wait_the_advised_six_seconds() {
-        assert_eq!(
-            Tuning::default().overload_retry_backoff,
-            Duration::from_secs(6)
+    fn overload_retries_wait_six_to_eight_seconds() {
+        let tuning = Tuning::default();
+        let waits: Vec<Duration> = (0..200).map(|_| tuning.overload_retry_wait()).collect();
+        assert!(
+            waits
+                .iter()
+                .all(|wait| (Duration::from_secs(6)..=Duration::from_secs(8)).contains(wait)),
+            "every wait must be at least the advised 6s and at most 8s: {waits:?}"
+        );
+        assert!(
+            waits.iter().any(|wait| *wait != waits[0]),
+            "the wait must vary between retries"
         );
     }
 
