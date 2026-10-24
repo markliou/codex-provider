@@ -966,10 +966,11 @@ async fn server_error_stream_fails_over_to_another_identity() {
     );
 }
 
-/// The same-account overload backoff is a second in production; tests pace
+/// The same-account overload backoff is 6s to 8s in production; tests pace
 /// it down as responses_ws_test.go does.
 pub(super) fn fast_overload(mut app: App) -> App {
     app.tuning.overload_retry_backoff = std::time::Duration::from_millis(1);
+    app.tuning.overload_retry_jitter = std::time::Duration::ZERO;
     app.tuning.transport_retry_backoff = std::time::Duration::from_millis(1);
     app
 }

@@ -85,6 +85,12 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     value
 }
 
+/// A uniform draw in [0, 1], for the pool's own pacing jitter (prime grace,
+/// overload retry wait).
+pub fn random_unit() -> f64 {
+    f64::from(u32::from_le_bytes(random_bytes::<4>())) / f64::from(u32::MAX)
+}
+
 /// A version 4 UUID. Upstream documents a UUID for the reset-credit redeem
 /// request id, and an id it rejects would be indistinguishable from one it
 /// never saw, so a retry could spend a second credit.

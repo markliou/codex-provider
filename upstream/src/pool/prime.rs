@@ -87,8 +87,7 @@ pub fn unanchored_budget_window(quota: &AccountQuota, now: Timestamp) -> Option<
 
 /// A random grace in [5, 30] minutes.
 pub fn random_quota_prime_grace() -> Duration {
-    let unit =
-        f64::from(u32::from_le_bytes(super::crypto::random_bytes::<4>())) / f64::from(u32::MAX);
+    let unit = super::crypto::random_unit();
     QUOTA_PRIME_GRACE_MIN + (QUOTA_PRIME_GRACE_MAX - QUOTA_PRIME_GRACE_MIN).mul_f64(unit)
 }
 

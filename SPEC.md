@@ -2207,12 +2207,15 @@ For streaming responses:
   account's allowance, so it is first retried on the same account, as a native
   Codex with its one account does (a server fault falls to Codex's default
   `ApiError::Retryable`, `codex-api/src/sse/responses_error.rs`): up to three
-  times per request, after 6 s each, with no cooldown, so the main
+  times per request, after 6 s to 8 s each, with no cooldown, so the main
   agent and its subagents stay on one account and keep its KV cache. The wait
-  is 6 s every time because that is the retry delay the Codex backend advises
+  is never under 6 s because that is the retry delay the Codex backend advises
   with its overloads (Codex reads them as `ServerOverloaded` with a 5999 ms or
   6999 ms retry, as the pool's verdict log shows); the earlier 1 s, 2 s and 4 s
-  retried sooner than upstream asked. Moving on
+  retried sooner than upstream asked. Each wait adds a fresh random share of up
+  to 2 s, so requests overloaded together do not all return at the same
+  instant; Codex jitters its own retries the same way
+  (`codex-client/src/retry.rs` `backoff`). Moving on
   the first `server_error` once carried a session off the expiring-credit
   accounts it had been placed on. Only a fault that outlasts that schedule, or
   any account-allowance failure (`rate_limit_exceeded`, `usage_not_included`,
