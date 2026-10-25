@@ -149,6 +149,10 @@ pub struct App {
     /// The distinct sets of native-endpoint client headers already logged as
     /// not relayed (native.rs), bounded at 256.
     pub unrelayed_header_sets: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The Codex thread identifiers of each app conversation completed on
+    /// /v1, and which request-gate log lines were already written
+    /// (codex_request.rs).
+    pub foreign_conversations: super::codex_request::Conversations,
     /// Reset-credit spends that failed without an upstream verdict, kept for
     /// a retry to resend (reset_credit.rs).
     pub reset_attempts: super::reset_credit::ResetCreditAttempts,
@@ -202,6 +206,7 @@ impl App {
             turn_state_issuers: std::sync::Mutex::new(HashMap::new()),
             ws_overload_drops: std::sync::Mutex::new(HashMap::new()),
             unrelayed_header_sets: std::sync::Mutex::new(std::collections::HashSet::new()),
+            foreign_conversations: super::codex_request::Conversations::default(),
             reset_attempts: super::reset_credit::ResetCreditAttempts::default(),
             prime_grace: super::prime::PrimeGrace::default(),
             prime_runner: std::sync::Mutex::new(None),

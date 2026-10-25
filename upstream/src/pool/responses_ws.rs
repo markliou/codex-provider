@@ -299,6 +299,37 @@ pub async fn handle_responses_websocket(
         );
         return;
     }
+    // The socket carries Codex's own messages, which the pool forwards
+    // without completing anything (codex_request.rs), so only a client that
+    // presents itself as Codex may open one; an app talks HTTP to /v1, where
+    // its request is completed.
+    if !super::codex_request::codex_identity(&request.headers) {
+        let refusal = if native {
+            super::codex_request::identity_refusal()
+        } else {
+            super::codex_request::Refusal::new(
+                "user-agent",
+                "is not in Codex's format, and the Responses WebSocket only carries Codex's own requests",
+                "Send HTTP requests to /v1/responses, which completes them into Codex requests.",
+            )
+        };
+        let entry = if native {
+            super::codex_request::Entry::Native
+        } else {
+            super::codex_request::Entry::V1
+        };
+        app.log_refused_request(
+            entry.label(true),
+            &super::server::request_api_key(&request.headers, &request.query),
+            &refusal,
+        );
+        super::http_io::write_json(
+            writer.as_mut(),
+            StatusCode::BAD_REQUEST,
+            &refusal.error_body(),
+        );
+        return;
+    }
     let (client_tx, client_rx) = mpsc::unbounded_channel();
     let session = Arc::new(Session {
         app: app.clone(),
@@ -440,6 +471,9 @@ where
             && let Ok(payload) = serde_json::from_slice::<Map<String, Value>>(text)
             && payload.get("type").and_then(Value::as_str) == Some("response.create")
         {
+            if !gate_response_create(session, &payload) {
+                break;
+            }
             if !start_response(session, text.clone(), payload).await {
                 break;
             }
@@ -454,6 +488,45 @@ where
     }
     pings.abort();
     shutdown(session);
+}
+
+/// Checks a response.create message as Codex writes it (codex_request.rs).
+/// Nothing on a socket is completed, so both entries hold it to the native
+/// rules. A refused message gets the wrapped error event a Codex reads as a
+/// 400, which it does not retry, and the socket closes; nothing reaches
+/// upstream.
+fn gate_response_create(session: &Arc<Session>, payload: &Map<String, Value>) -> bool {
+    use super::codex_request::{Body, Entry, check_responses, newer_than_pinned};
+    let entry = if session.native {
+        Entry::Native
+    } else {
+        Entry::V1
+    };
+    // A /v1 socket is Codex as a custom provider; a field it leaves out is
+    // logged rather than refused, as for a newer Codex.
+    match check_responses(
+        payload,
+        Entry::Native,
+        Body::WebSocket,
+        !session.native || newer_than_pinned(&session.handshake),
+    ) {
+        Ok(unknown) => {
+            session
+                .app
+                .note_unrecognized_request_fields(entry.label(true), &unknown);
+            true
+        }
+        Err(refusal) => {
+            session
+                .app
+                .log_refused_request(entry.label(true), &session.api_key, &refusal);
+            if let Ok(text) = serde_json::to_string(&refusal.websocket_event()) {
+                session.send_client(Frame::Text(Bytes::from(text)));
+            }
+            session.close_client(1008, "request refused");
+            false
+        }
+    }
 }
 
 async fn start_response(

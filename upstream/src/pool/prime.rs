@@ -371,7 +371,13 @@ impl App {
             self.prepare_upstream_request(candidate, &Bytes::from(body), false)?;
         let sent = tokio::time::timeout(QUOTA_PRIME_TIMEOUT, async {
             let response = self
-                .forward(candidate, &endpoint, outbound, &http::HeaderMap::new())
+                .forward(
+                    candidate,
+                    &endpoint,
+                    outbound,
+                    &http::HeaderMap::new(),
+                    super::proxy::Shaping::Adapt,
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             // The answer is worthless; only the usage it recorded matters.

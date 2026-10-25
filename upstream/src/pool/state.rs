@@ -651,6 +651,14 @@ pub struct ClientAgent {
     pub originator: String,
     #[serde(default)]
     pub seen_at: Timestamp,
+    /// The x-codex-beta-features this Codex sends, replayed on app requests
+    /// completed for the account (codex_request.rs).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub beta_features: String,
+    /// The static part of this Codex's turn metadata (codex_request.rs
+    /// PROFILE_KEYS), replayed with its user agent on completed requests.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub turn_profile: serde_json::Map<String, serde_json::Value>,
     #[serde(flatten)]
     pub extra: Unknown,
 }
