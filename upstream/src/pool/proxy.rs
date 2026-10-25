@@ -151,6 +151,19 @@ pub fn relayed_codex_request_header(name: &str) -> bool {
             .any(|prefix| lower.starts_with(prefix))
 }
 
+/// How a request's body reaches the Codex backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shaping {
+    /// The native endpoint: exactly as Codex wrote it (SPEC.md 2.3.3).
+    Exact,
+    /// A Codex request on /v1, or the pool's own: only what the backend
+    /// would reject is adapted (codex_backend_request_body).
+    Adapt,
+    /// An app's request already completed into a Codex request
+    /// (codex_request.rs); `aggregate` when the app asked for no stream.
+    Completed { aggregate: bool },
+}
+
 /// The inbound request, as the handlers read it.
 pub struct ProxyRequest {
     pub path: String,
@@ -631,6 +644,15 @@ impl App {
                 request.insert(name.into(), value.clone());
             }
         }
+        // The Chat Completions spellings of the two settings a Codex request
+        // carries; anything else the bridge cannot carry was refused before
+        // routing (codex_request::check_chat).
+        if let Some(effort) = chat_request.get("reasoning_effort").and_then(Value::as_str) {
+            request.insert("reasoning".into(), serde_json::json!({"effort": effort}));
+        }
+        if let Some(verbosity) = chat_request.get("verbosity").and_then(Value::as_str) {
+            request.insert("text".into(), serde_json::json!({"verbosity": verbosity}));
+        }
         Ok((
             format!("{base}/responses"),
             Bytes::from(gojson::marshal(&Value::Object(request))),
@@ -646,19 +668,35 @@ impl App {
         endpoint: &str,
         body: Bytes,
         inbound: &HeaderMap,
+        shaping: Shaping,
     ) -> Result<UpstreamResponse, ForwardError> {
+        let record_agent = !matches!(shaping, Shaping::Completed { .. });
         if !Self::uses_codex_backend_directly(candidate) {
             return self
-                .forward_once(candidate, endpoint, body, inbound, None)
+                .forward_once(candidate, endpoint, body, inbound, None, record_agent)
                 .await;
         }
-        let (body, aggregate) = codex_backend_request_body(endpoint, &body);
+        let (body, aggregate) = match shaping {
+            // The native endpoint's request is Codex's own and was checked
+            // whole (codex_request.rs); adapting it would rewrite a native
+            // body, as stripping stream_options once did.
+            Shaping::Exact => (body, false),
+            Shaping::Adapt => codex_backend_request_body(endpoint, &body),
+            Shaping::Completed { aggregate } => (body, aggregate),
+        };
         let auth = self
             .refreshed_codex_auth(candidate)
             .await
             .map_err(auth_error)?;
         let mut response = self
-            .forward_once(candidate, endpoint, body.clone(), inbound, Some(&auth))
+            .forward_once(
+                candidate,
+                endpoint,
+                body.clone(),
+                inbound,
+                Some(&auth),
+                record_agent,
+            )
             .await?;
         if response.status == StatusCode::UNAUTHORIZED {
             // A native Codex answers a 401 by refreshing its token and
@@ -679,8 +717,15 @@ impl App {
                     if !refreshed.access_token.is_empty()
                         && refreshed.access_token != auth.access_token =>
                 {
-                    self.forward_once(candidate, endpoint, body, inbound, Some(&refreshed))
-                        .await?
+                    self.forward_once(
+                        candidate,
+                        endpoint,
+                        body,
+                        inbound,
+                        Some(&refreshed),
+                        record_agent,
+                    )
+                    .await?
                 }
                 _ => UpstreamResponse {
                     status: StatusCode::UNAUTHORIZED,
@@ -722,8 +767,13 @@ impl App {
         mut body: Bytes,
         inbound: &HeaderMap,
         auth: Option<&super::metadata::CodexAuthInfo>,
+        record_agent: bool,
     ) -> Result<UpstreamResponse, ForwardError> {
-        self.note_client_agent(&candidate.id, inbound);
+        // A completed request presents the recorded agent itself; recording
+        // it back would only refresh the record with its own copy.
+        if record_agent {
+            self.note_client_agent(&candidate.id, inbound);
+        }
         self.note_account_activity(&candidate.id);
         let direct = Self::uses_codex_backend_directly(candidate);
         // The account presents its own installation id, not the client's
@@ -1082,6 +1132,12 @@ async fn proxy(
     // Codex sends its own backend and re-encoding sorted every key. Routing
     // still reads the model; nothing is written back.
     let native = request.native;
+    // Every request is checked before routing, whatever it says it is
+    // (codex_request.rs): a refused one never reaches upstream, and an app's
+    // request on /v1 is completed into a Codex request per attempt.
+    let Some(foreign) = app.gate_http_request(request, payload, writer, chat, compact) else {
+        return;
+    };
     let original: Option<Map<String, Value>> = (!native).then(|| payload.clone());
     if !native {
         payload.insert("model".into(), Value::String(model.clone()));
@@ -1114,9 +1170,12 @@ async fn proxy(
         app,
         request,
         writer,
-        chat,
-        compact,
-        native,
+        Kind {
+            chat,
+            compact,
+            native,
+            foreign,
+        },
         &model,
         &mut route,
         updated_body,
@@ -1126,19 +1185,34 @@ async fn proxy(
     app.finish_throughput_measurement(&mut throughput);
 }
 
+/// What kind of request an attempt loop carries.
+#[derive(Clone, Copy, Debug)]
+struct Kind {
+    chat: bool,
+    compact: bool,
+    native: bool,
+    /// An app's /v1 request, completed into a Codex request for each account
+    /// it is tried on (codex_request.rs).
+    foreign: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn attempts(
     app: &Arc<App>,
     request: &ProxyRequest,
     writer: &mut dyn ResponseWriter,
-    chat: bool,
-    compact: bool,
-    native: bool,
+    kind: Kind,
     model: &str,
     route: &mut super::routing::RoutingDecision,
     updated_body: Bytes,
     throughput: &mut super::outcome::ThroughputMeasurement,
 ) {
+    let Kind {
+        chat,
+        compact,
+        native,
+        foreign,
+    } = kind;
     let cancel = &request.cancel;
     let request_id = request_operational_id(&request.headers);
     let mut failover_from = String::new();
@@ -1209,8 +1283,30 @@ async fn attempts(
         let (inbound, turn_state) =
             turn_state_for_attempt(&request.headers, &turn_state_issuer, &candidate.id);
         route.client.turn_state = turn_state.to_string();
+        // The completed request presents the Codex that last used this
+        // account, so it is made per attempt, after the account is chosen.
+        let (out_body, inbound, shaping) = if native {
+            (out_body, inbound, Shaping::Exact)
+        } else if foreign && App::uses_codex_backend_directly(&candidate) {
+            let api_key = super::server::request_api_key(&request.headers, &request.query);
+            match app.complete_foreign_request(
+                &candidate,
+                &out_body,
+                &request.headers,
+                model,
+                &api_key,
+            ) {
+                Ok((body, headers, aggregate)) => (body, headers, Shaping::Completed { aggregate }),
+                Err(error) => {
+                    write_openai_error(writer, StatusCode::BAD_REQUEST, "invalid_request", &error);
+                    return;
+                }
+            }
+        } else {
+            (out_body, inbound, Shaping::Adapt)
+        };
         let forwarded = tokio::select! {
-            result = app.forward(&candidate, &endpoint, out_body, &inbound) => Some(result),
+            result = app.forward(&candidate, &endpoint, out_body, &inbound, shaping) => Some(result),
             () = cancel.cancelled() => None,
         };
         let Some(forwarded) = forwarded else {

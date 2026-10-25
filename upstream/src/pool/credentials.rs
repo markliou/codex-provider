@@ -327,7 +327,7 @@ impl App {
         if codex_client_version(inbound).is_empty() {
             return;
         }
-        let agent = ClientAgent {
+        let mut agent = ClientAgent {
             user_agent: super::http_io::header_value(inbound, "user-agent")
                 .trim()
                 .to_string(),
@@ -335,9 +335,29 @@ impl App {
                 .trim()
                 .to_string(),
             seen_at: Timestamp::now(),
+            beta_features: super::http_io::header_value(inbound, "x-codex-beta-features")
+                .trim()
+                .to_string(),
+            turn_profile: super::codex_request::profile_from_turn_metadata(
+                super::http_io::header_value(inbound, "x-codex-turn-metadata"),
+            ),
             ..ClientAgent::default()
         };
         let mut inner = self.write();
+        // A request without turn metadata (a compaction) says nothing about
+        // the profile; keep the one this same Codex sent with its turns.
+        if agent.turn_profile.is_empty()
+            && let Some(previous) = inner
+                .state
+                .client_agents()
+                .get(account_id)
+                .filter(|previous| previous.user_agent == agent.user_agent)
+        {
+            agent.turn_profile.clone_from(&previous.turn_profile);
+            if agent.beta_features.is_empty() {
+                agent.beta_features.clone_from(&previous.beta_features);
+            }
+        }
         if !account_id.is_empty() {
             inner
                 .state

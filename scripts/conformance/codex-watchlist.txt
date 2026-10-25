@@ -41,3 +41,9 @@ policy  codex-rs/model-provider/src/provider.rs                     which provid
 policy  codex-rs/model-provider-info/src/lib.rs                     which base URLs count as the Codex backend (native endpoint)
 policy  codex-rs/model-provider/src/workspace_routing.rs            workspace routing header and backend override
 policy  codex-rs/core/src/session/turn.rs                           what Codex does with response events (models etag, rate limits)
+send    codex-rs/core/src/responses_metadata.rs                     turn metadata and client_metadata keys and order, which app requests completed on /v1 replay
+send    codex-rs/protocol/src/models.rs                             input item and content types and their field order (the request gate and completion)
+send    codex-rs/tools/src/tool_spec.rs                             tool types Codex declares (the request gate)
+send    codex-rs/tools/src/responses_api.rs                         function tool field order (completion)
+send    codex-rs/tools/src/json_schema/types.rs                     tool parameter schema field order (completion)
+send    codex-rs/core/src/context/base_instructions.rs              base instructions as the leading developer message (completion)

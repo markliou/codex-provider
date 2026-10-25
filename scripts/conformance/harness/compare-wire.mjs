@@ -24,6 +24,11 @@
 //      built-in provider aimed at the pool. Through it the pool's upstream
 //      traffic must equal a native Codex's outright, body included; any
 //      difference fails the run.
+//   5. An in-house app's request to /v1 (app-client.mjs) must reach upstream
+//      as the request Codex sends a custom provider through the pool: the same
+//      header names, order and values (the app's identity replaced by the
+//      Codex that last used the account), the same body layout, nothing of
+//      the app; and the turn the pool refuses must not reach upstream at all.
 // Values minted per run (UUIDs, the fake's own response ids and turn states,
 // timestamps) are masked before comparing, and nothing else is: a difference
 // that has to be masked to pass is a difference.
@@ -427,6 +432,44 @@ function compareReset() {
   else notes.push("reset: the pool's credit redemption equal to a native Codex's");
 }
 
+// An app through /v1 (SPEC.md 2.3.4), held to Codex's request through the
+// pool on the same account in the same phase (pool-http request 1). The
+// conversation's content is the app's, so values in the body are not
+// compared; its layout is, and every header is.
+function compareApp() {
+  const log = (() => { try { return read("app-http.log"); } catch { return ""; } })();
+  const reference = load("pool-http.jsonl").find((entry) => entry.kind === "http");
+  const app = load("app-http.jsonl").filter((entry) => entry.kind === "http");
+  if (!/app turn: 200/.test(log)) fail(`app: the app's turn was not answered (${log.trim().slice(0, 200)})`);
+  if (!/app refused: 400 .*non_codex_request/.test(log)) fail(`app: the turn with temperature was not refused (${log.trim().slice(0, 300)})`);
+  if (app.length !== 1) { fail(`app: ${app.length} requests reached upstream; only the completed turn may (the refused one must not)`); return; }
+  if (!reference) { fail("app: no Codex request through the pool to compare with"); return; }
+  const request = app[0];
+  if (JSON.stringify(request).includes("conformance-app")) fail("app: the app's own name reached upstream");
+  for (const field of ["proto", "path", "encoding"]) {
+    if (request[field] !== reference[field]) fail(`app: ${field} codex=${reference[field]} app=${request[field]}`);
+  }
+  compareHeaders("app request", reference, request);
+  const codex = reference.body || {};
+  const body = request.body || {};
+  const keys = (value) => Object.keys(value || {}).join(",");
+  if (keys(codex) !== keys(body)) fail(`app: body keys differ\n    codex: ${keys(codex)}\n    app:   ${keys(body)}`);
+  const sorted = (value) => Object.keys(value || {}).sort().join(",");
+  if (sorted(codex.client_metadata) !== sorted(body.client_metadata)) fail(`app: client_metadata keys differ: codex ${sorted(codex.client_metadata)} app ${sorted(body.client_metadata)}`);
+  const turnKeys = (value) => { try { return Object.keys(JSON.parse(value || "{}")).join(","); } catch { return "(not JSON)"; } };
+  if (turnKeys(codex.client_metadata?.["x-codex-turn-metadata"]) !== turnKeys(body.client_metadata?.["x-codex-turn-metadata"])) fail("app: turn metadata keys differ from Codex's");
+  for (const [label, list] of [["input", "input"], ["tools", "tools"]]) {
+    for (const item of body[list] || []) {
+      const twin = (codex[list] || []).find((other) => other.type === item.type && (list !== "input" || other.role === item.role || other.type !== "message"));
+      if (twin && keys(twin) !== keys(item)) fail(`app: ${label} ${item.type} keys differ\n    codex: ${keys(twin)}\n    app:   ${keys(item)}`);
+    }
+  }
+  for (const [name, value] of [["stream", true], ["store", false], ["tool_choice", "auto"]]) {
+    if (body[name] !== value) fail(`app: ${name} is ${JSON.stringify(body[name])}, Codex sends ${JSON.stringify(value)}`);
+  }
+  notes.push("app: its turn reached upstream as Codex's request through the pool, and its refused turn did not");
+}
+
 compareOwn();
 compareTLS("tls-own.txt");
 compareReset();
@@ -434,6 +477,7 @@ compareInstallationIDs();
 comparePrime();
 compareTLS("tls-prime.txt", ["tls-own.txt", "tls-http.txt", "tls-ws.txt"]);
 compareHTTP();
+compareApp();
 compareWS();
 compareNativeEndpoint("http");
 compareNativeEndpoint("ws");

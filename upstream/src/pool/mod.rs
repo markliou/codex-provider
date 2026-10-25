@@ -15,6 +15,7 @@ pub mod app;
 #[cfg(test)]
 mod asset_tests;
 pub mod catalog;
+pub mod codex_request;
 pub mod credentials;
 pub mod crypto;
 pub mod dashboard;

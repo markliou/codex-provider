@@ -2088,7 +2088,7 @@ pub(super) fn account(app: &App, index: usize) -> Account {
 // Go TestDirectCodexGatewaySendsTheNativeCodexRequest.
 #[tokio::test]
 async fn direct_codex_gateway_sends_the_native_codex_request() {
-    const RAW: &str = r#"{"model":"gpt-test","stream":true,"input":[{"type":"message","role":"user","content":"hi"}],"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}],"store":false,"prompt_cache_key":"thread-native","n":1.50}"#;
+    const RAW: &str = r#"{"model":"gpt-test","stream":true,"input":[{"type":"message","role":"user","content":"hi"}],"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"z":{"type":"string"},"a":{"type":"string"}}}}],"store":false,"prompt_cache_key":"thread-native","n":1.50,"client_metadata":{"session_id":"session-native"}}"#;
     let upstream = FakeServer::start(|_| {
         FakeResponse::json(
             200,
@@ -2102,6 +2102,8 @@ async fn direct_codex_gateway_sends_the_native_codex_request() {
         .codex_auth(&account(&app, 0))
         .unwrap_or_else(|error| panic!("{error:?}"));
     let request = post("/v1/responses", RAW)
+        .with_header("user-agent", super::ws_tests::CODEX_EXEC_AGENT)
+        .with_header("originator", "codex_exec")
         .with_header("cookie", "client-cookie")
         .with_header("session-id", "session-native")
         .with_header("thread-id", "thread-native")
@@ -2174,10 +2176,7 @@ async fn direct_codex_gateway_answers_non_streaming_clients_from_the_stream() {
     );
     let result = serve(
         &app,
-        post(
-            "/v1/responses",
-            r#"{"model":"gpt-test","input":"hi","max_output_tokens":50}"#,
-        ),
+        post("/v1/responses", r#"{"model":"gpt-test","input":"hi"}"#),
     )
     .await;
     assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
@@ -2193,9 +2192,7 @@ async fn direct_codex_gateway_answers_non_streaming_clients_from_the_stream() {
     assert_eq!(first_bodies.len(), 1, "first account attempts");
     for body in &first_bodies {
         assert!(
-            body.contains(r#""stream":true"#)
-                && body.contains(r#""store":false"#)
-                && !body.contains("max_output_tokens"),
+            body.contains(r#""stream":true"#) && body.contains(r#""store":false"#),
             "{body}"
         );
     }
@@ -2220,7 +2217,13 @@ async fn direct_codex_gateway_sends_compaction_to_the_compact_endpoint() {
     .await;
     let (app, _dir) = codex_app(&upstream.url, &[("device", "acct-up", 100)]);
     const RAW: &str = r#"{"model":"gpt-test","input":[{"type":"message","role":"user","content":"hi"}],"instructions":"","prompt_cache_key":"k"}"#;
-    let result = serve(&app, post("/v1/responses/compact", RAW)).await;
+    let result = serve(
+        &app,
+        post("/v1/responses/compact", RAW)
+            .with_header("user-agent", super::ws_tests::CODEX_EXEC_AGENT)
+            .with_header("originator", "codex_exec"),
+    )
+    .await;
     assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
     let sent = upstream.requests().pop().unwrap_or_default();
     assert_eq!(
@@ -2259,12 +2262,15 @@ async fn direct_codex_gateway_sends_through_codexs_transport() {
         .unwrap_or_else(|error| panic!("{error:?}"));
     let request = post(
         "/v1/responses",
-        r#"{"model":"gpt-test","stream":true,"store":false,"input":[]}"#,
+        r#"{"model":"gpt-test","stream":true,"store":false,"input":[],"client_metadata":{}}"#,
     )
     .with_header(
         "user-agent",
         "codex-tui/0.163.0 (Mac OS 26.0.0; arm64) iTerm.app/3.6.6 (codex-tui; 0.163.0)",
-    );
+    )
+    .with_header("originator", "codex-tui")
+    .with_header("session-id", "session-transport")
+    .with_header("thread-id", "thread-transport");
     let result = serve(&app, request).await;
     assert!(
         result.code() == 200 && result.body_string().contains("resp_via_transport"),
@@ -4715,7 +4721,6 @@ async fn responses_proxy_preserves_large_mcp_tool_payload_and_streaming_events()
     }
     let second = proxy(serde_json::json!({
         "model": "gpt-test",
-        "previous_response_id": "resp_mcp_large",
         "input": [{"type": "function_call_output", "call_id": "call_mcp_long_1", "output": r#"{"saved":true}"#}],
         "stream": true,
         "tools": tools,
@@ -4748,7 +4753,6 @@ async fn responses_proxy_preserves_large_mcp_tool_payload_and_streaming_events()
             "large MCP JSON Schema was truncated or changed"
         );
         if round == 1 {
-            assert_eq!(payload["previous_response_id"], "resp_mcp_large");
             let input = payload["input"].as_array().cloned().unwrap_or_default();
             assert_eq!(input.len(), 1);
             assert!(
@@ -5545,4 +5549,207 @@ async fn front_peer_restores_the_client_address() {
         "203.0.113.9",
         "behind Caddy and the door the login key"
     );
+}
+
+// ---- requests from apps other than Codex (codex_request.rs) ----
+
+fn decoded_body(request: &super::testing::RecordedRequest) -> String {
+    String::from_utf8_lossy(&zstd::decode_all(request.body.as_slice()).unwrap_or_default())
+        .into_owned()
+}
+
+fn app_upstream_answer() -> FakeResponse {
+    sse_response(&[created("resp_app"), delta("ok"), completed("resp_app", "")])
+}
+
+// An app's request is completed into the request a Codex custom-provider
+// client sends, and nothing the app said about itself reaches upstream.
+#[tokio::test]
+async fn an_app_request_reaches_upstream_as_codex_without_a_trace_of_the_app() {
+    let upstream = FakeServer::start(|_| app_upstream_answer()).await;
+    let (app, _dir) = codex_app(&upstream.url, &[("device", "acct-up", 100)]);
+    let request = post(
+        "/v1/responses",
+        r#"{"model":"gpt-test","instructions":"be brief","input":"hi","stream":true,"user":"my-app-user","metadata":{"app":"my-app"},"prompt_cache_key":"my-app-cache","client_metadata":{"app":"my-app"}}"#,
+    )
+    .with_header("user-agent", "my-app/1.0")
+    .with_header("originator", "my-app")
+    .with_header("x-openai-app-tag", "my-app")
+    .with_header(
+        "traceparent",
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+    );
+    let result = serve(&app, request).await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let sent = upstream.requests().pop().unwrap_or_default();
+    let body = decoded_body(&sent);
+    for (name, value) in &sent.headers {
+        let value = value.to_str().unwrap_or_default();
+        assert!(!value.contains("my-app"), "{name}: {value}");
+    }
+    assert!(!body.contains("my-app"), "{body}");
+    assert!(
+        super::codex_request::codex_identity(&sent.headers),
+        "upstream must see Codex's identity: {:?}",
+        sent.headers
+    );
+    assert_eq!(sent.header("traceparent"), "");
+    assert_eq!(
+        sent.header("version"),
+        super::credentials::PINNED_CODEX_VERSION
+    );
+    assert!(
+        body.starts_with(
+            r#"{"model":"gpt-test","stream":true,"input":[{"type":"message","id":"msg_"#
+        ),
+        "{body}"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let thread = sent.header("thread-id").to_string();
+    assert!(!thread.is_empty());
+    assert_eq!(payload["prompt_cache_key"], thread.as_str());
+    assert_eq!(payload["client_metadata"]["thread_id"], thread.as_str());
+    let item = app.read().config.accounts()[0].clone();
+    assert_eq!(
+        payload["client_metadata"]["x-codex-installation-id"],
+        app.presented_installation_id(&item)
+            .unwrap_or_default()
+            .as_str(),
+        "the account presents its own installation id"
+    );
+}
+
+// A completed request presents the Codex that last used the account, with
+// the profile of its turn metadata, never a mix of two.
+#[tokio::test]
+async fn an_app_request_presents_the_codex_that_last_used_the_account() {
+    const TUI: &str =
+        "codex-tui/0.164.0 (Ubuntu 22.4.0; x86_64) xterm-256color (codex-tui; 0.164.0)";
+    let upstream = FakeServer::start(|_| app_upstream_answer()).await;
+    let (app, _dir) = codex_app(&upstream.url, &[("device", "acct-up", 100)]);
+    let codex = post(
+        "/v1/responses",
+        r#"{"model":"gpt-test","stream":true,"store":false,"input":[],"client_metadata":{}}"#,
+    )
+    .with_header("user-agent", TUI)
+    .with_header("originator", "codex-tui")
+    .with_header("session-id", "s1")
+    .with_header("thread-id", "t1")
+    .with_header("x-codex-beta-features", "remote_compaction_v2")
+    .with_header(
+        "x-codex-turn-metadata",
+        r#"{"session_id":"s1","thread_id":"t1","agent_name":"/root","thread_source":"user","turn_trigger":"tui","sandbox":"seatbelt","workspaces":{"/home/someone/repo":{}}}"#,
+    );
+    assert_eq!(serve(&app, codex).await.code(), 200);
+    let result = serve(
+        &app,
+        post(
+            "/v1/responses",
+            r#"{"model":"gpt-test","input":"hi","stream":true}"#,
+        )
+        .with_header("user-agent", "my-app/1.0"),
+    )
+    .await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let sent = upstream.requests().pop().unwrap_or_default();
+    assert_eq!(sent.header("user-agent"), TUI);
+    assert_eq!(sent.header("originator"), "codex-tui");
+    assert_eq!(sent.header("x-codex-beta-features"), "remote_compaction_v2");
+    let metadata = sent.header("x-codex-turn-metadata");
+    assert!(
+        metadata.contains(r#""turn_trigger":"tui""#)
+            && metadata.contains(r#""sandbox":"seatbelt""#),
+        "{metadata}"
+    );
+    assert!(
+        !metadata.contains("someone"),
+        "a person's workspace is never replayed: {metadata}"
+    );
+}
+
+#[tokio::test]
+async fn a_parameter_codex_never_sends_is_refused_before_upstream() {
+    let upstream = FakeServer::start(|_| app_upstream_answer()).await;
+    let (app, _dir) = codex_app(&upstream.url, &[("device", "acct-up", 100)]);
+    let (app, logged) = {
+        let app = Arc::try_unwrap(app).unwrap_or_else(|_| panic!("shared app"));
+        let (app, logged) = super::testing::capture_logs(app);
+        (Arc::new(app), logged)
+    };
+    for (path, body, param) in [
+        (
+            "/v1/responses",
+            r#"{"model":"gpt-test","input":"hi","temperature":0.3}"#,
+            "temperature",
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}],"max_tokens":20}"#,
+            "max_tokens",
+        ),
+    ] {
+        let result = serve(&app, post(path, body)).await;
+        assert_eq!(result.code(), 400, "{path}: {}", result.body_string());
+        let error: serde_json::Value = serde_json::from_slice(&result.body).unwrap_or_default();
+        assert_eq!(error["error"]["code"], "non_codex_request");
+        assert_eq!(error["error"]["param"], param);
+    }
+    assert_eq!(
+        upstream.count(),
+        0,
+        "a refused request never reaches upstream"
+    );
+    let lines = logged
+        .lock()
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_default();
+    assert!(
+        lines.contains("request refused before upstream: entry=v1")
+            && lines.contains("param=temperature"),
+        "{lines}"
+    );
+}
+
+#[tokio::test]
+async fn the_native_endpoint_refuses_a_client_that_is_not_in_codex_s_format() {
+    let upstream = FakeServer::start(|_| app_upstream_answer()).await;
+    let (app, _dir) = codex_app(&upstream.url, &[("device", "acct-up", 100)]);
+    let request = super::routes::Request::test(
+        http::Method::POST,
+        "/k/client-key/backend-api/codex/responses",
+        r#"{"model":"gpt-test","stream":true,"input":[],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"store":false,"include":[]}"#,
+    )
+    .with_header("user-agent", "my-app/1.0")
+    .with_header("originator", "codex_exec");
+    let result = serve(&app, request).await;
+    assert_eq!(result.code(), 400, "{}", result.body_string());
+    assert_eq!(upstream.count(), 0);
+}
+
+// The Chat Completions bridge goes through the same completion.
+#[tokio::test]
+async fn a_chat_request_is_completed_into_a_codex_request() {
+    let upstream = FakeServer::start(|_| app_upstream_answer()).await;
+    let (app, _dir) = codex_app(&upstream.url, &[("device", "acct-up", 100)]);
+    let result = serve(
+        &app,
+        post(
+            "/v1/chat/completions",
+            r#"{"model":"gpt-test","messages":[{"role":"system","content":"be brief"},{"role":"user","content":[{"type":"text","text":"hi"}]}],"user":"my-app-user","reasoning_effort":"low"}"#,
+        )
+        .with_header("user-agent", "my-app/1.0"),
+    )
+    .await;
+    assert_eq!(result.code(), 200, "chat: {}", result.body_string());
+    let sent = upstream.requests().pop().unwrap_or_default();
+    let body = decoded_body(&sent);
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    assert_eq!(payload["input"][0]["role"], "developer");
+    assert_eq!(
+        payload["input"][1]["content"],
+        serde_json::json!([{"type": "input_text", "text": "hi"}])
+    );
+    assert_eq!(payload["reasoning"], serde_json::json!({"effort": "low"}));
+    assert_eq!(payload["stream"], true);
+    assert!(!body.contains("my-app"), "{body}");
 }

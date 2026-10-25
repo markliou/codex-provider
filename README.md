@@ -144,6 +144,28 @@ aliases and a `(thinking-tier)` suffix are translated on this path. The checked-
 client key is accepted as a Bearer token, a raw `Authorization`, `X-Api-Key`,
 `X-Goog-Api-Key`, or the `key` / `auth_token` query parameters.
 
+Every request the pool sends upstream is one a Codex would send
+([SPEC.md 2.3.4](SPEC.md)), whatever the client says it is:
+
+- **Completed.** An app's `POST /v1/responses` or `/v1/chat/completions` is
+  rewritten into the request Codex sends: Codex's fields and order, its
+  identifiers, and the identity of the Codex that last used the account. The
+  app's own headers, `user`, `metadata` and cache key never leave the pool.
+  Send a `session_id` header to keep one conversation together; without it the
+  start of the history identifies it.
+- **Refused.** A parameter no Codex sends is answered `400` with code
+  `non_codex_request` and the field in `param`, and nothing goes upstream.
+  Remove `temperature`, `top_p`, `max_output_tokens` / `max_tokens`,
+  `previous_response_id` (send the whole conversation), hosted tools other than
+  web search and image generation, file inputs and forced `tool_choice`. Chat Completions carries
+  plain messages, images, `reasoning_effort` and `verbosity`; use
+  `/v1/responses` for tools.
+- **Codex only.** The Responses WebSocket, `/v1/responses/compact` and the
+  native endpoint require a client in Codex's own identity format.
+
+The pool log shows each refusal (`request refused before upstream`) and each
+field it passed without knowing it.
+
 ## Accounts
 
 ### Adding an account

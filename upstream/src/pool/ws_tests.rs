@@ -318,6 +318,10 @@ async fn dial(
     }
 }
 
+/// A Codex user agent; only a client presenting Codex's format may open a
+/// socket or use the native endpoint (codex_request.rs).
+pub(super) const CODEX_EXEC_AGENT: &str = "codex_exec/0.163.0 (Linux 6.1; x86_64) unknown";
+
 /// Go dialPool.
 async fn dial_pool(url: &str) -> ClientSocket {
     let headers = [
@@ -330,7 +334,10 @@ async fn dial_pool(url: &str) -> ClientSocket {
             r#"{"thread_id":"thread-ws","session_id":"session-ws"}"#,
         ),
         ("x-codex-turn-state", "stale-turn-state"),
-        ("user-agent", "codex-tui/0.163.0 (Mac OS 26.0.0; arm64)"),
+        (
+            "user-agent",
+            "Codex_Desktop/0.163.0 (Mac OS 26.0.0; arm64) iTerm.app",
+        ),
         ("originator", "Codex_Desktop"),
     ];
     match dial(url, &headers).await {
@@ -400,7 +407,7 @@ async fn responses_websocket_relays_codex_messages_unchanged() {
     let pool = ws_test_pool(Behavior::scripted(|_| completed_events("resp_ws")), |_| {}).await;
     let mut socket = dial_pool(&pool.url).await;
     let prewarm = r#"{"type":"response.create","model":"gpt-test","generate":false,"input":[],"tools":[{"type":"function","name":"z_tool"}],"store":false,"stream":true}"#;
-    let turn = r#"{"type":"response.create","model":"gpt-test","previous_response_id":"resp_ws","input":[{"type":"message","role":"user","content":"hi"}],"store":false,"stream":true}"#;
+    let turn = r#"{"type":"response.create","model":"gpt-test","previous_response_id":"resp_ws","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"store":false,"stream":true}"#;
     for message in [prewarm, turn] {
         send(&mut socket, message).await;
         let events = read_until_terminal(&mut socket).await;
@@ -668,6 +675,8 @@ async fn responses_websocket_relays_the_upstream_handshake() {
         &[
             ("authorization", "Bearer client-key"),
             ("session-id", "session-hs"),
+            ("user-agent", CODEX_EXEC_AGENT),
+            ("originator", "codex_exec"),
         ],
     )
     .await
@@ -802,7 +811,16 @@ async fn responses_websocket_passes_upgrade_required_on_at_once() {
     behavior.refuse.insert("first".into(), 426);
     behavior.refuse.insert("second".into(), 426);
     let pool = ws_test_pool(behavior, |_| {}).await;
-    match dial(&pool.url, &[("authorization", "Bearer client-key")]).await {
+    match dial(
+        &pool.url,
+        &[
+            ("authorization", "Bearer client-key"),
+            ("user-agent", CODEX_EXEC_AGENT),
+            ("originator", "codex_exec"),
+        ],
+    )
+    .await
+    {
         Err(Some(response)) => assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED),
         _ => panic!("handshake answer must be 426"),
     }
@@ -836,7 +854,9 @@ async fn native_codex_endpoint_serves_the_responses_websocket() {
     let mut socket = dial_pool(&native).await;
     send(
         &mut socket,
-        r#"{"type":"response.create","model":"gpt-test","input":[]}"#,
+        // Every field a Codex message carries: the native endpoint refuses
+        // one without them (codex_request.rs).
+        r#"{"type":"response.create","model":"gpt-test","stream":true,"input":[],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"store":false,"include":[]}"#,
     )
     .await;
     assert_eq!(
@@ -865,7 +885,7 @@ async fn native_codex_endpoint_sends_the_client_request_with_the_pool_account() 
     // image_gen is the namespace tool a native Codex sends its own backend;
     // the custom-provider path strips it, the native endpoint must not. Keys
     // are deliberately unsorted so a re-encode shows.
-    const RAW: &str = r#"{"model":"gpt-test","tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","name":"imagegen","parameters":{"type":"object"}}]}],"stream":true,"store":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t"}}],"client_metadata":{"guardian_credits_requested":"true","mcp_attribution":"{\"status\":\"none\"}"},"prompt_cache_key":"thread-native"}"#;
+    const RAW: &str = r#"{"model":"gpt-test","tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","name":"imagegen","parameters":{"type":"object"}}]}],"stream":true,"store":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t"}}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"include":[],"client_metadata":{"guardian_credits_requested":"true","mcp_attribution":"{\"status\":\"none\"}"},"prompt_cache_key":"thread-native"}"#;
     let upstream = FakeServer::start(|_| {
         let mut response = FakeResponse::json(
             200,
@@ -899,6 +919,7 @@ async fn native_codex_endpoint_sends_the_client_request_with_the_pool_account() 
             .with_header("version", "0.163.0")
             .with_header("session-id", "session-native")
             .with_header("originator", "codex_exec")
+            .with_header("user-agent", CODEX_EXEC_AGENT)
     };
     let refused = serve(&app, send("wrong-key")).await;
     assert!(
@@ -1119,7 +1140,7 @@ fn client_turn_metadata() -> String {
 fn client_metadata_body() -> String {
     let escaped = client_turn_metadata().replace('"', "\\\"");
     format!(
-        r#"{{"model":"gpt-test","input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"my id is {CLIENT_INSTALLATION_ID}"}}]}}],"stream":true,"store":false,"client_metadata":{{"x-codex-window-id":"01a15f63-427f-7fa2-884a-01ebe2c60a47:0","x-codex-installation-id":"{CLIENT_INSTALLATION_ID}","x-codex-turn-metadata":"{escaped}"}},"prompt_cache_key":"thread-native"}}"#
+        r#"{{"model":"gpt-test","input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"my id is {CLIENT_INSTALLATION_ID}"}}]}}],"stream":true,"store":false,"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"include":[],"client_metadata":{{"x-codex-window-id":"01a15f63-427f-7fa2-884a-01ebe2c60a47:0","x-codex-installation-id":"{CLIENT_INSTALLATION_ID}","x-codex-turn-metadata":"{escaped}"}},"prompt_cache_key":"thread-native"}}"#
     )
 }
 
@@ -1143,6 +1164,8 @@ async fn native_endpoint_presents_the_account_installation_id() {
         &client_metadata_body(),
     )
     .with_header("content-type", "application/json")
+    .with_header("user-agent", CODEX_EXEC_AGENT)
+    .with_header("originator", "codex_exec")
     .with_header("x-codex-turn-metadata", &client_turn_metadata());
     let result = serve(&app, request).await;
     assert_eq!(
@@ -1183,6 +1206,8 @@ async fn websocket_presents_the_account_installation_id() {
             ("authorization", "Bearer client-key"),
             ("openai-beta", "responses_websockets=2026-02-06"),
             ("x-codex-turn-metadata", &metadata),
+            ("user-agent", CODEX_EXEC_AGENT),
+            ("originator", "codex_exec"),
         ],
     )
     .await

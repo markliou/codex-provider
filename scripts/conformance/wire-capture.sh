@@ -7,7 +7,9 @@
 # encoding and body. A third run sends the pool's Codex provider config
 # straight to the fake, so the report separates what the pool changes (exit
 # non-zero) from what Codex itself sends differently to a custom provider
-# (reported as the client gap; see SPEC.md 2.3.2).
+# (reported as the client gap; see SPEC.md 2.3.2). An in-house app's request
+# to the pool's /v1 must reach the fake as the request Codex sends a custom
+# provider, and one the pool refuses must not reach it (SPEC.md 2.3.4).
 #
 #   sh scripts/conformance/wire-capture.sh
 #
@@ -236,12 +238,16 @@ docker run --rm --network "$net" -v "$work:/harness:ro" -v "$work/certs:/certs:r
 cp "$work/logs/capture.jsonl" "$work/reset.jsonl"
 stop_fake reset
 
-echo "HTTP: native Codex, then Codex through the pool"
+echo "HTTP: native Codex, then Codex through the pool, then an app through the pool"
 start_fake 1 http
 run_turn native native-http
 run_turn client-http client-http
 run_turn pool-http pool-http
 run_turn native-pool native-pool-http
+: > "$work/logs/capture.jsonl"
+docker run --rm --network "$net" -v "$repo_root/scripts/conformance/harness:/h:ro" -e CONFORMANCE_CLIENT_KEY="$CLIENT_KEY" \
+  node:22-alpine node /h/app-client.mjs "$model" > "$work/app-http.log" 2>&1 || true
+cp "$work/logs/capture.jsonl" "$work/app-http.jsonl"
 stop_fake http
 
 echo "WebSocket: native Codex, then Codex through the pool"
