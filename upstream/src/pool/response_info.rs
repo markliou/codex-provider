@@ -49,6 +49,13 @@ pub struct ProxyResponseInfo {
     /// message they never enter state, an event or a response.
     pub terminal_data: String,
     pub terminal_source: String,
+    /// Why upstream ended a response.incomplete early
+    /// (response.incomplete_details.reason, read where Codex reads it:
+    /// codex-api sse/responses.rs at the pinned release). Without it the log
+    /// said only that a turn stopped short, and a run of them could not be
+    /// told apart as a content filter, an output cap or a context limit. Log
+    /// only, like the message: it never decides a class, a retry or a route.
+    pub terminal_incomplete_reason: String,
     pub request_id: String,
     pub failover_from_account_id: String,
     pub failover_outcome: String,
@@ -97,6 +104,7 @@ impl ProxyResponseInfo {
             self.terminal_error_message = next.terminal_error_message;
             self.terminal_data = next.terminal_data;
             self.terminal_source = next.terminal_source;
+            self.terminal_incomplete_reason = next.terminal_incomplete_reason;
         }
     }
 }
@@ -190,6 +198,15 @@ pub fn response_info_from_sse_block(block: &str) -> ProxyResponseInfo {
         if !message.is_empty() {
             info.terminal_error_message = message;
         }
+    }
+    if event_type == "response.incomplete" {
+        info.terminal_incomplete_reason = clean_metadata_token(
+            source
+                .get("incomplete_details")
+                .and_then(Value::as_object)
+                .map(|details| claim_string(details, "reason"))
+                .unwrap_or_default(),
+        );
     }
     if is_terminal_response_event(&event_type) {
         if event_type != "response.completed" {
@@ -597,5 +614,36 @@ mod tests {
         assert_eq!(status_failure_class(503), "transient");
         assert_eq!(status_failure_class(404), "request");
         assert_eq!(status_failure_class(200), "unknown");
+    }
+
+    #[test]
+    fn response_incomplete_keeps_upstream_reason_for_the_log() {
+        // Shapes from Codex core/tests/suite/client.rs ("incomplete_details":
+        // {"reason": "max_output_tokens"}) and scenarios_content_filter.rs
+        // ("response": { "incomplete_details": { "reason": "content_filter" } }).
+        let capped = response_info_from_sse_block(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        );
+        assert_eq!(
+            (
+                capped.terminal_event.as_str(),
+                capped.terminal_failure_class.as_str(),
+                capped.terminal_error_code.as_str(),
+                capped.terminal_incomplete_reason.as_str()
+            ),
+            ("response.incomplete", "incomplete", "", "max_output_tokens")
+        );
+        let filtered = response_info_from_sse_block(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n",
+        );
+        assert_eq!(filtered.terminal_incomplete_reason, "content_filter");
+        let mut merged = ProxyResponseInfo::default();
+        merged.merge(filtered);
+        assert_eq!(merged.terminal_incomplete_reason, "content_filter");
+        // A failure that is not an incomplete answer carries no reason.
+        let failed = response_info_from_sse_block(
+            "data: {\"type\":\"response.failed\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        );
+        assert_eq!(failed.terminal_incomplete_reason, "");
     }
 }
