@@ -2135,7 +2135,12 @@ For streaming responses:
 - HTTP `200` plus a terminal `error`, `response.failed`, or
   `response.incomplete` is a failed client request. Preserve reported usage, but
   do not record success, clear consecutive failures, refresh sticky/thread
-  affinity, or create a response binding.
+  affinity, or create a response binding. The one exception is a
+  `response.incomplete` whose `incomplete_details.reason` is `interrupted`:
+  upstream ends a turn that way when Codex steers or preempts it, and Codex
+  reads it as the turn's normal completion (codex-api `sse/responses.rs`), so
+  the pool records it as `response.completed`. The service log names the
+  reason of every other incomplete response.
 - Capacity/retryable terminal failures may set cooldown; authentication
   failures may quarantine the credential. Context length, invalid prompt, and
   policy failures do not penalize account health. Unknown codes remain a
