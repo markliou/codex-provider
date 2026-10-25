@@ -286,6 +286,14 @@ impl App {
             or_dash(&info.terminal_error_code),
             if retried { "retried" } else { "final" }
         );
+        if info.terminal_event == "response.incomplete" {
+            // Codex names a missing reason "unknown" (sse/responses.rs).
+            let reason = info.terminal_incomplete_reason.as_str();
+            line.push_str(&format!(
+                " reason={}",
+                if reason.is_empty() { "unknown" } else { reason }
+            ));
+        }
         if !info.request_id.is_empty() {
             line.push_str(&format!(" request={}", info.request_id));
         }
