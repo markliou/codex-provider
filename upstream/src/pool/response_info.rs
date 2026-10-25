@@ -207,6 +207,17 @@ pub fn response_info_from_sse_block(block: &str) -> ProxyResponseInfo {
                 .map(|details| claim_string(details, "reason"))
                 .unwrap_or_default(),
         );
+        if info.terminal_incomplete_reason == "interrupted" {
+            // Codex reads an incomplete response stopped as "interrupted" as
+            // the turn's normal end, not a failure: codex-api
+            // sse/responses.rs (rust-v0.164.0) errors only for any other
+            // reason and parses this one as ResponseCompleted. Upstream sends
+            // it when Codex steers or preempts a running turn (core
+            // tests/suite/pending_input.rs steer_interrupts_and_drains_websocket).
+            // Recorded as a failure, each steer raised the failure count
+            // although nothing went wrong.
+            event_type = "response.completed".to_string();
+        }
     }
     if is_terminal_response_event(&event_type) {
         if event_type != "response.completed" {
@@ -640,6 +651,22 @@ mod tests {
         let mut merged = ProxyResponseInfo::default();
         merged.merge(filtered);
         assert_eq!(merged.terminal_incomplete_reason, "content_filter");
+        // A steered turn ends as Codex reads it: completed, no failure.
+        // Shape from Codex core/tests/suite/pending_input.rs
+        // (interrupted["response"]["incomplete_details"] =
+        // json!({"reason": "interrupted"})).
+        let steered = response_info_from_sse_block(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp-interrupted\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"interrupted\"}}}\n\n",
+        );
+        assert_eq!(
+            (
+                steered.terminal_event.as_str(),
+                steered.terminal_failure_class.as_str(),
+                steered.terminal_data.as_str(),
+                steered.response_id.as_str()
+            ),
+            ("response.completed", "", "", "resp-interrupted")
+        );
         // A failure that is not an incomplete answer carries no reason.
         let failed = response_info_from_sse_block(
             "data: {\"type\":\"response.failed\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
