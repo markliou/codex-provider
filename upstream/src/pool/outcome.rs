@@ -56,6 +56,10 @@ pub const THROUGHPUT_LATENCY_BOUNDS_MILLIS: &[u64] = &[
     100, 250, 500, 1000, 2000, 5000, 10000, 30000, 60000, 120000, 300000, 600000, 900000,
 ];
 
+/// The code upstream ends a Responses WebSocket with once it has been open 60
+/// minutes (codex-api endpoint/responses_websocket.rs, same name).
+pub const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE: &str = "websocket_connection_limit_reached";
+
 #[derive(Clone, Debug, Default)]
 pub struct ThroughputMeasurement {
     pub started_at: Timestamp,
@@ -498,6 +502,19 @@ impl App {
     ) {
         self.log_terminal_response_failure(account_id, model, info, false);
         let mut inner = self.write();
+        if info.terminal_error_code == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE {
+            // Upstream closes every Responses WebSocket after 60 minutes, and
+            // Codex reconnects and resends the request in full (codex-api
+            // endpoint/responses_websocket.rs WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+            // maps it to ApiError::Retryable, rust-v0.164.0). Nothing failed:
+            // the resent request is the one that counts. Recorded as a
+            // failure, each hourly reconnect pulled the dashboard's success
+            // rate below 100% with no fault behind it, so this request leaves
+            // no outcome: no success, failure or cancellation, and no routing
+            // event. The log line above still shows it.
+            inner.discard_throughput_measurement(measurement);
+            return;
+        }
         let now = Timestamp::now();
         inner.finish_throughput_measurement(measurement, now);
         let class = if info.terminal_failure_class.is_empty() {
@@ -832,6 +849,21 @@ impl Inner {
         }
         self.active_proxy_requests = self.active_proxy_requests.saturating_sub(1);
         self.record_throughput_measurement(measurement.clone());
+    }
+
+    /// Ends a measurement that must not count in any throughput bucket.
+    pub fn discard_throughput_measurement(
+        &mut self,
+        measurement: Option<&mut ThroughputMeasurement>,
+    ) {
+        let Some(measurement) = measurement else {
+            return;
+        };
+        if measurement.finished {
+            return;
+        }
+        measurement.finished = true;
+        self.active_proxy_requests = self.active_proxy_requests.saturating_sub(1);
     }
 
     pub fn record_throughput_measurement(&mut self, mut measurement: ThroughputMeasurement) {

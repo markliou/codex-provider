@@ -4590,6 +4590,57 @@ fn unrecognized_upstream_failures_are_counted() {
     );
 }
 
+// Upstream ends every Responses WebSocket after 60 minutes and Codex resends
+// the request on a new one; the ended attempt counts as nothing, so the hourly
+// reconnect does not pull the success rate below 100%.
+#[test]
+fn websocket_connection_limit_leaves_no_outcome() {
+    let (app, _dir) = test_app(vec![device_account("first", "", 0)]);
+    let raw = include_str!("../../testdata/codex-upstream-failures.json");
+    let fixture: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
+    let shape = fixture["failures"]
+        .as_array()
+        .and_then(|failures| {
+            failures
+                .iter()
+                .find(|shape| shape["name"] == "websocket connection limit")
+        })
+        .map(|shape| shape["event"].to_string())
+        .unwrap_or_default();
+    let info = super::response_info::response_info_from_sse_block(&format!("data: {shape}\n\n"));
+    assert_eq!(
+        info.terminal_error_code,
+        "websocket_connection_limit_reached"
+    );
+    let mut measurement = app.begin_throughput_measurement(true);
+    measurement.account_id = "first".into();
+    let (failures, requests) = {
+        let inner = app.read();
+        (inner.state.failure_count, inner.state.request_count)
+    };
+    app.mark_terminal_response_failure(
+        &super::routing::RoutingDecision::default(),
+        "gpt-test",
+        "first",
+        &info,
+        Some(&mut measurement),
+        true,
+    );
+    let inner = app.read();
+    assert!(measurement.finished);
+    assert_eq!(inner.active_proxy_requests, 0);
+    assert!(
+        inner.throughput_buckets.is_empty(),
+        "the ended attempt was counted: {:?}",
+        inner.throughput_buckets
+    );
+    assert_eq!(
+        (inner.state.failure_count, inner.state.request_count),
+        (failures, requests)
+    );
+    assert!(inner.state.routing_cache_events().is_empty());
+}
+
 // Go TestCodexUpstreamShapesClassifyAsCodexReadsThem: every recorded Codex
 // failure shape is terminal with its class and code, and every lifecycle
 // shape stays before the commit point.
