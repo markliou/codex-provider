@@ -2140,7 +2140,11 @@ For streaming responses:
   upstream ends a turn that way when Codex steers or preempts it, and Codex
   reads it as the turn's normal completion (codex-api `sse/responses.rs`), so
   the pool records it as `response.completed`. The service log names the
-  reason of every other incomplete response.
+  reason of every other incomplete response. A Responses WebSocket ended by
+  `websocket_connection_limit_reached` (upstream closes each socket after 60
+  minutes; Codex reconnects and resends the request) records no outcome at
+  all: no success, failure, cancellation or routing event, only its log line,
+  so the hourly reconnect does not lower the dashboard's success rate.
 - Capacity/retryable terminal failures may set cooldown; authentication
   failures may quarantine the credential. Context length, invalid prompt, and
   policy failures do not penalize account health. Unknown codes remain a
