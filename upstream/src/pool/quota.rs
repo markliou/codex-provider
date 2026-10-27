@@ -39,10 +39,10 @@ pub const FIVE_HOUR_WINDOW_MINUTES: i64 = 300;
 pub const WEEKLY_WINDOW_MINUTES: i64 = 10080;
 
 /// Quota telemetry is refreshed every four to six minutes for an account in
-/// use and every 20 to 30 for an idle one (quota_schedule.rs), so fresh covers
-/// the idle cadence plus a grace interval; read sooner it would mark every
-/// idle account stale. Freshness itself is never a routing gate: SPEC section
-/// 6.4 deliberately keeps telemetry failures fail-open.
+/// use; an idle one is asked only after its reset (quota_schedule.rs), so its
+/// figures read as stale until it is used again, which is what they are.
+/// Freshness itself is never a routing gate: SPEC section 6.4 deliberately
+/// keeps telemetry failures fail-open.
 pub const QUOTA_TELEMETRY_FRESHNESS_MINUTES: i64 = 35;
 
 /// Reset-credit expiry is descriptive metadata from a separate endpoint, not

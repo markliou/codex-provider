@@ -1147,9 +1147,9 @@ fn quota_prime_grace_is_random_unless_fixed_for_tests() {
     for _ in 0..50 {
         let grace = super::prime::random_quota_prime_grace();
         assert!(
-            grace >= std::time::Duration::from_secs(300)
-                && grace <= std::time::Duration::from_secs(1800),
-            "grace {grace:?} outside [5m, 30m]"
+            grace >= std::time::Duration::from_secs(30 * 60)
+                && grace <= std::time::Duration::from_secs(120 * 60),
+            "grace {grace:?} outside [30m, 120m]"
         );
         seen.insert(grace);
     }
@@ -1353,4 +1353,43 @@ fn account_activity_sets_the_cadence() {
         !app.account_in_use("acct", later),
         "the account stayed in use past the active window"
     );
+}
+
+// An idle account is next asked after its longest window resets, and not at
+// all from a failed read (the schedule's fallback applies then).
+#[test]
+fn idle_account_wakes_at_its_longest_window_reset() {
+    let (app, _dir) = super::testing::test_app(Vec::new());
+    let window = |minutes: i64, reset: i64| super::state::QuotaWindow {
+        window_minutes: Some(minutes),
+        reset_at: Some(reset),
+        present: true,
+        ..super::state::QuotaWindow::default()
+    };
+    let snapshot = |quota_error| super::state::QuotaSnapshot {
+        account_id: "acct".into(),
+        quota: Some(AccountQuota {
+            windows: vec![window(300, 1_800_000_100), window(10080, 1_800_500_000)],
+            ..AccountQuota::default()
+        }),
+        quota_error,
+        ..super::state::QuotaSnapshot::default()
+    };
+    assert_eq!(app.idle_quota_wake("acct"), None);
+    app.write()
+        .state
+        .quotas_mut()
+        .insert("acct".into(), snapshot(None));
+    assert_eq!(
+        app.idle_quota_wake("acct"),
+        Some(Timestamp::from_unix(1_800_500_000))
+    );
+    app.write().state.quotas_mut().insert(
+        "acct".into(),
+        snapshot(Some(super::state::QuotaErrorInfo {
+            code: "upstream_status".into(),
+            ..super::state::QuotaErrorInfo::default()
+        })),
+    );
+    assert_eq!(app.idle_quota_wake("acct"), None);
 }

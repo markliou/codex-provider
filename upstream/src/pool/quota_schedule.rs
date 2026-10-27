@@ -11,15 +11,20 @@
 //! sweep: that brings the burst back.
 //!
 //! That cadence is for an account in use (a request went to it within
-//! `ACTIVE_WINDOW`). An idle account is asked every 20 to 30 minutes, and is
-//! due at the in-use cadence again as soon as a request lands on it. A native
-//! Codex reads usage only while it is open (every 60 seconds, more often near
-//! exhaustion, timed from the end of the last read: tui
-//! app/rate_limit_refresh.rs `poll_deadline`, chatwidget/rate_limits.rs
-//! `rate_limit_refresh_interval`) and not at all while nobody uses it; polling
-//! idle accounts at the in-use rate around the clock was most of the pool's
-//! own load on upstream. Only when a poll is sent is the pool's own; what is
-//! sent stays the native Codex request.
+//! `ACTIVE_WINDOW`). An idle account is not polled on a cadence at all: it is
+//! asked once a random `WAKE_DELAY_MIN` to `WAKE_DELAY_MAX` after its longest
+//! window resets (`wake_at`), and is due at the in-use cadence again as soon as
+//! a request lands on it. Meanwhile only its owner's own Codex changes its
+//! quota, and routing already treats quota figures as hints (fail-open).
+//! An idle account whose reset is unknown waits `IDLE_MIN_INTERVAL` to
+//! `IDLE_MAX_INTERVAL`. A native Codex reads usage only while it is open (every
+//! 60 seconds, more often near exhaustion, timed from the end of the last read:
+//! tui app/rate_limit_refresh.rs `poll_deadline`, chatwidget/rate_limits.rs
+//! `rate_limit_refresh_interval`) and not at all while nobody uses it. The pool
+//! once asked idle accounts every 20 to 30 minutes around the clock, so
+//! accounts nobody was using still read usage all night from one address,
+//! which no person's Codex does; do not bring an idle cadence back. Only when a
+//! poll is sent is the pool's own; what is sent stays the native Codex request.
 //!
 //! The random source is the caller's (uniform in [0, 1)), so the schedule
 //! needs no dependency and tests can replay it.
@@ -34,8 +39,13 @@ use std::time::Instant;
 pub const INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const JITTER: Duration = Duration::from_secs(60);
 pub const MAX_INTERVAL: Duration = INTERVAL.saturating_add(JITTER);
-pub const IDLE_MIN_INTERVAL: Duration = Duration::from_secs(20 * 60);
-pub const IDLE_MAX_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// An idle account whose next reset is unknown (no quota read yet, or the
+/// last read failed).
+pub const IDLE_MIN_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+pub const IDLE_MAX_INTERVAL: Duration = Duration::from_secs(8 * 3600);
+/// How long after an idle account's reset it is asked again.
+pub const WAKE_DELAY_MIN: Duration = Duration::from_secs(60);
+pub const WAKE_DELAY_MAX: Duration = Duration::from_secs(10 * 60);
 /// How recently a request must have gone to an account for it to be in use.
 pub const ACTIVE_WINDOW: Duration = Duration::from_secs(30 * 60);
 pub const START_SPREAD: Duration = Duration::from_secs(2 * 60);
@@ -50,6 +60,8 @@ struct Plan {
     last: Option<Instant>,
     active_gap: Duration,
     idle_gap: Duration,
+    /// When an idle account is asked again: just after its reset.
+    wake: Option<Instant>,
     /// Brings the next poll forward to decide a waiting prime (Go
     /// codex_prime.go, quota prime grace).
     by: Option<Instant>,
@@ -60,7 +72,7 @@ impl Plan {
         let next = match self.last {
             None => self.first,
             Some(last) if active => last + self.active_gap,
-            Some(last) => last + self.idle_gap,
+            Some(last) => self.wake.unwrap_or(last + self.idle_gap),
         };
         match self.by {
             Some(by) if by < next => by,
@@ -104,6 +116,7 @@ impl<R: FnMut() -> f64> QuotaPollSchedule<R> {
                     last: None,
                     active_gap: Duration::ZERO,
                     idle_gap: Duration::ZERO,
+                    wake: None,
                     by: None,
                 };
                 self.plans.insert(id.clone(), plan);
@@ -130,9 +143,18 @@ impl<R: FnMut() -> f64> QuotaPollSchedule<R> {
             last: Some(finished),
             active_gap: self.between(INTERVAL - JITTER, MAX_INTERVAL),
             idle_gap: self.between(IDLE_MIN_INTERVAL, IDLE_MAX_INTERVAL),
+            wake: None,
             by: None,
         };
         self.plans.insert(account_id.to_string(), plan);
+    }
+
+    /// Asks the account again, while idle, a random moment after `reset`.
+    pub fn wake_at(&mut self, account_id: &str, reset: Instant) {
+        let delay = self.between(WAKE_DELAY_MIN, WAKE_DELAY_MAX);
+        if let Some(plan) = self.plans.get_mut(account_id) {
+            plan.wake = Some(reset + delay);
+        }
     }
 
     /// Makes the account due no later than `at`.
@@ -226,39 +248,67 @@ mod tests {
         );
     }
 
-    // Go TestQuotaPollScheduleAsksIdleAccountsLess.
+    // Go TestQuotaPollScheduleAsksIdleAccountsLess, changed: an idle
+    // account is asked only after its reset, not on a cadence.
     #[test]
-    fn asks_idle_accounts_less() {
+    fn asks_an_idle_account_only_after_its_reset() {
         let mut schedule = QuotaPollSchedule::new(replayable(3));
         let ids = vec!["idle".to_string(), "busy".to_string()];
         let start = Instant::now();
+        let reset = start + Duration::from_secs(3 * 3600);
         let mut polls: HashMap<String, Vec<Instant>> = HashMap::new();
         let mut now = start;
-        while now < start + Duration::from_secs(4 * 3600) {
+        while now < start + Duration::from_secs(5 * 3600) {
             if let Some(id) = schedule.due(now, &ids, |id| id == "busy") {
                 polls.entry(id.clone()).or_default().push(now);
                 now += Duration::from_secs(1);
                 schedule.polled(&id, now);
+                if id == "idle" && now < reset {
+                    schedule.wake_at(&id, reset);
+                }
             }
             now += schedule.pause();
         }
+        let idle = &polls["idle"];
+        assert_eq!(idle.len(), 2, "idle account polled at {idle:?}");
+        assert!(idle[0] - start <= START_SPREAD + PAUSE_MAX * 2);
         let slack = (PAUSE_MAX + Duration::from_secs(1)) * 2;
-        for pair in polls["idle"].windows(2) {
-            let gap = pair[1] - pair[0];
-            assert!(
-                gap >= IDLE_MIN_INTERVAL && gap <= IDLE_MAX_INTERVAL + slack,
-                "idle account polled {gap:?} apart"
-            );
-        }
-        assert!(polls["busy"].len() >= 3 * polls["idle"].len());
+        assert!(
+            idle[1] >= reset + WAKE_DELAY_MIN && idle[1] <= reset + WAKE_DELAY_MAX + slack,
+            "idle account asked {:?} after its reset",
+            idle[1].saturating_duration_since(reset)
+        );
+        assert!(polls["busy"].len() >= 40);
         // Use resumes: the idle account, last asked over six minutes ago, is due.
-        let last = *polls["idle"].last().unwrap();
+        let last = *idle.last().unwrap();
         let resumed = last + MAX_INTERVAL + Duration::from_secs(2);
         assert_eq!(
             schedule
                 .due(resumed, &["idle".to_string()], |_| true)
                 .as_deref(),
             Some("idle")
+        );
+    }
+
+    // An idle account with no known reset is asked hours apart, not minutes.
+    #[test]
+    fn idle_account_without_a_reset_waits_hours() {
+        let mut schedule = QuotaPollSchedule::new(|| 0.0);
+        let now = Instant::now();
+        let a = vec!["a".to_string()];
+        schedule.due(now, &a, |_| false);
+        schedule.polled("a", now);
+        assert_eq!(
+            schedule.due(now + IDLE_MIN_INTERVAL - Duration::from_secs(1), &a, |_| {
+                false
+            }),
+            None
+        );
+        assert_eq!(
+            schedule
+                .due(now + IDLE_MIN_INTERVAL, &a, |_| false)
+                .as_deref(),
+            Some("a")
         );
     }
 

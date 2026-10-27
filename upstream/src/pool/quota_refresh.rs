@@ -567,6 +567,26 @@ impl App {
         }
     }
 
+    /// When an idle account's quota next changes on its own: the reset of its
+    /// longest reported window, the budget window priming also reads
+    /// (prime.rs `unanchored_budget_window`). Until then the background poll
+    /// leaves it alone (quota_schedule.rs).
+    pub fn idle_quota_wake(&self, account_id: &str) -> Option<Timestamp> {
+        let snapshot = self.read().quota_snapshot(account_id);
+        let quota = snapshot
+            .quota
+            .as_ref()
+            .filter(|_| snapshot.quota_error.is_none())?;
+        quota::quota_reported_windows(quota)
+            .into_iter()
+            .filter(|window| {
+                window.present && window.window_minutes.is_some_and(|length| length > 0)
+            })
+            .max_by_key(|window| window.window_minutes.unwrap_or_default())
+            .and_then(|window| window.reset_at)
+            .map(Timestamp::from_unix)
+    }
+
     /// The background poll (Go startQuotaRefresher): one account at a time,
     /// each on its own randomized cadence (quota_schedule.rs), never a fixed
     /// beat a backend could recognize. It stops when `stop` is cancelled.
@@ -589,6 +609,13 @@ impl App {
                         app.poll_account_quota(item).await;
                     }
                     schedule.polled(&id, std::time::Instant::now());
+                    // A reset already past would wake it again every few
+                    // minutes; such an account waits the idle fallback.
+                    if let Some(reset) = app.idle_quota_wake(&id)
+                        && let Ok(wait) = reset.sub(&Timestamp::now()).to_std()
+                    {
+                        schedule.wake_at(&id, std::time::Instant::now() + wait);
+                    }
                     if let Some(at) = app.prime_grace_due(&id) {
                         let wait = at.sub(&Timestamp::now()).to_std().unwrap_or_default();
                         schedule.poll_by(&id, std::time::Instant::now() + wait);

@@ -4,7 +4,7 @@
 //! codex_prime.go. A window that has been spent against reports a fixed reset
 //! instant that draws closer on every refresh; one that reset and has seen no
 //! usage reports a reset a full window ahead that slides with the clock, so
-//! the quota never cycles. The pool first gives the owner a random 5 to 30
+//! the quota never cycles. The pool first gives the owner a random 30 to 120
 //! minutes to start it by using the account, then spends the smallest request
 //! that registers as usage. A Codex account is primed by one turn of the
 //! bundled Codex CLI, so upstream receives a native Codex request rather than
@@ -38,9 +38,11 @@ const QUOTA_PRIME_MIN_INTERVAL_HOURS: i64 = 1;
 /// that still registers as usage, never to obtain an answer.
 pub const QUOTA_PRIME_PROMPT: &str = "What day of the week is it today? Answer with one word.";
 const QUOTA_PRIME_TIMEOUT: Duration = Duration::from_secs(90);
-/// The owner's first chance to start the window by using the account.
-const QUOTA_PRIME_GRACE_MIN: Duration = Duration::from_secs(5 * 60);
-const QUOTA_PRIME_GRACE_MAX: Duration = Duration::from_secs(30 * 60);
+/// The owner's first chance to start the window by using the account. Long
+/// on purpose: a prime is a request no person sent, so the owner gets up to
+/// two hours to start the window with real work first.
+const QUOTA_PRIME_GRACE_MIN: Duration = Duration::from_secs(30 * 60);
+const QUOTA_PRIME_GRACE_MAX: Duration = Duration::from_secs(120 * 60);
 /// Codex's installation id file in its home (core installation_id.rs).
 const CODEX_INSTALLATION_ID_FILE: &str = "installation_id";
 
@@ -85,7 +87,7 @@ pub fn unanchored_budget_window(quota: &AccountQuota, now: Timestamp) -> Option<
     Some(budget)
 }
 
-/// A random grace in [5, 30] minutes.
+/// A random grace in [30, 120] minutes.
 pub fn random_quota_prime_grace() -> Duration {
     let unit = super::crypto::random_unit();
     QUOTA_PRIME_GRACE_MIN + (QUOTA_PRIME_GRACE_MAX - QUOTA_PRIME_GRACE_MIN).mul_f64(unit)
