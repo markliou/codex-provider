@@ -236,7 +236,7 @@ impl Settings {
         )?;
         // Quota priming defaults on, the owner's choice: an idle account's
         // window should start counting so its quota cycles back. A prime is a
-        // request no native Codex sends, so it waits a random 5 to 30 minutes
+        // request no native Codex sends, so it waits a random 30 to 120 minutes
         // for a real request to start the window first, and the Console switch
         // turns it off (SPEC.md, quota window priming).
         let quota_prime = bool_from_env(

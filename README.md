@@ -314,8 +314,8 @@ The control page refreshes every five minutes (**Refresh** reads at once).
   `Standby`), every quota window with its own percentage and reset time, credits,
   spend control, and reset credits with the nearest expiry (red within seven
   days). Quota is read from `/wham/usage` one account at a time, at random:
-  every four to six minutes for an account used in the last 30 minutes, every
-  20 to 30 for an idle one; a value upstream
+  every four to six minutes for an account used in the last 30 minutes, and
+  for an idle one only once after its quota resets; a value upstream
   does not report shows as `Not reported`. **Use reset credit** spends one the
   way Codex's own `/usage` reset does: the credit expiring soonest, and a press
   after a failed attempt resends that attempt, so it cannot spend twice.
@@ -351,7 +351,7 @@ The pool's own calls also go out the way Codex makes them. Token refresh, usage,
 account check and reset-credit reads use Codex's endpoints and header order, with
 the identity of the Codex that last used the account. A quota-window prime is one
 read-only turn of the bundled Codex CLI that holds no refresh token; no native
-Codex sends one, so a window that reset first waits a random 5 to 30 minutes
+Codex sends one, so a window that reset first waits a random 30 to 120 minutes
 for a real request to start it, and only a window still untouched is primed.
 **Prime idle accounts** (on by default) turns priming off.
 
