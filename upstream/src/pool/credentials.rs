@@ -36,7 +36,7 @@ use std::sync::Mutex;
 /// The Codex release the pool is held to. It must equal the tag in
 /// upstream/Cargo.toml and the bundled CLI in the Dockerfile; a test
 /// (bundled_codex_matches_the_pinned_release) keeps the three together.
-pub const PINNED_CODEX_VERSION: &str = "0.164.0";
+pub const PINNED_CODEX_VERSION: &str = "0.165.0";
 /// Why a token refresh is made, as Codex names it upstream (login
 /// oauth/client.rs RefreshReason::as_str, 0.164.0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

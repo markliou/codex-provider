@@ -343,7 +343,7 @@ refreshes the account's token five minutes before expiry, and once more on a
 `401` before treating the account as signed out.
 
 The pool is one Rust process ([upstream/](upstream/)) built from Codex's HTTP
-and WebSocket client crates at the pinned release (`rust-v0.164.0` in
+and WebSocket client crates at the pinned release (`rust-v0.165.0` in
 [upstream/Cargo.toml](upstream/Cargo.toml)). It opens one connection per
 request, as Codex does, and serves clients on port 8317 itself.
 

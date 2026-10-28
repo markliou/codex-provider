@@ -337,7 +337,12 @@ pub fn terminal_failure_class(event_type: &str, code: &str) -> &'static str {
         | "misalignment_policy_violation"
         | "content_policy_violation"
         | "policy_violation"
-        | "invalid_request_error" => "request",
+        | "invalid_request_error"
+        // Codex 0.165 ends the turn on it, in a stream or an HTTP 400/403/404
+        // answer, without retrying (codex-api error.rs
+        // parse_terminal_provider_error, ApiError::ModelNotFound): the model
+        // named in the request does not exist upstream.
+        | "model_not_found" => "request",
         // Recognized, and Codex's to handle: it reconnects on the WebSocket
         // connection limit, resends in full when a previous response is gone,
         // and reports flex unavailability itself. Another account would not do
