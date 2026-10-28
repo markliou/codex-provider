@@ -33,7 +33,7 @@ FROM node:22-bookworm-slim AS codex-cli
 # The bundled Codex CLI signs accounts in and primes quota windows, so it is
 # the pinned Codex release, the same one the pool is built from
 # (upstream/Cargo.toml) and PINNED_CODEX_VERSION names; a test keeps them equal.
-ARG CODEX_CLI_VERSION=0.164.0
+ARG CODEX_CLI_VERSION=0.165.0
 RUN npm install --global @openai/codex@${CODEX_CLI_VERSION}
 
 FROM node:22-bookworm-slim

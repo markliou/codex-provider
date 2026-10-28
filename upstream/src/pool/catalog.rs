@@ -27,7 +27,10 @@ use serde_json::Value;
 /// every client_version. gpt-6-sol and gpt-6-luna shipped on 2026-09-22 and
 /// rank above their gpt-5.6 predecessors, which stay listed until upstream
 /// drops them; there is no gpt-6-terra. gpt-6.1-sol shipped on 2026-09-29 and
-/// ranks just under gpt-6-astra; there is no gpt-6.1-astra. Listing a retired
+/// ranks just under gpt-6-astra; there is no gpt-6.1-astra. gpt-6.1-terra
+/// came with Codex 0.165, whose bundled list (models-manager/models.json)
+/// ranks it between gpt-5.6-sol and gpt-5.6-terra; it is listed from that
+/// file, not yet from upstream's own catalog. Listing a retired
 /// model is worse than omitting it: a client picks it out of this catalog and
 /// every request dies at the gateway, which answers a model it cannot route
 /// with a 5xx that reads as an account failure.
@@ -37,6 +40,7 @@ pub const DEFAULT_CODEX_MODEL_SLUGS: &[&str] = &[
     "gpt-6-sol",
     "gpt-6-luna",
     "gpt-5.6-sol",
+    "gpt-6.1-terra",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.5",
@@ -409,6 +413,7 @@ mod tests {
             "gpt-6-sol",
             "gpt-6-luna",
             "gpt-5.6-sol",
+            "gpt-6.1-terra",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
             "gpt-5.5",
