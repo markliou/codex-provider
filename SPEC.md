@@ -179,6 +179,8 @@ docker run -d \
 | `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | `24h` | Upstream prompt cache retention. Defaults to `24h` (extended retention) to maximize cache hit rate across conversation turns. Set `passthrough` to leave requests untouched, or `in_memory` for the shorter built-in retention. |
 | `CODEX_POOL_PRESERVE_PRO_QUOTA` | no | `false` | Initial default for the admin Console `Use Pro last` switch. Once saved in `/data/config.json`, the Console setting takes precedence. |
 | `CODEX_POOL_UPSTREAM_ENABLED` | no | `false` | The upstream switch (section 2.3.5). Off, the pool sends nothing upstream: no client request, quota poll, token refresh, prime, reset-credit spend or sign-in. Set `true` to let the pool reach upstream. |
+| `CODEX_POOL_CLIENT_MAX_IN_FLIGHT` | no | `16` | Responses one client key may have running at once (section 2.3.6). A positive integer; there is no unlimited. |
+| `CODEX_POOL_CLIENT_MAX_PER_MINUTE` | no | `120` | Requests one client key may start in a minute (section 2.3.6). A positive integer; there is no unlimited. |
 | `CODEX_POOL_QUOTA_PRIME` | no | `true` | Initial default for the admin Console `Prime idle accounts` switch (quota window priming). Once saved in `/data/config.json`, the Console setting takes precedence. |
 | `CODEX_POOL_QUOTA_PRIME_GRACE` | no | random 30–120 min | Test override: a fixed wait (for example `0s`) before an unanchored window is primed. |
 | `CODEX_POOL_LINEAGE_AFFINITY` | no | `true` | Initial default for the admin Console `Keep subagents together` switch (section 6.2.1). Once saved in `/data/config.json`, the Console setting takes precedence. |
@@ -321,6 +323,15 @@ The identity format is Codex's own: `<originator>/<version> (<os> <version>; <ar
 - **The dashboard says so.** A notice says upstream is closed, and its figures are the last the pool had.
 
 `/v1/models`, the dashboard and the admin API keep working: they are answered from the pool's own data. Test pools (the integration scripts and `wire-capture.sh`) set the switch on.
+
+#### 2.3.6 Client limits
+
+The request gate (2.3.4) checks what a request says, never how many arrive. An app stuck in a loop, or one that retries at once on every error, sends requests that each pass the gate, and upstream would see one address flooding it. So each client key is held to two limits before anything reaches upstream (`upstream/src/pool/client_limit.rs`):
+
+- **Running at once** (`CODEX_POOL_CLIENT_MAX_IN_FLIGHT`, default 16): a Responses, compact or Chat request on `/v1`, any request on the native endpoint, and each `response.create` on a Responses WebSocket holds a slot until its response ends. A Codex session runs its main agent and up to six subagents at once (Codex `DEFAULT_AGENT_MAX_THREADS`), so the default leaves room for two full sessions on one key.
+- **Started in a minute** (`CODEX_POOL_CLIENT_MAX_PER_MINUTE`, default 120): each of those requests, and each Responses WebSocket handshake (opening a socket dials upstream), counts in a sliding minute.
+
+Over either limit the client gets `429` with `retry-after` (whole seconds: when the minute frees a slot, or 5 seconds for running requests) and an OpenAI-style error with code `client_rate_limited` and a message saying which limit and what to check. On a socket it is the wrapped error event with `status` 429 and the header in `headers`, and the socket closes. This is the answer a Codex waits on: a 429 that is not a usage limit becomes a retry after the server's delay, within the turn's retry budget (Codex `codex-api/src/api_bridge.rs`, `protocol/src/error.rs` `retry_delay`). Without `retry-after` a Codex treats the 429 as final, so it must not be dropped. The pool logs `client held back before upstream` with the entry, the key's fingerprint and the limit, at most once a minute per key. The limits are counted in memory per process, and neither can be turned off.
 ---
 
 ## 3. Persistent Data Layout

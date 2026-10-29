@@ -340,6 +340,11 @@ pub async fn handle_native(
         super::responses_ws::handle_responses_websocket(app, request, true, writer).await;
         return;
     }
+    // A passthrough is relayed upstream too, so it is held to the key's
+    // limits like a response (client_limit.rs).
+    let Some(_permit) = app.admit_client(&key, "native", writer.as_mut()) else {
+        return;
+    };
     handle_native_passthrough(app, request, rest, writer.as_mut()).await;
 }
 

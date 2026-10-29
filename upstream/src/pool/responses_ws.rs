@@ -159,6 +159,8 @@ struct WsResponse {
     account_id: String,
     warmup: bool,
     finished: AtomicBool,
+    /// The key's slot while this response runs (client_limit.rs).
+    permit: Mutex<Option<super::client_limit::Permit>>,
     /// The fields below belong to the upstream relay. buffered holds the
     /// lifecycle preamble Codex has not been shown yet.
     state: Mutex<ResponseState>,
@@ -328,6 +330,16 @@ pub async fn handle_responses_websocket(
             StatusCode::BAD_REQUEST,
             &refusal.error_body(),
         );
+        return;
+    }
+    // Opening the socket dials upstream, so it counts in the key's minute
+    // (client_limit.rs); each response on it is admitted in start_response.
+    let entry = if native { "native-ws" } else { "v1-ws" };
+    if !app.count_client(
+        &super::server::request_api_key(&request.headers, &request.query),
+        entry,
+        writer.as_mut(),
+    ) {
         return;
     }
     let (client_tx, client_rx) = mpsc::unbounded_channel();
@@ -535,6 +547,22 @@ async fn start_response(
     mut payload: Map<String, Value>,
 ) -> bool {
     let app = &session.app;
+    // Held to the key's limits like an HTTP request (client_limit.rs). The
+    // answer is the wrapped 429 a Codex waits on and retries on a new
+    // socket; nothing of this message reaches upstream.
+    let now = std::time::Instant::now();
+    let permit = match app.client_limits.admit(&session.api_key, now) {
+        Ok(permit) => permit,
+        Err(over) => {
+            let entry = if session.native { "native-ws" } else { "v1-ws" };
+            app.log_client_held(&session.api_key, entry, over, now);
+            if let Ok(text) = serde_json::to_string(&over.websocket_event()) {
+                session.send_client(Frame::Text(Bytes::from(text)));
+            }
+            session.close_client(1013, "too many requests");
+            return false;
+        }
+    };
     let mut requested = payload
         .get("model")
         .and_then(Value::as_str)
@@ -598,6 +626,7 @@ async fn start_response(
         account_id: bound.id,
         warmup,
         finished: AtomicBool::new(false),
+        permit: Mutex::new(Some(permit)),
         state: Mutex::new(ResponseState {
             info: ProxyResponseInfo::default(),
             throughput,
@@ -1111,6 +1140,9 @@ fn finish(
     if response.finished.swap(true, Ordering::SeqCst) {
         return;
     }
+    // The response no longer runs, though the socket may keep it as the
+    // last one until the next.
+    lock(&response.permit).take();
     let app = &session.app;
     if !response.warmup {
         // A prewarm is connection setup, not a model request.

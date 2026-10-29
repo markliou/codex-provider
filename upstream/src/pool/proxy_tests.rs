@@ -2068,13 +2068,23 @@ async fn proxy_client_cancel_does_not_mark_transport_failure() {
 
 /// Go's device-auth slots with `a.codexBaseURL = <server>/backend-api`.
 pub(super) fn codex_app(server_url: &str, slots: &[(&str, &str, i64)]) -> (Arc<App>, TempDir) {
+    codex_app_with(server_url, slots, |_| {})
+}
+
+pub(super) fn codex_app_with(
+    server_url: &str,
+    slots: &[(&str, &str, i64)],
+    configure: impl FnOnce(&mut super::settings::Settings),
+) -> (Arc<App>, TempDir) {
     let accounts = slots
         .iter()
         .map(|(id, upstream, priority)| device_account(id, upstream, *priority))
         .collect();
     let base = format!("{server_url}/backend-api");
-    let (app, dir) =
-        super::testing::test_app_with(accounts, |settings| settings.codex_base_url = base);
+    let (app, dir) = super::testing::test_app_with(accounts, |settings| {
+        settings.codex_base_url = base;
+        configure(settings);
+    });
     for (id, upstream, _) in slots {
         write_codex_device_auth(&app, id, upstream, &format!("{id}@example.test"));
     }
@@ -5891,4 +5901,42 @@ async fn a_closed_upstream_sends_no_call_of_the_pool_s_own() {
         Err(super::login::LoginStartError::UpstreamClosed)
     ));
     assert_eq!(upstream.count(), 0);
+}
+
+// A client key over its minute is held back before upstream, with the 429
+// and retry-after a Codex waits on (client_limit.rs).
+#[tokio::test]
+async fn a_client_over_its_minute_is_held_back_before_upstream() {
+    let upstream = FakeServer::start(|_| FakeResponse::json(200, OK_RESPONSE)).await;
+    let (app, _dir) = codex_app_with(&upstream.url, &[("device", "acct-up", 100)], |settings| {
+        settings.client_max_per_minute = 2;
+    });
+    let (app, logs) = {
+        let app = Arc::try_unwrap(app).unwrap_or_else(|_| panic!("app shared"));
+        let (app, logs) = super::testing::capture_logs(app);
+        (Arc::new(app), logs)
+    };
+    let request = || responses(r#"{"model":"gpt-test","input":"hello"}"#, "limited");
+    for _ in 0..2 {
+        let result = serve(&app, request()).await;
+        assert_eq!(result.code(), 200, "{}", result.body_string());
+    }
+    let held = serve(&app, request()).await;
+    assert_eq!(held.code(), 429, "{}", held.body_string());
+    assert_eq!(error_code(&held), "client_rate_limited");
+    let retry_after: u64 = held.header("retry-after").parse().unwrap_or_default();
+    assert!((1..=60).contains(&retry_after), "retry-after {retry_after}");
+    // The native endpoint counts against the same key.
+    let native = Request::test(Method::GET, "/k/client-key/backend-api/codex/models", "");
+    assert_eq!(serve(&app, native).await.code(), 429);
+    assert_eq!(upstream.count(), 2);
+    let lines = logs
+        .lock()
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_default();
+    assert_eq!(
+        lines.matches("client held back before upstream").count(),
+        1,
+        "{lines}"
+    );
 }

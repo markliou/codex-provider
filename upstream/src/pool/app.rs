@@ -140,6 +140,8 @@ pub struct App {
     /// returned, streams included. The shutdown drain and the deploy script's
     /// idle wait both read it.
     pub in_flight: std::sync::atomic::AtomicI64,
+    /// What each client key may send (client_limit.rs).
+    pub client_limits: Arc<super::client_limit::ClientLimits>,
     /// Which account issued each turn state seen on a socket, so a message
     /// presenting it reaches only that account (responses_ws.rs).
     pub turn_state_issuers: std::sync::Mutex<HashMap<String, (String, Timestamp)>>,
@@ -194,6 +196,10 @@ impl App {
             state,
             jobs: BTreeMap::new(),
         };
+        let client_limits = Arc::new(super::client_limit::ClientLimits::new(
+            settings.client_max_in_flight,
+            settings.client_max_per_minute,
+        ));
         Self {
             settings,
             tuning,
@@ -203,6 +209,7 @@ impl App {
             refused: super::credentials::RefusedCredentials::default(),
             account_activity: std::sync::Mutex::new(HashMap::new()),
             in_flight: std::sync::atomic::AtomicI64::new(0),
+            client_limits,
             turn_state_issuers: std::sync::Mutex::new(HashMap::new()),
             ws_overload_drops: std::sync::Mutex::new(HashMap::new()),
             unrelayed_header_sets: std::sync::Mutex::new(std::collections::HashSet::new()),

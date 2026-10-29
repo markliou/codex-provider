@@ -560,9 +560,16 @@ pub async fn serve_provider(
     app: &Arc<App>,
     request: Request,
     native: bool,
-    writer: Box<dyn ResponseWriter>,
+    mut writer: Box<dyn ResponseWriter>,
     chat: bool,
 ) {
+    // Held to the client key's limits before anything else (client_limit.rs);
+    // the permit is the key's slot until the response ends.
+    let entry = if native { "native" } else { "v1" };
+    let api_key = request_api_key(&request.headers, &request.query);
+    let Some(_permit) = app.admit_client(&api_key, entry, writer.as_mut()) else {
+        return;
+    };
     app.in_flight.fetch_add(1, Ordering::SeqCst);
     let proxy = ProxyRequest {
         path: request.path,

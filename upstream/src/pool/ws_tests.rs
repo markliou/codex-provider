@@ -264,10 +264,19 @@ impl Drop for Pool {
 /// Go wsTestPool: two device accounts whose Codex backend is the fake, served
 /// on a real listener. `prepare` runs before the listener starts.
 async fn ws_test_pool(behavior: Behavior, prepare: impl FnOnce(&App)) -> Pool {
+    ws_test_pool_with(behavior, |_| {}, prepare).await
+}
+
+async fn ws_test_pool_with(
+    behavior: Behavior,
+    configure: impl FnOnce(&mut super::settings::Settings),
+    prepare: impl FnOnce(&App),
+) -> Pool {
     let upstream = FakeCodexUpstream::start(behavior).await;
-    let (app, dir) = codex_app(
+    let (app, dir) = super::proxy_tests::codex_app_with(
         &upstream.url,
         &[("first", "acct-first", 100), ("second", "acct-second", 10)],
+        configure,
     );
     prepare(&app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1249,5 +1258,60 @@ async fn websocket_presents_the_account_installation_id() {
             .unwrap_or_default(),
         id,
         "two accounts share an installation id"
+    );
+}
+
+// A socket counts in its key's minute when it opens and again for each
+// response; over the limit the client gets the wrapped 429 with retry-after a
+// Codex waits on, and nothing of that message reaches upstream
+// (client_limit.rs).
+#[tokio::test]
+async fn responses_websocket_holds_a_client_over_its_minute() {
+    let pool = ws_test_pool_with(
+        Behavior::scripted(|_| completed_events("resp_limited")),
+        |settings| settings.client_max_per_minute = 2,
+        |_| {},
+    )
+    .await;
+    let mut socket = dial_pool(&pool.url).await;
+    let turn = r#"{"type":"response.create","model":"gpt-test","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"tools":[],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"store":false,"stream":true,"include":[]}"#;
+    send(&mut socket, turn).await;
+    let events = read_until_terminal(&mut socket).await;
+    assert!(
+        events
+            .last()
+            .is_some_and(|event| event.contains("response.completed")),
+        "{events:?}"
+    );
+    wait_in_flight_zero(&pool.app).await;
+    send(&mut socket, turn).await;
+    let events = read_until_terminal(&mut socket).await;
+    let held: serde_json::Value =
+        serde_json::from_str(events.last().map_or("", String::as_str)).unwrap_or_default();
+    assert_eq!(held["status"], 429, "{events:?}");
+    assert_eq!(held["error"]["code"], "client_rate_limited");
+    assert!(
+        held["headers"]["retry-after"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(pool.upstream.messages().len(), 1);
+    // A new socket is over the minute too, and is refused before it dials.
+    let refused = dial(
+        &pool.url,
+        &[
+            ("authorization", "Bearer client-key"),
+            ("user-agent", CODEX_EXEC_AGENT),
+            ("originator", "codex_exec"),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(&refused, Err(Some(response)) if response.status() == StatusCode::TOO_MANY_REQUESTS),
+        "{:?}",
+        refused
+            .as_ref()
+            .err()
+            .map(|response| response.as_ref().map(hyper::Response::status))
     );
 }
