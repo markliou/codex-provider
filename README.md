@@ -392,6 +392,8 @@ settings and SPEC.md 2.1 lists them all. The ones most often changed:
 | `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` | `5` | Assumed Business Premium seat size |
 | `CODEX_POOL_PRESERVE_PRO_QUOTA` | `false` | Initial **Use Pro last** setting |
 | `CODEX_POOL_LINEAGE_AFFINITY` | `true` | Initial **Keep subagents together** setting |
+| `CODEX_POOL_CLIENT_MAX_IN_FLIGHT` | `16` | Requests one client key may have running at once; over it the client gets a 429 to retry later (SPEC.md 2.3.6) |
+| `CODEX_POOL_CLIENT_MAX_PER_MINUTE` | `120` | Requests one client key may start in a minute (SPEC.md 2.3.6) |
 | `CODEX_POOL_QUOTA_PRIME` | `true` | Initial **Prime idle accounts** setting |
 | `CODEX_POOL_SHUTDOWN_GRACE` | `120s` | Drain time on stop (keep `stop_grace_period` above it) |
 

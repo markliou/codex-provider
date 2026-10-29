@@ -60,6 +60,11 @@ pub struct Settings {
     /// CODEX_POOL_UPSTREAM_ENABLED: whether the pool may reach upstream at
     /// all. Off by default (SPEC.md, upstream switch).
     pub upstream_enabled: bool,
+    /// CODEX_POOL_CLIENT_MAX_IN_FLIGHT and CODEX_POOL_CLIENT_MAX_PER_MINUTE:
+    /// what one client key may run at once and start in a minute
+    /// (client_limit.rs).
+    pub client_max_in_flight: usize,
+    pub client_max_per_minute: usize,
     /// Codex's token endpoint and OAuth client (CODEX_REFRESH_TOKEN_URL_OVERRIDE
     /// and CODEX_APP_SERVER_LOGIN_CLIENT_ID, the variables Codex itself reads).
     pub refresh_url: String,
@@ -135,6 +140,9 @@ impl Settings {
             quota_prime: false,
             quota_prime_grace: Some(Duration::ZERO),
             upstream_enabled: true,
+            // Out of the way of tests that are not about the limits.
+            client_max_in_flight: 1_000,
+            client_max_per_minute: 100_000,
             refresh_url: CODEX_REFRESH_URL_DEFAULT.to_string(),
             oauth_client_id: CODEX_OAUTH_CLIENT_ID_DEFAULT.to_string(),
             usage_url: String::new(),
@@ -253,6 +261,16 @@ impl Settings {
         // were revoked: a pool started without it sends nothing upstream, not
         // a quota poll, a prime, a token refresh, a login or a client's
         // request, until the operator opts in (SPEC.md, upstream switch).
+        let client_max_in_flight = client_limit(
+            &get("CODEX_POOL_CLIENT_MAX_IN_FLIGHT"),
+            "CODEX_POOL_CLIENT_MAX_IN_FLIGHT",
+            super::client_limit::DEFAULT_MAX_IN_FLIGHT,
+        )?;
+        let client_max_per_minute = client_limit(
+            &get("CODEX_POOL_CLIENT_MAX_PER_MINUTE"),
+            "CODEX_POOL_CLIENT_MAX_PER_MINUTE",
+            super::client_limit::DEFAULT_MAX_PER_MINUTE,
+        )?;
         let upstream_enabled = bool_from_env(
             &get("CODEX_POOL_UPSTREAM_ENABLED"),
             "CODEX_POOL_UPSTREAM_ENABLED",
@@ -298,6 +316,8 @@ impl Settings {
             quota_prime,
             quota_prime_grace,
             upstream_enabled,
+            client_max_in_flight,
+            client_max_per_minute,
             refresh_url: env_or(
                 &get("CODEX_REFRESH_TOKEN_URL_OVERRIDE"),
                 CODEX_REFRESH_URL_DEFAULT,
@@ -450,6 +470,19 @@ pub fn session_affinity_ttl(raw: &str) -> Result<TimeDelta, String> {
                 .to_string(),
         ),
     }
+}
+
+/// A client limit is a positive count: there is no "unlimited", since the
+/// limit is what keeps a looping app from flooding upstream.
+pub fn client_limit(raw: &str, name: &str, fallback: usize) -> Result<usize, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(fallback);
+    }
+    raw.parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{name} must be a positive integer"))
 }
 
 pub fn max_retry_accounts(raw: &str) -> Result<usize, String> {
@@ -685,6 +718,10 @@ mod tests {
         assert!(!settings.preserve_pro_quota);
         // The upstream switch is the one that defaults off.
         assert!(!settings.upstream_enabled);
+        assert_eq!(settings.client_max_in_flight, 16);
+        assert_eq!(settings.client_max_per_minute, 120);
+        assert_eq!(client_limit("8", "X", 1), Ok(8));
+        assert!(client_limit("0", "X", 1).is_err());
         assert_eq!(settings.routing_strategy, ROUTING_STRATEGY_BALANCED);
         assert_eq!(
             bool_from_env("false", "CODEX_POOL_LINEAGE_AFFINITY", true),
