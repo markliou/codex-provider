@@ -5804,3 +5804,91 @@ async fn a_chat_request_is_completed_into_a_codex_request() {
     assert_eq!(payload["stream"], true);
     assert!(!body.contains("my-app"), "{body}");
 }
+
+// The upstream switch off (SPEC.md, upstream switch): nothing reaches
+// upstream, whichever way it would have gone.
+fn closed_codex_app(server_url: &str) -> (Arc<App>, TempDir) {
+    let base = format!("{server_url}/backend-api");
+    let (app, dir) =
+        super::testing::test_app_with(vec![device_account("device", "acct-up", 100)], |settings| {
+            settings.codex_base_url = base;
+            settings.upstream_enabled = false;
+        });
+    write_codex_device_auth(&app, "device", "acct-up", "device@example.test");
+    (Arc::new(app), dir)
+}
+
+fn error_code(result: &Recorded) -> String {
+    let body: serde_json::Value = serde_json::from_str(&result.body_string()).unwrap_or_default();
+    body["error"]["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_closed_upstream_refuses_every_client_entry() {
+    let upstream = FakeServer::start(|_| app_upstream_answer()).await;
+    let (app, _dir) = closed_codex_app(&upstream.url);
+    let native = |method: Method, rest: &str, body: &str| {
+        Request::test(
+            method,
+            &format!("/k/client-key/backend-api/codex/{rest}"),
+            body,
+        )
+    };
+    for request in [
+        responses(r#"{"model":"gpt-test","input":"hi"}"#, ""),
+        post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-test","input":[]}"#,
+        ),
+        post(
+            "/v1/chat/completions",
+            r#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        Request::test(Method::GET, "/v1/responses", "")
+            .with_header("authorization", "Bearer client-key"),
+        native(
+            Method::POST,
+            "responses",
+            r#"{"model":"gpt-test","input":[]}"#,
+        ),
+        native(Method::GET, "models", ""),
+    ] {
+        let target = request.path.clone();
+        let result = serve(&app, request).await;
+        assert_eq!(result.code(), 400, "{target}: {}", result.body_string());
+        assert_eq!(error_code(&result), "upstream_closed", "{target}");
+    }
+    // A wrong key still learns nothing about the pool.
+    let stranger = Request::test(Method::POST, "/v1/responses", "{}")
+        .with_header("authorization", "Bearer wrong-key");
+    assert_eq!(serve(&app, stranger).await.code(), 401);
+    let stranger = Request::test(
+        Method::POST,
+        "/k/wrong-key/backend-api/codex/responses",
+        "{}",
+    );
+    assert_eq!(serve(&app, stranger).await.code(), 401);
+    assert_eq!(upstream.count(), 0);
+}
+
+#[tokio::test]
+async fn a_closed_upstream_sends_no_call_of_the_pool_s_own() {
+    let upstream = FakeServer::start(|_| FakeResponse::json(200, "{}")).await;
+    let (app, _dir) = closed_codex_app(&upstream.url);
+    let item = account(&app, 0);
+    // The quota poll has no check of its own: the transport refuses it.
+    app.poll_account_quota(&item).await;
+    let primed = app.send_quota_prime_request(&item, "gpt-test").await;
+    assert!(
+        primed.is_err_and(|error| error.contains("CODEX_POOL_UPSTREAM_ENABLED")),
+        "a prime was not refused"
+    );
+    assert!(matches!(
+        app.start_login_job("device"),
+        Err(super::login::LoginStartError::UpstreamClosed)
+    ));
+    assert_eq!(upstream.count(), 0);
+}

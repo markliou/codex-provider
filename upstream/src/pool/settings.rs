@@ -57,6 +57,9 @@ pub struct Settings {
     /// CODEX_POOL_QUOTA_PRIME_GRACE: a fixed grace for tests; None draws one
     /// at random (codex_prime.go, quota prime grace).
     pub quota_prime_grace: Option<Duration>,
+    /// CODEX_POOL_UPSTREAM_ENABLED: whether the pool may reach upstream at
+    /// all. Off by default (SPEC.md, upstream switch).
+    pub upstream_enabled: bool,
     /// Codex's token endpoint and OAuth client (CODEX_REFRESH_TOKEN_URL_OVERRIDE
     /// and CODEX_APP_SERVER_LOGIN_CLIENT_ID, the variables Codex itself reads).
     pub refresh_url: String,
@@ -131,6 +134,7 @@ impl Settings {
             lineage_affinity: true,
             quota_prime: false,
             quota_prime_grace: Some(Duration::ZERO),
+            upstream_enabled: true,
             refresh_url: CODEX_REFRESH_URL_DEFAULT.to_string(),
             oauth_client_id: CODEX_OAUTH_CLIENT_ID_DEFAULT.to_string(),
             usage_url: String::new(),
@@ -245,6 +249,15 @@ impl Settings {
             true,
         )?;
         let quota_prime_grace = quota_prime_grace(&get("CODEX_POOL_QUOTA_PRIME_GRACE"))?;
+        // The upstream switch defaults off, the owner's choice after accounts
+        // were revoked: a pool started without it sends nothing upstream, not
+        // a quota poll, a prime, a token refresh, a login or a client's
+        // request, until the operator opts in (SPEC.md, upstream switch).
+        let upstream_enabled = bool_from_env(
+            &get("CODEX_POOL_UPSTREAM_ENABLED"),
+            "CODEX_POOL_UPSTREAM_ENABLED",
+            false,
+        )?;
         // Product contract: the combined-port root is a public control page,
         // while management actions require password auth. A previous hardening
         // pass flipped this default and broke the expected landing page, so
@@ -284,6 +297,7 @@ impl Settings {
             lineage_affinity,
             quota_prime,
             quota_prime_grace,
+            upstream_enabled,
             refresh_url: env_or(
                 &get("CODEX_REFRESH_TOKEN_URL_OVERRIDE"),
                 CODEX_REFRESH_URL_DEFAULT,
@@ -669,6 +683,8 @@ mod tests {
         let settings = settings.unwrap_or_else(|error| panic!("{error}"));
         assert!(settings.lineage_affinity && settings.quota_prime && settings.public_dashboard);
         assert!(!settings.preserve_pro_quota);
+        // The upstream switch is the one that defaults off.
+        assert!(!settings.upstream_enabled);
         assert_eq!(settings.routing_strategy, ROUTING_STRATEGY_BALANCED);
         assert_eq!(
             bool_from_env("false", "CODEX_POOL_LINEAGE_AFFINITY", true),

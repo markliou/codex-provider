@@ -1007,6 +1007,7 @@ impl Inner {
             "preserveProQuota": self.preserve_pro_quota,
             "lineageAffinity": self.lineage_affinity,
             "quotaPrime": self.quota_prime,
+            "upstreamEnabled": self.settings.upstream_enabled,
             "promptCacheKeyMode": or_default(&self.settings.prompt_cache_key_mode, "auto"),
             "promptCacheKeyScope": or_default(&self.settings.prompt_cache_key_scope, "auto"),
             "promptCacheKeyPolicy": or_default(&self.settings.prompt_cache_key_policy, "preserve"),
@@ -1048,6 +1049,7 @@ impl Inner {
             "accounts": accounts,
             "promptCacheWindow": self.prompt_cache_window(),
             "throughput": self.throughput_snapshot("", now),
+            "upstreamEnabled": self.settings.upstream_enabled,
         })
     }
 }

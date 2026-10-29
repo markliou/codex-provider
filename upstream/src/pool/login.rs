@@ -37,6 +37,9 @@ pub enum LoginStartError {
     RepairIdentityMismatch,
     Storage(String),
     AccountGone,
+    /// The upstream switch is off: a sign-in is the bundled Codex talking to
+    /// OpenAI, so it is not started (SPEC.md, upstream switch).
+    UpstreamClosed,
 }
 
 impl std::fmt::Display for LoginStartError {
@@ -50,6 +53,7 @@ impl std::fmt::Display for LoginStartError {
             }
             Self::Storage(detail) => write!(f, "persist pending auth verification: {detail}"),
             Self::AccountGone => f.write_str("account no longer exists"),
+            Self::UpstreamClosed => f.write_str(crate::transport::UPSTREAM_CLOSED),
         }
     }
 }
@@ -452,6 +456,9 @@ impl App {
         account_id: &str,
         public_repair: bool,
     ) -> Result<LoginJob, LoginStartError> {
+        if !self.settings.upstream_enabled {
+            return Err(LoginStartError::UpstreamClosed);
+        }
         let mut inner = self.write();
         let item = inner
             .account(account_id)

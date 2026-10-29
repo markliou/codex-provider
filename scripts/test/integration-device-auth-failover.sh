@@ -52,6 +52,7 @@ docker run -d --name "$POOL" --network "$NETWORK" --network-alias codex-pool -v 
   -e CODEX_POOL_CODEX_BASE_URL=http://codex-mock:4010/backend-api \
   -e CODEX_POOL_ADDR=0.0.0.0:8317 \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
+  -e CODEX_POOL_UPSTREAM_ENABLED=true \
   "$POOL_IMAGE" >/dev/null
 
 docker run --rm --network "$NETWORK" --entrypoint node "$POOL_IMAGE" -e '

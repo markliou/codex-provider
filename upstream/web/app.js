@@ -659,7 +659,14 @@
     $("#cache-window-reset").hidden = state.mode !== "management";
   }
 
+  // Missing means an older server, which had no switch and was always open.
+  function renderUpstreamClosed(upstreamEnabled) {
+    const notice = $("#upstream-closed-notice");
+    if (notice) notice.hidden = upstreamEnabled !== false;
+  }
+
   function renderSettings(serviceState) {
+    renderUpstreamClosed(serviceState?.upstreamEnabled);
     const preserveSwitch = $("#preserve-pro-quota-switch");
     if (preserveSwitch) {
       preserveSwitch.checked = Boolean(serviceState?.preserveProQuota);
@@ -1250,6 +1257,7 @@
       if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
       const accounts = body.dashboard.accounts || [];
       state.quotaFloorPercent = finiteMetric(body.dashboard.quotaFloorPercent) ?? 0;
+      renderUpstreamClosed(body.dashboard.upstreamEnabled);
       renderSummary(body.dashboard.summary || {}, true);
       renderPoolCapacity(body.dashboard.poolCapacity);
       renderThroughput(body.dashboard.throughput);
