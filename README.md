@@ -56,7 +56,8 @@ The full product contract is [SPEC.md](SPEC.md); repository rules are in
 3. Copy [.env.example](.env.example) to `.env` and set at least
    `CODEX_POOL_API_KEY` (a long random client key) and
    `CODEX_POOL_ADMIN_PASSWORD_HASH` (the `pbkdf2-sha256:...` value above).
-   Never commit `.env`.
+   The pool sends nothing upstream until `CODEX_POOL_UPSTREAM_ENABLED=true`
+   is set too. Never commit `.env`.
 
 4. Create the volume once and deploy:
 
@@ -382,6 +383,7 @@ settings and SPEC.md 2.1 lists them all. The ones most often changed:
 |---|---|---|
 | `CODEX_POOL_API_KEY` | (required) | Client key for `/v1`, `/healthz` and the native endpoint path |
 | `CODEX_POOL_ADMIN_PASSWORD_HASH` | (required) | Output of `hash-password` |
+| `CODEX_POOL_UPSTREAM_ENABLED` | `false` | Off, the pool sends nothing upstream and clients get an error; set `true` to let it reach upstream (SPEC.md 2.3.5) |
 | `CODEX_POOL_DEFAULT_MODEL` | `gpt-6.1-sol(xhigh)` | Model when a request names none |
 | `CODEX_POOL_TRUSTED_PROXIES` | none | Reverse proxy addresses/CIDRs |
 | `CODEX_POOL_SESSION_AFFINITY_TTL_MS` | `86400000` | Idle time after which a conversation's binding expires |

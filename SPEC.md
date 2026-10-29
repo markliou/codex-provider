@@ -178,6 +178,7 @@ docker run -d \
 | `CODEX_POOL_PROMPT_CACHE_BUCKETS` | no | `4` | Number of buckets (1–256) a coarse cache key is split across, keyed by the stable per-conversation routing key, to stay under OpenAI's ~15 RPM-per-(prefix+key) cache-routing limit. Raise for hot pools; set `1` to maximize sharing. |
 | `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | `24h` | Upstream prompt cache retention. Defaults to `24h` (extended retention) to maximize cache hit rate across conversation turns. Set `passthrough` to leave requests untouched, or `in_memory` for the shorter built-in retention. |
 | `CODEX_POOL_PRESERVE_PRO_QUOTA` | no | `false` | Initial default for the admin Console `Use Pro last` switch. Once saved in `/data/config.json`, the Console setting takes precedence. |
+| `CODEX_POOL_UPSTREAM_ENABLED` | no | `false` | The upstream switch (section 2.3.5). Off, the pool sends nothing upstream: no client request, quota poll, token refresh, prime, reset-credit spend or sign-in. Set `true` to let the pool reach upstream. |
 | `CODEX_POOL_QUOTA_PRIME` | no | `true` | Initial default for the admin Console `Prime idle accounts` switch (quota window priming). Once saved in `/data/config.json`, the Console setting takes precedence. |
 | `CODEX_POOL_QUOTA_PRIME_GRACE` | no | random 30–120 min | Test override: a fixed wait (for example `0s`) before an unanchored window is primed. |
 | `CODEX_POOL_LINEAGE_AFFINITY` | no | `true` | Initial default for the admin Console `Keep subagents together` switch (section 6.2.1). Once saved in `/data/config.json`, the Console setting takes precedence. |
@@ -308,6 +309,18 @@ In-house apps other than Codex share the pool, and every request the pool sends 
 - **Chat Completions.** `/v1/chat/completions` is checked for what its bridge cannot carry (sampling settings, output caps, tools and tool messages, `response_format`, audio, non-text parts), then converted (`reasoning_effort` and `verbosity` included) and completed like a `/v1` request.
 
 The identity format is Codex's own: `<originator>/<version> (<os> <version>; <arch>)`, then the terminal and an optional suffix, with the `originator` header naming the same product (`login/src/auth/default_client.rs`). Passing it says nothing about who the client is; it guarantees that nothing in those headers names an app.
+
+#### 2.3.5 Upstream switch
+
+`CODEX_POOL_UPSTREAM_ENABLED` decides whether the pool may reach upstream at all, and it defaults off. The owner chose this after accounts were revoked: a pool that is started, redeployed or restored must not send anything to OpenAI until the operator opts in. While it is off:
+
+- **No background calls.** The quota poll is not started, so there is no quota request, token refresh or prime (`upstream/src/pool/serve.rs`).
+- **Clients are refused.** After a valid key, `/v1/responses` (HTTP and WebSocket), `/v1/responses/compact`, `/v1/chat/completions` and every path under the native endpoint are answered `400` with code `upstream_closed` and a message saying the pool is closed. A Codex does not retry a `400`, so the turn stops at once instead of retrying. A wrong key still gets `401`.
+- **The owner's actions are refused.** Sign-in, quota refresh (one or all) and reset-credit spend answer `503` with the same code. Sign-in is the bundled Codex talking to OpenAI, and priming runs it too, so both check the switch themselves.
+- **A backstop.** The transport every upstream request and socket passes through refuses to send (`upstream/src/transport.rs`, `Transports::with_upstream`), so a path that forgets to check the switch still sends nothing.
+- **The dashboard says so.** A notice says upstream is closed, and its figures are the last the pool had.
+
+`/v1/models`, the dashboard and the admin API keep working: they are answered from the pool's own data. Test pools (the integration scripts and `wire-capture.sh`) set the switch on.
 ---
 
 ## 3. Persistent Data Layout

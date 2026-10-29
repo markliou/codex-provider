@@ -246,6 +246,7 @@ impl App {
         let _ = std::fs::create_dir_all(data_dir.join("state"));
         let mut settings = Settings::for_test(data_dir.to_path_buf());
         configure(&mut settings);
+        let upstream_enabled = settings.upstream_enabled;
         Self::new(
             settings,
             tuning,
@@ -254,7 +255,8 @@ impl App {
             Logger::discard(),
             Arc::new(
                 crate::transport::Transports::new()
-                    .unwrap_or_else(|error| panic!("Codex transport: {error}")),
+                    .unwrap_or_else(|error| panic!("Codex transport: {error}"))
+                    .with_upstream(upstream_enabled),
             ),
         )
     }

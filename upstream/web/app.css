@@ -360,6 +360,7 @@ input:focus, select:focus { border-color: var(--accent-hot); box-shadow: 0 0 0 4
 .full { width: 100%; margin-top: 22px; }
 
 /* Hero: the page heading becomes a bright banner with the operator controls. */
+.upstream-closed-notice { margin: 0 0 20px; padding: 14px 18px; color: var(--red); background: var(--red-bg); border: 1px solid var(--red); border-radius: 18px; font-weight: 600; }
 .page-heading, .section-heading, .dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .page-heading { position: relative; align-items: center; flex-wrap: wrap; margin-bottom: 20px; padding: 26px 28px; overflow: hidden; color: var(--hero-ink); background: var(--hero-bg); border-radius: 30px; box-shadow: 0 22px 46px color-mix(in srgb, var(--primary-start) 30%, transparent); }
 .page-heading::before, .page-heading::after { content: ""; position: absolute; border-radius: 50%; background: rgba(255, 255, 255, .18); pointer-events: none; }

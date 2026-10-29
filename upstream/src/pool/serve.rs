@@ -29,7 +29,9 @@ pub async fn run() -> Result<(), String> {
     // the log is also kept under /data, which outlives the container.
     let logger = Logger::production(&settings.data_dir);
     let transports = Arc::new(
-        crate::transport::Transports::new().map_err(|error| format!("codex transport: {error}"))?,
+        crate::transport::Transports::new()
+            .map_err(|error| format!("codex transport: {error}"))?
+            .with_upstream(settings.upstream_enabled),
     );
     let app = Arc::new(App::load(settings, tuning, logger, transports, env)?);
     let listener = bind(&app.settings.listen_address)
@@ -39,8 +41,17 @@ pub async fn run() -> Result<(), String> {
         "provider API and control UI listening on {}",
         app.settings.listen_address
     ));
-    // Never stopped: like Go's, the poll ends with the process.
-    let _poll = app.start_quota_refresher(Cancel::default());
+    // Never stopped: like Go's, the poll ends with the process. With the
+    // upstream switch off there is no poll at all, so no quota request, no
+    // token refresh and no prime leaves the pool (SPEC.md, upstream switch).
+    let _poll = if app.settings.upstream_enabled {
+        Some(app.start_quota_refresher(Cancel::default()))
+    } else {
+        app.logger.printf(
+            "upstream is closed (CODEX_POOL_UPSTREAM_ENABLED is off): nothing is sent upstream",
+        );
+        None
+    };
     let served = app.clone();
     serve_until_stopped(
         &app,

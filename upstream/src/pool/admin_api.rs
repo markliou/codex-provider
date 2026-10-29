@@ -17,6 +17,7 @@ use super::http_io::header_value;
 use super::http_io::set_header;
 use super::http_io::write_json;
 use super::http_io::write_openai_error;
+use super::http_io::write_upstream_closed;
 use super::login::LoginStartError;
 use super::login::public_repair_job;
 use super::plan;
@@ -532,6 +533,9 @@ pub fn handle_public_account_action(
                         "another sign-in is already in progress",
                     );
                 }
+                Err(LoginStartError::UpstreamClosed) => {
+                    write_upstream_closed(writer, StatusCode::SERVICE_UNAVAILABLE)
+                }
                 Err(LoginStartError::RepairIdentityMismatch) => {
                     write_openai_error(
                         writer,
@@ -855,6 +859,9 @@ pub fn quota_refresh_fields(snapshot: &super::state::QuotaSnapshot) -> serde_jso
 }
 
 pub async fn handle_refresh_all_quota(app: &App, writer: &mut dyn ResponseWriter) {
+    if !app.settings.upstream_enabled {
+        return write_upstream_closed(writer, StatusCode::SERVICE_UNAVAILABLE);
+    }
     let mut results = Vec::new();
     for item in app.quota_poll_accounts() {
         // Refresh-all leaves out an account whose tokens upstream refused, as
@@ -1012,6 +1019,11 @@ pub async fn handle_account_action(
         );
         return;
     };
+    // These ask upstream; with the upstream switch off they are refused
+    // here, before the transport would fail them (SPEC.md, upstream switch).
+    if matches!(action, "quota/reset-credit" | "quota/refresh") && !app.settings.upstream_enabled {
+        return write_upstream_closed(writer, StatusCode::SERVICE_UNAVAILABLE);
+    }
     match action {
         "quota/reset-credit" => {
             return super::reset_credit::handle_reset_credit(app, id, writer).await;
@@ -1041,6 +1053,9 @@ pub async fn handle_account_action(
                         "login_in_progress",
                         &LoginStartError::AnotherJobInProgress.to_string(),
                     );
+                }
+                Err(LoginStartError::UpstreamClosed) => {
+                    write_upstream_closed(writer, StatusCode::SERVICE_UNAVAILABLE)
                 }
                 Err(_) => write_storage_error(writer, "unable to persist sign-in repair state"),
             }

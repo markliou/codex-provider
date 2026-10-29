@@ -290,6 +290,12 @@ pub async fn handle_native(
         );
         return;
     }
+    // Every native path is relayed upstream, so with the upstream switch off
+    // none is (SPEC.md, upstream switch).
+    if !app.settings.upstream_enabled {
+        super::http_io::write_upstream_closed(writer.as_mut(), StatusCode::BAD_REQUEST);
+        return;
+    }
     app.note_unrelayed_native_headers(&request.headers);
     request.headers.remove("authorization");
     request.headers.remove("chatgpt-account-id");

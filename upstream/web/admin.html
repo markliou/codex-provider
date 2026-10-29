@@ -81,7 +81,7 @@
               </label>
               <!-- On by default. A prime is a request no native Codex sends, made
                    only to start an idle account's quota window early, and only
-                   after the window's user had 5 to 30 minutes to start it. -->
+                   after the window's user had 30 to 120 minutes to start it. -->
               <label class="switch-row" for="quota-prime-switch" title="Send one small request to start an idle account's quota window">
                 <span class="switch-label">Prime idle accounts</span>
                 <input id="quota-prime-switch" type="checkbox" role="switch">
@@ -90,6 +90,11 @@
               <button id="add-account-button" class="button primary" type="button">Add account</button>
             </div>
           </header>
+
+          <!-- Shown while the upstream switch is off (SPEC.md, upstream
+               switch): the pool then sends nothing upstream, so every figure
+               below is the last one it had. -->
+          <p id="upstream-closed-notice" class="upstream-closed-notice" role="status" hidden>Upstream is closed: this pool sends nothing to OpenAI, and clients get an error.</p>
 
           <section id="summary-grid" class="summary-grid" aria-label="Pool summary"></section>
 

@@ -78,6 +78,20 @@ pub fn write_openai_error(
     );
 }
 
+/// The answer to anything that would reach upstream while the upstream
+/// switch is off (SPEC.md, upstream switch). A client's request gets a 400,
+/// which a Codex does not retry, so the turn stops at once with this message
+/// instead of retrying a 5xx against a pool that will not send it; the
+/// owner's actions get a 503.
+pub fn write_upstream_closed(writer: &mut dyn ResponseWriter, status: StatusCode) {
+    write_openai_error(
+        writer,
+        status,
+        "upstream_closed",
+        "This pool is not sending anything to OpenAI right now: its owner has closed upstream (CODEX_POOL_UPSTREAM_ENABLED). Use Codex with your own sign-in instead.",
+    );
+}
+
 /// Go writeStreamingBytes: write, then flush.
 pub fn write_streaming_bytes(writer: &mut dyn ResponseWriter, data: &[u8]) {
     if !data.is_empty() {

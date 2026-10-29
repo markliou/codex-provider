@@ -144,7 +144,14 @@ pub struct Transports {
     // Codex's default factory (transport default proxy, no PSP cookie), from
     // which each WebSocket connection gets its own connector.
     factory: HttpClientFactory,
+    // The upstream switch, off (SPEC.md, upstream switch). Every request and
+    // socket the pool opens passes through here, so this is the backstop
+    // that holds even if a caller forgets to check the switch first.
+    closed: bool,
 }
+
+/// Why a send was refused while the upstream switch is off.
+pub const UPSTREAM_CLOSED: &str = "upstream is closed on this pool (CODEX_POOL_UPSTREAM_ENABLED)";
 
 impl Transports {
     pub fn new() -> std::io::Result<Self> {
@@ -152,7 +159,20 @@ impl Transports {
         // Fail at startup, not on the first socket, if Codex's TLS setup
         // (native roots, custom CA) cannot be built.
         WebSocketConnector::new(&factory).map_err(std::io::Error::other)?;
-        Ok(Self { factory })
+        Ok(Self {
+            factory,
+            closed: false,
+        })
+    }
+
+    /// The same transports, refusing every send unless upstream is enabled.
+    pub fn with_upstream(mut self, enabled: bool) -> Self {
+        self.closed = !enabled;
+        self
+    }
+
+    pub fn closed(&self) -> bool {
+        self.closed
     }
 
     // A new connector per connection, as Codex builds one in every
@@ -432,6 +452,9 @@ pub async fn send_request(
     codex_request: CodexRequest,
     after: &HeaderMap,
 ) -> Result<UpstreamResponse, SendFailure> {
+    if transports.closed {
+        return Err(SendFailure::Prepare(UPSTREAM_CLOSED.to_string()));
+    }
     let mut prepared = codex_request
         .into_prepared()
         .map_err(|error| SendFailure::Prepare(format!("prepare request: {error}")))?;
@@ -503,6 +526,9 @@ pub async fn connect_websocket(
     headers: &HeaderMap,
 ) -> Result<(UpstreamSocket, HeaderMap), WebSocketRefusal> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    if transports.closed {
+        return Err(WebSocketRefusal::Connection(UPSTREAM_CLOSED.to_string()));
+    }
     let mut request = url
         .into_client_request()
         .map_err(|error| WebSocketRefusal::Connection(format!("upstream url: {error}")))?;
