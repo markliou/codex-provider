@@ -246,15 +246,15 @@ impl Settings {
             "CODEX_POOL_LINEAGE_AFFINITY",
             true,
         )?;
-        // Quota priming defaults on, the owner's choice: an idle account's
-        // window should start counting so its quota cycles back. A prime is a
-        // request no native Codex sends, so it waits a random 30 to 120 minutes
-        // for a real request to start the window first, and the Console switch
-        // turns it off (SPEC.md, quota window priming).
+        // Quota priming defaults off, the owner's choice (2026-11-01): a prime
+        // is a model request no person sent, real work for upstream, so it runs
+        // only when the owner turns the Console switch on. On, it still waits a
+        // random 30 to 120 minutes for a real request to start the window first
+        // (SPEC.md, quota window priming).
         let quota_prime = bool_from_env(
             &get("CODEX_POOL_QUOTA_PRIME"),
             "CODEX_POOL_QUOTA_PRIME",
-            true,
+            false,
         )?;
         let quota_prime_grace = quota_prime_grace(&get("CODEX_POOL_QUOTA_PRIME_GRACE"))?;
         // The upstream switch defaults off, the owner's choice after accounts
@@ -705,18 +705,19 @@ mod tests {
         assert!(routing_strategy("round_robin").is_err());
     }
 
-    // Go TestLineageAffinityDefaultsOnAndEnvCanDisable, TestQuotaPrimeDefaultsOn.
+    // Go TestLineageAffinityDefaultsOnAndEnvCanDisable; priming now defaults off.
     #[test]
-    fn switches_default_on() {
+    fn switch_defaults() {
         let settings = Settings::from_env(env(&[
             ("CODEX_POOL_API_KEY", "client-key"),
             ("CODEX_POOL_ADMIN_PASSWORD_HASH", &admin_hash()),
             ("CODEX_POOL_ADDR", "127.0.0.1:8317"),
         ]));
         let settings = settings.unwrap_or_else(|error| panic!("{error}"));
-        assert!(settings.lineage_affinity && settings.quota_prime && settings.public_dashboard);
+        assert!(settings.lineage_affinity && settings.public_dashboard);
         assert!(!settings.preserve_pro_quota);
-        // The upstream switch is the one that defaults off.
+        // Priming and the upstream switch default off.
+        assert!(!settings.quota_prime);
         assert!(!settings.upstream_enabled);
         assert_eq!(settings.client_max_in_flight, 16);
         assert_eq!(settings.client_max_per_minute, 120);

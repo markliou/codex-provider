@@ -680,8 +680,8 @@
     }
     const primeSwitch = $("#quota-prime-switch");
     if (primeSwitch) {
-      // Missing means an older server; the product default is on.
-      primeSwitch.checked = serviceState?.quotaPrime !== false;
+      // Missing means an older server; the product default is off.
+      primeSwitch.checked = serviceState?.quotaPrime === true;
       primeSwitch.disabled = false;
     }
     const routingPill = $("#routing-strategy-pill");
@@ -1405,7 +1405,7 @@
   };
   const updatePreserveProQuota = updateSetting("preserveProQuota", false);
   const updateLineageAffinity = updateSetting("lineageAffinity", true);
-  const updateQuotaPrime = updateSetting("quotaPrime", true);
+  const updateQuotaPrime = updateSetting("quotaPrime", false);
 
   async function watchLoginJob(jobId) {
     let attempts = 0;
