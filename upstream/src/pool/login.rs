@@ -456,7 +456,7 @@ impl App {
         account_id: &str,
         public_repair: bool,
     ) -> Result<LoginJob, LoginStartError> {
-        if !self.settings.upstream_enabled {
+        if !self.upstream_enabled() {
             return Err(LoginStartError::UpstreamClosed);
         }
         let mut inner = self.write();

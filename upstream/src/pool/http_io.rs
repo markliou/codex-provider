@@ -84,13 +84,12 @@ pub fn write_openai_error(
 /// instead of retrying a 5xx against a pool that will not send it; the
 /// owner's actions get a 503.
 pub fn write_upstream_closed(writer: &mut dyn ResponseWriter, status: StatusCode) {
-    write_openai_error(
-        writer,
-        status,
-        "upstream_closed",
-        "This pool is not sending anything to OpenAI right now: its owner has closed upstream (CODEX_POOL_UPSTREAM_ENABLED). Use Codex with your own sign-in instead.",
-    );
+    write_openai_error(writer, status, "upstream_closed", UPSTREAM_CLOSED_MESSAGE);
 }
+
+/// What a client is told while the upstream switch is off, on HTTP and on a
+/// Responses WebSocket alike.
+pub const UPSTREAM_CLOSED_MESSAGE: &str = "This pool is not sending anything to OpenAI right now: its owner has turned the upstream switch off. Use Codex with your own sign-in instead.";
 
 /// Go writeStreamingBytes: write, then flush.
 pub fn write_streaming_bytes(writer: &mut dyn ResponseWriter, data: &[u8]) {

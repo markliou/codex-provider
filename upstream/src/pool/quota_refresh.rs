@@ -601,6 +601,16 @@ impl App {
                     / f64::from(u32::MAX)
             });
             loop {
+                // The upstream switch off: nothing is polled, refreshed or
+                // primed until the owner opens it again (SPEC.md, upstream
+                // switch). The schedule keeps its due times, so accounts are
+                // polled as soon as upstream is open.
+                if !app.upstream_enabled() {
+                    if !stop.sleep(std::time::Duration::from_secs(5)).await {
+                        return;
+                    }
+                    continue;
+                }
                 let accounts = app.quota_poll_accounts();
                 let ids: Vec<String> = accounts.iter().map(|item| item.id.clone()).collect();
                 let (instant, now) = (std::time::Instant::now(), Timestamp::now());

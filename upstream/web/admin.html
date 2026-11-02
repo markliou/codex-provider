@@ -92,6 +92,23 @@
             </div>
           </header>
 
+          <!-- The upstream switch (SPEC.md, upstream switch): the one control
+               that decides whether anything leaves this pool for OpenAI. Large
+               and colored on purpose, the owner's choice, so its state is never
+               missed; flipping it asks first and takes effect at once. -->
+          <section id="upstream-switch-card" class="upstream-switch-card management-only" aria-label="Upstream switch" hidden>
+            <div class="upstream-switch-copy">
+              <div class="eyebrow">UPSTREAM</div>
+              <strong id="upstream-switch-state">Closed</strong>
+              <span id="upstream-switch-detail">Nothing is sent to OpenAI: no client request, quota poll, token refresh, prime or sign-in.</span>
+            </div>
+            <label class="upstream-switch-toggle" for="upstream-switch" title="Allow this pool to send to OpenAI">
+              <span class="visually-hidden">Send to OpenAI</span>
+              <input id="upstream-switch" type="checkbox" role="switch">
+              <span class="upstream-switch-ui" aria-hidden="true"></span>
+            </label>
+          </section>
+
           <!-- Shown while the upstream switch is off (SPEC.md, upstream
                switch): the pool then sends nothing upstream, so every figure
                below is the last one it had. -->

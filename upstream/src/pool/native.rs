@@ -292,7 +292,7 @@ pub async fn handle_native(
     }
     // Every native path is relayed upstream, so with the upstream switch off
     // none is (SPEC.md, upstream switch).
-    if !app.settings.upstream_enabled {
+    if !app.upstream_enabled() {
         super::http_io::write_upstream_closed(writer.as_mut(), StatusCode::BAD_REQUEST);
         return;
     }

@@ -28,10 +28,10 @@ pub async fn run() -> Result<(), String> {
     // Each deploy recreates the container, and Docker's log goes with it, so
     // the log is also kept under /data, which outlives the container.
     let logger = Logger::production(&settings.data_dir);
+    // The transport starts closed; App::load opens it from the upstream
+    // switch's saved state (SPEC.md, upstream switch).
     let transports = Arc::new(
-        crate::transport::Transports::new()
-            .map_err(|error| format!("codex transport: {error}"))?
-            .with_upstream(settings.upstream_enabled),
+        crate::transport::Transports::new().map_err(|error| format!("codex transport: {error}"))?,
     );
     let app = Arc::new(App::load(settings, tuning, logger, transports, env)?);
     let listener = bind(&app.settings.listen_address)
@@ -41,17 +41,15 @@ pub async fn run() -> Result<(), String> {
         "provider API and control UI listening on {}",
         app.settings.listen_address
     ));
-    // Never stopped: like Go's, the poll ends with the process. With the
-    // upstream switch off there is no poll at all, so no quota request, no
-    // token refresh and no prime leaves the pool (SPEC.md, upstream switch).
-    let _poll = if app.settings.upstream_enabled {
-        Some(app.start_quota_refresher(Cancel::default()))
-    } else {
-        app.logger.printf(
-            "upstream is closed (CODEX_POOL_UPSTREAM_ENABLED is off): nothing is sent upstream",
-        );
-        None
-    };
+    // Never stopped: like Go's, the poll ends with the process. It runs even
+    // with the upstream switch off, because the owner can open upstream from
+    // the Console at any time, but it polls nothing while the switch is off:
+    // no quota request, no token refresh and no prime leaves the pool.
+    if !app.upstream_enabled() {
+        app.logger
+            .printf("upstream is closed (the upstream switch is off): nothing is sent upstream");
+    }
+    let _poll = app.start_quota_refresher(Cancel::default());
     let served = app.clone();
     serve_until_stopped(
         &app,

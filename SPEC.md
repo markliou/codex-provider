@@ -178,7 +178,7 @@ docker run -d \
 | `CODEX_POOL_PROMPT_CACHE_BUCKETS` | no | `4` | Number of buckets (1–256) a coarse cache key is split across, keyed by the stable per-conversation routing key, to stay under OpenAI's ~15 RPM-per-(prefix+key) cache-routing limit. Raise for hot pools; set `1` to maximize sharing. |
 | `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | `24h` | Upstream prompt cache retention. Defaults to `24h` (extended retention) to maximize cache hit rate across conversation turns. Set `passthrough` to leave requests untouched, or `in_memory` for the shorter built-in retention. |
 | `CODEX_POOL_PRESERVE_PRO_QUOTA` | no | `false` | Initial default for the admin Console `Use Pro last` switch. Once saved in `/data/config.json`, the Console setting takes precedence. |
-| `CODEX_POOL_UPSTREAM_ENABLED` | no | `false` | The upstream switch (section 2.3.5). Off, the pool sends nothing upstream: no client request, quota poll, token refresh, prime, reset-credit spend or sign-in. Set `true` to let the pool reach upstream. |
+| `CODEX_POOL_UPSTREAM_ENABLED` | no | `false` | Initial state of the upstream switch (section 2.3.5) until the owner flips it in the Console, whose saved choice then wins. Off, the pool sends nothing upstream: no client request, quota poll, token refresh, prime, reset-credit spend or sign-in. |
 | `CODEX_POOL_CLIENT_MAX_IN_FLIGHT` | no | `16` | Responses one client key may have running at once (section 2.3.6). A positive integer; there is no unlimited. |
 | `CODEX_POOL_CLIENT_MAX_PER_MINUTE` | no | `120` | Requests one client key may start in a minute (section 2.3.6). A positive integer; there is no unlimited. |
 | `CODEX_POOL_QUOTA_PRIME` | no | `false` | Initial default for the admin Console `Prime idle accounts` switch (quota window priming). Once saved in `/data/config.json`, the Console setting takes precedence. |
@@ -315,13 +315,13 @@ The identity format is Codex's own: `<originator>/<version> (<os> <version>; <ar
 
 #### 2.3.5 Upstream switch
 
-`CODEX_POOL_UPSTREAM_ENABLED` decides whether the pool may reach upstream at all, and it defaults off. The owner chose this after accounts were revoked: a pool that is started, redeployed or restored must not send anything to OpenAI until the operator opts in. While it is off:
+The upstream switch decides whether the pool may reach upstream at all, and it defaults off. The owner chose this after accounts were revoked: a pool that is started, redeployed or restored must not send anything to OpenAI until the operator opts in. The owner flips it in the Console, on a large switch at the top of the management view (red and "Closed" when off, green and "Open" when on), which asks for confirmation each way. The change takes effect at once for every send that starts after it, is logged, and is saved in `/data/config.json` as `upstreamEnabled`; a saved choice wins over `CODEX_POOL_UPSTREAM_ENABLED`, which only sets the switch until the owner first flips it. The transport starts closed and is opened at startup only if the saved choice, else the environment, allows it. While it is off:
 
-- **No background calls.** The quota poll is not started, so there is no quota request, token refresh or prime (`upstream/src/pool/serve.rs`).
-- **Clients are refused.** After a valid key, `/v1/responses` (HTTP and WebSocket), `/v1/responses/compact`, `/v1/chat/completions` and every path under the native endpoint are answered `400` with code `upstream_closed` and a message saying the pool is closed. A Codex does not retry a `400`, so the turn stops at once instead of retrying. A wrong key still gets `401`.
+- **No background calls.** The quota poll runs but polls nothing, so there is no quota request, token refresh or prime; accounts that came due are polled as soon as upstream opens (`upstream/src/pool/quota_refresh.rs`).
+- **Clients are refused.** After a valid key, `/v1/responses` (HTTP and WebSocket), `/v1/responses/compact`, `/v1/chat/completions` and every path under the native endpoint are answered `400` with code `upstream_closed` and a message saying the pool is closed. A Codex does not retry a `400`, so the turn stops at once instead of retrying. A wrong key still gets `401`. A WebSocket already open when the switch goes off answers its next request with the wrapped error event (`status` 400, the same code) and closes; a response already under way finishes.
 - **The owner's actions are refused.** Sign-in, quota refresh (one or all) and reset-credit spend answer `503` with the same code. Sign-in is the bundled Codex talking to OpenAI, and priming runs it too, so both check the switch themselves.
-- **A backstop.** The transport every upstream request and socket passes through refuses to send (`upstream/src/transport.rs`, `Transports::with_upstream`), so a path that forgets to check the switch still sends nothing.
-- **The dashboard says so.** A notice says upstream is closed, and its figures are the last the pool had.
+- **A backstop.** The transport every upstream request and socket passes through refuses to send (`upstream/src/transport.rs`, `Transports::set_upstream`), so a path that forgets to check the switch still sends nothing.
+- **The dashboard says so.** A red notice says upstream is closed, on the public view too, and its figures are the last the pool had.
 
 `/v1/models`, the dashboard and the admin API keep working: they are answered from the pool's own data. Test pools (the integration scripts and `wire-capture.sh`) set the switch on.
 
@@ -2065,11 +2065,12 @@ Request:
 {
   "preserveProQuota": true,
   "lineageAffinity": true,
-  "quotaPrime": false
+  "quotaPrime": false,
+  "upstreamEnabled": false
 }
 ```
 
-At least one field is required; an omitted field leaves that setting unchanged, so each Console switch posts only its own field. `preserveProQuota` backs the `Use Pro last` switch, `lineageAffinity` backs the `Keep subagents together` switch (default on), and `quotaPrime` backs the `Prime idle accounts` switch (default off). All are persisted in `/data/config.json` and returned in the admin state.
+At least one field is required; an omitted field leaves that setting unchanged, so each Console switch posts only its own field. `preserveProQuota` backs the `Use Pro last` switch, `lineageAffinity` backs the `Keep subagents together` switch (default on), `quotaPrime` backs the `Prime idle accounts` switch (default off), and `upstreamEnabled` backs the large `Upstream` switch (section 2.3.5; default off, takes effect at once, logged). All are persisted in `/data/config.json` and returned in the admin state.
 
 ---
 

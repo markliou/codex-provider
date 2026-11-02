@@ -369,6 +369,8 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
         lineage_affinity: Option<bool>,
         #[serde(default)]
         quota_prime: Option<bool>,
+        #[serde(default)]
+        upstream_enabled: Option<bool>,
     }
     let Some(switches) = decode::<Switches>(&request.body, SMALL_BODY) else {
         write_openai_error(
@@ -384,12 +386,13 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
     if switches.preserve_pro_quota.is_none()
         && switches.lineage_affinity.is_none()
         && switches.quota_prime.is_none()
+        && switches.upstream_enabled.is_none()
     {
         write_openai_error(
             writer,
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "preserveProQuota, lineageAffinity or quotaPrime is required",
+            "preserveProQuota, lineageAffinity, quotaPrime or upstreamEnabled is required",
         );
         return;
     }
@@ -405,6 +408,18 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
     if let Some(value) = switches.quota_prime {
         inner.quota_prime = value;
         inner.config.quota_prime = Some(value);
+    }
+    // The upstream switch takes effect at once for every send that starts
+    // after it (App::set_upstream), and the log records each change.
+    if let Some(value) = switches.upstream_enabled
+        && value != app.upstream_enabled()
+    {
+        app.set_upstream(&mut inner, value);
+        app.logger.printf(if value {
+            "upstream opened by the owner: the pool may send to upstream"
+        } else {
+            "upstream closed by the owner: nothing is sent upstream"
+        });
     }
     if inner.save().is_err() {
         write_storage_error(writer, "unable to persist settings");
@@ -859,7 +874,7 @@ pub fn quota_refresh_fields(snapshot: &super::state::QuotaSnapshot) -> serde_jso
 }
 
 pub async fn handle_refresh_all_quota(app: &App, writer: &mut dyn ResponseWriter) {
-    if !app.settings.upstream_enabled {
+    if !app.upstream_enabled() {
         return write_upstream_closed(writer, StatusCode::SERVICE_UNAVAILABLE);
     }
     let mut results = Vec::new();
@@ -1021,7 +1036,7 @@ pub async fn handle_account_action(
     };
     // These ask upstream; with the upstream switch off they are refused
     // here, before the transport would fail them (SPEC.md, upstream switch).
-    if matches!(action, "quota/reset-credit" | "quota/refresh") && !app.settings.upstream_enabled {
+    if matches!(action, "quota/reset-credit" | "quota/refresh") && !app.upstream_enabled() {
         return write_upstream_closed(writer, StatusCode::SERVICE_UNAVAILABLE);
     }
     match action {

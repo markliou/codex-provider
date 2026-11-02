@@ -23,6 +23,8 @@ use http::HeaderMap;
 use http::HeaderName;
 use http::Method;
 use http::StatusCode;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::extensions::ExtensionsConfig;
@@ -146,12 +148,14 @@ pub struct Transports {
     factory: HttpClientFactory,
     // The upstream switch, off (SPEC.md, upstream switch). Every request and
     // socket the pool opens passes through here, so this is the backstop
-    // that holds even if a caller forgets to check the switch first.
-    closed: bool,
+    // that holds even if a caller forgets to check the switch first. The
+    // owner flips it from the Console while the pool runs, so it is read on
+    // every send rather than fixed at startup.
+    closed: AtomicBool,
 }
 
 /// Why a send was refused while the upstream switch is off.
-pub const UPSTREAM_CLOSED: &str = "upstream is closed on this pool (CODEX_POOL_UPSTREAM_ENABLED)";
+pub const UPSTREAM_CLOSED: &str = "upstream is closed on this pool (the upstream switch is off)";
 
 impl Transports {
     pub fn new() -> std::io::Result<Self> {
@@ -159,20 +163,21 @@ impl Transports {
         // Fail at startup, not on the first socket, if Codex's TLS setup
         // (native roots, custom CA) cannot be built.
         WebSocketConnector::new(&factory).map_err(std::io::Error::other)?;
+        // Closed until App::new opens it from the switch's saved state, so
+        // nothing can go upstream before the pool knows the owner allows it.
         Ok(Self {
             factory,
-            closed: false,
+            closed: AtomicBool::new(true),
         })
     }
 
-    /// The same transports, refusing every send unless upstream is enabled.
-    pub fn with_upstream(mut self, enabled: bool) -> Self {
-        self.closed = !enabled;
-        self
+    /// Opens or closes upstream for every send that starts after this call.
+    pub fn set_upstream(&self, enabled: bool) {
+        self.closed.store(!enabled, Ordering::SeqCst);
     }
 
     pub fn closed(&self) -> bool {
-        self.closed
+        self.closed.load(Ordering::SeqCst)
     }
 
     // A new connector per connection, as Codex builds one in every
@@ -452,7 +457,7 @@ pub async fn send_request(
     codex_request: CodexRequest,
     after: &HeaderMap,
 ) -> Result<UpstreamResponse, SendFailure> {
-    if transports.closed {
+    if transports.closed() {
         return Err(SendFailure::Prepare(UPSTREAM_CLOSED.to_string()));
     }
     let mut prepared = codex_request
@@ -527,7 +532,7 @@ pub async fn connect_websocket(
     routing_pin: Option<&codex_http_client::ChatGptRoutingAffinity>,
 ) -> Result<(UpstreamSocket, HeaderMap), WebSocketRefusal> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    if transports.closed {
+    if transports.closed() {
         return Err(WebSocketRefusal::Connection(UPSTREAM_CLOSED.to_string()));
     }
     let mut request = url
