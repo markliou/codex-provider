@@ -16,6 +16,8 @@ pub(crate) use auth::AuthError;
 pub(crate) use codex_client::TransportError;
 pub(crate) use error::ApiError;
 pub(crate) use telemetry::WebsocketTelemetry;
+// codex-api lib.rs defines it at the root; the WebSocket files name it there.
+pub(crate) const RESPONSES_PATH: &str = "/responses";
 pub mod pool;
 
 // Each file comes whole, while the pool uses part of it; an import that only
@@ -32,6 +34,9 @@ pub(crate) mod common;
 #[allow(dead_code)]
 #[path = "../vendor/codex/codex-rs/codex-api/src/error.rs"]
 pub(crate) mod error;
+#[allow(dead_code)]
+#[path = "../vendor/codex/codex-rs/codex-api/src/guardian_assessment.rs"]
+pub(crate) mod guardian_assessment;
 #[allow(dead_code, unused_imports)]
 #[path = "../vendor/codex/codex-rs/codex-api/src/provider.rs"]
 pub(crate) mod provider;
@@ -41,6 +46,9 @@ pub(crate) mod rate_limits;
 #[allow(dead_code)]
 #[path = "../vendor/codex/codex-rs/codex-api/src/responses_headers.rs"]
 pub(crate) mod responses_headers;
+#[allow(dead_code)]
+#[path = "../vendor/codex/codex-rs/codex-api/src/endpoint/responses_websocket_probe.rs"]
+pub(crate) mod responses_websocket_probe;
 #[allow(dead_code)]
 #[path = "../vendor/codex/codex-rs/codex-api/src/safety_buffering.rs"]
 pub(crate) mod safety_buffering;
@@ -52,6 +60,10 @@ pub(crate) mod sse;
 pub(crate) mod telemetry;
 
 pub(crate) mod endpoint {
+    // Declared at the root above: a #[path] inside this inline module would
+    // resolve from a src/endpoint/ directory that does not exist.
+    pub(crate) use crate::responses_websocket_probe;
+
     // Included rather than declared as a module file so that the pool's
     // accessors, written in this module, can reach the file's private
     // wrapped-error parsing. Its `mod connector;` resolves to the pool-owned

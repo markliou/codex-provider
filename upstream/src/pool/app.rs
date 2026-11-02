@@ -145,6 +145,9 @@ pub struct App {
     /// Which account issued each turn state seen on a socket, so a message
     /// presenting it reaches only that account (responses_ws.rs).
     pub turn_state_issuers: std::sync::Mutex<HashMap<String, (String, Timestamp)>>,
+    /// Each thread's latest socket pin, for its Guardian reviewer
+    /// (routing_pin.rs).
+    pub routing_pins: super::routing_pin::RoutingPins,
     /// Overloads in a row that closed a socket before content, per account
     /// and model: the WebSocket same-account schedule (responses_ws.rs).
     pub ws_overload_drops: std::sync::Mutex<HashMap<String, u32>>,
@@ -211,6 +214,7 @@ impl App {
             in_flight: std::sync::atomic::AtomicI64::new(0),
             client_limits,
             turn_state_issuers: std::sync::Mutex::new(HashMap::new()),
+            routing_pins: super::routing_pin::RoutingPins::default(),
             ws_overload_drops: std::sync::Mutex::new(HashMap::new()),
             unrelayed_header_sets: std::sync::Mutex::new(std::collections::HashSet::new()),
             foreign_conversations: super::codex_request::Conversations::default(),

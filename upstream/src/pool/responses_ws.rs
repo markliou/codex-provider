@@ -69,6 +69,7 @@ use super::tuning::OVERLOAD_SAME_ACCOUNT_RETRY_LIMIT;
 use super::tuning::TRANSPORT_SAME_ACCOUNT_RETRY_LIMIT;
 use crate::transport::WebSocketRefusal;
 use bytes::Bytes;
+use codex_http_client::ChatGptRoutingAffinity;
 use futures::SinkExt;
 use futures::StreamExt;
 use http::HeaderMap;
@@ -181,7 +182,18 @@ struct SessionState {
     upstream_headers: HeaderMap,
     /// A request has gone out on the current upstream socket.
     sent: bool,
+    /// The routing pin the current upstream socket was opened with; only a
+    /// Guardian reviewer's socket has one (routing_pin.rs).
+    routing_pin: Option<ChatGptRoutingAffinity>,
 }
+
+/// An opened upstream socket, its handshake response, and the routing pin it
+/// was opened with.
+type DialedSocket = (
+    crate::transport::UpstreamSocket,
+    HeaderMap,
+    Option<ChatGptRoutingAffinity>,
+);
 
 struct Session {
     app: Arc<App>,
@@ -357,6 +369,7 @@ pub async fn handle_responses_websocket(
             active: None,
             upstream_headers: HeaderMap::new(),
             sent: false,
+            routing_pin: None,
         }),
         next_upstream: AtomicU64::new(1),
     });
@@ -607,6 +620,31 @@ async fn start_response(
             return false;
         }
     }
+    // A Guardian reviewer's socket follows its parent's pin: when the parent
+    // thread has opened a new socket since, Codex opens a new reviewer socket
+    // with the new pin before sending (core/src/client.rs, a changed
+    // parent_routing_affinity resets the connection). Equal pins come from
+    // the same parent socket (ChatGptRoutingAffinity's PartialEq).
+    let (bound_id, opened_pin, sent) = {
+        let state = session.state();
+        (
+            state.account.id.clone(),
+            state.routing_pin.clone(),
+            state.sent,
+        )
+    };
+    if super::routing_pin::is_guardian_reviewer(&session.handshake)
+        && app.routing_pins.for_reviewer(&bound_id, &session.handshake) != opened_pin
+    {
+        if sent {
+            // As above: Codex resends this request on a new socket.
+            session.close_client(1012, "routing changed");
+            return false;
+        }
+        if !redial(session, &mut route, &model).await {
+            return false;
+        }
+    }
     let bound = session.state().account.clone();
     app.note_session_placement(&route.balance_key, &bound.id);
     app.note_account_activity(&bound.id);
@@ -697,7 +735,7 @@ async fn dial(
             retry += 1;
         }
         match result {
-            Ok((socket, handshake)) => {
+            Ok((socket, handshake, routing_pin)) => {
                 let turn_state = header_value(&handshake, "x-codex-turn-state").to_string();
                 if !turn_state.is_empty() {
                     app.note_turn_state_issuer(&turn_state, &candidate.id);
@@ -705,6 +743,7 @@ async fn dial(
                 let mut state = session.state();
                 state.account = candidate;
                 state.upstream_headers = handshake;
+                state.routing_pin = routing_pin;
                 state.sent = false;
                 return Ok(socket);
             }
@@ -815,7 +854,7 @@ async fn dial_codex_websocket(
     candidate: &Account,
     client_headers: &HeaderMap,
     model: &str,
-) -> Result<(crate::transport::UpstreamSocket, HeaderMap), WsDialError> {
+) -> Result<DialedSocket, WsDialError> {
     let auth = app
         .refreshed_codex_auth(candidate)
         .await
@@ -854,7 +893,7 @@ async fn dial_codex_websocket_once(
     client_headers: &HeaderMap,
     model: &str,
     auth: &super::metadata::CodexAuthInfo,
-) -> Result<(crate::transport::UpstreamSocket, HeaderMap), WsDialError> {
+) -> Result<DialedSocket, WsDialError> {
     app.note_client_agent(&candidate.id, client_headers);
     app.note_account_activity(&candidate.id);
     let mut headers = GoHeader::default();
@@ -912,20 +951,37 @@ async fn dial_codex_websocket_once(
         Some(rest) => format!("ws{rest}"),
         None => base,
     };
-    crate::transport::connect_websocket(&app.transports, &url, &headers.to_map())
-        .await
-        .map_err(|refusal| match refusal {
-            WebSocketRefusal::Http {
-                status,
-                headers,
-                body,
-            } => WsDialError::Refused {
-                status,
-                headers,
-                body,
-            },
-            WebSocketRefusal::Connection(_) => WsDialError::Unreachable,
-        })
+    // A Guardian reviewer's socket carries its parent thread's pin, and every
+    // other socket leaves its own for that thread's reviewer (routing_pin.rs).
+    let routing_pin = app.routing_pins.for_reviewer(&candidate.id, client_headers);
+    crate::transport::connect_websocket(
+        &app.transports,
+        &url,
+        &headers.to_map(),
+        routing_pin.as_ref(),
+    )
+    .await
+    .map(|(socket, handshake)| {
+        app.routing_pins.note(
+            &candidate.id,
+            client_headers,
+            socket.routing_affinity().cloned(),
+            std::time::Instant::now(),
+        );
+        (socket, handshake, routing_pin)
+    })
+    .map_err(|refusal| match refusal {
+        WebSocketRefusal::Http {
+            status,
+            headers,
+            body,
+        } => WsDialError::Refused {
+            status,
+            headers,
+            body,
+        },
+        WebSocketRefusal::Connection(_) => WsDialError::Unreachable,
+    })
 }
 
 /// Starts the writer and the relay for a newly bound upstream socket.

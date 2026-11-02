@@ -1155,7 +1155,10 @@ impl Inner {
             }
             if !matches!(
                 cooldown.reason.as_str(),
-                "server_is_overloaded" | "slow_down" | "upstream_5xx"
+                "server_is_overloaded"
+                    | "policy_capacity_unavailable"
+                    | "slow_down"
+                    | "upstream_5xx"
             ) {
                 return None;
             }

@@ -81,9 +81,11 @@ pub struct ThroughputMeasurement {
 /// cooldown; anything else gets the shorter default.
 pub fn retryable_terminal_cooldown(reason: &str) -> TimeDelta {
     match reason {
-        "server_is_overloaded" | "slow_down" | "server_error" | "internal_server_error" => {
-            seconds(UPSTREAM_5XX_COOLDOWN_SECONDS)
-        }
+        "server_is_overloaded"
+        | "policy_capacity_unavailable"
+        | "slow_down"
+        | "server_error"
+        | "internal_server_error" => seconds(UPSTREAM_5XX_COOLDOWN_SECONDS),
         // A spent allowance does not come back in seconds. Hold the account
         // out until the next quota refresh has seen the spent window, which
         // then keeps it out (or lets it back the moment its owner resets it); a
@@ -109,6 +111,7 @@ pub fn retryable_cooldown_reason(reason: &str) -> bool {
     matches!(
         reason,
         "server_is_overloaded"
+            | "policy_capacity_unavailable"
             | "slow_down"
             | "upstream_5xx"
             | "server_error"
