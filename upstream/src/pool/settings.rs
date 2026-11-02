@@ -60,6 +60,9 @@ pub struct Settings {
     /// CODEX_POOL_UPSTREAM_ENABLED: whether the pool may reach upstream at
     /// all. Off by default (SPEC.md, upstream switch).
     pub upstream_enabled: bool,
+    /// CODEX_POOL_QUOTA_RESERVE: whether the global quota reserve starts on
+    /// (SPEC.md 9.7); its two thresholds are the Console's.
+    pub quota_reserve: bool,
     /// CODEX_POOL_CLIENT_MAX_IN_FLIGHT and CODEX_POOL_CLIENT_MAX_PER_MINUTE:
     /// what one client key may run at once and start in a minute
     /// (client_limit.rs).
@@ -140,6 +143,9 @@ impl Settings {
             quota_prime: false,
             quota_prime_grace: Some(Duration::ZERO),
             upstream_enabled: true,
+            // Off in tests that are not about it, so their quota windows
+            // route as they always have.
+            quota_reserve: false,
             // Out of the way of tests that are not about the limits.
             client_max_in_flight: 1_000,
             client_max_per_minute: 100_000,
@@ -276,6 +282,15 @@ impl Settings {
             "CODEX_POOL_UPSTREAM_ENABLED",
             false,
         )?;
+        // The global quota reserve defaults on, the owner's choice
+        // (2026-11-02): ChatGPT and Codex are to share one allowance, so the
+        // pool leaves every account's last 10% of each window to its owner's
+        // own use (SPEC.md 9.7).
+        let quota_reserve = bool_from_env(
+            &get("CODEX_POOL_QUOTA_RESERVE"),
+            "CODEX_POOL_QUOTA_RESERVE",
+            true,
+        )?;
         // Product contract: the combined-port root is a public control page,
         // while management actions require password auth. A previous hardening
         // pass flipped this default and broke the expected landing page, so
@@ -316,6 +331,7 @@ impl Settings {
             quota_prime,
             quota_prime_grace,
             upstream_enabled,
+            quota_reserve,
             client_max_in_flight,
             client_max_per_minute,
             refresh_url: env_or(
@@ -719,6 +735,8 @@ mod tests {
         // Priming and the upstream switch default off.
         assert!(!settings.quota_prime);
         assert!(!settings.upstream_enabled);
+        // The global quota reserve defaults on.
+        assert!(settings.quota_reserve);
         assert_eq!(settings.client_max_in_flight, 16);
         assert_eq!(settings.client_max_per_minute, 120);
         assert_eq!(client_limit("8", "X", 1), Ok(8));

@@ -1155,3 +1155,38 @@ async fn admin_settings_toggle_the_upstream_switch() {
     );
     assert!(!reopened.upstream_enabled() && !reopened.read().upstream_enabled);
 }
+
+// The global quota reserve's switch and thresholds are the Console's, saved
+// apart, and a threshold outside 0..=100 changes nothing (SPEC.md 9.7).
+#[tokio::test]
+async fn admin_settings_set_the_global_quota_reserve() {
+    let (app, _dir) = arc_app(Vec::new());
+    let session = admin_session(&app);
+    let result = post_settings(&app, &session, r#"{"quotaReserve":true}"#).await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    assert!(
+        result
+            .body_string()
+            .contains(r#""quotaReserve":{"enabled":true,"fiveHour":10,"weekly":10}"#)
+    );
+    let result = post_settings(
+        &app,
+        &session,
+        r#"{"quotaReserveFiveHour":25,"quotaReserveWeekly":5}"#,
+    )
+    .await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    let reserve = app.read().quota_reserve;
+    assert!(reserve.enabled && reserve.five_hour == 25 && reserve.weekly == 5);
+    let saved = saved_config(&app);
+    assert_eq!(saved["quotaReserve"], true);
+    assert_eq!(saved["quotaReserveFiveHour"], 25);
+    assert_eq!(saved["quotaReserveWeekly"], 5);
+    let result = post_settings(&app, &session, r#"{"quotaReserveWeekly":101}"#).await;
+    assert_eq!(result.code(), 400, "{}", result.body_string());
+    assert_eq!(app.read().quota_reserve.weekly, 5);
+    let result = post_settings(&app, &session, r#"{"quotaReserve":false}"#).await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    assert!(!app.read().quota_reserve.enabled);
+    assert_eq!(app.read().quota_reserve.five_hour, 25, "thresholds kept");
+}

@@ -109,6 +109,28 @@
             </label>
           </section>
 
+          <!-- The global quota reserve (SPEC.md 9.7): on by default at 10% of
+               each window, the owner's choice, because ChatGPT and Codex are
+               to share one allowance and an account's owner keeps that much
+               for their own use. An account's own protection overrides it. -->
+          <section id="quota-reserve-card" class="quota-reserve-card management-only" aria-label="Global quota reserve" hidden>
+            <div class="quota-reserve-copy">
+              <div class="eyebrow">QUOTA RESERVE</div>
+              <strong id="quota-reserve-state">On</strong>
+              <span id="quota-reserve-detail">Every account keeps part of each window for its owner.</span>
+            </div>
+            <div class="quota-reserve-controls">
+              <label class="switch-row" for="quota-reserve-switch" title="Stop using an account once a window is down to its reserve">
+                <span class="switch-label">Reserve for owners</span>
+                <input id="quota-reserve-switch" type="checkbox" role="switch">
+                <span class="switch-ui" aria-hidden="true"></span>
+              </label>
+              <label class="quota-reserve-field">5 hours <input id="quota-reserve-five-hour" class="quota-threshold-input" type="number" min="0" max="100" step="1" inputmode="numeric">%</label>
+              <label class="quota-reserve-field">Week <input id="quota-reserve-weekly" class="quota-threshold-input" type="number" min="0" max="100" step="1" inputmode="numeric">%</label>
+              <button id="quota-reserve-save" class="button quiet" type="button">Save</button>
+            </div>
+          </section>
+
           <!-- Shown while the upstream switch is off (SPEC.md, upstream
                switch): the pool then sends nothing upstream, so every figure
                below is the last one it had. -->

@@ -181,6 +181,7 @@ docker run -d \
 | `CODEX_POOL_UPSTREAM_ENABLED` | no | `false` | Initial state of the upstream switch (section 2.3.5) until the owner flips it in the Console, whose saved choice then wins. Off, the pool sends nothing upstream: no client request, quota poll, token refresh, prime, reset-credit spend or sign-in. |
 | `CODEX_POOL_CLIENT_MAX_IN_FLIGHT` | no | `16` | Responses one client key may have running at once (section 2.3.6). A positive integer; there is no unlimited. |
 | `CODEX_POOL_CLIENT_MAX_PER_MINUTE` | no | `120` | Requests one client key may start in a minute (section 2.3.6). A positive integer; there is no unlimited. |
+| `CODEX_POOL_QUOTA_RESERVE` | no | `true` | Initial default for the admin Console global quota reserve switch (section 9.7); its thresholds are set in the Console (10% of each window by default). Once saved in `/data/config.json`, the Console setting takes precedence. |
 | `CODEX_POOL_QUOTA_PRIME` | no | `false` | Initial default for the admin Console `Prime idle accounts` switch (quota window priming). Once saved in `/data/config.json`, the Console setting takes precedence. |
 | `CODEX_POOL_QUOTA_PRIME_GRACE` | no | random 30–120 min | Test override: a fixed wait (for example `0s`) before an unanchored window is primed. |
 | `CODEX_POOL_LINEAGE_AFFINITY` | no | `true` | Initial default for the admin Console `Keep subagents together` switch (section 6.2.1). Once saved in `/data/config.json`, the Console setting takes precedence. |
@@ -1754,7 +1755,39 @@ Content-Type: application/json
 The policy belongs to the local credential slot. Duplicate slots can have
 different settings but still share upstream capacity and remain subject to the
 same-request duplicate suppression rule. Blocking does not delete existing
-sticky bindings; the next request reselects normally.
+sticky bindings; the next request reselects normally. A slot with its own
+protection on is judged by it alone; the global reserve (9.7) does not apply
+to it.
+
+### 9.7 Global quota reserve
+
+ChatGPT and Codex are to share one allowance per account, so what the pool
+spends is what the account's owner can no longer use in ChatGPT. The global
+reserve keeps part of every account's allowance for its owner: the pool stops
+selecting an account once its five-hour window has at most `fiveHour` percent
+left, or its weekly window at most `weekly` percent. The two thresholds are
+set apart (each an integer 0–100, both 10 by default) and share one switch,
+on by default (`CODEX_POOL_QUOTA_RESERVE`, the owner's choice, 2026-11-02).
+
+- It applies to every Codex device-auth slot whose own protection (9.6) is
+  off; a slot with its own protection on is judged by that alone.
+- Unlike a slot's own protection, which reads one window, both windows are
+  read, each against its own threshold. The evidence rules are the same: only
+  a reported window counts, missing, stale or failed telemetry never blocks,
+  and a window seen at or below its threshold stays evidence until its
+  observed reset time, after which it fails open.
+- A blocked account is out of selection like any protected slot: an existing
+  sticky binding is not deleted, and the next request reselects. When every
+  account is held back, the client gets the pool's usual no-account answer.
+- The Console shows it as a card with its switch and both thresholds, and
+  each account's protection panel shows `Global` while it applies.
+
+```http
+POST /admin/api/settings
+Content-Type: application/json
+
+{"quotaReserve": true, "quotaReserveFiveHour": 10, "quotaReserveWeekly": 10}
+```
 
 ### 9.1 Duplicate upstream identity guard
 
@@ -2071,11 +2104,14 @@ Request:
   "preserveProQuota": true,
   "lineageAffinity": true,
   "quotaPrime": false,
-  "upstreamEnabled": false
+  "upstreamEnabled": false,
+  "quotaReserve": true,
+  "quotaReserveFiveHour": 10,
+  "quotaReserveWeekly": 10
 }
 ```
 
-At least one field is required; an omitted field leaves that setting unchanged, so each Console switch posts only its own field. `preserveProQuota` backs the `Use Pro last` switch, `lineageAffinity` backs the `Keep subagents together` switch (default on), `quotaPrime` backs the `Prime idle accounts` switch (default off), and `upstreamEnabled` backs the large `Upstream` switch (section 2.3.5; default off, takes effect at once, logged). All are persisted in `/data/config.json` and returned in the admin state.
+At least one field is required; an omitted field leaves that setting unchanged, so each Console switch posts only its own field. `preserveProQuota` backs the `Use Pro last` switch, `lineageAffinity` backs the `Keep subagents together` switch (default on), `quotaPrime` backs the `Prime idle accounts` switch (default off), `upstreamEnabled` backs the large `Upstream` switch (section 2.3.5; default off, takes effect at once, logged), and `quotaReserve`, `quotaReserveFiveHour` and `quotaReserveWeekly` back the global quota reserve card (section 9.7; on, 10 and 10 by default; a threshold outside 0–100 is `400` and changes nothing). All are persisted in `/data/config.json` and returned in the admin state.
 
 ---
 

@@ -682,9 +682,33 @@
       : "Nothing is sent to OpenAI: no client request, quota poll, token refresh, prime or sign-in.";
   }
 
+  // The global quota reserve (SPEC.md 9.7). Missing means an older server,
+  // which has none; the card then says so instead of showing a default.
+  function renderQuotaReserve(reserve) {
+    const input = $("#quota-reserve-switch");
+    if (!input) return;
+    const known = reserve && typeof reserve === "object";
+    const on = known && reserve.enabled === true;
+    input.checked = on;
+    input.disabled = !known;
+    $("#quota-reserve-save").disabled = !known;
+    const fiveHour = $("#quota-reserve-five-hour");
+    const weekly = $("#quota-reserve-weekly");
+    if (known && document.activeElement !== fiveHour) fiveHour.value = String(reserve.fiveHour ?? 10);
+    if (known && document.activeElement !== weekly) weekly.value = String(reserve.weekly ?? 10);
+    $("#quota-reserve-card").classList.toggle("off", !on);
+    $("#quota-reserve-state").textContent = !known ? "Unavailable" : on ? "On" : "Off";
+    $("#quota-reserve-detail").textContent = !known
+      ? "This server has no global reserve."
+      : on
+        ? `The pool stops using an account once its 5-hour window is down to ${reserve.fiveHour}% or its week to ${reserve.weekly}%, unless the account has its own protection.`
+        : "Accounts are used until their quota runs out, unless they have their own protection.";
+  }
+
   function renderSettings(serviceState) {
     renderUpstreamClosed(serviceState?.upstreamEnabled);
     renderUpstreamSwitch(serviceState?.upstreamEnabled);
+    renderQuotaReserve(serviceState?.quotaReserve);
     const preserveSwitch = $("#preserve-pro-quota-switch");
     if (preserveSwitch) {
       preserveSwitch.checked = Boolean(serviceState?.preserveProQuota);
@@ -1041,7 +1065,10 @@
     const windowDetail = window?.present
       ? ` · ${window.label || "Window"} ${quotaPercent(window.remainingPercent ?? window.percentage)}% left`
       : "";
-    const state = protection.blocked ? "Blocked" : protection.enabled ? "On" : "Off";
+    // Without its own protection an account is held to the global reserve
+    // (SPEC.md 9.7), shown as "Global"; turning its own on replaces it.
+    const global = !protection.enabled && protection.source === "global";
+    const state = protection.blocked ? "Blocked" : protection.enabled ? "On" : global ? "Global" : "Off";
     return `<details class="quota-protection"><summary><span>Protection</span><strong>${escapeHTML(state)}</strong></summary>
       <div class="quota-protection-body">
         <div class="quota-detail"><strong>${escapeHTML(protectionMessage)}</strong>${escapeHTML(windowDetail)}</div>
@@ -1050,7 +1077,7 @@
           <label>Threshold <input class="quota-threshold-input" type="number" min="0" max="100" step="1" value="${quotaPercent(protection.threshold)}" data-quota-protection-threshold="${escapeHTML(account.id)}">%</label>
           <button class="button quiet" type="button" data-quota-protection-save="${escapeHTML(account.id)}">Save</button>
         </div>
-        <div class="quota-detail">Duplicate slots share upstream capacity; this threshold applies only to this local slot.</div>
+        <div class="quota-detail">${global ? `Global reserve: 5h ${escapeHTML(protection.fiveHourThreshold)}%, week ${escapeHTML(protection.weeklyThreshold)}%. Turning on this account's own protection replaces it.` : "Duplicate slots share upstream capacity; this threshold applies only to this local slot."}</div>
       </div>
     </details>`;
   }
@@ -1424,6 +1451,29 @@
   const updatePreserveProQuota = updateSetting("preserveProQuota", false);
   const updateLineageAffinity = updateSetting("lineageAffinity", true);
   const updateQuotaPrime = updateSetting("quotaPrime", false);
+  // The reserve's switch saves at once; its two thresholds save together.
+  const saveQuotaReserve = async (body) => {
+    try {
+      const response = await api("/settings", { method: "POST", body: JSON.stringify(body) });
+      state.data = { ...(state.data || {}), serviceState: response.state };
+      renderSettings(response.state);
+      $("#service-status").textContent = "Settings updated";
+      refresh(true);
+    } catch (error) {
+      renderSettings(state.data?.serviceState);
+      notify(error.message, true);
+    }
+  };
+  const updateQuotaReserve = (event) => saveQuotaReserve({ quotaReserve: event.currentTarget.checked });
+  const updateQuotaReserveThresholds = () => {
+    const fiveHour = Number($("#quota-reserve-five-hour").value);
+    const weekly = Number($("#quota-reserve-weekly").value);
+    if (![fiveHour, weekly].every((value) => Number.isInteger(value) && value >= 0 && value <= 100)) {
+      notify("Reserve thresholds must be integers from 0 to 100", true);
+      return;
+    }
+    return saveQuotaReserve({ quotaReserveFiveHour: fiveHour, quotaReserveWeekly: weekly });
+  };
   const saveUpstreamSwitch = updateSetting("upstreamEnabled", false);
   // The master switch asks before it changes anything: opening lets the pool
   // reach OpenAI, closing stops every client mid-work.
@@ -1559,6 +1609,8 @@
   $("#preserve-pro-quota-switch").addEventListener("change", updatePreserveProQuota);
   $("#lineage-affinity-switch").addEventListener("change", updateLineageAffinity);
   $("#quota-prime-switch").addEventListener("change", updateQuotaPrime);
+  $("#quota-reserve-switch").addEventListener("change", updateQuotaReserve);
+  $("#quota-reserve-save").addEventListener("click", updateQuotaReserveThresholds);
   $("#upstream-switch").addEventListener("change", updateUpstreamSwitch);
   $("#close-device-auth-button").addEventListener("click", () => closeDeviceAuth(true));
   $("#device-auth-dialog").addEventListener("click", (event) => {

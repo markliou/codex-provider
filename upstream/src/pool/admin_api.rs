@@ -371,6 +371,12 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
         quota_prime: Option<bool>,
         #[serde(default)]
         upstream_enabled: Option<bool>,
+        #[serde(default)]
+        quota_reserve: Option<bool>,
+        #[serde(default)]
+        quota_reserve_five_hour: Option<i64>,
+        #[serde(default)]
+        quota_reserve_weekly: Option<i64>,
     }
     let Some(switches) = decode::<Switches>(&request.body, SMALL_BODY) else {
         write_openai_error(
@@ -387,12 +393,31 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
         && switches.lineage_affinity.is_none()
         && switches.quota_prime.is_none()
         && switches.upstream_enabled.is_none()
+        && switches.quota_reserve.is_none()
+        && switches.quota_reserve_five_hour.is_none()
+        && switches.quota_reserve_weekly.is_none()
     {
         write_openai_error(
             writer,
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "preserveProQuota, lineageAffinity, quotaPrime or upstreamEnabled is required",
+            "preserveProQuota, lineageAffinity, quotaPrime, upstreamEnabled, quotaReserve, quotaReserveFiveHour or quotaReserveWeekly is required",
+        );
+        return;
+    }
+    if [
+        switches.quota_reserve_five_hour,
+        switches.quota_reserve_weekly,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|percent| !(0..=100).contains(&percent))
+    {
+        write_openai_error(
+            writer,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "quotaReserveFiveHour and quotaReserveWeekly must be integers from 0 to 100",
         );
         return;
     }
@@ -408,6 +433,20 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
     if let Some(value) = switches.quota_prime {
         inner.quota_prime = value;
         inner.config.quota_prime = Some(value);
+    }
+    // The global quota reserve: its switch and each window's threshold are
+    // saved apart, so the Console may post any one of them (SPEC.md 9.7).
+    if let Some(value) = switches.quota_reserve {
+        inner.quota_reserve.enabled = value;
+        inner.config.quota_reserve = Some(value);
+    }
+    if let Some(value) = switches.quota_reserve_five_hour {
+        inner.quota_reserve.five_hour = value;
+        inner.config.quota_reserve_five_hour = Some(value);
+    }
+    if let Some(value) = switches.quota_reserve_weekly {
+        inner.quota_reserve.weekly = value;
+        inner.config.quota_reserve_weekly = Some(value);
     }
     // The upstream switch takes effect at once for every send that starts
     // after it (App::set_upstream), and the log records each change.

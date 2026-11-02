@@ -1008,6 +1008,11 @@ impl Inner {
             "lineageAffinity": self.lineage_affinity,
             "quotaPrime": self.quota_prime,
             "upstreamEnabled": self.upstream_enabled,
+            "quotaReserve": {
+                "enabled": self.quota_reserve.enabled,
+                "fiveHour": self.quota_reserve.five_hour,
+                "weekly": self.quota_reserve.weekly,
+            },
             "promptCacheKeyMode": or_default(&self.settings.prompt_cache_key_mode, "auto"),
             "promptCacheKeyScope": or_default(&self.settings.prompt_cache_key_scope, "auto"),
             "promptCacheKeyPolicy": or_default(&self.settings.prompt_cache_key_policy, "preserve"),
