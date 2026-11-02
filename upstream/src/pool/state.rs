@@ -77,6 +77,14 @@ pub struct Config {
     /// CODEX_POOL_UPSTREAM_ENABLED decides (SPEC.md, upstream switch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_enabled: Option<bool>,
+    /// The global quota reserve as the owner last set it in the Console
+    /// (SPEC.md 9.7); unset, CODEX_POOL_QUOTA_RESERVE and 10% decide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_reserve: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_reserve_five_hour: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_reserve_weekly: Option<i64>,
     #[serde(default)]
     pub created_at: Timestamp,
     #[serde(default)]

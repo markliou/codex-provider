@@ -114,6 +114,8 @@ pub struct Inner {
     /// The upstream switch as shown; the transport holds the copy every send
     /// reads, and App::set_upstream changes both together.
     pub upstream_enabled: bool,
+    /// The global quota reserve (SPEC.md 9.7).
+    pub quota_reserve: QuotaReserve,
     pub jobs: BTreeMap<String, LoginJob>,
     /// In-memory placement load: which account each recently active session
     /// is on (see note_session_placement).
@@ -197,6 +199,17 @@ impl App {
             lineage_affinity: config.lineage_affinity.unwrap_or(settings.lineage_affinity),
             quota_prime: config.quota_prime.unwrap_or(settings.quota_prime),
             upstream_enabled: config.upstream_enabled.unwrap_or(settings.upstream_enabled),
+            quota_reserve: QuotaReserve {
+                enabled: config.quota_reserve.unwrap_or(settings.quota_reserve),
+                five_hour: config
+                    .quota_reserve_five_hour
+                    .unwrap_or(QUOTA_RESERVE_DEFAULT_PERCENT)
+                    .clamp(0, 100),
+                weekly: config
+                    .quota_reserve_weekly
+                    .unwrap_or(QUOTA_RESERVE_DEFAULT_PERCENT)
+                    .clamp(0, 100),
+            },
             settings: settings.clone(),
             tuning,
             config,
@@ -490,8 +503,17 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Resul
 #[serde(rename_all = "camelCase")]
 pub struct QuotaProtectionStatus {
     pub supported: bool,
+    /// The account's own protection; the global reserve shows as `source`.
     pub enabled: bool,
     pub threshold: i64,
+    /// Which policy decided: "account" (the account's own protection),
+    /// "global" (the global reserve), or empty when neither applies.
+    pub source: String,
+    /// The global reserve's thresholds, when it decided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub five_hour_threshold: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weekly_threshold: Option<i64>,
     pub state: String,
     pub message: String,
     pub blocked: bool,
@@ -500,6 +522,21 @@ pub struct QuotaProtectionStatus {
     pub freshness: String,
     pub last_successful_update: Timestamp,
 }
+
+/// The global quota reserve: below these remaining percentages of an
+/// account's five-hour or weekly window the pool stops using it, so the rest
+/// stays for the account owner's own use. ChatGPT and Codex are to share one
+/// allowance, so what the pool spends is what the owner can no longer chat
+/// with (SPEC.md 9.7). An account with its own protection on is judged by that
+/// alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuotaReserve {
+    pub enabled: bool,
+    pub five_hour: i64,
+    pub weekly: i64,
+}
+
+pub const QUOTA_RESERVE_DEFAULT_PERCENT: i64 = 10;
 
 /// Use Pro last spends accounts in three tiers: ordinary accounts first, then
 /// Pro 100 (Pro Lite), then Pro 200 and Pro 500. Pro Lite was once an ordinary
@@ -966,8 +1003,14 @@ impl Inner {
             return status;
         }
         if !status.enabled {
+            // An account without its own protection is held to the global
+            // reserve; one with it is judged by its own alone (SPEC.md 9.7).
+            if self.quota_reserve.enabled {
+                return self.quota_reserve_status(status, snapshot, now);
+            }
             return status;
         }
+        status.source = "account".to_string();
         let Some(snapshot_quota) = &snapshot.quota else {
             set(
                 &mut status,
@@ -1038,6 +1081,93 @@ impl Inner {
             &mut status,
             "available",
             "Protection active: quota is above threshold",
+        );
+        status
+    }
+
+    /// The global reserve's verdict (SPEC.md 9.7): blocked when the five-hour
+    /// or the weekly window has at most its threshold left. Unlike the
+    /// account's own protection, which reads one window, both are read, since
+    /// the owner sets them apart. The evidence rules are the account
+    /// protection's: missing, stale or reset-expired telemetry never blocks,
+    /// and a window seen below its threshold stays evidence until it resets.
+    fn quota_reserve_status(
+        &self,
+        mut status: QuotaProtectionStatus,
+        snapshot: &QuotaSnapshot,
+        now: Timestamp,
+    ) -> QuotaProtectionStatus {
+        let reserve = self.quota_reserve;
+        status.source = "global".to_string();
+        status.five_hour_threshold = Some(reserve.five_hour);
+        status.weekly_threshold = Some(reserve.weekly);
+        let set = |status: &mut QuotaProtectionStatus, state: &str, message: String| {
+            status.state = state.to_string();
+            status.message = message;
+        };
+        let Some(quota) = &snapshot.quota else {
+            set(
+                &mut status,
+                "unavailable",
+                "Global reserve unavailable: quota not reported; routing remains fail-open"
+                    .to_string(),
+            );
+            return status;
+        };
+        let windows = quota::quota_reported_windows(quota);
+        let mut reported = None;
+        for (minutes, threshold, label) in [
+            (quota::FIVE_HOUR_WINDOW_MINUTES, reserve.five_hour, "5h"),
+            (quota::WEEKLY_WINDOW_MINUTES, reserve.weekly, "weekly"),
+        ] {
+            let Some(window) = windows
+                .iter()
+                .find(|window| window.present && window.window_minutes == Some(minutes))
+                .cloned()
+            else {
+                continue;
+            };
+            reported.get_or_insert_with(|| window.clone());
+            #[allow(clippy::cast_precision_loss)]
+            let below = quota::quota_window_remaining(&window) <= threshold as f64;
+            let reset_passed = window
+                .reset_at
+                .is_some_and(|reset_at| now.unix() >= reset_at);
+            let unproven = window.reset_at.is_none() && status.freshness != "fresh";
+            if below && !reset_passed && !unproven {
+                status.effective_window = Some(window);
+                status.blocked = true;
+                set(
+                    &mut status,
+                    "blocked",
+                    format!("Global reserve: {label} quota at or below {threshold}%"),
+                );
+                return status;
+            }
+        }
+        let Some(window) = reported else {
+            set(
+                &mut status,
+                "unavailable",
+                "Global reserve unavailable: 5h/week quota not reported; routing remains fail-open"
+                    .to_string(),
+            );
+            return status;
+        };
+        status.effective_window = Some(window);
+        if status.freshness != "fresh" {
+            set(
+                &mut status,
+                "unavailable",
+                "Global reserve unavailable: quota telemetry is stale; routing remains fail-open"
+                    .to_string(),
+            );
+            return status;
+        }
+        set(
+            &mut status,
+            "available",
+            "Global reserve active: quota is above the reserve".to_string(),
         );
         status
     }
@@ -1306,6 +1436,85 @@ mod tests {
         };
         let status = inner.quota_protection_status(&provider, &QuotaSnapshot::default(), now);
         assert!(!status.supported && !status.blocked);
+    }
+
+    // The global reserve reads both windows with their own thresholds, an
+    // account's own protection replaces it, and it never blocks on missing or
+    // reset-expired telemetry (SPEC.md 9.7).
+    #[test]
+    fn global_quota_reserve_reads_both_windows_and_yields_to_the_account() {
+        let now = Timestamp::from_unix(1_800_000_000);
+        let future = now.add(hours(1)).unix();
+        let expired = now.add(seconds(-1)).unix();
+        let item = Account {
+            id: "device".into(),
+            auth_type: "codex_device_auth".into(),
+            ..Account::default()
+        };
+        let (app, _dir) = test_app(vec![item.clone()]);
+        let snapshot = |five_hour: f64, week: f64, week_reset: i64| QuotaSnapshot {
+            last_successful_refresh_at: now,
+            quota: Some(AccountQuota {
+                windows: vec![
+                    window("primary", "5h", five_hour, 300, Some(future)),
+                    window("secondary", "Week", week, 10080, Some(week_reset)),
+                ],
+                ..AccountQuota::default()
+            }),
+            ..QuotaSnapshot::default()
+        };
+        let roomy = snapshot(50.0, 50.0, future);
+        {
+            let inner = app.read();
+            // Off in tests by default: nothing changes.
+            let status = inner.quota_protection_status(&item, &snapshot(5.0, 5.0, future), now);
+            assert!(!status.blocked && status.source.is_empty());
+        }
+        app.write().quota_reserve = QuotaReserve {
+            enabled: true,
+            five_hour: 10,
+            weekly: 20,
+        };
+        let inner = app.read();
+        let status = inner.quota_protection_status(&item, &roomy, now);
+        assert!(!status.blocked);
+        assert_eq!(status.source, "global");
+        assert_eq!(status.state, "available");
+        assert_eq!(
+            (status.five_hour_threshold, status.weekly_threshold),
+            (Some(10), Some(20))
+        );
+        // The five-hour window at its threshold blocks.
+        let status = inner.quota_protection_status(&item, &snapshot(10.0, 50.0, future), now);
+        assert!(status.blocked);
+        assert_eq!(
+            status.effective_window.and_then(|w| w.window_minutes),
+            Some(300)
+        );
+        // So does the week at its own, with the five-hour window roomy: unlike
+        // an account's own protection, both windows are read.
+        let status = inner.quota_protection_status(&item, &snapshot(50.0, 20.0, future), now);
+        assert!(status.blocked);
+        assert_eq!(
+            status.effective_window.and_then(|w| w.window_minutes),
+            Some(10080)
+        );
+        // A week whose reset has passed is no evidence.
+        let status = inner.quota_protection_status(&item, &snapshot(50.0, 20.0, expired), now);
+        assert!(!status.blocked);
+        // No quota reported: fail-open.
+        let status = inner.quota_protection_status(&item, &QuotaSnapshot::default(), now);
+        assert!(!status.blocked);
+        assert_eq!(status.state, "unavailable");
+        // An account with its own protection is judged by it alone.
+        let own = Account {
+            quota_protection_enabled: true,
+            quota_protection_threshold: 5,
+            ..item
+        };
+        let status = inner.quota_protection_status(&own, &snapshot(8.0, 8.0, future), now);
+        assert!(!status.blocked);
+        assert_eq!(status.source, "account");
     }
 
     // The representative of a shared upstream identity is the usable copy.
