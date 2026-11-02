@@ -24,6 +24,11 @@
 //      built-in provider aimed at the pool. Through it the pool's upstream
 //      traffic must equal a native Codex's outright, body included; any
 //      difference fails the run.
+//      A Codex signed in with an API key on the same endpoint (key-pool-*)
+//      leaves out what only a ChatGPT login sends; the pool completes it
+//      (upstream/src/pool/key_login.rs), and what reaches upstream must
+//      equal a native Codex's the same way, the answers to the completed
+//      tools included (the keytools scenario).
 //   5. An in-house app's request to /v1 (app-client.mjs) must reach upstream
 //      as the request Codex sends a custom provider through the pool: the same
 //      header names, order and values (the app's identity replaced by the
@@ -203,17 +208,18 @@ function compareTLS(name, referenceNames = [name]) {
 
 // Native endpoint: what reached upstream through the pool must be what a
 // native Codex sent, header for header and body for body.
-function compareNativeEndpoint(mode) {
+function compareNativeEndpoint(mode, prefix = "native-pool") {
   const kind = mode === "http" ? "http" : "ws-message";
   const native = load(`native-${mode}.jsonl`);
-  const pool = load(`native-pool-${mode}.jsonl`);
-  if (mode === "ws" && pool.some((entry) => entry.kind === "http")) fail("native endpoint ws: the pool fell back to HTTP");
+  const pool = load(`${prefix}-${mode}.jsonl`);
+  const endpoint = prefix === "key-pool" ? "key login" : "native endpoint";
+  if (mode === "ws" && pool.some((entry) => entry.kind === "http")) fail(`${endpoint} ws: the pool fell back to HTTP`);
   const left = native.filter((entry) => entry.kind === kind);
   const right = pool.filter((entry) => entry.kind === kind);
-  if (!right.length) { fail(`native endpoint ${mode}: nothing reached upstream through the pool`); return; }
-  if (left.length !== right.length) fail(`native endpoint ${mode}: native sent ${left.length}, the pool ${right.length}`);
+  if (!right.length) { fail(`${endpoint} ${mode}: nothing reached upstream through the pool`); return; }
+  if (left.length !== right.length) fail(`${endpoint} ${mode}: native sent ${left.length}, the pool ${right.length}`);
   for (let i = 0; i < Math.min(left.length, right.length); i++) {
-    const label = `native endpoint ${mode} ${kind === "http" ? "request" : "message"} ${i + 1}`;
+    const label = `${endpoint} ${mode} ${kind === "http" ? "request" : "message"} ${i + 1}`;
     if (kind === "http") {
       if (left[i].proto !== right[i].proto) fail(`${label}: protocol native=${left[i].proto} pool=${right[i].proto}`);
       if (left[i].path !== right[i].path) fail(`${label}: path native=${left[i].path} pool=${right[i].path}`);
@@ -225,10 +231,10 @@ function compareNativeEndpoint(mode) {
   }
   if (mode === "ws") {
     const handshakes = [native, pool].map((entries) => entries.filter((entry) => entry.kind === "ws-handshake"));
-    if (handshakes[0].length !== handshakes[1].length) fail(`native endpoint ws: native opened ${handshakes[0].length} sockets, the pool ${handshakes[1].length}`);
-    for (let i = 0; i < Math.min(handshakes[0].length, handshakes[1].length); i++) compareHeaders(`native endpoint ws handshake ${i + 1}`, handshakes[0][i], handshakes[1][i]);
+    if (handshakes[0].length !== handshakes[1].length) fail(`${endpoint} ws: native opened ${handshakes[0].length} sockets, the pool ${handshakes[1].length}`);
+    for (let i = 0; i < Math.min(handshakes[0].length, handshakes[1].length); i++) compareHeaders(`${endpoint} ws handshake ${i + 1}`, handshakes[0][i], handshakes[1][i]);
   }
-  notes.push(`native endpoint ${mode}: ${right.length} ${kind === "http" ? "requests" : "messages"} equal to a native Codex`);
+  notes.push(`${endpoint} ${mode}: ${right.length} ${kind === "http" ? "requests" : "messages"} equal to a native Codex`);
 }
 
 // Codex builds a fresh client for every request (core/src/client.rs
@@ -319,9 +325,9 @@ function comparePrime() {
 // upstream through the pool's native endpoint must be a native Codex's, role
 // by role (parent and child threads interleave differently from run to run,
 // so each role is compared in its own order).
-function compareScenario(label, { requireChild = false, requireCompaction = false, failover = false } = {}) {
+function compareScenario(label, { requireChild = false, requireCompaction = false, failover = false, prefix = "native-pool", requireKeyTools = false } = {}) {
   const native = load(`native-${label}.jsonl`);
-  const pool = load(`native-pool-${label}.jsonl`);
+  const pool = load(`${prefix}-${label}.jsonl`);
   const childHeaders = (headers) => Boolean(headers && (headers["x-openai-subagent"] || headers["x-codex-parent-thread-id"]));
   const roleOf = (entries) => {
     const sockets = new Map(entries.filter((entry) => entry.kind === "ws-handshake").map((entry) => [entry.conn, childHeaders(entry.headers) ? "child" : "parent"]));
@@ -334,6 +340,12 @@ function compareScenario(label, { requireChild = false, requireCompaction = fals
   const poolRole = roleOf(pool);
   if (!nativeRequests.length) { fail(`${label}: the native Codex sent nothing; the scenario did not run`); return; }
   if (requireChild && !nativeRequests.some((entry) => nativeRole(entry) === "child")) fail(`${label}: the native Codex spawned no subagent; the scenario did not run`);
+  // Every keytools call must have been answered, or the answers the pool
+  // rewrites (key_login.rs) were never compared.
+  if (requireKeyTools) {
+    const answered = new Set(nativeRequests.flatMap((entry) => ((entry.body || {}).input || []).filter((item) => item && item.type === "function_call_output").map((item) => item.call_id)));
+    if (answered.size < 4) fail(`${label}: the native Codex answered ${answered.size} of the 4 keytools calls; the scenario did not run`);
+  }
   if (requireCompaction && !nativeRequests.some((entry) => entry.kind !== "ws-handshake" && /compaction/.test(JSON.stringify((entry.body || {}).input || []) + JSON.stringify((entry.body || {}).client_metadata || {})))) fail(`${label}: the native Codex sent no compaction request; the scenario did not run`);
   const ignored = new Set();
   if (failover) {
@@ -361,7 +373,7 @@ function compareScenario(label, { requireChild = false, requireCompaction = fals
     }
   }
   const children = nativeRequests.filter((entry) => nativeRole(entry) === "child").length;
-  notes.push(`${label}: ${poolRequests.length} requests equal to a native Codex's${children ? ` (${children} from the subagent)` : ""}`);
+  notes.push(`${prefix === "key-pool" ? "key login " : ""}${label}: ${poolRequests.length} requests equal to a native Codex's${children ? ` (${children} from the subagent)` : ""}`);
 }
 
 // Each pool account presents its own installation id in place of the
@@ -481,13 +493,26 @@ compareApp();
 compareWS();
 compareNativeEndpoint("http");
 compareNativeEndpoint("ws");
+// A Codex signed in with an API key on the native endpoint, completed by the
+// pool into a native Codex's request (SPEC.md 2.3.3, key login).
+compareNativeEndpoint("http", "key-pool");
+compareNativeEndpoint("ws", "key-pool");
 compareConnections("native-http.jsonl", "pool-http.jsonl");
 compareConnections("native-ws.jsonl", "pool-ws.jsonl");
 compareConnections("native-http.jsonl", "native-pool-http.jsonl");
 compareConnections("native-ws.jsonl", "native-pool-ws.jsonl");
+compareConnections("native-http.jsonl", "key-pool-http.jsonl");
+compareConnections("native-ws.jsonl", "key-pool-ws.jsonl");
 compareScenario("subagent-http", { requireChild: true });
 compareScenario("subagent-ws", { requireChild: true });
 compareScenario("compact", { requireCompaction: true });
+compareScenario("subagent-http", { requireChild: true, prefix: "key-pool" });
+compareScenario("subagent-ws", { requireChild: true, prefix: "key-pool" });
+compareScenario("compact", { requireCompaction: true, prefix: "key-pool" });
+compareScenario("keytools-http", { requireKeyTools: true });
+compareScenario("keytools-ws", { requireKeyTools: true });
+compareScenario("keytools-http", { requireKeyTools: true, prefix: "key-pool" });
+compareScenario("keytools-ws", { requireKeyTools: true, prefix: "key-pool" });
 compareScenario("failover-http", { failover: true });
 compareScenario("failover-ws", { failover: true });
 compareTLS("tls-http.txt");

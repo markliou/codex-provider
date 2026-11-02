@@ -63,6 +63,10 @@ function hasToolOutput(body) {
 //   failover  the first account the pool (FAIL_FROM, its address) sends a
 //             Responses request or socket for is refused as spent, so the
 //             pool moves the request to its other account
+//   keytools  the model calls, one after another, each tool a Codex signed in
+//             with an API key leaves out and the pool adds for it
+//             (key_login.rs): the MCP resource helpers and image_gen, so the
+//             answers Codex sends back can be compared with a native Codex's
 const SCENARIO = process.env.SCENARIO || "";
 const FAIL_FROM = process.env.FAIL_FROM || "";
 let failedAccount = "";
@@ -117,6 +121,24 @@ function issueCall(name, id) {
   if (!issuedCalls.has(name)) issuedCalls.set(name, new Set());
   issuedCalls.get(name).add(id);
 }
+// The keytools calls, in order. The read names a server no Codex here has, so
+// a native Codex answers it itself (core/src/tools/handlers/mcp_resource.rs
+// resource_environments: "unknown MCP server"), and image_gen asks for a new
+// image, which a native Codex requests from images/generations below.
+const KEY_TOOL_CALLS = [
+  { name: "list_mcp_resources", arguments: {} },
+  { name: "list_mcp_resource_templates", arguments: {} },
+  { name: "read_mcp_resource", arguments: { server: "docs", uri: "docs://readme" } },
+  { namespace: "image_gen", name: "imagegen", arguments: { prompt: "A red square on a white background." } },
+];
+function nextKeyToolCall(body) {
+  for (const call of KEY_TOOL_CALLS) {
+    const offered = offeredTool(body, call.name);
+    if (!offered || offered.namespace !== (call.namespace || null)) return null;
+    if (!hasCallOutput(body, call.name)) return call;
+  }
+  return null;
+}
 // Whether the pool's request for this account must be refused (failover).
 function refuseForFailover(remoteAddress, account) {
   if (SCENARIO !== "failover" || !FAIL_FROM || remoteAddress !== FAIL_FROM || !account) return false;
@@ -155,6 +177,12 @@ function events(body, headers) {
     item = { type: "function_call", id: `fc_${n}`, call_id: `call_${n}`, name: "wait_agent", ...(namespace ? { namespace } : {}), arguments: JSON.stringify({ timeout_ms: 30000 }), status: "completed" };
   } else if (SCENARIO === "subagent") {
     item = { type: "message", id: `msg_${n}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "PARENT_OK", annotations: [] }] };
+  } else if (SCENARIO === "keytools" && nextKeyToolCall(body)) {
+    // The call shapes of Codex's own tests (core/tests/common/responses.rs
+    // ev_function_call and ev_function_call_with_namespace).
+    const call = nextKeyToolCall(body);
+    issueCall(call.name, `call_${n}`);
+    item = { type: "function_call", id: `fc_${n}`, call_id: `call_${n}`, name: call.name, ...(call.namespace ? { namespace: call.namespace } : {}), arguments: JSON.stringify(call.arguments), status: "completed" };
   } else if (!hasToolOutput(body) && pickTool(body)) {
     const name = pickTool(body);
     item = { type: "function_call", id: `fc_${n}`, call_id: `call_${n}`, name, arguments: JSON.stringify(toolArgs(name)), status: "completed" };
@@ -286,6 +314,11 @@ const server = http2.createSecureServer({ allowHTTP1: true, key: fs.readFileSync
     if (/\/wham\/rate-limit-reset-credits$/.test(req.url.split("?")[0])) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ credits: [] })); return; }
     if (/accounts\/check/.test(req.url)) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ accounts: [{ id: "acct-capture", plan_type: "pro", workspace_backend_origin: "NO_CONSTRAINT", account_routing_override: "NO_CONSTRAINT", structure: "personal" }], account_ordering: ["acct-capture"], default_account_id: "acct-capture" })); return; }
     if (/\/models/.test(req.url)) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ models: [] })); return; }
+    // An image answer with no image in it, in the fields Codex reads
+    // (codex-api/src/images.rs ImageResponse: created, data), so a native
+    // Codex's image_gen ends in its own "image generation returned no image
+    // data" (ext/image-generation/src/tool.rs).
+    if (/\/images\/generations$/.test(req.url.split("?")[0])) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ created: 1700000000, data: [] })); return; }
     res.writeHead(404, { "content-type": "application/json" });
     res.end("{}");
   });

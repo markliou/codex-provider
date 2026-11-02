@@ -297,6 +297,9 @@ pub async fn handle_native(
         return;
     }
     app.note_unrelayed_native_headers(&request.headers);
+    // Read before the client's credential is dropped: a Codex signed in with
+    // an API key presents only a bearer key (key_login.rs).
+    request.key_login = super::key_login::is_key_login(&request.headers);
     request.headers.remove("authorization");
     request.headers.remove("chatgpt-account-id");
     if let Ok(value) = http::HeaderValue::from_str(&format!("Bearer {key}")) {
@@ -436,15 +439,25 @@ async fn handle_native_passthrough(
         }
     }
     writer.write_header(response.status);
+    // The models catalog is kept as it passes, for completing a key-login
+    // Codex's requests (key_login.rs: image models, the catalog's tool text).
+    let keep_catalog = rest == "models" && response.status == StatusCode::OK;
+    let mut catalog = Vec::new();
     let mut reader = SseReader::new(response.body);
     loop {
         let (chunk, end) = reader.read_block().await;
         if !chunk.is_empty() {
+            if keep_catalog && catalog.len() + chunk.len() <= MAX_REQUEST_BODY {
+                catalog.extend_from_slice(&chunk);
+            }
             writer.write(&chunk);
             writer.flush();
         }
         if end.is_some() {
             break;
         }
+    }
+    if keep_catalog {
+        app.key_login.note_catalog(&catalog);
     }
 }

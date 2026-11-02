@@ -27,6 +27,7 @@ pub mod gosort;
 pub mod hash;
 pub mod http_io;
 pub mod installation_id;
+pub mod key_login;
 pub mod listener;
 pub mod log;
 pub mod login;

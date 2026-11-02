@@ -199,6 +199,9 @@ struct Session {
     app: Arc<App>,
     handshake: HeaderMap,
     native: bool,
+    /// A Codex signed in with an API key on the native endpoint: each message
+    /// is completed for the account it goes to (key_login.rs).
+    key_login: bool,
     api_key: String,
     cancel: Cancel,
     client: mpsc::UnboundedSender<Outgoing>,
@@ -359,6 +362,7 @@ pub async fn handle_responses_websocket(
         app: app.clone(),
         handshake: request.headers.clone(),
         native,
+        key_login: native && request.key_login,
         api_key: super::server::request_api_key(&request.headers, &request.query),
         cancel: request.cancel.clone(),
         client: client_tx,
@@ -670,6 +674,11 @@ async fn start_response(
     if let Some(id) = app.presented_installation_id(&bound) {
         let text = String::from_utf8_lossy(&message).into_owned();
         message = Bytes::from(installation_id::with_installation_id(&text, &id).into_owned());
+    }
+    // Completed for the account it goes to, as on HTTP (key_login.rs); a
+    // socket carries only Responses requests.
+    if session.key_login && App::uses_codex_backend_directly(&bound) {
+        message = app.complete_key_login(&bound, message, &session.handshake, true);
     }
     let throughput = (!warmup).then(|| {
         let mut measurement = app.begin_throughput_measurement(true);
@@ -1060,6 +1069,11 @@ async fn relay_upstream<S>(
         let response = session.state().active.clone();
         if let Frame::Text(text) = &frame {
             app.note_event_turn_state(text, &account_id);
+            // A later message answers a resource or image call without
+            // repeating it; key_login.rs needs its arguments.
+            if session.key_login {
+                app.key_login.note_event(text);
+            }
         }
         let text = match &frame {
             Frame::Text(text) => Some(text.clone()),

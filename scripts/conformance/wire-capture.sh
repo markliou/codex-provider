@@ -153,14 +153,23 @@ run_turn() {
   cp "$work/logs/capture.jsonl" "$work/$2.jsonl"
 }
 
+reset_fake() {
+  docker run --rm --network "$net" alpine:3.21 wget -q --no-check-certificate -O /dev/null https://chatgpt.com/__conformance/reset || true
+}
+
 # A scenario phase: the same turn from a native Codex and from Codex on the
-# pool's native endpoint, against a fake answering in that scenario.
+# pool's native endpoint, against a fake answering in that scenario; with
+# WITH_KEY=1 also from a Codex signed in with an API key on that endpoint.
 #   scenario_phase <label> <scenario> <reject-ws>
 scenario_phase() {
   SCENARIO=$2 start_fake "$3" "$1"
   SCENARIO=$2 run_turn native "native-$1"
-  docker run --rm --network "$net" alpine:3.21 wget -q --no-check-certificate -O /dev/null https://chatgpt.com/__conformance/reset || true
+  reset_fake
   SCENARIO=$2 run_turn native-pool "native-pool-$1"
+  if [ "${WITH_KEY:-}" = 1 ]; then
+    reset_fake
+    SCENARIO=$2 run_turn key-pool "key-pool-$1"
+  fi
   stop_fake "$1"
 }
 
@@ -245,6 +254,7 @@ run_turn native native-http
 run_turn client-http client-http
 run_turn pool-http pool-http
 run_turn native-pool native-pool-http
+run_turn key-pool key-pool-http
 : > "$work/logs/capture.jsonl"
 docker run --rm --network "$net" -v "$repo_root/scripts/conformance/harness:/h:ro" -e CONFORMANCE_CLIENT_KEY="$CLIENT_KEY" \
   node:22-alpine node /h/app-client.mjs "$model" > "$work/app-http.log" 2>&1 || true
@@ -257,6 +267,7 @@ run_turn native native-ws
 run_turn client-ws client-ws
 run_turn pool-ws pool-ws
 run_turn native-pool native-pool-ws
+run_turn key-pool key-pool-ws
 stop_fake ws
 
 echo "Subagent: a parent spawns one child, over HTTP and over the WebSocket"
@@ -265,12 +276,16 @@ enabled = true
 max_concurrent_threads_per_session = 3
 non_code_mode_only = false'
 CONFORMANCE_EXTRA="$subagent_config" CONFORMANCE_PROMPT="Use the spawn_agent tool exactly once, wait for the child, then reply with PARENT_OK." \
-  scenario_phase subagent-http subagent 1
+  WITH_KEY=1 scenario_phase subagent-http subagent 1
 CONFORMANCE_EXTRA="$subagent_config" CONFORMANCE_PROMPT="Use the spawn_agent tool exactly once, wait for the child, then reply with PARENT_OK." \
-  scenario_phase subagent-ws subagent 0
+  WITH_KEY=1 scenario_phase subagent-ws subagent 0
 
 echo "Compaction: a low auto-compact limit makes Codex compact mid-turn"
-CONFORMANCE_EXTRA='model_auto_compact_token_limit = 20000' scenario_phase compact compact 1
+CONFORMANCE_EXTRA='model_auto_compact_token_limit = 20000' WITH_KEY=1 scenario_phase compact compact 1
+
+echo "Key login: the model calls the tools the pool adds for a Codex signed in with an API key"
+WITH_KEY=1 scenario_phase keytools-http keytools 1
+WITH_KEY=1 scenario_phase keytools-ws keytools 0
 
 echo "Failover: the pool's first account is refused as spent and the request moves to its second"
 docker stop "$pool" >/dev/null

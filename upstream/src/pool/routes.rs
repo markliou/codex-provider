@@ -45,6 +45,10 @@ pub struct Request {
     pub cancel: Cancel,
     /// The connection, for a WebSocket upgrade.
     pub upgrade: Option<hyper::upgrade::OnUpgrade>,
+    /// Sent by a Codex signed in with an API key to the native endpoint,
+    /// whose requests the pool completes (key_login.rs). Set by the native
+    /// endpoint before it drops the client's credential.
+    pub key_login: bool,
 }
 
 impl Request {
@@ -61,6 +65,7 @@ impl Request {
             remote_addr: "192.0.2.1:1234".to_string(),
             cancel: Cancel::default(),
             upgrade: None,
+            key_login: false,
         }
     }
 
@@ -577,6 +582,7 @@ pub async fn serve_provider(
         headers: request.headers,
         body: request.body,
         native,
+        key_login: native && request.key_login,
         cancel: request.cancel,
     };
     handle_proxy(app, proxy, writer, chat).await;

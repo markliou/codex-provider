@@ -9,6 +9,10 @@
 #   sh run-codex.sh native-pool <model>   Codex's built-in OpenAI provider with
 #                                         ChatGPT auth, its base URL moved to the
 #                                         pool's native endpoint (SPEC.md 2.3.3)
+#   sh run-codex.sh key-pool <model>      as native-pool, but Codex signed in
+#                                         with an API key (codex login
+#                                         --with-api-key), which the pool
+#                                         completes (SPEC.md 2.3.3, key login)
 #   sh run-codex.sh native-reset <model>  as native, but Codex's app-server spends
 #                                         a reset credit over JSON-RPC, as the
 #                                         TUI's /usage reset does
@@ -26,11 +30,15 @@ export CODEX_HOME=/tmp/codex-home PATH=/codex/codex-path:$PATH
 mkdir -p "$CODEX_HOME" /tmp/work
 cd /tmp/work
 case "$target" in
-  native|native-refresh|native-pool|native-reset)
+  native|native-refresh|native-pool|native-reset|key-pool)
     cat /certs/ca.pem >> /etc/ssl/certs/ca-certificates.crt
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt CODEX_CA_CERTIFICATE=/certs/ca.pem
     if [ "$target" = native-refresh ]; then
       cp /harness/auth-expiring.json "$CODEX_HOME/auth.json"
+    elif [ "$target" = key-pool ]; then
+      # Codex stores the key without checking it (login/src/auth/manager.rs
+      # login_with_api_key); the pool drops it.
+      printf '%s' sk-proj-capture-key | /codex/bin/codex login --with-api-key >/dev/null 2>&1
     else
       cp /harness/auth.json "$CODEX_HOME/auth.json"
     fi
@@ -38,7 +46,7 @@ case "$target" in
 model = "$model"
 model_reasoning_effort = "xhigh"
 CFG
-    if [ "$target" = native-pool ]; then
+    if [ "$target" = native-pool ] || [ "$target" = key-pool ]; then
       echo "openai_base_url = \"http://conformance-pool:8317/k/$CONFORMANCE_CLIENT_KEY/backend-api/codex\"" >> "$CODEX_HOME/config.toml"
     fi
     printf '%s\n' "${CONFORMANCE_EXTRA:-}" >> "$CODEX_HOME/config.toml"
