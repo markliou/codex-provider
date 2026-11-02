@@ -27,6 +27,12 @@ receive codex-rs/codex-api/src/responses_headers.rs                  response he
 policy  codex-rs/core/src/client.rs                                  transport choice, reconnect, fallback between WebSocket and HTTP
 policy  codex-rs/core/src/responses_retry.rs                         which failures Codex retries, and when it falls back from WebSocket to HTTP
 policy  codex-rs/core/src/util.rs                                    retry backoff
+send    codex-rs/core/src/tools/handlers/mcp_resource_spec.rs       key login: the MCP resource helpers the pool adds (key_login.rs)
+send    codex-rs/core/src/tools/handlers/mcp_resource.rs            key login: a native Codex's answers to the resource helpers
+send    codex-rs/core/src/tools/spec_plan.rs                        key login: which tools a ChatGPT login offers, and their order
+send    codex-rs/ext/image-generation/src/tool.rs                   key login: the image_gen tool and its answer without an image
+send    codex-rs/core/src/tools/registry.rs                         key login: the "unsupported call" answer the pool replaces
+send    codex-rs/model-provider/src/bearer_auth_provider.rs         key login: an API-key Codex sends no ChatGPT-Account-ID
 send    codex-rs/backend-client/src/client.rs                       the pool's own backend calls: account check, headers
 send    codex-rs/backend-client/src/client/rate_limit_resets.rs     the pool's own usage and reset-credit calls
 send    codex-rs/tui/src/chatwidget/reset_credits.rs                 which credit a reset names (the picker's first)

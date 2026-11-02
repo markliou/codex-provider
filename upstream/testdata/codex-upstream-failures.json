@@ -584,6 +584,16 @@
   ],
   "_assumptionsComment": "Codex behaviors the pool's own requests and the native endpoint are built on (SPEC.md 2.3.2, 2.3.3). codex-conformance.sh check fails when a marker disappears: re-read that Codex code and adjust the pool before moving the pin.",
   "assumptions": [
+    {"name": "key login: detection", "source": "codex-rs/model-provider/src/bearer_auth_provider.rs", "marker": "            account_id: None,\n            is_fedramp_account,", "pool": "an API-key Codex sends a bearer key and no ChatGPT-Account-ID (key_login.rs is_key_login)"},
+    {"name": "key login: resource helpers need an MCP server", "source": "codex-rs/core/src/tools/spec_plan.rs", "marker": "    if context.mcp.has_servers()", "pool": "a ChatGPT login's apps MCP server brings the resource helpers"},
+    {"name": "key login: image_gen gate", "source": "codex-rs/core/src/tools/spec_plan.rs", "marker": "        == Some(PlanType::Free)", "pool": "no image_gen on the Free plan or for a model without image input"},
+    {"name": "key login: guardian credits", "source": "codex-rs/core/src/client.rs", "marker": ".insert(\"guardian_credits_requested\".to_owned(), \"true\".to_owned());", "pool": "guardian_credits_requested on a ChatGPT login's Responses request, not a reviewer's"},
+    {"name": "key login: unsupported call answer", "source": "codex-rs/core/src/tools/registry.rs", "marker": "_ => format!(\"unsupported call: {tool_name}\"),", "pool": "the answer of a Codex that did not offer the tool, which the pool replaces"},
+    {"name": "key login: namespaced tool name", "source": "codex-rs/protocol/src/tool_name.rs", "marker": "Some(namespace) => write!(f, \"{namespace}{}\", self.name),", "pool": "unsupported call: image_genimagegen"},
+    {"name": "key login: unknown server answer", "source": "codex-rs/core/src/tools/handlers/mcp_resource.rs", "marker": "FunctionCallError::RespondToModel(format!(\"unknown MCP server '{server}'\"))", "pool": "read or list of a server the Codex does not have"},
+    {"name": "key login: cursor answer", "source": "codex-rs/core/src/tools/handlers/mcp_resource.rs", "marker": "\"cursor can only be used when a server is specified\".to_string(),", "pool": "a cursor without a server"},
+    {"name": "key login: empty image answer", "source": "codex-rs/ext/image-generation/src/tool.rs", "marker": "\"image generation returned no image data\".to_string(),", "pool": "the answer the pool gives for image_gen"},
+    {"name": "key login: apps server name", "source": "codex-rs/core/src/tools/handlers/mcp_resource.rs", "marker": "turn.config.orchestrator_mcp_enabled || server != CODEX_APPS_MCP_SERVER_NAME", "pool": "the apps server is reachable while orchestrator.mcp.enabled is on (the default)"},
     {
       "name": "backend-client headers",
       "source": "codex-rs/backend-client/src/client.rs",

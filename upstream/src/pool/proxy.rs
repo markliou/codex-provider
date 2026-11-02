@@ -172,6 +172,9 @@ pub struct ProxyRequest {
     pub body: Bytes,
     /// Arrived on the native Codex endpoint (/k/<key>/backend-api/codex/).
     pub native: bool,
+    /// From a Codex signed in with an API key on the native endpoint; each
+    /// attempt is completed for its account (key_login.rs).
+    pub key_login: bool,
     pub cancel: Cancel,
 }
 
@@ -1286,6 +1289,14 @@ async fn attempts(
         // The completed request presents the Codex that last used this
         // account, so it is made per attempt, after the account is chosen.
         let (out_body, inbound, shaping) = if native {
+            // A key-login Codex's request is completed into the one a native
+            // Codex signed in with this account sends (key_login.rs); every
+            // other native request goes as Codex wrote it.
+            let out_body = if request.key_login && App::uses_codex_backend_directly(&candidate) {
+                app.complete_key_login(&candidate, out_body, &request.headers, !compact)
+            } else {
+                out_body
+            };
             (out_body, inbound, Shaping::Exact)
         } else if foreign && App::uses_codex_backend_directly(&candidate) {
             let api_key = super::server::request_api_key(&request.headers, &request.query);

@@ -135,6 +135,7 @@ pub async fn handle(
         remote_addr,
         cancel: cancel.clone(),
         upgrade: Some(upgrade),
+        key_login: false,
     };
     let (writer, response) = ChannelWriter::new();
     tokio::spawn(async move {

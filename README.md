@@ -117,6 +117,14 @@ Use HTTPS for this endpoint: Codex sends your ChatGPT login to the pool in
 `Authorization` (the pool drops it), and the key is in the URL, so no proxy in
 front of the pool may log `/k/` paths.
 
+If you do not need Codex's analytics, turn them off at the end of
+`config.toml`:
+
+```toml
+[analytics]
+enabled = false
+```
+
 ### Custom provider (`/v1`)
 
 Without changing `openai_base_url`, Codex can use the pool as a custom provider.

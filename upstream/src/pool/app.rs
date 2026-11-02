@@ -151,6 +151,9 @@ pub struct App {
     /// Each thread's latest socket pin, for its Guardian reviewer
     /// (routing_pin.rs).
     pub routing_pins: super::routing_pin::RoutingPins,
+    /// What completing a key-login Codex's requests reads: the models
+    /// catalog and the tool calls upstream made on a socket (key_login.rs).
+    pub key_login: super::key_login::KeyLogin,
     /// Overloads in a row that closed a socket before content, per account
     /// and model: the WebSocket same-account schedule (responses_ws.rs).
     pub ws_overload_drops: std::sync::Mutex<HashMap<String, u32>>,
@@ -222,6 +225,7 @@ impl App {
             client_limits,
             turn_state_issuers: std::sync::Mutex::new(HashMap::new()),
             routing_pins: super::routing_pin::RoutingPins::default(),
+            key_login: super::key_login::KeyLogin::default(),
             ws_overload_drops: std::sync::Mutex::new(HashMap::new()),
             unrelayed_header_sets: std::sync::Mutex::new(std::collections::HashSet::new()),
             foreign_conversations: super::codex_request::Conversations::default(),
