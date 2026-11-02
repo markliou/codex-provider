@@ -111,6 +111,9 @@ pub struct Inner {
     pub preserve_pro_quota: bool,
     pub lineage_affinity: bool,
     pub quota_prime: bool,
+    /// The upstream switch as shown; the transport holds the copy every send
+    /// reads, and App::set_upstream changes both together.
+    pub upstream_enabled: bool,
     pub jobs: BTreeMap<String, LoginJob>,
     /// In-memory placement load: which account each recently active session
     /// is on (see note_session_placement).
@@ -193,12 +196,16 @@ impl App {
                 .unwrap_or(settings.preserve_pro_quota),
             lineage_affinity: config.lineage_affinity.unwrap_or(settings.lineage_affinity),
             quota_prime: config.quota_prime.unwrap_or(settings.quota_prime),
+            upstream_enabled: config.upstream_enabled.unwrap_or(settings.upstream_enabled),
             settings: settings.clone(),
             tuning,
             config,
             state,
             jobs: BTreeMap::new(),
         };
+        // The transport starts closed; this opens it only if the saved switch,
+        // else the environment, allows upstream.
+        transports.set_upstream(inner.upstream_enabled);
         let client_limits = Arc::new(super::client_limit::ClientLimits::new(
             settings.client_max_in_flight,
             settings.client_max_per_minute,
@@ -257,7 +264,6 @@ impl App {
         let _ = std::fs::create_dir_all(data_dir.join("state"));
         let mut settings = Settings::for_test(data_dir.to_path_buf());
         configure(&mut settings);
-        let upstream_enabled = settings.upstream_enabled;
         Self::new(
             settings,
             tuning,
@@ -266,10 +272,25 @@ impl App {
             Logger::discard(),
             Arc::new(
                 crate::transport::Transports::new()
-                    .unwrap_or_else(|error| panic!("Codex transport: {error}"))
-                    .with_upstream(upstream_enabled),
+                    .unwrap_or_else(|error| panic!("Codex transport: {error}")),
             ),
         )
+    }
+
+    /// Whether the upstream switch is on right now.
+    pub fn upstream_enabled(&self) -> bool {
+        !self.transports.closed()
+    }
+
+    /// Flips the upstream switch from the Console: the transport, which every
+    /// send reads, and the shown state change together under the write lock,
+    /// and the choice is saved so it survives a restart (SPEC.md, upstream
+    /// switch). Sends already under way finish; nothing new starts once it is
+    /// off.
+    pub fn set_upstream(&self, inner: &mut Inner, enabled: bool) {
+        self.transports.set_upstream(enabled);
+        inner.upstream_enabled = enabled;
+        inner.config.upstream_enabled = Some(enabled);
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, Inner> {

@@ -5893,7 +5893,7 @@ async fn a_closed_upstream_sends_no_call_of_the_pool_s_own() {
     app.poll_account_quota(&item).await;
     let primed = app.send_quota_prime_request(&item, "gpt-test").await;
     assert!(
-        primed.is_err_and(|error| error.contains("CODEX_POOL_UPSTREAM_ENABLED")),
+        primed.is_err_and(|error| error == crate::transport::UPSTREAM_CLOSED),
         "a prime was not refused"
     );
     assert!(matches!(

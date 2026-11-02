@@ -361,7 +361,7 @@ impl App {
     ) -> Result<(), String> {
         // A prime is a request upstream like any other (SPEC.md, upstream
         // switch); the CLI below would not pass through the pool's transport.
-        if !self.settings.upstream_enabled {
+        if !self.upstream_enabled() {
             return Err(crate::transport::UPSTREAM_CLOSED.to_string());
         }
         // A Codex account is primed by Codex itself, so upstream sees a native

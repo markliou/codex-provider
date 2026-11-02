@@ -1115,3 +1115,43 @@ async fn pool_participation_cannot_change_during_auth_repair() {
         "repair conflict cleared or rewrote sticky route"
     );
 }
+
+// The Console's upstream switch: it takes effect at once, is saved, and a
+// saved choice wins over CODEX_POOL_UPSTREAM_ENABLED at the next start
+// (SPEC.md, upstream switch).
+#[tokio::test]
+async fn admin_settings_toggle_the_upstream_switch() {
+    let (app, dir) = arc_app(Vec::new());
+    let session = admin_session(&app);
+    assert!(app.upstream_enabled(), "the test pool starts open");
+    let result = post_settings(&app, &session, r#"{"upstreamEnabled":false}"#).await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    assert!(!app.upstream_enabled() && !app.read().upstream_enabled);
+    assert!(app.transports.closed(), "the transport is the backstop");
+    assert!(result.body_string().contains(r#""upstreamEnabled":false"#));
+    assert_eq!(saved_config(&app)["upstreamEnabled"], false);
+    assert!(app.read().lineage_affinity, "other switches untouched");
+    let result = post_settings(&app, &session, r#"{"upstreamEnabled":true}"#).await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    assert!(app.upstream_enabled() && !app.transports.closed());
+    assert_eq!(saved_config(&app)["upstreamEnabled"], true);
+
+    // A saved choice outlives the environment's default.
+    let config = super::state::Config {
+        upstream_enabled: Some(false),
+        ..super::state::Config::default()
+    };
+    let mut settings = super::settings::Settings::for_test(dir.path().to_path_buf());
+    settings.upstream_enabled = true;
+    let reopened = App::new(
+        settings,
+        super::tuning::Tuning::default(),
+        config,
+        super::state::RuntimeState::default(),
+        super::log::Logger::discard(),
+        std::sync::Arc::new(
+            crate::transport::Transports::new().unwrap_or_else(|error| panic!("{error}")),
+        ),
+    );
+    assert!(!reopened.upstream_enabled() && !reopened.read().upstream_enabled);
+}

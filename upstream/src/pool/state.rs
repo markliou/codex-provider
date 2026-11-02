@@ -73,6 +73,10 @@ pub struct Config {
     pub lineage_affinity: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_prime: Option<bool>,
+    /// The upstream switch as the owner last set it in the Console; unset,
+    /// CODEX_POOL_UPSTREAM_ENABLED decides (SPEC.md, upstream switch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_enabled: Option<bool>,
     #[serde(default)]
     pub created_at: Timestamp,
     #[serde(default)]

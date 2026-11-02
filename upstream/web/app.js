@@ -665,8 +665,26 @@
     if (notice) notice.hidden = upstreamEnabled !== false;
   }
 
+  // The owner's large upstream switch. Unlike the other switches a missing
+  // value is shown as closed: this control must never claim upstream is open
+  // when the server did not say so.
+  function renderUpstreamSwitch(upstreamEnabled) {
+    const card = $("#upstream-switch-card");
+    const input = $("#upstream-switch");
+    if (!card || !input) return;
+    const open = upstreamEnabled === true;
+    card.classList.toggle("open", open);
+    input.checked = open;
+    input.disabled = false;
+    $("#upstream-switch-state").textContent = open ? "Open" : "Closed";
+    $("#upstream-switch-detail").textContent = open
+      ? "This pool sends client requests to OpenAI, and polls quota and refreshes sign-ins for its accounts."
+      : "Nothing is sent to OpenAI: no client request, quota poll, token refresh, prime or sign-in.";
+  }
+
   function renderSettings(serviceState) {
     renderUpstreamClosed(serviceState?.upstreamEnabled);
+    renderUpstreamSwitch(serviceState?.upstreamEnabled);
     const preserveSwitch = $("#preserve-pro-quota-switch");
     if (preserveSwitch) {
       preserveSwitch.checked = Boolean(serviceState?.preserveProQuota);
@@ -1406,6 +1424,20 @@
   const updatePreserveProQuota = updateSetting("preserveProQuota", false);
   const updateLineageAffinity = updateSetting("lineageAffinity", true);
   const updateQuotaPrime = updateSetting("quotaPrime", false);
+  const saveUpstreamSwitch = updateSetting("upstreamEnabled", false);
+  // The master switch asks before it changes anything: opening lets the pool
+  // reach OpenAI, closing stops every client mid-work.
+  const updateUpstreamSwitch = (event) => {
+    const input = event.currentTarget;
+    const question = input.checked
+      ? "Open upstream? This pool will start sending to OpenAI: client requests, quota polls and token refreshes."
+      : "Close upstream? Clients get an error and nothing more is sent to OpenAI until you open it again.";
+    if (!window.confirm(question)) {
+      input.checked = !input.checked;
+      return;
+    }
+    return saveUpstreamSwitch(event);
+  };
 
   async function watchLoginJob(jobId) {
     let attempts = 0;
@@ -1527,6 +1559,7 @@
   $("#preserve-pro-quota-switch").addEventListener("change", updatePreserveProQuota);
   $("#lineage-affinity-switch").addEventListener("change", updateLineageAffinity);
   $("#quota-prime-switch").addEventListener("change", updateQuotaPrime);
+  $("#upstream-switch").addEventListener("change", updateUpstreamSwitch);
   $("#close-device-auth-button").addEventListener("click", () => closeDeviceAuth(true));
   $("#device-auth-dialog").addEventListener("click", (event) => {
     const button = event.target.closest("[data-copy-target]");

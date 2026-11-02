@@ -560,6 +560,24 @@ async fn start_response(
     mut payload: Map<String, Value>,
 ) -> bool {
     let app = &session.app;
+    // The owner may turn the upstream switch off while a socket is open; the
+    // next request on it then goes nowhere. The wrapped 400 is one a Codex
+    // does not retry, the same answer an HTTP request gets (SPEC.md, upstream
+    // switch).
+    if !app.upstream_enabled() {
+        let event = super::gojson::marshal(&serde_json::json!({
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "upstream_closed",
+                "message": super::http_io::UPSTREAM_CLOSED_MESSAGE,
+            },
+        }));
+        session.send_client(Frame::Text(Bytes::from(event)));
+        session.close_client(1000, "upstream closed");
+        return false;
+    }
     // Held to the key's limits like an HTTP request (client_limit.rs). The
     // answer is the wrapped 429 a Codex waits on and retries on a new
     // socket; nothing of this message reaches upstream.

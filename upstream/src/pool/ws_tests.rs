@@ -1315,3 +1315,38 @@ async fn responses_websocket_holds_a_client_over_its_minute() {
             .map(|response| response.as_ref().map(hyper::Response::status))
     );
 }
+
+// The owner turns the upstream switch off while a socket is open: the next
+// request on it is answered with the wrapped 400 Codex does not retry, and
+// nothing more reaches upstream (SPEC.md, upstream switch).
+#[tokio::test]
+async fn responses_websocket_refuses_a_request_once_upstream_is_closed() {
+    let pool = ws_test_pool_with(
+        Behavior::scripted(|_| completed_events("resp_open")),
+        |_| {},
+        |_| {},
+    )
+    .await;
+    let mut socket = dial_pool(&pool.url).await;
+    let turn = r#"{"type":"response.create","model":"gpt-test","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"tools":[],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":null,"store":false,"stream":true,"include":[]}"#;
+    send(&mut socket, turn).await;
+    let events = read_until_terminal(&mut socket).await;
+    assert!(
+        events
+            .last()
+            .is_some_and(|event| event.contains("response.completed")),
+        "{events:?}"
+    );
+    wait_in_flight_zero(&pool.app).await;
+    {
+        let mut inner = pool.app.write();
+        pool.app.set_upstream(&mut inner, false);
+    }
+    send(&mut socket, turn).await;
+    let events = read_until_terminal(&mut socket).await;
+    let refused: serde_json::Value =
+        serde_json::from_str(events.last().map_or("", String::as_str)).unwrap_or_default();
+    assert_eq!(refused["status"], 400, "{events:?}");
+    assert_eq!(refused["error"]["code"], "upstream_closed");
+    assert_eq!(pool.upstream.messages().len(), 1);
+}

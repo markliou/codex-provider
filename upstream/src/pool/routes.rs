@@ -508,7 +508,7 @@ pub async fn serve(app: &Arc<App>, request: Request, writer: Box<dyn ResponseWri
         // Checked after the key, so only a client of this pool learns that
         // it is closed (SPEC.md, upstream switch).
         Handler::Responses | Handler::ResponsesWebSocket | Handler::Compact | Handler::Chat
-            if !app.settings.upstream_enabled =>
+            if !app.upstream_enabled() =>
         {
             super::http_io::write_upstream_closed(writer.as_mut(), StatusCode::BAD_REQUEST);
         }
