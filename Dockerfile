@@ -1,8 +1,8 @@
 # The pool: one Rust binary that routes and sends
 # upstream with Codex's own HTTP and WebSocket clients. Alpine's native musl
-# target and Rust 1.99.1 match how the official Codex Linux release is built,
+# target and Rust 1.95.0 match how the official Codex Linux release is built,
 # and --locked keeps the Codex-seeded lock.
-FROM rust:1.99.1-alpine AS pool
+FROM rust:1.95.0-alpine AS pool
 
 RUN apk add --no-cache musl-dev perl make gcc linux-headers git
 # .dockerignore keeps .git out of the image context, so release identity must be
@@ -33,7 +33,7 @@ FROM node:22-bookworm-slim AS codex-cli
 # The bundled Codex CLI signs accounts in and primes quota windows, so it is
 # the pinned Codex release, the same one the pool is built from
 # (upstream/Cargo.toml) and PINNED_CODEX_VERSION names; a test keeps them equal.
-ARG CODEX_CLI_VERSION=0.165.0
+ARG CODEX_CLI_VERSION=0.166.0
 RUN npm install --global @openai/codex@${CODEX_CLI_VERSION}
 
 FROM node:22-bookworm-slim

@@ -309,6 +309,7 @@ pub fn terminal_failure_class(event_type: &str, code: &str) -> &'static str {
         | "usage_not_included"
         | "usage_limit_reached"
         | "server_is_overloaded"
+        | "policy_capacity_unavailable"
         | "slow_down"
         | "credit_balance_exhausted"
         | "organization_spend_limit_exceeded"

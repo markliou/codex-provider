@@ -33,7 +33,7 @@ for name in "$CHECK_IMAGE" "$REGISTRY_VOLUME" "$GIT_VOLUME" "$TARGET_VOLUME"; do
 done
 
 docker build -q -t "$CHECK_IMAGE" - >/dev/null <<'DOCKERFILE'
-FROM rust:1.99.1-alpine
+FROM rust:1.95.0-alpine
 RUN apk add --no-cache musl-dev perl make gcc linux-headers git && \
     rustup component add rustfmt clippy
 DOCKERFILE

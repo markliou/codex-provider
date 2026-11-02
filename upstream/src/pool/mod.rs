@@ -51,6 +51,7 @@ pub mod response_info;
 pub mod responses_ws;
 pub mod routes;
 pub mod routing;
+pub mod routing_pin;
 #[cfg(test)]
 mod routing_tests;
 pub mod serve;

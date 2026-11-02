@@ -1732,10 +1732,17 @@ async fn attempts(
 /// falls to the default ApiError::Retryable branch). Moving on the first
 /// server_error once carried a session off the expiring-credit accounts it
 /// had been placed on, two faults in four minutes, under strict lineage
-/// binding.
+/// binding. policy_capacity_unavailable (Codex 0.166) is an overload on a
+/// policy-restricted route and Codex retries it exactly as it retries
+/// server_is_overloaded (codex-api sse/responses_error_tests.rs
+/// policy_capacity_classification_preserves_overload_retry_behavior).
 pub fn transient_overload_code(code: &str) -> bool {
     matches!(
         quota::sanitized_error_code(code).as_str(),
-        "server_is_overloaded" | "slow_down" | "server_error" | "internal_server_error"
+        "server_is_overloaded"
+            | "policy_capacity_unavailable"
+            | "slow_down"
+            | "server_error"
+            | "internal_server_error"
     )
 }

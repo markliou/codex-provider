@@ -524,6 +524,7 @@ pub async fn connect_websocket(
     transports: &Transports,
     url: &str,
     headers: &HeaderMap,
+    routing_pin: Option<&codex_http_client::ChatGptRoutingAffinity>,
 ) -> Result<(UpstreamSocket, HeaderMap), WebSocketRefusal> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     if transports.closed {
@@ -535,6 +536,19 @@ pub async fn connect_websocket(
     request
         .headers_mut()
         .extend(ordered_websocket_headers(headers));
+    // A Guardian reviewer's pin (pool/routing_pin.rs), merged the way Codex
+    // merges it (core/src/client.rs connect_websocket): the shared jar's
+    // cookies with their routing cookies replaced by the pin's. Without a pin
+    // the connector adds the jar's cookies itself, after every other header;
+    // the merged Cookie takes that same place, and with it present the
+    // connector leaves it as is (websocket-client lib.rs connect_with_route).
+    if let Some(pin) = routing_pin {
+        let uri = request.uri().clone();
+        let jar = transports.factory.chatgpt_cookie_header(&uri);
+        if let Some(cookies) = pin.merge_cookie_header(&uri, jar.as_ref()) {
+            request.headers_mut().insert(http::header::COOKIE, cookies);
+        }
+    }
     let connector = transports
         .websocket()
         .map_err(|error| WebSocketRefusal::Connection(error.to_string()))?;
