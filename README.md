@@ -354,7 +354,7 @@ the identity of the Codex that last used the account. A quota-window prime is on
 read-only turn of the bundled Codex CLI that holds no refresh token; no native
 Codex sends one, so a window that reset first waits a random 30 to 120 minutes
 for a real request to start it, and only a window still untouched is primed.
-**Prime idle accounts** (on by default) turns priming off.
+Priming is off by default; **Prime idle accounts** turns it on.
 
 A bundled CLIProxyAPI sidecar used to be the gateway; it rewrote what Codex
 sent and was removed (issue #32). Setting `CODEX_POOL_CODEX_GATEWAY_MODE=sidecar`
@@ -394,7 +394,7 @@ settings and SPEC.md 2.1 lists them all. The ones most often changed:
 | `CODEX_POOL_LINEAGE_AFFINITY` | `true` | Initial **Keep subagents together** setting |
 | `CODEX_POOL_CLIENT_MAX_IN_FLIGHT` | `16` | Requests one client key may have running at once; over it the client gets a 429 to retry later (SPEC.md 2.3.6) |
 | `CODEX_POOL_CLIENT_MAX_PER_MINUTE` | `120` | Requests one client key may start in a minute (SPEC.md 2.3.6) |
-| `CODEX_POOL_QUOTA_PRIME` | `true` | Initial **Prime idle accounts** setting |
+| `CODEX_POOL_QUOTA_PRIME` | `false` | Initial **Prime idle accounts** setting |
 | `CODEX_POOL_SHUTDOWN_GRACE` | `120s` | Drain time on stop (keep `stop_grace_period` above it) |
 
 ### Data and logs

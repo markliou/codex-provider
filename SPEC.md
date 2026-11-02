@@ -181,7 +181,7 @@ docker run -d \
 | `CODEX_POOL_UPSTREAM_ENABLED` | no | `false` | The upstream switch (section 2.3.5). Off, the pool sends nothing upstream: no client request, quota poll, token refresh, prime, reset-credit spend or sign-in. Set `true` to let the pool reach upstream. |
 | `CODEX_POOL_CLIENT_MAX_IN_FLIGHT` | no | `16` | Responses one client key may have running at once (section 2.3.6). A positive integer; there is no unlimited. |
 | `CODEX_POOL_CLIENT_MAX_PER_MINUTE` | no | `120` | Requests one client key may start in a minute (section 2.3.6). A positive integer; there is no unlimited. |
-| `CODEX_POOL_QUOTA_PRIME` | no | `true` | Initial default for the admin Console `Prime idle accounts` switch (quota window priming). Once saved in `/data/config.json`, the Console setting takes precedence. |
+| `CODEX_POOL_QUOTA_PRIME` | no | `false` | Initial default for the admin Console `Prime idle accounts` switch (quota window priming). Once saved in `/data/config.json`, the Console setting takes precedence. |
 | `CODEX_POOL_QUOTA_PRIME_GRACE` | no | random 30–120 min | Test override: a fixed wait (for example `0s`) before an unanchored window is primed. |
 | `CODEX_POOL_LINEAGE_AFFINITY` | no | `true` | Initial default for the admin Console `Keep subagents together` switch (section 6.2.1). Once saved in `/data/config.json`, the Console setting takes precedence. |
 
@@ -1687,8 +1687,9 @@ A quota window that has reset but has seen no usage reports a reset instant a
 full window ahead that slides forward with the wall clock rather than counting
 down. Such a window never elapses, so an idle credential's quota never cycles
 back into usable capacity. While the Console's `Prime idle accounts` switch is
-on (`quotaPrime`, initial value `CODEX_POOL_QUOTA_PRIME`, default on, the
-owner's choice), after each refresh the pool detects this state on the
+on (`quotaPrime`, initial value `CODEX_POOL_QUOTA_PRIME`, default off, the
+owner's choice: a prime is a model request no person sent, real work for
+upstream), after each refresh the pool detects this state on the
 account's longest reported window and spends a minimal amount of quota against
 that account to anchor it. A prime is a request no native Codex sends, made for
 the pool's capacity rather than for a user; with the switch off a window anchors
@@ -2068,7 +2069,7 @@ Request:
 }
 ```
 
-At least one field is required; an omitted field leaves that setting unchanged, so each Console switch posts only its own field. `preserveProQuota` backs the `Use Pro last` switch, `lineageAffinity` backs the `Keep subagents together` switch (default on), and `quotaPrime` backs the `Prime idle accounts` switch (default on). All are persisted in `/data/config.json` and returned in the admin state.
+At least one field is required; an omitted field leaves that setting unchanged, so each Console switch posts only its own field. `preserveProQuota` backs the `Use Pro last` switch, `lineageAffinity` backs the `Keep subagents together` switch (default on), and `quotaPrime` backs the `Prime idle accounts` switch (default off). All are persisted in `/data/config.json` and returned in the admin state.
 
 ---
 
