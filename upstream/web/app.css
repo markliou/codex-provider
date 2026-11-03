@@ -635,3 +635,4 @@ tr[data-pool-membership="out"] .quota-track::-moz-progress-bar { background: lin
 }
 /* Text for assistive technology only (the upstream switch's input label). */
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.capacity-watch-recent { margin-top: 10px; }.capacity-watch-recent summary { cursor: pointer; color: var(--muted-strong); font-size: 12px; }

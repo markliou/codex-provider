@@ -219,7 +219,7 @@ healthy copy can stand in when the current one has failed.
 ### Per-account protection and notes
 
 - **Quota protection** (off by default): stop new routing to a slot once its
-  reported 5-hour window (else weekly window) is at or below a threshold.
+  reported 5-hour or weekly window is at or below its own threshold.
   Missing or failed quota readings never block a slot.
 - **Quota reserve** (on by default, one switch for the whole pool): every slot
   without its own protection stops taking new routing once its 5-hour window

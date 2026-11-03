@@ -5338,6 +5338,34 @@ async fn quota_protection_routing_and_configuration_are_per_slot() {
         !backup.quota_protection_enabled && backup.quota_protection_threshold == 0,
         "one slot update mutated another slot"
     );
+    // A body without weeklyThreshold holds the week to the same number; one
+    // with it sets the week apart; one out of range changes nothing.
+    assert_eq!(protected.quota_protection_weekly_threshold, Some(15));
+    for (body, code, weekly) in [
+        (
+            r#"{"enabled":true,"threshold":15,"weeklyThreshold":30}"#,
+            200,
+            Some(30),
+        ),
+        (
+            r#"{"enabled":true,"threshold":15,"weeklyThreshold":101}"#,
+            400,
+            Some(30),
+        ),
+    ] {
+        let update = serve(
+            &app,
+            super::admin_tests::admin_request(
+                &session,
+                Method::POST,
+                "/admin/api/accounts/protected/quota-protection/set",
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(update.code(), code, "{body}: {}", update.body_string());
+        assert_eq!(account(&app, 0).quota_protection_weekly_threshold, weekly);
+    }
 }
 
 // Go TestProTiersFollowCodexPlanNames.

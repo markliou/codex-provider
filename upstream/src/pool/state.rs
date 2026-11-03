@@ -142,8 +142,14 @@ pub struct Account {
     pub remaining_quota: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub quota_protection_enabled: bool,
+    /// The five-hour window's threshold of the account's own protection.
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub quota_protection_threshold: i64,
+    /// The weekly window's threshold. Protection once read one window with
+    /// one threshold; an account saved then has none here and keeps its one
+    /// threshold for both windows (SPEC.md 9.6, `account_weekly_threshold`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_protection_weekly_threshold: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -538,6 +544,21 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+/// One overload answer upstream gave an account, kept for the capacity watch
+/// (SPEC.md 9.8). Only recorded and shown: routing never reads it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapacityEvent {
+    #[serde(default)]
+    pub timestamp: Timestamp,
+    #[serde(default)]
+    pub account_id: String,
+    #[serde(default)]
+    pub model_id: String,
+    #[serde(default)]
+    pub code: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutingCacheEvent {
@@ -706,6 +727,8 @@ pub struct RuntimeState {
     pub quota_window_primes: Option<BTreeMap<String, Timestamp>>,
     #[serde(default, skip_serializing_if = "option_vec_empty")]
     pub routing_cache_events: Option<Vec<RoutingCacheEvent>>,
+    #[serde(default, skip_serializing_if = "option_vec_empty")]
+    pub capacity_events: Option<Vec<CapacityEvent>>,
     #[serde(default, skip_serializing_if = "option_map_empty")]
     pub client_agents: Option<BTreeMap<String, ClientAgent>>,
     #[serde(default, skip_serializing_if = "option_vec_empty")]
@@ -805,6 +828,14 @@ impl RuntimeState {
 
     pub fn routing_cache_events_mut(&mut self) -> &mut Vec<RoutingCacheEvent> {
         self.routing_cache_events.get_or_insert_with(Vec::new)
+    }
+
+    pub fn capacity_events(&self) -> &[CapacityEvent] {
+        self.capacity_events.as_deref().unwrap_or_default()
+    }
+
+    pub fn capacity_events_mut(&mut self) -> &mut Vec<CapacityEvent> {
+        self.capacity_events.get_or_insert_with(Vec::new)
     }
 }
 

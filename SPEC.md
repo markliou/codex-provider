@@ -1742,15 +1742,23 @@ protection. Runtime HTTP `429`/`Retry-After` behavior remains authoritative.
 ### 9.6 Per-slot quota protection
 
 `quotaProtectionEnabled` defaults to false.
-`quotaProtectionThreshold` is an integer 0–100. The authenticated management
-action is:
+`quotaProtectionThreshold` (the five-hour window's) and
+`quotaProtectionWeeklyThreshold` (the weekly window's) are integers 0–100. The
+slot stops being selected once either window has at most its threshold left
+(the owner's choice, 2026-11-02; protection once read one window with one
+threshold). A slot saved before then has no weekly threshold and holds both
+windows to its one threshold. The evidence rules are the global reserve's
+(9.7). The authenticated management action is:
 
 ```http
 POST /admin/api/accounts/{accountId}/quota-protection/set
 Content-Type: application/json
 
-{"enabled": true, "threshold": 20}
+{"enabled": true, "threshold": 20, "weeklyThreshold": 10}
 ```
+
+A body without `weeklyThreshold` sets both windows to `threshold`; a value
+outside 0–100 is `400` and changes nothing.
 
 The policy belongs to the local credential slot. Duplicate slots can have
 different settings but still share upstream capacity and remain subject to the
@@ -1771,9 +1779,8 @@ on by default (`CODEX_POOL_QUOTA_RESERVE`, the owner's choice, 2026-11-02).
 
 - It applies to every Codex device-auth slot whose own protection (9.6) is
   off; a slot with its own protection on is judged by that alone.
-- Unlike a slot's own protection, which reads one window, both windows are
-  read, each against its own threshold. The evidence rules are the same: only
-  a reported window counts, missing, stale or failed telemetry never blocks,
+- Both windows are read, each against its own threshold, as a slot's own
+  protection reads them. Only a reported window counts, missing, stale or failed telemetry never blocks,
   and a window seen at or below its threshold stays evidence until its
   observed reset time, after which it fails open.
 - A blocked account is out of selection like any protected slot: an existing
@@ -1788,6 +1795,24 @@ Content-Type: application/json
 
 {"quotaReserve": true, "quotaReserveFiveHour": 10, "quotaReserveWeekly": 10}
 ```
+
+### 9.8 Capacity watch
+
+The pool records every answer in which upstream says it is short of capacity
+(`server_is_overloaded`, `policy_capacity_unavailable`, `slow_down`, the codes
+Codex reads as an overload), whether it came in an HTTP error body, a stream
+or a WebSocket, retried or final: the time, the account, the model and the
+code. A spent allowance, a server fault or any other failure is not recorded.
+The watch keeps 7 days, at most 1000 answers, in the runtime state, and is
+display only: routing, retries, cooldowns and failover never read it (the
+owner's choice, 2026-11-02, to see when and where upstream runs short before
+deciding anything about it).
+
+The admin state carries it as `capacityWatch`: `lastDay` and `lastWeek`
+counts, `accounts` (per account: label, hashed ref, `lastDay`, `lastWeek`,
+`lastAt`, and a count per code, most answers first) and `recent` (the latest
+50, newest first). The Console shows it as the `Upstream capacity` section.
+Account ids leave the pool only as labels and hashed refs.
 
 ### 9.1 Duplicate upstream identity guard
 

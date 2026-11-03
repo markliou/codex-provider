@@ -1074,10 +1074,11 @@
         <div class="quota-detail"><strong>${escapeHTML(protectionMessage)}</strong>${escapeHTML(windowDetail)}</div>
         <div class="quota-protection-controls">
           <label><input type="checkbox" data-quota-protection-enabled="${escapeHTML(account.id)}"${protection.enabled ? " checked" : ""}> Protect quota</label>
-          <label>Threshold <input class="quota-threshold-input" type="number" min="0" max="100" step="1" value="${quotaPercent(protection.threshold)}" data-quota-protection-threshold="${escapeHTML(account.id)}">%</label>
+          <label>5h <input class="quota-threshold-input" type="number" min="0" max="100" step="1" value="${quotaPercent(protection.threshold)}" data-quota-protection-threshold="${escapeHTML(account.id)}">%</label>
+          <label>Week <input class="quota-threshold-input" type="number" min="0" max="100" step="1" value="${quotaPercent(account.quotaProtectionWeeklyThreshold ?? protection.threshold)}" data-quota-protection-weekly="${escapeHTML(account.id)}">%</label>
           <button class="button quiet" type="button" data-quota-protection-save="${escapeHTML(account.id)}">Save</button>
         </div>
-        <div class="quota-detail">${global ? `Global reserve: 5h ${escapeHTML(protection.fiveHourThreshold)}%, week ${escapeHTML(protection.weeklyThreshold)}%. Turning on this account's own protection replaces it.` : "Duplicate slots share upstream capacity; this threshold applies only to this local slot."}</div>
+        <div class="quota-detail">${global ? `Global reserve: 5h ${escapeHTML(protection.fiveHourThreshold)}%, week ${escapeHTML(protection.weeklyThreshold)}%. Turning on this account's own protection replaces it.` : "Either window at or below its threshold stops this account. Duplicate slots share upstream capacity; these thresholds apply only to this local slot."}</div>
       </div>
     </details>`;
   }
@@ -1228,6 +1229,29 @@
     }).join("");
   }
 
+  // The capacity watch (SPEC.md 9.8): when and on which accounts upstream
+  // answered that it was short of capacity. Display only; routing is
+  // unchanged by it.
+  function renderCapacityWatch(watch) {
+    const accounts = Array.isArray(watch?.accounts) ? watch.accounts : [];
+    const recent = Array.isArray(watch?.recent) ? watch.recent : [];
+    $("#capacity-watch-count").textContent = `${Number(watch?.lastDay) || 0} in 24 hours · ${Number(watch?.lastWeek) || 0} in 7 days`;
+    const codes = (map) => Object.entries(map || {}).map(([code, count]) => `${code} ${count}`).join(" · ");
+    $("#capacity-watch-body").innerHTML = accounts.length ? accounts.map((row) => `<tr>
+        <td>${escapeHTML(row.accountLabel || "Credential")}</td>
+        <td>${escapeHTML(row.lastDay)}</td>
+        <td>${escapeHTML(row.lastWeek)}</td>
+        <td>${escapeHTML(displayTime(row.lastAt))}</td>
+        <td>${escapeHTML(codes(row.codes))}</td>
+      </tr>`).join("") : '<tr><td colspan="5"><div class="empty-state">No overload answers in the last 7 days</div></td></tr>';
+    $("#capacity-watch-recent-body").innerHTML = recent.length ? recent.map((event) => `<tr>
+        <td>${escapeHTML(displayTime(event.timestamp))}</td>
+        <td>${escapeHTML(event.accountLabel || "Credential")}</td>
+        <td>${escapeHTML(event.modelId || "—")}</td>
+        <td>${escapeHTML(event.code)}</td>
+      </tr>`).join("") : '<tr><td colspan="4"><div class="empty-state">None</div></td></tr>';
+  }
+
   function maskRouteKey(value) {
     const key = String(value || "").trim();
     if (!key) return "";
@@ -1276,6 +1300,7 @@
       renderCacheWindow(serviceState.promptCacheWindow);
       renderAccounts(state.data.accounts, healthByID);
       renderRoutingCacheEvents(serviceState.routingCacheEvents);
+      renderCapacityWatch(serviceState.capacityWatch);
       renderSticky(state.data.sessions, state.data.accounts);
       const addAccountButton = $("#add-account-button");
       if (addAccountButton) addAccountButton.disabled = Boolean(activeLoginJob);
@@ -1363,15 +1388,17 @@
   async function updateQuotaProtection(accountId) {
     const enabledInput = document.querySelector(`[data-quota-protection-enabled="${CSS.escape(accountId)}"]`);
     const thresholdInput = document.querySelector(`[data-quota-protection-threshold="${CSS.escape(accountId)}"]`);
+    const weeklyInput = document.querySelector(`[data-quota-protection-weekly="${CSS.escape(accountId)}"]`);
     const threshold = Number(thresholdInput?.value);
-    if (!Number.isInteger(threshold) || threshold < 0 || threshold > 100) {
-      notify("Quota protection threshold must be an integer from 0 to 100", true);
+    const weeklyThreshold = Number(weeklyInput?.value);
+    if (![threshold, weeklyThreshold].every((value) => Number.isInteger(value) && value >= 0 && value <= 100)) {
+      notify("Quota protection thresholds must be integers from 0 to 100", true);
       return;
     }
     try {
       await api(`/accounts/${encodeURIComponent(accountId)}/quota-protection/set`, {
         method: "POST",
-        body: JSON.stringify({ enabled: Boolean(enabledInput?.checked), threshold }),
+        body: JSON.stringify({ enabled: Boolean(enabledInput?.checked), threshold, weeklyThreshold }),
       });
       notify("Quota protection updated");
       refresh(true);
