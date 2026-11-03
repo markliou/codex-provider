@@ -782,6 +782,18 @@ pub fn handle_accounts(app: &App, request: &Request, writer: &mut dyn ResponseWr
             );
             return;
         }
+        if input
+            .quota_protection_weekly_threshold
+            .is_some_and(|weekly| !(0..=100).contains(&weekly))
+        {
+            write_openai_error(
+                writer,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "quotaProtectionWeeklyThreshold must be an integer from 0 to 100",
+            );
+            return;
+        }
         // Verification markers are internal lifecycle state, never client
         // input: accepting them could create a permanently blocked slot or
         // inject an identity baseline that never came from a verified login.
@@ -797,6 +809,7 @@ pub fn handle_accounts(app: &App, request: &Request, writer: &mut dyn ResponseWr
         input.quota_policy.clear();
         input.quota_protection_enabled = false;
         input.quota_protection_threshold = 0;
+        input.quota_protection_weekly_threshold = None;
     }
     let generate = input.id.is_empty();
     if !generate && !plan::valid_account_id(&input.id) {
@@ -1229,23 +1242,36 @@ pub async fn handle_account_action(
                     "quota protection is only available for Codex device-auth accounts",
                 );
             }
+            // `threshold` is the five-hour window's; a body without
+            // `weeklyThreshold` (an older Console) holds the week to the same
+            // number, as protection did when it read one window (SPEC.md 9.6).
             #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
             struct Protection {
                 #[serde(default)]
                 enabled: bool,
                 #[serde(default)]
                 threshold: Option<i64>,
+                #[serde(default)]
+                weekly_threshold: Option<i64>,
             }
-            let Some((enabled, threshold)) = decode::<Protection>(&request.body, SMALL_BODY)
-                .and_then(|value| {
-                    value
-                        .threshold
-                        .filter(|threshold| (0..=100).contains(threshold))
-                        .map(|threshold| (value.enabled, threshold))
+            let percent = |value: i64| (0..=100).contains(&value);
+            let Some((enabled, threshold, weekly)) =
+                decode::<Protection>(&request.body, SMALL_BODY).and_then(|value| {
+                    let threshold = value.threshold.filter(|value| percent(*value))?;
+                    let weekly = match value.weekly_threshold {
+                        None => threshold,
+                        Some(weekly) if percent(weekly) => weekly,
+                        Some(_) => return None,
+                    };
+                    Some((value.enabled, threshold, weekly))
                 })
             else {
                 drop(inner);
-                return bad(writer, "threshold must be an integer from 0 to 100");
+                return bad(
+                    writer,
+                    "threshold and weeklyThreshold must be integers from 0 to 100",
+                );
             };
             // Deliberately per local slot: duplicates may share upstream
             // capacity, but changing one slot must not mutate another slot's
@@ -1253,6 +1279,7 @@ pub async fn handle_account_action(
             let slot = &mut inner.config.accounts_mut()[index];
             slot.quota_protection_enabled = enabled;
             slot.quota_protection_threshold = threshold;
+            slot.quota_protection_weekly_threshold = Some(weekly);
         }
         _ => {
             drop(inner);

@@ -1374,3 +1374,53 @@ async fn organization_set_action_is_not_available() {
         result.body_string()
     );
 }
+
+// The capacity watch keeps a week of overload answers per account and leaves
+// every other failure out (SPEC.md 9.8).
+#[test]
+fn capacity_watch_counts_a_week_of_overload_answers() {
+    use super::time::hours;
+    let (app, _dir) = test_app(vec![
+        device_account("busy", "upstream-busy", 10),
+        device_account("calm", "upstream-calm", 20),
+    ]);
+    let now = Timestamp::from_unix(1_800_000_000);
+    {
+        let mut inner = app.write();
+        inner.note_capacity_event(
+            "busy",
+            "gpt-test",
+            "policy_capacity_unavailable",
+            now.add(-hours(8 * 24)),
+        );
+        inner.note_capacity_event(
+            "busy",
+            "gpt-test",
+            "server_is_overloaded",
+            now.add(-hours(48)),
+        );
+        inner.note_capacity_event(
+            "busy",
+            "gpt-test",
+            "policy_capacity_unavailable",
+            now.add(-hours(1)),
+        );
+        inner.note_capacity_event("calm", "gpt-test", "slow_down", now.add(-hours(2)));
+        // Not capacity: a spent allowance and a server fault.
+        inner.note_capacity_event("calm", "gpt-test", "usage_limit_reached", now);
+        inner.note_capacity_event("calm", "gpt-test", "server_error", now);
+    }
+    let view = app.read().capacity_watch_view(now);
+    assert_eq!(view["lastDay"], 2);
+    assert_eq!(view["lastWeek"], 3);
+    let accounts = view["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(accounts[0]["lastWeek"], 2);
+    assert_eq!(accounts[0]["lastDay"], 1);
+    assert_eq!(accounts[0]["codes"]["policy_capacity_unavailable"], 1);
+    assert_eq!(accounts[0]["codes"]["server_is_overloaded"], 1);
+    assert_eq!(accounts[1]["codes"]["slow_down"], 1);
+    let recent = view["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 3);
+    assert_eq!(recent[0]["code"], "slow_down");
+}

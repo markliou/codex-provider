@@ -1,7 +1,7 @@
 //! What the pool records once an attempt has an outcome: account health and
 //! cooldowns, sticky, thread, lineage and response bindings, prompt-cache
-//! statistics, routing events, throughput, and the log line for a failure
-//! with Codex's own verdict beside the pool's.
+//! statistics, routing events, the capacity watch, throughput, and the log
+//! line for a failure with Codex's own verdict beside the pool's.
 //!
 //! A port of markFailure, markSuccess*, markTerminalResponseFailure,
 //! recordLineageSuccessLocked, appendRoutingCacheEventLocked and the
@@ -27,6 +27,7 @@ use super::routing::RoutingDecision;
 use super::routing::identity_parent_id;
 use super::routing::thread_binding_state_key;
 use super::state::AccountHealth;
+use super::state::CapacityEvent;
 use super::state::Cooldown;
 use super::state::LineageBinding;
 use super::state::QuotaErrorInfo;
@@ -39,6 +40,7 @@ use super::time::Timestamp;
 use super::time::minutes;
 use super::time::seconds;
 use chrono::TimeDelta;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 pub const UPSTREAM_5XX_COOLDOWN_SECONDS: i64 = 10;
@@ -116,6 +118,24 @@ pub fn retryable_cooldown_reason(reason: &str) -> bool {
             | "upstream_5xx"
             | "server_error"
             | "internal_server_error"
+    )
+}
+
+/// The capacity watch (SPEC.md 9.8) keeps a week of upstream's overload
+/// answers, at most this many, to show when and on which accounts upstream
+/// ran short. It only records: retries and failover are decided elsewhere,
+/// exactly as before.
+pub const CAPACITY_EVENT_LIMIT: usize = 1000;
+pub const CAPACITY_EVENT_TTL_HOURS: i64 = 7 * 24;
+
+/// The answers the capacity watch records: upstream short of capacity, as
+/// Codex reads them (codex-api sse/responses_error.rs; policy_capacity_unavailable
+/// since 0.166). A server fault or a spent allowance is not a capacity
+/// shortage and is left out.
+pub fn capacity_watch_code(code: &str) -> bool {
+    matches!(
+        code,
+        "server_is_overloaded" | "policy_capacity_unavailable" | "slow_down"
     )
 }
 
@@ -272,6 +292,12 @@ impl App {
             or_dash(&code),
             verdict_log_field(&verdict)
         ));
+        let code = sanitized_error_code(&code);
+        if capacity_watch_code(&code) {
+            // Saved with the failure the caller records next.
+            self.write()
+                .note_capacity_event(account_id, model, &code, Timestamp::now());
+        }
     }
 
     /// Which identity produced an upstream terminal failure. The caller is
@@ -472,6 +498,7 @@ impl App {
             reason = "upstream_response_failed".to_string();
         }
         inner.note_failure_health(account_id, &reason, now);
+        inner.note_capacity_event(account_id, model, &reason, now);
         if cool_down {
             inner.append_cooldown(
                 account_id,
@@ -532,6 +559,7 @@ impl App {
         if info.terminal_event == "response.incomplete" {
             reason = "stream_incomplete".to_string();
         }
+        inner.note_capacity_event(account_id, model, &reason, now);
         match class {
             "capacity" | "transient" => {
                 inner.note_failure_health(account_id, &reason, now);
@@ -1052,6 +1080,109 @@ impl Inner {
             stat.routing_failover_count += 1;
         }
         stat.updated_at = now;
+    }
+
+    /// Records an overload answer for the capacity watch (SPEC.md 9.8); any
+    /// other code is ignored. Never read by routing.
+    pub fn note_capacity_event(
+        &mut self,
+        account_id: &str,
+        model: &str,
+        code: &str,
+        now: Timestamp,
+    ) {
+        if !capacity_watch_code(code) {
+            return;
+        }
+        let cutoff = now.add(-super::time::hours(CAPACITY_EVENT_TTL_HOURS));
+        let events = self.state.capacity_events_mut();
+        events.retain(|event| !event.timestamp.before(&cutoff));
+        events.push(CapacityEvent {
+            timestamp: now,
+            account_id: account_id.to_string(),
+            model_id: model.to_string(),
+            code: code.to_string(),
+        });
+        if events.len() > CAPACITY_EVENT_LIMIT {
+            let extra = events.len() - CAPACITY_EVENT_LIMIT;
+            events.drain(..extra);
+        }
+    }
+
+    /// The capacity watch's dashboard view: counts over the last day and
+    /// week, per account, and the latest answers, newest first. Account ids
+    /// leave only as labels and hashed refs, as in the routing view.
+    pub fn capacity_watch_view(&self, now: Timestamp) -> serde_json::Value {
+        let day = now.add(-super::time::hours(24));
+        let week = now.add(-super::time::hours(CAPACITY_EVENT_TTL_HOURS));
+        let label = |account_id: &str| {
+            self.account_index(account_id)
+                .map(|index| {
+                    super::plan::public_credential_display_name(
+                        &self.config.accounts()[index],
+                        Some(index),
+                    )
+                })
+                .unwrap_or_else(|| "Removed credential".to_string())
+        };
+        let events: Vec<&CapacityEvent> = self
+            .state
+            .capacity_events()
+            .iter()
+            .filter(|event| !event.timestamp.before(&week))
+            .collect();
+        let in_day = |event: &CapacityEvent| !event.timestamp.before(&day);
+        struct Row {
+            account_id: String,
+            last_day: u64,
+            last_week: u64,
+            last_at: Timestamp,
+            codes: BTreeMap<String, u64>,
+        }
+        let mut accounts: Vec<Row> = Vec::new();
+        for event in &events {
+            let index = match accounts
+                .iter()
+                .position(|row| row.account_id == event.account_id)
+            {
+                Some(index) => index,
+                None => {
+                    accounts.push(Row {
+                        account_id: event.account_id.clone(),
+                        last_day: 0,
+                        last_week: 0,
+                        last_at: event.timestamp,
+                        codes: BTreeMap::new(),
+                    });
+                    accounts.len() - 1
+                }
+            };
+            let row = &mut accounts[index];
+            row.last_week += 1;
+            if in_day(event) {
+                row.last_day += 1;
+            }
+            row.last_at = row.last_at.max(event.timestamp);
+            *row.codes.entry(event.code.clone()).or_default() += 1;
+        }
+        accounts.sort_by(|a, b| {
+            b.last_week
+                .cmp(&a.last_week)
+                .then_with(|| b.last_at.cmp(&a.last_at))
+        });
+        serde_json::json!({
+            "lastDay": events.iter().filter(|event| in_day(event)).count(),
+            "lastWeek": events.len(),
+            "accounts": accounts.iter().map(|row| serde_json::json!({
+                "accountLabel": label(&row.account_id),
+                "accountRef": operational_identifier_hash("account", &row.account_id),
+                "lastDay": row.last_day, "lastWeek": row.last_week, "lastAt": row.last_at, "codes": row.codes,
+            })).collect::<Vec<_>>(),
+            "recent": events.iter().rev().take(50).map(|event| serde_json::json!({
+                "timestamp": event.timestamp, "accountLabel": label(&event.account_id),
+                "modelId": event.model_id, "code": event.code,
+            })).collect::<Vec<_>>(),
+        })
     }
 
     /// Counts an unclassified terminal failure on the same prompt-cache stat

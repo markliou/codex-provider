@@ -138,9 +138,11 @@ impl Refusal {
 
 const REMOVE_IT: &str = "Remove it and send the request again.";
 
-/// Top-level fields a Codex release sends: 0.164.0's ResponsesApiRequest plus
-/// `instructions`, which releases up to 0.162 sent before moving the base
-/// instructions into the input.
+/// Top-level fields a Codex release sends: ResponsesApiRequest (unchanged from
+/// 0.164.0 to 0.166.0, re-read field by field with ResponseItem, ContentItem,
+/// ToolSpec and the user agent on 2026-11-02) plus `instructions`, which
+/// releases up to 0.162 sent before moving the base instructions into the
+/// input.
 const CODEX_FIELDS: &[&str] = &[
     "model",
     "instructions",

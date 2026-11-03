@@ -220,6 +220,28 @@
             </div>
           </section>
 
+          <section id="capacity-watch" class="section-block capacity-watch management-only" aria-labelledby="capacity-watch-title">
+            <div class="section-heading">
+              <div><h2 id="capacity-watch-title" class="section-title" data-icon="routing">Upstream capacity</h2><p class="muted">Overload answers upstream gave each account over the last 7 days. Recorded only; routing does not read them.</p></div>
+              <span id="capacity-watch-count" class="muted"></span>
+            </div>
+            <div class="table-wrap routing-cache-wrap">
+              <table class="routing-cache-table">
+                <thead><tr><th>Account</th><th>24 hours</th><th>7 days</th><th>Last</th><th>Answers</th></tr></thead>
+                <tbody id="capacity-watch-body"></tbody>
+              </table>
+            </div>
+            <details class="capacity-watch-recent">
+              <summary>Latest answers</summary>
+              <div class="table-wrap routing-cache-wrap">
+                <table class="routing-cache-table">
+                  <thead><tr><th>Time</th><th>Account</th><th>Model</th><th>Answer</th></tr></thead>
+                  <tbody id="capacity-watch-recent-body"></tbody>
+                </table>
+              </div>
+            </details>
+          </section>
+
           <div class="secondary-grid management-only">
             <section id="active-routes" class="section-block compact" aria-labelledby="sticky-title">
               <div class="section-heading"><div><h2 id="sticky-title" class="section-title" data-icon="routes">Active routes</h2><p id="sticky-count" class="muted"></p></div></div>
