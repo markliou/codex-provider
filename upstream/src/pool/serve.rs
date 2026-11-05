@@ -160,10 +160,16 @@ pub async fn serve_until_stopped<C, Fut>(
     // left its connection at the upgrade, so a response still streaming on
     // one is waited for through the in-flight count, within the same grace.
     // Idle sockets are not counted and close when the process exits; Codex
-    // reconnects to the new container.
+    // reconnects to the new container. A token refresh that has started is
+    // waited for too, whoever started it: cut between upstream's answer and
+    // auth.json, it would leave the account holding a refresh token upstream
+    // already spent (credentials.rs refresh_codex_auth_holding).
     let deadline = tokio::time::Instant::now() + grace;
     let drained = loop {
-        if connections.is_empty() && app.in_flight.load(Ordering::SeqCst) <= 0 {
+        if connections.is_empty()
+            && app.in_flight.load(Ordering::SeqCst) <= 0
+            && app.refreshes_settling.load(Ordering::SeqCst) <= 0
+        {
             break true;
         }
         tokio::select! {

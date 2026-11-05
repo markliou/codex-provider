@@ -319,6 +319,161 @@ pub async fn read_body(response: UpstreamResponse, limit: usize) -> Result<Vec<u
     SseReader::new(response.body).read_all(limit).await
 }
 
+/// send_own_call without the App, for work that must outlive its caller.
+async fn send_own_call_with(
+    transports: &crate::transport::Transports,
+    call: &OwnCall,
+) -> Result<UpstreamResponse, SendFailure> {
+    let composed = super::own_call::compose(call).map_err(SendFailure::Prepare)?;
+    let (request, after) =
+        crate::transport::build_own_call(composed).map_err(SendFailure::Prepare)?;
+    crate::transport::send_request(transports, request, &after).await
+}
+
+/// How long a token refresh exchange may take before it fails as transient.
+/// Codex 0.166 sets none; 0.168 bounds its own at 45 seconds (login
+/// auth/manager.rs request_chatgpt_token_refresh, `timeout:
+/// Some(Duration::from_secs(45))`, rust-v0.168.0-alpha.3). The pool takes it
+/// ahead of the upgrade: a refresh now runs to the end detached from its
+/// caller and holds the account's refresh lock, so without a bound a stalled
+/// exchange would stall every request to the account and the shutdown drain.
+pub const CODEX_TOKEN_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// The token refresh exchange (login auth/manager.rs
+/// request_chatgpt_token_refresh), with Codex's verdict on a failure.
+async fn exchange_codex_token_refresh(
+    transports: &crate::transport::Transports,
+    call: &OwnCall,
+) -> Result<RefreshResponse, CredentialError> {
+    let exchange = async {
+        let response = send_own_call_with(transports, call)
+            .await
+            .map_err(|error| {
+                CredentialError::transient(format!("refresh codex token: {error:?}"))
+            })?;
+        let status = response.status.as_u16();
+        let body = read_body(response, super::stream::MAX_REQUEST_BODY)
+            .await
+            .map_err(|error| CredentialError::transient(format!("refresh codex token: {error}")))?;
+        if !(200..300).contains(&status) {
+            let message = format!("refresh codex token failed with status {status}");
+            let refused = codex_refresh_failure_is_permanent(status, &body);
+            return Err(CredentialError {
+                auth_failed: matches!(status, 400 | 401 | 403),
+                refused,
+                missing: false,
+                message,
+            });
+        }
+        serde_json::from_slice(&body).map_err(|error| {
+            CredentialError::transient(format!("decode refreshed codex token: {error}"))
+        })
+    };
+    tokio::time::timeout(CODEX_TOKEN_REFRESH_TIMEOUT, exchange)
+        .await
+        .unwrap_or_else(|_| Err(CredentialError::transient("refresh codex token: timed out")))
+}
+
+/// Everything a refresh needs once it has started, owned so it can finish
+/// after its caller is gone (App::refresh_codex_auth_holding).
+struct RefreshSettle {
+    transports: Arc<crate::transport::Transports>,
+    refused: Arc<RefusedCredentials>,
+    logger: Arc<super::log::Logger>,
+    account_id: String,
+    path: std::path::PathBuf,
+    /// The tokens this refresh spends, as read from auth.json.
+    spent: super::metadata::CodexAuthTokens,
+    digest: [u8; 32],
+}
+
+impl RefreshSettle {
+    async fn run(self, call: &OwnCall) -> Result<(), CredentialError> {
+        let refreshed = match exchange_codex_token_refresh(&self.transports, call).await {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                if error.refused {
+                    note_refused_tokens(
+                        &self.refused,
+                        &self.logger,
+                        &self.account_id,
+                        self.digest,
+                        REFUSED_REASON_REFRESH,
+                    );
+                }
+                return Err(error);
+            }
+        };
+        self.persist(refreshed)
+    }
+
+    /// Writes the refreshed tokens only over the tokens this refresh spent
+    /// (login auth/manager.rs persist_tokens, which compares the stored
+    /// refresh and access tokens with the ones it refreshed and saves with
+    /// compare_and_save, rust-v0.168.0-alpha.3). A sign-in finished from the
+    /// management page while the exchange was out wrote a new login; the
+    /// rotated tokens of the old one must not overwrite it. Unlike Codex,
+    /// which fails the refresh, the pool keeps going: the caller reads
+    /// auth.json next and gets the new login.
+    fn persist(self, refreshed: RefreshResponse) -> Result<(), CredentialError> {
+        let mut auth = read_codex_auth_file(&self.path, &self.account_id)?;
+        let Some(tokens) = auth.tokens.as_mut().filter(|tokens| {
+            tokens.refresh_token == self.spent.refresh_token
+                && tokens.access_token == self.spent.access_token
+        }) else {
+            self.logger.printf(&format!(
+                "refreshed codex token for {} discarded: the account's credentials changed during the refresh",
+                self.account_id
+            ));
+            return Ok(());
+        };
+        if let Some(id_token) = refreshed.id_token.filter(|token| !token.is_empty()) {
+            tokens.id_token = id_token;
+        }
+        if let Some(access) = refreshed.access_token.filter(|token| !token.is_empty()) {
+            tokens.access_token = access;
+        }
+        if let Some(refresh) = refreshed.refresh_token.filter(|token| !token.is_empty()) {
+            tokens.refresh_token = refresh;
+        }
+        auth.last_refresh = Some(Timestamp::now());
+        write_json_atomic(&self.path, &auth).map_err(|error| {
+            CredentialError::transient(format!("persist refreshed codex auth: {error}"))
+        })
+    }
+}
+
+/// Counts a refresh from its start until it has settled, for the shutdown
+/// drain (serve.rs): a refresh cut by the process exit is the one gap the
+/// detached task cannot close.
+pub struct SettlingRefresh(Arc<std::sync::atomic::AtomicI64>);
+
+impl SettlingRefresh {
+    fn start(count: Arc<std::sync::atomic::AtomicI64>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for SettlingRefresh {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn note_refused_tokens(
+    refused: &RefusedCredentials,
+    logger: &super::log::Logger,
+    account_id: &str,
+    tokens: [u8; 32],
+    reason: &str,
+) {
+    refused.record(account_id, tokens, reason);
+    logger.printf(&format!(
+        "credential refused for {account_id}: {reason}; automatic quota refresh stops until the account logs in again"
+    ));
+}
+
 impl App {
     /// Records the agent of a Codex request routed to account_id, and as the
     /// pool-wide latest. Only a Codex product token is recorded, so a foreign
@@ -410,10 +565,7 @@ impl App {
     /// Sends one of the pool's own calls, composed as Codex composes it
     /// (own_call.rs), with Codex's client.
     pub async fn send_own_call(&self, call: &OwnCall) -> Result<UpstreamResponse, SendFailure> {
-        let composed = super::own_call::compose(call).map_err(SendFailure::Prepare)?;
-        let (request, after) =
-            crate::transport::build_own_call(composed).map_err(SendFailure::Prepare)?;
-        crate::transport::send_request(&self.transports, request, &after).await
+        send_own_call_with(&self.transports, call).await
     }
 
     /// The account's refresh lock: one permit, held across the refresh's
@@ -444,6 +596,25 @@ impl App {
             .map_err(CredentialError::from)
     }
 
+    /// Codex's ChatGPT token refresh request (login auth/manager.rs
+    /// request_chatgpt_token_refresh), carrying the account's Codex agent.
+    fn token_refresh_call(
+        &self,
+        account_id: &str,
+        refresh_token: &str,
+        reason: RefreshReason,
+    ) -> OwnCall {
+        let agent = self.client_agent_for(account_id);
+        OwnCall::TokenRefresh(RefreshCall {
+            url: self.settings.refresh_url.clone(),
+            user_agent: codex_default_client_user_agent(&agent.user_agent),
+            originator: agent.originator,
+            client_id: self.settings.oauth_client_id.clone(),
+            refresh_token: refresh_token.to_string(),
+            refresh_reason: Some(reason.as_str().to_string()),
+        })
+    }
+
     /// Codex's ChatGPT token refresh (login auth/manager.rs
     /// request_chatgpt_token_refresh), with Codex's verdict on a failure.
     pub async fn request_codex_token_refresh(
@@ -452,56 +623,54 @@ impl App {
         refresh_token: &str,
         reason: RefreshReason,
     ) -> Result<RefreshResponse, CredentialError> {
-        let agent = self.client_agent_for(account_id);
-        let call = OwnCall::TokenRefresh(RefreshCall {
-            url: self.settings.refresh_url.clone(),
-            user_agent: codex_default_client_user_agent(&agent.user_agent),
-            originator: agent.originator,
-            client_id: self.settings.oauth_client_id.clone(),
-            refresh_token: refresh_token.to_string(),
-            refresh_reason: Some(reason.as_str().to_string()),
-        });
-        let response = self.send_own_call(&call).await.map_err(|error| {
-            CredentialError::transient(format!("refresh codex token: {error:?}"))
-        })?;
-        let status = response.status.as_u16();
-        let body = read_body(response, super::stream::MAX_REQUEST_BODY)
-            .await
-            .map_err(|error| CredentialError::transient(format!("refresh codex token: {error}")))?;
-        if !(200..300).contains(&status) {
-            let message = format!("refresh codex token failed with status {status}");
-            let refused = codex_refresh_failure_is_permanent(status, &body);
-            return Err(CredentialError {
-                auth_failed: matches!(status, 400 | 401 | 403),
-                refused,
-                missing: false,
-                message,
-            });
-        }
-        serde_json::from_slice(&body).map_err(|error| {
-            CredentialError::transient(format!("decode refreshed codex token: {error}"))
-        })
+        let call = self.token_refresh_call(account_id, refresh_token, reason);
+        exchange_codex_token_refresh(&self.transports, &call).await
     }
 
     /// Refreshes the account's token when it expires within the refresh
-    /// window, or now when `force`. A refresh upstream already refused for
-    /// these tokens fails without network until they change, as Codex's
-    /// cached permanent_refresh_failure does.
+    /// window, or now when `force`, under the account's refresh lock.
     pub async fn refresh_codex_auth(
         &self,
         item: &Account,
         force: bool,
     ) -> Result<(), CredentialError> {
+        let permit = self.auth_lock(&item.id).await;
+        self.refresh_codex_auth_holding(item, force, permit).await
+    }
+
+    /// The refresh itself; the caller already holds the account's refresh
+    /// lock and hands its permit over. A refresh upstream already refused for
+    /// these tokens fails without network until they change, as Codex's
+    /// cached permanent_refresh_failure does.
+    ///
+    /// Once the exchange starts it runs to the end in a task of its own,
+    /// holding the permit, whatever happens to the caller. Refresh tokens
+    /// rotate on use: when a client disconnected (or a caller's timeout fired)
+    /// after upstream had issued new tokens but before they reached auth.json,
+    /// the account was left holding a refresh token upstream had already
+    /// spent, and its next refresh presented it again. Codex 0.168 guards the
+    /// same gap by remembering an exchange that was dropped mid-way
+    /// (login auth/manager.rs unsettled_chatgpt_refresh,
+    /// rust-v0.168.0-alpha.3); the pool never drops one. Do not move the
+    /// exchange back into the caller's future, and keep the permit inside the
+    /// task, or a second request can spend the same token while the first is
+    /// still settling.
+    async fn refresh_codex_auth_holding(
+        &self,
+        item: &Account,
+        force: bool,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<(), CredentialError> {
         let path = self.auth_path(&item.id);
-        let mut auth = read_codex_auth_file(&path, &item.id)?;
-        let refresh_token = auth
+        let auth = read_codex_auth_file(&path, &item.id)?;
+        let Some(spent) = auth
             .tokens
             .as_ref()
-            .map(|tokens| tokens.refresh_token.clone())
-            .unwrap_or_default();
-        if refresh_token.is_empty() {
+            .filter(|tokens| !tokens.refresh_token.is_empty())
+            .cloned()
+        else {
             return Ok(());
-        }
+        };
         let digest = codex_tokens_digest_of(&auth);
         if self.refused.refused(&item.id, digest).as_deref() == Some(REFUSED_REASON_REFRESH) {
             return Err(CredentialError {
@@ -510,12 +679,7 @@ impl App {
             });
         }
         if !force {
-            let access = auth
-                .tokens
-                .as_ref()
-                .map(|tokens| tokens.access_token.clone())
-                .unwrap_or_default();
-            match jwt_expiry(&access) {
+            match jwt_expiry(&spent.access_token) {
                 Some(expiry)
                     if expiry.sub(&Timestamp::now())
                         <= minutes(CODEX_TOKEN_REFRESH_WINDOW_MINUTES) => {}
@@ -532,32 +696,26 @@ impl App {
         } else {
             RefreshReason::ProactiveExpiry
         };
-        let refreshed = match self
-            .request_codex_token_refresh(&item.id, &refresh_token, reason)
-            .await
-        {
-            Ok(refreshed) => refreshed,
-            Err(error) => {
-                if error.refused {
-                    self.record_refused_tokens(&item.id, digest, REFUSED_REASON_REFRESH);
-                }
-                return Err(error);
-            }
+        let call = self.token_refresh_call(&item.id, &spent.refresh_token, reason);
+        let settle = RefreshSettle {
+            transports: self.transports.clone(),
+            refused: self.refused.clone(),
+            logger: self.logger.clone(),
+            account_id: item.id.clone(),
+            path,
+            spent,
+            digest,
         };
-        if let Some(tokens) = auth.tokens.as_mut() {
-            if let Some(id_token) = refreshed.id_token.filter(|token| !token.is_empty()) {
-                tokens.id_token = id_token;
-            }
-            if let Some(access) = refreshed.access_token.filter(|token| !token.is_empty()) {
-                tokens.access_token = access;
-            }
-            if let Some(refresh) = refreshed.refresh_token.filter(|token| !token.is_empty()) {
-                tokens.refresh_token = refresh;
-            }
-        }
-        auth.last_refresh = Some(Timestamp::now());
-        write_json_atomic(&path, &auth).map_err(|error| {
-            CredentialError::transient(format!("persist refreshed codex auth: {error}"))
+        let settling = SettlingRefresh::start(self.refreshes_settling.clone());
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            let _settling = settling;
+            settle.run(&call).await
+        });
+        task.await.unwrap_or_else(|error| {
+            Err(CredentialError::transient(format!(
+                "refresh codex token: {error}"
+            )))
         })
     }
 
@@ -567,8 +725,8 @@ impl App {
         &self,
         item: &Account,
     ) -> Result<CodexAuthInfo, CredentialError> {
-        let _permit = self.auth_lock(&item.id).await;
-        self.refresh_codex_auth(item, false).await?;
+        let permit = self.auth_lock(&item.id).await;
+        self.refresh_codex_auth_holding(item, false, permit).await?;
         self.codex_auth(item)
     }
 
@@ -581,21 +739,18 @@ impl App {
         item: &Account,
         rejected_access_token: &str,
     ) -> Result<CodexAuthInfo, CredentialError> {
-        let _permit = self.auth_lock(&item.id).await;
+        let permit = self.auth_lock(&item.id).await;
         let current = self.codex_auth(item)?;
         if current.access_token != rejected_access_token {
             return Ok(current);
         }
-        self.refresh_codex_auth(item, true).await?;
+        self.refresh_codex_auth_holding(item, true, permit).await?;
         self.codex_auth(item)
     }
 
     /// Records a refusal of tokens the caller already holds.
     pub fn record_refused_tokens(&self, account_id: &str, tokens: [u8; 32], reason: &str) {
-        self.refused.record(account_id, tokens, reason);
-        self.logger.printf(&format!(
-            "credential refused for {account_id}: {reason}; automatic quota refresh stops until the account logs in again"
-        ));
+        note_refused_tokens(&self.refused, &self.logger, account_id, tokens, reason);
     }
 
     /// Remembers that upstream refused the account's current tokens for good.
@@ -709,6 +864,112 @@ mod tests {
         );
         let _ = app.refresh_codex_auth(&item, false).await;
         assert_eq!(refresh.count(), 2, "new tokens were not refreshed");
+    }
+
+    fn rotated_refresh_reply() -> FakeResponse {
+        FakeResponse::json(
+            200,
+            &format!(
+                r#"{{"access_token":"{}","refresh_token":"<rotated>"}}"#,
+                fake_jwt(Timestamp::now().add(super::super::time::hours(1)))
+            ),
+        )
+    }
+
+    // A request whose client went away while upstream was answering the
+    // refresh used to drop the exchange with it: upstream had rotated the
+    // refresh token, auth.json still held the spent one.
+    #[tokio::test]
+    async fn a_refresh_settles_after_its_caller_is_dropped() {
+        let refresh = FakeServer::start(|_| {
+            let mut reply = rotated_refresh_reply();
+            reply.chunks[0].0 = std::time::Duration::from_millis(300);
+            reply
+        })
+        .await;
+        let url = refresh.url.clone();
+        let (app, _dir) = test_app_with(
+            vec![device_account("device", "acct-device", 100)],
+            |settings| settings.refresh_url = url,
+        );
+        write_test_codex_auth_tokens(
+            &app,
+            "device",
+            &fake_jwt(Timestamp::now().add(minutes(1))),
+            "<refresh>",
+        );
+        let item = app.read().config.accounts()[0].clone();
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            app.refreshed_codex_auth(&item),
+        )
+        .await;
+        assert!(dropped.is_err(), "the caller was not dropped mid-refresh");
+        // The next request waits for the settling refresh rather than
+        // spending the same refresh token again.
+        let auth = app
+            .refreshed_codex_auth(&item)
+            .await
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(refresh.count(), 1, "the spent refresh token was sent again");
+        let file = app
+            .read()
+            .read_codex_auth_file(&item)
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        let tokens = file.tokens.unwrap_or_default();
+        assert_eq!(tokens.refresh_token, "<rotated>");
+        assert_eq!(auth.access_token, tokens.access_token);
+        assert_eq!(
+            app.refreshes_settling
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    // A sign-in finished while a refresh was out wins over the old login's
+    // rotated tokens (Codex 0.168 persist_tokens).
+    #[tokio::test]
+    async fn a_refresh_never_overwrites_a_new_login() {
+        let new_login = fake_jwt(Timestamp::now().add(super::super::time::hours(2)));
+        let auth_file: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let signed_in = (auth_file.clone(), new_login.clone());
+        let refresh = FakeServer::start(move |_| {
+            let (path, access) = &signed_in;
+            if let Some(path) = path.lock().ok().and_then(|path| path.clone()) {
+                let login = serde_json::json!({"auth_mode": "chatgpt", "tokens": {"id_token": "", "access_token": access, "refresh_token": "<new-login>"}});
+                if let Err(error) = std::fs::write(path, login.to_string()) {
+                    panic!("{error}");
+                }
+            }
+            rotated_refresh_reply()
+        })
+        .await;
+        let url = refresh.url.clone();
+        let (app, _dir) = test_app_with(
+            vec![device_account("device", "acct-device", 100)],
+            |settings| settings.refresh_url = url,
+        );
+        write_test_codex_auth_tokens(
+            &app,
+            "device",
+            &fake_jwt(Timestamp::now().add(minutes(1))),
+            "<refresh>",
+        );
+        if let Ok(mut path) = auth_file.lock() {
+            *path = Some(app.auth_path("device"));
+        }
+        let item = app.read().config.accounts()[0].clone();
+        let auth = app
+            .refreshed_codex_auth(&item)
+            .await
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(refresh.count(), 1);
+        assert_eq!(auth.access_token, new_login);
+        let file = app
+            .read()
+            .read_codex_auth_file(&item)
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(file.tokens.unwrap_or_default().refresh_token, "<new-login>");
     }
 
     // Go TestPoolOwnCallsPresentTheAccountsCodex (the refresh half; the usage

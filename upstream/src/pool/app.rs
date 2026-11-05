@@ -137,7 +137,10 @@ pub struct App {
     /// two requests never spend the same rotating refresh token.
     pub auth_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Credentials upstream refused for good (credentials.rs).
-    pub refused: super::credentials::RefusedCredentials,
+    pub refused: Arc<super::credentials::RefusedCredentials>,
+    /// Token refreshes that started and have not settled; the shutdown drain
+    /// waits for them (credentials.rs SettlingRefresh).
+    pub refreshes_settling: Arc<std::sync::atomic::AtomicI64>,
     /// When a request last went to each account; it sets the account's quota
     /// poll cadence (quota_schedule.rs).
     pub account_activity: std::sync::Mutex<HashMap<String, Timestamp>>,
@@ -232,7 +235,8 @@ impl App {
             logger,
             transports,
             auth_locks: std::sync::Mutex::new(HashMap::new()),
-            refused: super::credentials::RefusedCredentials::default(),
+            refused: Arc::default(),
+            refreshes_settling: Arc::default(),
             account_activity: std::sync::Mutex::new(HashMap::new()),
             in_flight: std::sync::atomic::AtomicI64::new(0),
             client_limits,
