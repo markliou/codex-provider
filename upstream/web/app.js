@@ -705,6 +705,86 @@
         : "Accounts are used until their quota runs out, unless they have their own protection.";
   }
 
+  // The Pi channel's per-account sign-ins (SPEC.md 2.3.7). Each ChatGPT
+  // account signs in for it apart from its Codex sign-in; the state says
+  // whether the channel can use the account now.
+  const PI_STATE_TEXT = {
+    ready: "Signed in",
+    sign_in: "Needs sign-in",
+    refused: "Not eligible",
+    limited: "Usage limit reached",
+  };
+  function renderPiChannel(response) {
+    const card = $("#pi-channel-card");
+    const list = $("#pi-channel-accounts");
+    if (!card || !list) return;
+    list.replaceChildren();
+    if (!response || !Array.isArray(response.accounts)) {
+      $("#pi-channel-summary").textContent = "This server has no Pi channel.";
+      return;
+    }
+    const ready = response.accounts.filter((item) => item.state === "ready").length;
+    $("#pi-channel-summary").textContent = `${response.enabled ? "On" : "Off"} · Pi ${response.piRelease} · ${ready} of ${response.accounts.length} accounts signed in`;
+    for (const item of response.accounts) {
+      const row = document.createElement("li");
+      const name = document.createElement("span");
+      name.className = "pi-channel-account";
+      name.textContent = item.accountId;
+      const status = document.createElement("span");
+      status.className = `pi-channel-state ${item.state}`;
+      status.textContent = PI_STATE_TEXT[item.state] || item.state;
+      if (item.detail) status.title = item.detail;
+      const signIn = document.createElement("button");
+      signIn.type = "button";
+      signIn.className = "button";
+      signIn.textContent = item.state === "ready" ? "Sign in again" : "Sign in";
+      signIn.dataset.piAction = "sign-in";
+      signIn.dataset.accountId = item.accountId;
+      row.append(name, status, signIn);
+      if (item.state !== "sign_in" || item.detail !== "not signed in") {
+        const signOut = document.createElement("button");
+        signOut.type = "button";
+        signOut.className = "button";
+        signOut.textContent = "Sign out";
+        signOut.dataset.piAction = "sign-out";
+        signOut.dataset.accountId = item.accountId;
+        row.append(signOut);
+      }
+      list.append(row);
+    }
+  }
+
+  // Sign in for the Pi channel: open ChatGPT's page, then paste back the
+  // address the browser landed on (http://127.0.0.1:1455/...), which only
+  // this machine receives; the pool finishes the sign-in with it.
+  async function piSignIn(accountId) {
+    const path = `/accounts/${encodeURIComponent(accountId)}/pi`;
+    try {
+      const started = await api(`${path}/login/start`, { method: "POST" });
+      window.open(started.authorizeUrl, "_blank", "noopener");
+      const landed = window.prompt(
+        `Sign in with the ChatGPT account for ${accountId} in the new tab. When the browser shows an address starting with ${started.redirectUri} (the page itself may fail to load), copy the whole address and paste it here.`,
+      );
+      if (!landed) return;
+      await api(`${path}/login/complete`, { method: "POST", body: JSON.stringify({ callbackUrl: landed }) });
+      notify(`Signed ${accountId} in for the Pi channel`);
+    } catch (error) {
+      notify(error.message, true);
+    }
+    refresh(true);
+  }
+
+  async function piSignOut(accountId) {
+    if (!window.confirm(`Sign ${accountId} out of the Pi channel? Its Codex sign-in is not affected.`)) return;
+    try {
+      await api(`/accounts/${encodeURIComponent(accountId)}/pi/logout`, { method: "POST" });
+      notify(`Signed ${accountId} out of the Pi channel`);
+    } catch (error) {
+      notify(error.message, true);
+    }
+    refresh(true);
+  }
+
   function renderSettings(serviceState) {
     renderUpstreamClosed(serviceState?.upstreamEnabled);
     renderUpstreamSwitch(serviceState?.upstreamEnabled);
@@ -725,6 +805,12 @@
       // Missing means an older server; the product default is off.
       primeSwitch.checked = serviceState?.quotaPrime === true;
       primeSwitch.disabled = false;
+    }
+    const piSwitch = $("#pi-channel-switch");
+    if (piSwitch) {
+      // Missing means an older server without the channel; shown off.
+      piSwitch.checked = serviceState?.piChannel === true;
+      piSwitch.disabled = serviceState?.piChannel === undefined;
     }
     const routingPill = $("#routing-strategy-pill");
     if (routingPill) {
@@ -1302,6 +1388,9 @@
       renderRoutingCacheEvents(serviceState.routingCacheEvents);
       renderCapacityWatch(serviceState.capacityWatch);
       renderSticky(state.data.sessions, state.data.accounts);
+      // Apart from the others: an older server has no Pi channel, and its
+      // absence must not fail the whole refresh.
+      api("/pi-channel").then(renderPiChannel).catch(() => renderPiChannel(null));
       const addAccountButton = $("#add-account-button");
       if (addAccountButton) addAccountButton.disabled = Boolean(activeLoginJob);
       // Device-auth jobs are intentionally single-flight. Recover a live job
@@ -1478,6 +1567,7 @@
   const updatePreserveProQuota = updateSetting("preserveProQuota", false);
   const updateLineageAffinity = updateSetting("lineageAffinity", true);
   const updateQuotaPrime = updateSetting("quotaPrime", false);
+  const updatePiChannel = updateSetting("piChannel", false);
   // The reserve's switch saves at once; its two thresholds save together.
   const saveQuotaReserve = async (body) => {
     try {
@@ -1636,6 +1726,13 @@
   $("#preserve-pro-quota-switch").addEventListener("change", updatePreserveProQuota);
   $("#lineage-affinity-switch").addEventListener("change", updateLineageAffinity);
   $("#quota-prime-switch").addEventListener("change", updateQuotaPrime);
+  $("#pi-channel-switch").addEventListener("change", updatePiChannel);
+  $("#pi-channel-accounts").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-pi-action]");
+    if (!button) return;
+    if (button.dataset.piAction === "sign-in") piSignIn(button.dataset.accountId);
+    if (button.dataset.piAction === "sign-out") piSignOut(button.dataset.accountId);
+  });
   $("#quota-reserve-switch").addEventListener("change", updateQuotaReserve);
   $("#quota-reserve-save").addEventListener("click", updateQuotaReserveThresholds);
   $("#upstream-switch").addEventListener("change", updateUpstreamSwitch);

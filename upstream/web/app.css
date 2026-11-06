@@ -636,3 +636,14 @@ tr[data-pool-membership="out"] .quota-track::-moz-progress-bar { background: lin
 /* Text for assistive technology only (the upstream switch's input label). */
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .capacity-watch-recent { margin-top: 10px; }.capacity-watch-recent summary { cursor: pointer; color: var(--muted-strong); font-size: 12px; }
+
+/* The Pi channel's sign-ins (SPEC.md 2.3.7). */
+.pi-channel-card { display: grid; gap: 10px; margin: 0 0 20px; padding: 18px 22px; background: var(--surface); border: 1px solid var(--line); border-radius: 20px; }
+.pi-channel-card[hidden] { display: none; }
+.pi-channel-summary { margin: 0; color: var(--muted-strong); font-size: 14px; }
+.pi-channel-accounts { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.pi-channel-accounts li { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.pi-channel-account { min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
+.pi-channel-state { color: var(--muted); font-size: 13px; }
+.pi-channel-state.ready { color: var(--green); }
+.pi-channel-state.refused, .pi-channel-state.limited { color: var(--red); }

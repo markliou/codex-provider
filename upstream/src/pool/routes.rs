@@ -109,6 +109,7 @@ enum Handler {
     JobCancel,
     StickySessions,
     StickySessionDelete,
+    PiChannel,
     AccountAction,
     AccountDelete,
 }
@@ -299,6 +300,11 @@ const ROUTES: &[(Option<&str>, PathPattern, Handler)] = &[
         Some("GET"),
         PathPattern::Exact("/admin/api/sticky-sessions"),
         Handler::StickySessions,
+    ),
+    (
+        Some("GET"),
+        PathPattern::Exact("/admin/api/pi-channel"),
+        Handler::PiChannel,
     ),
     (
         Some("DELETE"),
@@ -548,6 +554,7 @@ pub async fn serve(app: &Arc<App>, request: Request, writer: Box<dyn ResponseWri
         Handler::Job => admin::handle_job(app, &request, writer.as_mut()),
         Handler::JobCancel => admin::handle_job_cancel(app, &request, writer.as_mut()),
         Handler::StickySessions => admin::handle_sticky_sessions(app, writer.as_mut()),
+        Handler::PiChannel => admin::handle_pi_channel(app, writer.as_mut()),
         Handler::StickySessionDelete => {
             admin::handle_sticky_session_delete(app, &request, writer.as_mut())
         }

@@ -54,6 +54,10 @@ pub struct Settings {
     pub preserve_pro_quota: bool,
     pub lineage_affinity: bool,
     pub quota_prime: bool,
+    /// CODEX_POOL_PI_CHANNEL: whether an app's non-Codex /v1 request goes on
+    /// the Pi channel (pi_channel.rs) rather than being completed into a
+    /// Codex request. Off until the owner has signed accounts in for it.
+    pub pi_channel: bool,
     /// CODEX_POOL_QUOTA_PRIME_GRACE: a fixed grace for tests; None draws one
     /// at random (codex_prime.go, quota prime grace).
     pub quota_prime_grace: Option<Duration>,
@@ -141,6 +145,7 @@ impl Settings {
             preserve_pro_quota: false,
             lineage_affinity: true,
             quota_prime: false,
+            pi_channel: false,
             quota_prime_grace: Some(Duration::ZERO),
             upstream_enabled: true,
             // Off in tests that are not about it, so their quota windows
@@ -263,6 +268,14 @@ impl Settings {
             false,
         )?;
         let quota_prime_grace = quota_prime_grace(&get("CODEX_POOL_QUOTA_PRIME_GRACE"))?;
+        // The Pi channel defaults off: with no account signed in for it, every
+        // app request would be refused, so the owner turns it on in the
+        // Console once accounts are signed in (SPEC.md 2.3.7).
+        let pi_channel = bool_from_env(
+            &get("CODEX_POOL_PI_CHANNEL"),
+            "CODEX_POOL_PI_CHANNEL",
+            false,
+        )?;
         // The upstream switch defaults off, the owner's choice after accounts
         // were revoked: a pool started without it sends nothing upstream, not
         // a quota poll, a prime, a token refresh, a login or a client's
@@ -329,6 +342,7 @@ impl Settings {
             preserve_pro_quota,
             lineage_affinity,
             quota_prime,
+            pi_channel,
             quota_prime_grace,
             upstream_enabled,
             quota_reserve,

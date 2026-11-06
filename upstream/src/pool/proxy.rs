@@ -1135,6 +1135,23 @@ async fn proxy(
     // Codex sends its own backend and re-encoding sorted every key. Routing
     // still reads the model; nothing is written back.
     let native = request.native;
+    // With the Pi channel on, an app's request on /v1 that is not a Codex
+    // request goes upstream as Pi sends it (pi_channel.rs, SPEC.md 2.3.7)
+    // instead of being completed into a Codex request. The fields Pi itself
+    // leaves out on that route are taken out before the gate checks the
+    // request: a Pi pointed at the pool sends max_output_tokens, which Pi
+    // signed in to ChatGPT never sends, and refusing it would refuse Pi for
+    // what Pi drops. Every other field is still checked.
+    let pi = !native
+        && !compact
+        && app.pi_channel_enabled()
+        && (chat || !super::codex_request::codex_shaped(&request.headers, payload));
+    if pi {
+        let removed = super::pi_channel::strip_pi_omitted(payload);
+        if !removed.is_empty() {
+            app.note_pi_removed_fields(&removed);
+        }
+    }
     // Every request is checked before routing, whatever it says it is
     // (codex_request.rs): a refused one never reaches upstream, and an app's
     // request on /v1 is completed into a Codex request per attempt.
@@ -1142,7 +1159,11 @@ async fn proxy(
         return;
     };
     let original: Option<Map<String, Value>> = (!native).then(|| payload.clone());
-    if !native {
+    // A Pi-channel request keeps the client's bytes: the model and tier are
+    // written into it per attempt (pi_channel::pi_request_body), and the
+    // hosted-tool filter and prompt-cache rewrites are Codex-completion steps
+    // Pi never takes.
+    if !native && !pi {
         payload.insert("model".into(), Value::String(model.clone()));
         if !chat && !tier.is_empty() && tier != "none" {
             payload.insert("reasoning".into(), serde_json::json!({"effort": tier}));
@@ -1156,7 +1177,7 @@ async fn proxy(
     };
     let api_key = super::server::request_api_key(&request.headers, &request.query);
     let mut route = app.routing_decision(&facts, payload, &model, &api_key);
-    if !native {
+    if !native && !pi {
         app.read().apply_prompt_cache_controls(payload, &route);
     }
     let mut throughput = app.begin_throughput_measurement(streaming);
@@ -1178,6 +1199,10 @@ async fn proxy(
             compact,
             native,
             foreign,
+            pi: pi.then(|| PiRequest {
+                tier: (!chat && !tier.is_empty() && tier != "none").then(|| tier.clone()),
+                aggregate: !chat && !streaming,
+            }),
         },
         &model,
         &mut route,
@@ -1189,7 +1214,7 @@ async fn proxy(
 }
 
 /// What kind of request an attempt loop carries.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Kind {
     chat: bool,
     compact: bool,
@@ -1197,6 +1222,17 @@ struct Kind {
     /// An app's /v1 request, completed into a Codex request for each account
     /// it is tried on (codex_request.rs).
     foreign: bool,
+    /// Goes on the Pi channel (pi_channel.rs) instead.
+    pi: Option<PiRequest>,
+}
+
+/// What the Pi channel writes into the client's request per attempt.
+#[derive(Clone, Debug)]
+struct PiRequest {
+    tier: Option<String>,
+    /// The client asked for no stream: the route always streams, so the
+    /// answer is assembled from the stream, as for a completed request.
+    aggregate: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1215,12 +1251,36 @@ async fn attempts(
         compact,
         native,
         foreign,
+        pi,
     } = kind;
     let cancel = &request.cancel;
     let request_id = request_operational_id(&request.headers);
     let mut failover_from = String::new();
     let mut failover_outcome = String::new();
     let mut excluded: HashMap<String, bool> = HashMap::new();
+    // The Pi channel can use only accounts signed in for it and not resting
+    // (pi_channel.rs). They are left out from the start; that is not a
+    // failure, so the "already tried" checks below count past them.
+    if pi.is_some() {
+        for id in app.pi_unusable_accounts() {
+            excluded.insert(id, true);
+        }
+        if !app.has_preferred_account(model, &excluded) {
+            write_openai_error(
+                writer,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "pi_channel_unavailable",
+                "no account is signed in and available for the pi channel",
+            );
+            return;
+        }
+    }
+    let left_out = excluded.len();
+    let client_name = if pi.is_some() {
+        super::pi_channel::client_name(&request.headers)
+    } else {
+        String::new()
+    };
     // The subset of excluded that refused for capacity alone. Only those may
     // be restored for a later round; an auth or transport failure is not
     // transient and must stay excluded.
@@ -1245,7 +1305,7 @@ async fn attempts(
                 return;
             }
             Err(error) => {
-                if !excluded.is_empty() {
+                if excluded.len() > left_out {
                     // At least one upstream was already selected and failed.
                     // Reporting "no eligible account" makes a transient upstream
                     // failure look like pool exhaustion, especially when Pro is
@@ -1298,6 +1358,26 @@ async fn attempts(
                 out_body
             };
             (out_body, inbound, Shaping::Exact)
+        } else if let Some(pi) = &pi {
+            // As a Pi of the pinned release sends it (pi_channel.rs); the
+            // log line keeps the client's own name for the owner's analysis
+            // of which clients the colleagues run.
+            app.logger.printf(&format!(
+                "pi channel request: client={} account={} model={model}",
+                if client_name.is_empty() {
+                    "-"
+                } else {
+                    client_name.as_str()
+                },
+                candidate.id
+            ));
+            match super::pi_channel::pi_request_body(&out_body, model, pi.tier.as_deref()) {
+                Ok((body, _)) => (body, inbound, Shaping::Exact),
+                Err(error) => {
+                    write_openai_error(writer, StatusCode::BAD_REQUEST, "invalid_request", &error);
+                    return;
+                }
+            }
         } else if foreign && App::uses_codex_backend_directly(&candidate) {
             let api_key = super::server::request_api_key(&request.headers, &request.query);
             match app.complete_foreign_request(
@@ -1316,8 +1396,24 @@ async fn attempts(
         } else {
             (out_body, inbound, Shaping::Adapt)
         };
+        let send = async {
+            if pi.is_some() {
+                match app.pi_forward(&candidate, out_body, &inbound).await {
+                    Ok(response)
+                        if pi.as_ref().is_some_and(|pi| pi.aggregate)
+                            && response.status.is_success() =>
+                    {
+                        Ok(aggregate_codex_stream(response).await)
+                    }
+                    other => other,
+                }
+            } else {
+                app.forward(&candidate, &endpoint, out_body, &inbound, shaping)
+                    .await
+            }
+        };
         let forwarded = tokio::select! {
-            result = app.forward(&candidate, &endpoint, out_body, &inbound, shaping) => Some(result),
+            result = send => Some(result),
             () = cancel.cancelled() => None,
         };
         let Some(forwarded) = forwarded else {
@@ -1352,7 +1448,12 @@ async fn attempts(
                 }
                 excluded.insert(candidate.id.clone(), true);
                 failover_from.clone_from(&candidate.id);
-                if auth {
+                if auth && pi.is_some() {
+                    // The account's Pi-channel credential, already marked for
+                    // a new sign-in (App::pi_forward). Its Codex credential is
+                    // another one and must not be quarantined for it.
+                    failover_outcome = "pi_auth_failover".to_string();
+                } else if auth {
                     // A revoked or invalid device-auth credential must not end
                     // the user request while other upstream accounts are
                     // eligible. Mark it unavailable and continue; selection
@@ -1374,6 +1475,123 @@ async fn attempts(
             }
         };
         let status = response.status;
+        if pi.is_some() && !status.is_success() {
+            // The Pi channel reads its answers by OpenAI's table for the
+            // route (pi_channel::verdict), never by the Codex rules below:
+            // those quarantine the account's Codex credential on a 401 and
+            // cool the account down for both channels on a 429.
+            let headers = response.headers.clone();
+            let body = super::credentials::read_body(response, MAX_REQUEST_BODY)
+                .await
+                .unwrap_or_default();
+            use super::pi_channel::Unavailable;
+            use super::pi_channel::Verdict;
+            let verdict = super::pi_channel::verdict(status, &body).or_else(|| {
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    Some(Verdict::Limited("rate_limited".to_string()))
+                } else if status.is_server_error() {
+                    Some(Verdict::Retry(format!("upstream_{}", status.as_u16())))
+                } else {
+                    None
+                }
+            });
+            let now = Timestamp::now();
+            let mut fail_over = |reason: Unavailable, code: &str| {
+                app.logger.printf(&format!(
+                    "pi channel: account={} status={} code={code}; trying another account",
+                    candidate.id,
+                    status.as_u16()
+                ));
+                app.pi_mark(&candidate.id, reason);
+                excluded.insert(candidate.id.clone(), true);
+                failover_from.clone_from(&candidate.id);
+                failover_outcome = "pi_failover".to_string();
+            };
+            match verdict {
+                Some(Verdict::SignIn(code)) => {
+                    fail_over(Unavailable::SignIn(code.clone()), &code);
+                    attempt += 1;
+                    continue;
+                }
+                Some(Verdict::Refused(code)) => {
+                    fail_over(Unavailable::Refused(code.clone()), &code);
+                    attempt += 1;
+                    continue;
+                }
+                Some(Verdict::Limited(code)) => {
+                    // A plain 429 is a rate limit with its own Retry-After;
+                    // the route's usage limit names no reset time.
+                    let rest = if code == "rate_limited" {
+                        delta(retry_after_or_default(
+                            header(&headers, "retry-after"),
+                            Duration::from_secs(60),
+                        ))
+                    } else {
+                        super::pi_channel::LIMIT_REST
+                    };
+                    fail_over(
+                        Unavailable::Limited {
+                            code: code.clone(),
+                            until: now.add(rest),
+                        },
+                        &code,
+                    );
+                    attempt += 1;
+                    continue;
+                }
+                Some(Verdict::Retry(code)) => {
+                    // "Retry with bounded backoff. Keep credentials." The
+                    // same account first, as for a transport failure.
+                    if transport_retries < TRANSPORT_SAME_ACCOUNT_RETRY_LIMIT {
+                        transport_retries += 1;
+                        app.logger.printf(&format!(
+                            "pi channel: account={} status={} code={code}; retrying this account",
+                            candidate.id,
+                            status.as_u16()
+                        ));
+                        if !cancel
+                            .sleep(tuning.transport_retry_backoff * (1 << (transport_retries - 1)))
+                            .await
+                        {
+                            throughput.cancelled = true;
+                            throughput.cancel_reason = "client_closed_during_transport_retry";
+                            return;
+                        }
+                        continue;
+                    }
+                    app.logger.printf(&format!(
+                        "pi channel: account={} status={} code={code}; trying another account",
+                        candidate.id,
+                        status.as_u16()
+                    ));
+                    excluded.insert(candidate.id.clone(), true);
+                    failover_from.clone_from(&candidate.id);
+                    failover_outcome = "pi_failover".to_string();
+                    attempt += 1;
+                    continue;
+                }
+                Some(Verdict::Caller(_)) | None => {
+                    // The request or the integration, not the account: the
+                    // caller gets upstream's answer as it came, and no
+                    // account is marked.
+                    for (name, value) in app.current_account_response_headers(&candidate.id) {
+                        set_header(writer, &name, &value);
+                    }
+                    throughput.success = false;
+                    let _ = copy_proxy_response(
+                        writer,
+                        UpstreamResponse {
+                            status,
+                            headers,
+                            body: super::stream::byte_stream_from(body),
+                        },
+                        &tuning,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             let headers = response.headers.clone();
             let body = super::credentials::read_body(response, MAX_REQUEST_BODY)
@@ -1710,13 +1928,43 @@ async fn attempts(
             // retry at this point: splicing a second stream could duplicate
             // work, tool effects, or response IDs and corrupt the SSE sequence.
             throughput.success = false;
+            if pi.is_some() {
+                // The route's usage codes arrive mid-stream too ("Usage-limit
+                // failures can arrive mid-stream as response.failed"). They
+                // rest the account on this channel only; the Codex rules
+                // would read them as unknown, and an "authentication" class
+                // would quarantine the account's Codex credential.
+                use super::pi_channel::Unavailable;
+                use super::pi_channel::Verdict;
+                match super::pi_channel::stream_failure_verdict(&info.terminal_error_code) {
+                    Some(Verdict::Limited(code)) => {
+                        app.pi_mark(
+                            &candidate.id,
+                            Unavailable::Limited {
+                                code,
+                                until: Timestamp::now().add(super::pi_channel::LIMIT_REST),
+                            },
+                        );
+                        info.terminal_failure_class = "pi_channel".to_string();
+                    }
+                    Some(_) => info.terminal_failure_class = "pi_channel".to_string(),
+                    None if info.terminal_failure_class == "authentication" => {
+                        app.pi_mark(
+                            &candidate.id,
+                            Unavailable::SignIn(info.terminal_error_code.clone()),
+                        );
+                        info.terminal_failure_class = "pi_channel".to_string();
+                    }
+                    None => {}
+                }
+            }
             app.mark_terminal_response_failure(
                 route,
                 model,
                 &candidate.id,
                 &info,
                 Some(throughput),
-                true,
+                pi.is_none(),
             );
             return;
         }

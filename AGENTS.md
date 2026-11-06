@@ -24,6 +24,16 @@ The pool must behave like a native Codex of the release pinned in `upstream/Carg
 - After a deploy, check the dashboard's Unrecognized failures and the log for `class=unknown`. Any occurrence means upstream sent a shape the pool does not read as Codex does; find it, compare it with Codex's source, and record it.
 - Account semantics (identity, allowance, quota) are the pool's own and cannot be checked against Codex. Routing and the dashboard must share one definition of each, held together by a test, and an assumption about accounts must be checked against live account data (field names, hashes and timestamps only) before it ships.
 
+## Pi Channel Conformance
+
+The Pi channel (SPEC.md 2.3.7, `upstream/src/pool/pi_channel.rs`) sends an app's non-Codex request the way an unmodified Pi of `PI_RELEASE` sends it on OpenAI's "Sign in with ChatGPT" route. The source of truth is Pi's source at that release and the request measured by `sh scripts/conformance/pi-capture.sh`, recorded in `upstream/testdata/pi-reference.json`; OpenAI's "ChatGPT plan usage" docs decide what the route accepts and how its answers are read.
+
+- A change to what this channel sends (headers, body, token calls) cites the Pi source or the docs page it matches, and keeps `pi-capture.sh check` and the pool's tests passing.
+- Its sign-in and token calls are composed in `pi_channel.rs` from Pi's source, never from another client or freely.
+- A test that fakes this route answers in the shapes the docs' "Errors and recovery" table names.
+- Its answers never touch the account's Codex credential, and the Codex channel's rules above are unchanged by it.
+- Moving to a new Pi release: update `PI_RELEASE`, run `pi-capture.sh update`, read the reference's diff, and match the channel to each change.
+
 ## Codex Account Security
 
 Treat every Codex, ChatGPT, OAuth, upstream provider, and admin credential as a release blocker.

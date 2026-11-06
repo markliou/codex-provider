@@ -37,6 +37,9 @@ pub mod metadata;
 pub mod native;
 pub mod outcome;
 pub mod own_call;
+pub mod pi_channel;
+#[cfg(test)]
+mod pi_channel_tests;
 pub mod plan;
 pub mod prime;
 pub mod proxy;

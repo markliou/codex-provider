@@ -111,6 +111,8 @@ pub struct Inner {
     pub preserve_pro_quota: bool,
     pub lineage_affinity: bool,
     pub quota_prime: bool,
+    /// The Pi channel switch (pi_channel.rs).
+    pub pi_channel: bool,
     /// The upstream switch as shown; the transport holds the copy every send
     /// reads, and App::set_upstream changes both together.
     pub upstream_enabled: bool,
@@ -180,6 +182,9 @@ pub struct App {
     pub login_cancels: super::login::LoginCancels,
     /// Failed owner logins per client, for the lockout (admin_api.rs).
     pub login_failures: super::admin_api::LoginFailures,
+    /// The Pi channel's sign-ins in progress and per-account state
+    /// (pi_channel.rs).
+    pub pi_channel: super::pi_channel::PiChannel,
     inner: RwLock<Inner>,
 }
 
@@ -204,6 +209,7 @@ impl App {
                 .unwrap_or(settings.preserve_pro_quota),
             lineage_affinity: config.lineage_affinity.unwrap_or(settings.lineage_affinity),
             quota_prime: config.quota_prime.unwrap_or(settings.quota_prime),
+            pi_channel: config.pi_channel.unwrap_or(settings.pi_channel),
             upstream_enabled: config.upstream_enabled.unwrap_or(settings.upstream_enabled),
             quota_reserve: QuotaReserve {
                 enabled: config.quota_reserve.unwrap_or(settings.quota_reserve),
@@ -251,6 +257,7 @@ impl App {
             prime_runner: std::sync::Mutex::new(None),
             login_cancels: super::login::LoginCancels::default(),
             login_failures: super::admin_api::LoginFailures::default(),
+            pi_channel: super::pi_channel::PiChannel::default(),
             inner: RwLock::new(inner),
         }
     }
@@ -296,6 +303,32 @@ impl App {
                     .unwrap_or_else(|error| panic!("Codex transport: {error}")),
             ),
         )
+    }
+
+    /// Whether an app's non-Codex request goes on the Pi channel.
+    pub fn pi_channel_enabled(&self) -> bool {
+        self.read().pi_channel
+    }
+
+    /// One line per distinct set of fields the Pi channel removed from an
+    /// app's request because Pi leaves them out on that route
+    /// (pi_channel::PI_OMITTED_FIELDS), so the owner can see it happen
+    /// without a line per request.
+    pub fn note_pi_removed_fields(&self, removed: &[String]) {
+        let key = format!("pi-removed:{}", removed.join(","));
+        let first = {
+            let mut seen = self
+                .unrelayed_header_sets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            seen.len() < 256 && seen.insert(key)
+        };
+        if first {
+            self.logger.printf(&format!(
+                "pi channel removed fields Pi leaves out on its route: {}",
+                removed.join(",")
+            ));
+        }
     }
 
     /// Whether the upstream switch is on right now.

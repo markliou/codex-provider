@@ -1008,6 +1008,7 @@ impl Inner {
             "preserveProQuota": self.preserve_pro_quota,
             "lineageAffinity": self.lineage_affinity,
             "quotaPrime": self.quota_prime,
+            "piChannel": self.pi_channel,
             "upstreamEnabled": self.upstream_enabled,
             "quotaReserve": {
                 "enabled": self.quota_reserve.enabled,
