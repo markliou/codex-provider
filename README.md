@@ -177,8 +177,8 @@ Every request the pool sends upstream is one a Codex would send
 The pool log shows each refusal (`request refused before upstream`) and each
 field it passed without knowing it.
 
-With the **Pi channel** switch on (below), "Completed" no longer applies: an
-app's request that is not a Codex request goes upstream as Pi sends it instead.
+"Completed" applies only with `CODEX_POOL_PI_CHANNEL=false`: by default an
+app's request that is not a Codex request goes upstream as Pi sends it (below).
 
 ### Pi
 
@@ -206,9 +206,9 @@ allow. Then pick an `openai/...` model (for example `pi --model openai/gpt-5.5`)
 - **Log Pi out of OpenAI** (`/logout`) on that machine if it was ever signed in
   there: Pi prefers a stored login over the key in `models.json`, would send
   that login to the pool, and the pool refuses it.
-- **The pool's Pi channel must be on**, with at least one account signed in for
-  Pi (see [Pi sign-in](#pi-sign-in)). With it off, Pi's request is completed
-  into a Codex request, and the `max_output_tokens` Pi sends is refused.
+- **At least one account must be signed in for Pi** (see
+  [Pi sign-in](#pi-sign-in)); otherwise the pool answers `503`
+  `pi_channel_unavailable`.
 
 On the Pi channel the pool sends what an unmodified Pi sends OpenAI through
 "Sign in with ChatGPT": the public Responses API with the account's own Pi
@@ -250,11 +250,12 @@ one device-auth job runs at a time.
 
 ### Pi sign-in
 
-An account can hold a second sign-in, for the Pi channel, apart from its Codex
-one. The account row shows a badge per sign-in it holds (**Codex**, **Pi**).
-**Repair sign-in** opens a chooser: **Codex · device code** is the repair above;
-**Pi · browser sign-in** opens OpenAI's sign-in page (`auth.openai.com`) in a
-new tab.
+An account can hold a Codex sign-in, a Pi sign-in, or both. The account row
+shows a badge per sign-in it holds (**Codex**, **Pi**). **Add account** and each
+row's **Repair sign-in** open the same chooser: **Codex · device code** is the
+device flow above; **Pi · browser sign-in** opens OpenAI's sign-in page
+(`auth.openai.com`) in a new tab. An account signed in for Pi alone serves only
+Pi requests and is never given a Codex request.
 
 1. Upstream must be open: the last step talks to OpenAI.
 2. Log in with the account's ChatGPT login and allow it.
@@ -272,9 +273,9 @@ disconnect the app in ChatGPT's Settings.
 
 The plan's windows in the quota column are shared by both modes. OpenAI gives
 an app no plan-usage reading, so under the Pi badge the pool shows its own count
-of the Pi channel's use (last five hours and seven days). Each app's weekly cap
-is set in ChatGPT's Settings > Usage. Turn on the **Pi channel** switch at the
-top once accounts are signed in.
+of the Pi channel's use (last five hours and seven days); an account signed in
+for Pi alone has no plan windows there, since they are read with the Codex
+sign-in. Each app's weekly cap is set in ChatGPT's Settings > Usage.
 
 ### Duplicates and workspace members
 
@@ -477,7 +478,7 @@ settings and SPEC.md 2.1 lists them all. The ones most often changed:
 | `CODEX_POOL_CLIENT_MAX_IN_FLIGHT` | `16` | Requests one client key may have running at once; over it the client gets a 429 to retry later (SPEC.md 2.3.6) |
 | `CODEX_POOL_CLIENT_MAX_PER_MINUTE` | `120` | Requests one client key may start in a minute (SPEC.md 2.3.6) |
 | `CODEX_POOL_QUOTA_PRIME` | `false` | Initial **Prime idle accounts** setting |
-| `CODEX_POOL_PI_CHANNEL` | `false` | Initial **Pi channel** setting (apps' non-Codex requests go as Pi sends them) |
+| `CODEX_POOL_PI_CHANNEL` | `true` | Apps' non-Codex requests go as Pi sends them; `false` completes them into Codex requests (no Console switch) |
 | `CODEX_POOL_QUOTA_RESERVE` | `true` | Initial **Quota reserve** setting: stop using an account at 10% left in its 5-hour or weekly window (both set in the Console) |
 | `CODEX_POOL_SHUTDOWN_GRACE` | `120s` | Drain time on stop (keep `stop_grace_period` above it) |
 

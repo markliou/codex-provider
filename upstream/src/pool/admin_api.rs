@@ -370,8 +370,6 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
         #[serde(default)]
         quota_prime: Option<bool>,
         #[serde(default)]
-        pi_channel: Option<bool>,
-        #[serde(default)]
         upstream_enabled: Option<bool>,
         #[serde(default)]
         quota_reserve: Option<bool>,
@@ -394,7 +392,6 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
     if switches.preserve_pro_quota.is_none()
         && switches.lineage_affinity.is_none()
         && switches.quota_prime.is_none()
-        && switches.pi_channel.is_none()
         && switches.upstream_enabled.is_none()
         && switches.quota_reserve.is_none()
         && switches.quota_reserve_five_hour.is_none()
@@ -404,7 +401,7 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
             writer,
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "preserveProQuota, lineageAffinity, quotaPrime, piChannel, upstreamEnabled, quotaReserve, quotaReserveFiveHour or quotaReserveWeekly is required",
+            "preserveProQuota, lineageAffinity, quotaPrime, upstreamEnabled, quotaReserve, quotaReserveFiveHour or quotaReserveWeekly is required",
         );
         return;
     }
@@ -432,17 +429,6 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
     if let Some(value) = switches.lineage_affinity {
         inner.lineage_affinity = value;
         inner.config.lineage_affinity = Some(value);
-    }
-    if let Some(value) = switches.pi_channel
-        && value != inner.pi_channel
-    {
-        inner.pi_channel = value;
-        inner.config.pi_channel = Some(value);
-        app.logger.printf(if value {
-            "pi channel turned on by the owner: apps' non-Codex requests go as Pi sends them"
-        } else {
-            "pi channel turned off by the owner: apps' requests are completed into Codex requests"
-        });
     }
     if let Some(value) = switches.quota_prime {
         inner.quota_prime = value;

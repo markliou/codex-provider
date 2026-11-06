@@ -45,7 +45,10 @@ impl Inner {
         // read auth.json for accounts that can actually participate in
         // routing; staging slots otherwise serialize dashboard/status requests
         // behind repeated missing-auth retries while the state lock is held.
-        if plan::is_codex_device_auth(item) && self.codex_auth(item).is_err() {
+        // An account signed in for Pi alone has no Codex credential by design;
+        // its Pi badge carries its sign-in state.
+        if plan::is_codex_device_auth(item) && self.codex_auth(item).is_err() && !self.pi_only(item)
+        {
             return ("missing_auth", "Device auth login is required".into());
         }
         let snapshot = self.quota_snapshot(&item.id);

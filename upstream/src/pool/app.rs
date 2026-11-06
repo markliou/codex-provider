@@ -111,7 +111,8 @@ pub struct Inner {
     pub preserve_pro_quota: bool,
     pub lineage_affinity: bool,
     pub quota_prime: bool,
-    /// The Pi channel switch (pi_channel.rs).
+    /// Whether apps' non-Codex requests go on the Pi channel (pi_channel.rs);
+    /// from CODEX_POOL_PI_CHANNEL, with no Console switch.
     pub pi_channel: bool,
     /// The upstream switch as shown; the transport holds the copy every send
     /// reads, and App::set_upstream changes both together.
@@ -209,7 +210,7 @@ impl App {
                 .unwrap_or(settings.preserve_pro_quota),
             lineage_affinity: config.lineage_affinity.unwrap_or(settings.lineage_affinity),
             quota_prime: config.quota_prime.unwrap_or(settings.quota_prime),
-            pi_channel: config.pi_channel.unwrap_or(settings.pi_channel),
+            pi_channel: settings.pi_channel,
             upstream_enabled: config.upstream_enabled.unwrap_or(settings.upstream_enabled),
             quota_reserve: QuotaReserve {
                 enabled: config.quota_reserve.unwrap_or(settings.quota_reserve),
@@ -1088,7 +1089,15 @@ impl Inner {
             return false;
         }
         if is_codex_device_auth(item) {
-            if self.codex_auth(item).is_err() {
+            // The Pi channel needs the account's Pi sign-in, everything else
+            // its Codex one (pi_channel::pi_selection): an account signed in
+            // for one mode is never given the other's request.
+            let signed_in = if super::pi_channel::pi_selection() {
+                self.has_pi_credential(item)
+            } else {
+                self.codex_auth(item).is_ok()
+            };
+            if !signed_in {
                 return false;
             }
         } else if item.upstream_base_url.is_empty() {

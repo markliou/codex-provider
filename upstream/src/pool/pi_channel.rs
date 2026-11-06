@@ -180,6 +180,46 @@ struct Pending {
     started: Timestamp,
 }
 
+tokio::task_local! {
+    /// Set while the Pi channel's attempt loop picks accounts: an account then
+    /// needs its Pi sign-in, not its Codex one (Inner::usable). Every other
+    /// selection (Codex requests, sockets, the native endpoint, the pool's
+    /// own calls) runs outside it and keeps needing the Codex credential, so
+    /// an account signed in for Pi alone is never given a Codex request.
+    static PI_SELECTION: bool;
+}
+
+/// Whether the current task is picking an account for the Pi channel.
+pub fn pi_selection() -> bool {
+    PI_SELECTION.try_with(|value| *value).unwrap_or(false)
+}
+
+/// Runs `future` as the Pi channel's account selection.
+pub async fn as_pi_selection<F: std::future::Future>(future: F) -> F::Output {
+    PI_SELECTION.scope(true, future).await
+}
+
+impl super::app::Inner {
+    /// Whether the account holds a Pi sign-in.
+    pub fn has_pi_credential(&self, item: &Account) -> bool {
+        self.account_codex_home(&item.id)
+            .join(CREDENTIAL_FILE)
+            .is_file()
+    }
+
+    /// An account signed in for Pi and not for Codex: it serves the Pi
+    /// channel only, and nothing of the Codex side (the quota poll, the
+    /// missing-sign-in status) applies to it.
+    pub fn pi_only(&self, item: &Account) -> bool {
+        super::plan::is_codex_device_auth(item)
+            && self.has_pi_credential(item)
+            && !self
+                .account_codex_home(&item.id)
+                .join("auth.json")
+                .is_file()
+    }
+}
+
 pub const STATE_FILE: &str = "pi-state.json";
 
 /// The channel's in-memory state; each account's `Unavailable` is read from
@@ -986,9 +1026,71 @@ impl App {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(account_id);
         self.pi_clear(account_id);
+        self.activate_pi_slot(account_id, &reply.id_token);
         self.logger
             .printf(&format!("pi channel signed in for {account_id}"));
         Ok(())
+    }
+
+    /// A slot added for Pi (Add account, Pi) waits out of the pool until its
+    /// sign-in finishes, as a Codex slot waits for its device sign-in
+    /// (login.rs, pending_pool_activation); then it joins the pool. The email
+    /// and plan in the ID token are kept for recognition only, as a Codex
+    /// sign-in's are: the pool never sends them anywhere.
+    fn activate_pi_slot(&self, account_id: &str, id_token: &str) {
+        let claims = id_token
+            .split('.')
+            .nth(1)
+            .and_then(|payload| {
+                use base64::Engine;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload.trim_end_matches('='))
+                    .ok()
+            })
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or(Value::Null);
+        let email = claims
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let plan = claims
+            .get("https://api.openai.com/auth")
+            .and_then(|auth| auth.get("chatgpt_plan_type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut inner = self.write();
+        let Some(index) = inner.account_index(account_id) else {
+            return;
+        };
+        let pi_only = {
+            let item = inner.config.accounts()[index].clone();
+            inner.pi_only(&item)
+        };
+        let slot = &mut inner.config.accounts_mut()[index];
+        if !pi_only {
+            return;
+        }
+        if slot.email.is_empty() && !email.is_empty() {
+            slot.email = super::plan::normalize_email(email);
+        }
+        if slot.raw_plan_type.is_empty() && !plan.is_empty() {
+            slot.raw_plan_type = super::plan::clean_raw_plan_type(plan);
+            slot.plan_family = super::plan::plan_family_from_raw(&slot.raw_plan_type).to_string();
+            slot.plan_type.clone_from(&slot.plan_family);
+            slot.plan_rank = super::plan::plan_rank(&slot.plan_family);
+        }
+        if slot.pending_pool_activation {
+            slot.enabled = true;
+            slot.in_pool = true;
+            slot.pending_pool_activation = false;
+        }
+        slot.updated_at = Timestamp::now();
+        if inner.save().is_err() {
+            drop(inner);
+            self.logger.printf(&format!(
+                "pi channel sign-in for {account_id}: the account could not be saved"
+            ));
+        }
     }
 
     /// Forgets the account's credential for this channel. Upstream's

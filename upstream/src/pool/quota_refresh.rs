@@ -530,13 +530,16 @@ fn choose(value: Option<&str>, fallback: Option<&str>) -> String {
 
 impl App {
     /// The accounts the poller reads: every Codex device-auth slot, in or out
-    /// of the pool.
+    /// of the pool, except one signed in for Pi alone. The poll reads the
+    /// plan with the Codex credential; without one it would record an auth
+    /// failure, and that failure blocks routing for the Pi channel too.
     pub fn quota_poll_accounts(&self) -> Vec<super::state::Account> {
-        self.read()
+        let inner = self.read();
+        inner
             .config
             .accounts()
             .iter()
-            .filter(|item| plan::is_codex_device_auth(item))
+            .filter(|item| plan::is_codex_device_auth(item) && !inner.pi_only(item))
             .cloned()
             .collect()
     }

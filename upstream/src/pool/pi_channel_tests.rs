@@ -547,3 +547,98 @@ async fn the_channel_counts_its_own_usage() {
     assert_eq!(usage["fiveHours"]["cachedTokens"], 8);
     assert_eq!(usage["week"]["outputTokens"], 4);
 }
+
+/// An app whose one account is signed in for Pi alone (Add account, Pi).
+fn pi_only_app(upstream: &FakeServer) -> (Arc<App>, TempDir) {
+    let (app, dir) = test_app(vec![device_account("acct-pi", "", 100)]);
+    write_pi_credential(&app, "acct-pi", "<pi-access-acct-pi>", far_future());
+    app.write().pi_channel = true;
+    app.pi_channel.set_endpoints(Endpoints {
+        authorize: format!("{}/api/accounts/authorize", upstream.url),
+        token: format!("{}/api/accounts/oauth/token", upstream.url),
+        responses: format!("{}/v1/responses", upstream.url),
+    });
+    (Arc::new(app), dir)
+}
+
+#[tokio::test]
+async fn an_account_signed_in_for_pi_alone_serves_the_pi_channel() {
+    let upstream = FakeServer::start(|_| ok_stream()).await;
+    let (app, _dir) = pi_only_app(&upstream);
+    let result = serve(&app, pi_request(PI_BODY)).await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    assert_eq!(
+        upstream.requests()[0].header("authorization"),
+        "Bearer <pi-access-acct-pi>"
+    );
+    // Nothing of the Codex side applies to it: no missing-sign-in status,
+    // no quota poll (which would record an auth failure that blocks it).
+    let item = app.read().config.accounts()[0].clone();
+    assert_ne!(
+        app.read().account_status(&item, Timestamp::now()).0,
+        "missing_auth"
+    );
+    assert!(app.quota_poll_accounts().is_empty());
+}
+
+#[tokio::test]
+async fn an_account_signed_in_for_pi_alone_never_gets_a_codex_request() {
+    let upstream = FakeServer::start(|_| ok_stream()).await;
+    let (app, _dir) = pi_only_app(&upstream);
+    let request = post(
+        "/v1/responses",
+        r#"{"model":"gpt-5.5","input":[],"stream":true,"store":false,"tool_choice":"auto","parallel_tool_calls":true,"reasoning":null,"include":[],"client_metadata":{}}"#,
+    )
+    .with_header("user-agent", "codex_exec/0.166.0 (Linux 6.1; x86_64) unknown")
+    .with_header("originator", "codex_exec")
+    .with_header("session-id", "s")
+    .with_header("thread-id", "t");
+    let result = serve(&app, request).await;
+    assert_ne!(result.code(), 200);
+    assert_eq!(
+        upstream.count(),
+        0,
+        "a Codex request must not reach a Pi-only account"
+    );
+}
+
+#[tokio::test]
+async fn a_slot_added_for_pi_joins_the_pool_when_its_sign_in_finishes() {
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"access_token":"<pi-access-new>","refresh_token":"<refresh-new>","id_token":"eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im93bmVyQGV4YW1wbGUudGVzdCJ9.sig","token_type":"Bearer","expires_in":3600,"scope":"openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"}"#,
+        )
+    })
+    .await;
+    // As Add account makes it: waiting out of the pool for its sign-in.
+    let slot = super::state::Account {
+        enabled: false,
+        in_pool: false,
+        pending_pool_activation: true,
+        ..device_account("acct-new", "", 100)
+    };
+    let (app, _dir) = test_app(vec![slot]);
+    app.pi_channel.set_endpoints(Endpoints {
+        authorize: format!("{}/api/accounts/authorize", upstream.url),
+        token: format!("{}/api/accounts/oauth/token", upstream.url),
+        responses: format!("{}/v1/responses", upstream.url),
+    });
+    let authorize = app.pi_login_start("acct-new").unwrap();
+    let state = url::Url::parse(&authorize)
+        .unwrap()
+        .query_pairs()
+        .find(|(name, _)| name == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    app.pi_login_complete(
+        "acct-new",
+        &format!("http://127.0.0.1:1455/auth/callback?code=c&state={state}&client_id=issued"),
+    )
+    .await
+    .unwrap();
+    let item = app.read().config.accounts()[0].clone();
+    assert!(item.enabled && item.in_pool && !item.pending_pool_activation);
+    assert_eq!(item.email, "owner@example.test");
+}
