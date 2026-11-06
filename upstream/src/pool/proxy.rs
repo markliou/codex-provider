@@ -1987,6 +1987,10 @@ async fn attempts(
             // channel keeps its own count from each answer's usage
             // (pi_channel.rs, the Console's Pi badge).
             app.pi_record_usage(&candidate.id, &info.usage);
+            // What the answer ended with, names and presence only: the
+            // route's stream is undocumented, and an answer whose usage the
+            // pool cannot read shows up here.
+            app.note_pi_answer_shape(&info);
         }
         app.mark_success_with_measurement(route, model, &candidate.id, &info, Some(throughput));
         return;
