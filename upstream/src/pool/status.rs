@@ -6,7 +6,6 @@
 
 use super::app::App;
 use super::app::Inner;
-use super::app::quota_error_blocks_routing;
 use super::plan;
 use super::proxy::safe_header_value;
 use super::quota;
@@ -59,7 +58,7 @@ impl Inner {
         // polling failures remain diagnostic history rather than availability
         // gates; quota_error_blocks_routing only accepts errors that prove the
         // credential itself cannot route requests.
-        if quota_error_blocks_routing(snapshot.quota_error.as_ref()) {
+        if self.credential_error_blocks(item) {
             let mut reason = "Quota refresh failed".to_string();
             if let Some(error) = &snapshot.quota_error
                 && !error.code.is_empty()

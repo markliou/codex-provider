@@ -642,3 +642,31 @@ async fn a_slot_added_for_pi_joins_the_pool_when_its_sign_in_finishes() {
     assert!(item.enabled && item.in_pool && !item.pending_pool_activation);
     assert_eq!(item.email, "owner@example.test");
 }
+
+#[tokio::test]
+async fn a_codex_quota_error_does_not_hold_back_a_pi_only_account() {
+    // A slot added for Pi is polled in the minutes before its sign-in
+    // finishes, and the poll, which reads the plan with the Codex
+    // credential, records an auth failure. That says nothing about the Pi
+    // sign-in (it once kept the account from every Pi request).
+    let upstream = FakeServer::start(|_| ok_stream()).await;
+    let (app, _dir) = pi_only_app(&upstream);
+    app.write().state.quotas_mut().insert(
+        "acct-pi".to_string(),
+        super::state::QuotaSnapshot {
+            account_id: "acct-pi".to_string(),
+            quota_error: Some(super::state::QuotaErrorInfo {
+                code: "account_auth_failed".to_string(),
+                ..super::state::QuotaErrorInfo::default()
+            }),
+            ..super::state::QuotaSnapshot::default()
+        },
+    );
+    let result = serve(&app, pi_request(PI_BODY)).await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    let item = app.read().config.accounts()[0].clone();
+    assert_ne!(
+        app.read().account_status(&item, Timestamp::now()).0,
+        "error"
+    );
+}
