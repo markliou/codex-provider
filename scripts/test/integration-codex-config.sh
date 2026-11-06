@@ -42,6 +42,7 @@ docker run -d \
   -e CODEX_POOL_ADDR="0.0.0.0:8317" \
   -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
   -e CODEX_POOL_UPSTREAM_ENABLED=true \
+  -e CODEX_POOL_PI_CHANNEL=false \
   "$POOL_IMAGE" >/dev/null
 
 docker run --rm --network "$NETWORK" --entrypoint node "$POOL_IMAGE" -e '

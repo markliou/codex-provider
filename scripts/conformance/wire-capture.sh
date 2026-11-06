@@ -10,6 +10,10 @@
 # (reported as the client gap; see SPEC.md 2.3.2). An in-house app's request
 # to the pool's /v1 must reach the fake as the request Codex sends a custom
 # provider, and one the pool refuses must not reach it (SPEC.md 2.3.4).
+# That app check is the completion path, so this pool runs with the Pi channel
+# off (CODEX_POOL_PI_CHANNEL=false); the Pi channel, on by default, is held to a
+# native Pi by scripts/conformance/pi-capture.sh and the pool's own tests
+# (SPEC.md 2.3.7).
 #
 #   sh scripts/conformance/wire-capture.sh
 #
@@ -198,6 +202,7 @@ docker run -d --name "$pool" --network "$net" --network-alias conformance-pool \
   -e CODEX_POOL_API_KEY="$CLIENT_KEY" -e CODEX_POOL_ADMIN_PASSWORD_HASH="$admin_hash" \
   -e CODEX_POOL_ADDR=0.0.0.0:8317 -e CODEX_POOL_ALLOW_REMOTE_ADMIN=true \
   -e CODEX_POOL_UPSTREAM_ENABLED=true \
+  -e CODEX_POOL_PI_CHANNEL=false \
   -e CODEX_POOL_QUOTA_PRIME_GRACE=0s \
   -e CODEX_POOL_PROMPT_CACHE_RETENTION="${CONFORMANCE_PROMPT_CACHE_RETENTION:-passthrough}" \
   -e CODEX_POOL_PROMPT_CACHE_KEY_MODE="${CONFORMANCE_PROMPT_CACHE_KEY_MODE:-passthrough}" \
