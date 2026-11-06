@@ -139,8 +139,9 @@ impl Refusal {
 const REMOVE_IT: &str = "Remove it and send the request again.";
 
 /// Top-level fields a Codex release sends: ResponsesApiRequest (unchanged from
-/// 0.164.0 to 0.166.0, re-read field by field with ResponseItem, ContentItem,
-/// ToolSpec and the user agent on 2026-11-02) plus `instructions`, which
+/// 0.164.0 to 0.167.0, re-read field by field with ResponseItem, ContentItem,
+/// ToolSpec and the user agent on 2026-11-02; 0.167 changes only how
+/// ContentItem::InputAudio holds its reference, a file id it does not yet send) plus `instructions`, which
 /// releases up to 0.162 sent before moving the base instructions into the
 /// input.
 const CODEX_FIELDS: &[&str] = &[
@@ -793,6 +794,14 @@ pub struct ModelDefaults {
     pub effort: String,
     pub verbosity: Option<String>,
     pub parallel_tool_calls: bool,
+    /// The model takes Responses Lite (catalog `use_responses_lite`): Codex
+    /// sends its tools as an additional_tools input item, not a `tools`
+    /// field, with reasoning context and the Lite header.
+    pub responses_lite: bool,
+    /// The model takes mid-conversation effort updates (catalog
+    /// `supports_reasoning_effort_updates`): Codex keeps configuration_update
+    /// items in the request, else it drops them.
+    pub effort_updates: bool,
 }
 
 /// The Codex a completed request presents: the one that last used the
@@ -1082,6 +1091,29 @@ pub fn complete(
     field(&mut out, "input");
     out.push(b'[');
     let mut wrote_item = false;
+    // Responses Lite (core/src/client.rs build_responses_request): the tools
+    // lead the input as one additional_tools item, rebuilt on every request,
+    // and the request has no `tools` field. An app that already declares its
+    // tools in additional_tools items (Pi does) has them gathered into that
+    // one item, later declarations replacing earlier ones of the same name,
+    // as its own items accumulate.
+    let lite_tools = defaults
+        .responses_lite
+        .then(|| lite_tool_list(payload, &normalized.items))
+        .filter(|tools| !tools.is_empty());
+    if let Some(tools) = &lite_tools {
+        let namespace = Uuid::new_v5(&Uuid::NAMESPACE_OID, turn.thread_id.as_bytes());
+        let tools_json = lite_tools_json(tools);
+        // The item id is a v5 UUID of the tool list within the thread's
+        // namespace, so a resent request keeps it.
+        let id = format!("at_{}", Uuid::new_v5(&namespace, &tools_json));
+        out.extend_from_slice(br#"{"type":"additional_tools","id":"#);
+        write_string(&mut out, &id);
+        out.extend_from_slice(br#","role":"developer","tools":"#);
+        out.extend_from_slice(&tools_json);
+        out.push(b'}');
+        wrote_item = true;
+    }
     if let Some(text) = &normalized.instructions {
         // core/src/client.rs: the base instructions lead the input as a
         // developer message whose id is a v5 UUID of the text within the
@@ -1092,10 +1124,38 @@ pub fn complete(
         if let Some(object) = item.as_object_mut() {
             object.insert("id".into(), Value::from(id));
         }
+        // After the Lite tools item, when there is one (Codex's prefix order:
+        // tools, then base instructions).
+        if wrote_item {
+            out.push(b',');
+        }
         write_item(&mut out, &item);
         wrote_item = true;
     }
+    let kind = |item: &Value| {
+        item.get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
     for (index, item) in normalized.items.iter().enumerate() {
+        let item_kind = kind(item);
+        if defaults.responses_lite && item_kind == "additional_tools" {
+            // Gathered into the leading item above.
+            continue;
+        }
+        if item_kind == "configuration_update" {
+            // Codex keeps these only for a model that takes effort updates,
+            // and of consecutive ones only the latest (core/src/client.rs
+            // build_responses_request).
+            let next_is_update = normalized
+                .items
+                .get(index + 1)
+                .is_some_and(|next| kind(next) == "configuration_update");
+            if !defaults.effort_updates || next_is_update {
+                continue;
+            }
+        }
         if wrote_item {
             out.push(b',');
         }
@@ -1112,7 +1172,9 @@ pub fn complete(
         }
     }
     out.push(b']');
-    if let Some(Value::Array(tools)) = payload.get("tools") {
+    if let Some(Value::Array(tools)) = payload.get("tools")
+        && !defaults.responses_lite
+    {
         field(&mut out, "tools");
         out.push(b'[');
         for (index, tool) in tools.iter().enumerate() {
@@ -1132,18 +1194,17 @@ pub fn complete(
         .unwrap_or(defaults.parallel_tool_calls);
     out.extend_from_slice(if parallel { b"true" } else { b"false" });
     field(&mut out, "reasoning");
-    match payload.get("reasoning") {
-        Some(Value::Object(reasoning)) => {
-            let mut reasoning = reasoning.clone();
-            reasoning.insert("effort".into(), Value::from(effort.as_str()));
-            write_ordered(&mut out, &reasoning, &["effort", "summary"]);
-        }
-        _ => {
-            let mut reasoning = Map::new();
-            reasoning.insert("effort".into(), Value::from(effort.as_str()));
-            write_ordered(&mut out, &reasoning, &["effort"]);
-        }
+    let mut reasoning = match payload.get("reasoning") {
+        Some(Value::Object(reasoning)) => reasoning.clone(),
+        _ => Map::new(),
+    };
+    reasoning.insert("effort".into(), Value::from(effort.as_str()));
+    if defaults.responses_lite {
+        // Responses Lite reads every turn's reasoning (core/src/client.rs
+        // build_reasoning: ReasoningContext::AllTurns).
+        reasoning.insert("context".into(), Value::from("all_turns"));
     }
+    write_ordered(&mut out, &reasoning, &["effort", "summary", "context"]);
     field(&mut out, "store");
     out.extend_from_slice(b"false");
     if let Some(options) = payload.get("stream_options") {
@@ -1210,6 +1271,11 @@ pub fn complete(
     }
     set("x-codex-window-id", &window_id);
     set("x-codex-turn-metadata", &metadata);
+    if defaults.responses_lite {
+        // Codex marks a Responses Lite request with this header
+        // (core/src/client.rs X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER).
+        set("x-openai-internal-codex-responses-lite", "true");
+    }
     set("x-client-request-id", &turn.thread_id);
     set("session-id", &turn.thread_id);
     set("thread-id", &turn.thread_id);
@@ -1450,6 +1516,103 @@ fn write_item(out: &mut Vec<u8>, item: &Value) {
 
 /// A tool in ToolSpec's field order (tools/src/responses_api.rs
 /// ResponsesApiTool), its parameters in JsonSchema's.
+/// The tools a Responses Lite request declares: the request's `tools` and
+/// those its additional_tools items declare, a later one of the same name
+/// replacing the earlier.
+fn lite_tool_list(payload: &Map<String, Value>, items: &[Value]) -> Vec<Value> {
+    let mut tools: Vec<Value> = Vec::new();
+    let mut add = |tool: &Value| {
+        let name = tool.get("name").and_then(Value::as_str);
+        if let Some(name) = name
+            && let Some(slot) = tools
+                .iter_mut()
+                .find(|kept| kept.get("name").and_then(Value::as_str) == Some(name))
+        {
+            *slot = tool.clone();
+        } else {
+            tools.push(tool.clone());
+        }
+    };
+    if let Some(Value::Array(declared)) = payload.get("tools") {
+        declared.iter().for_each(&mut add);
+    }
+    for item in items {
+        if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+            && let Some(Value::Array(declared)) = item.get("tools")
+        {
+            declared.iter().for_each(&mut add);
+        }
+    }
+    tools
+}
+
+/// tools/src/tool_spec.rs create_tools_json_for_responses_lite: function and
+/// custom tools gathered into the `functions` namespace (placed where the
+/// first of them was), a declared `functions` namespace merged into it, every
+/// other tool as it is; written in Codex's field order.
+fn lite_tools_json(tools: &[Value]) -> Vec<u8> {
+    let mut functions: Vec<&Value> = Vec::new();
+    let mut description = String::new();
+    let mut functions_index: Option<usize> = None;
+    let mut others: Vec<&Value> = Vec::new();
+    for tool in tools {
+        let kind = tool.get("type").and_then(Value::as_str).unwrap_or_default();
+        let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+        match kind {
+            "function" | "custom" => functions.push(tool),
+            "namespace" if name == "functions" => {
+                if let Some(text) = tool.get("description").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    description = text.to_string();
+                }
+                if let Some(Value::Array(members)) = tool.get("tools") {
+                    functions.extend(members.iter());
+                }
+            }
+            _ => {
+                others.push(tool);
+                continue;
+            }
+        }
+        functions_index.get_or_insert(others.len());
+    }
+    let mut out = vec![b'['];
+    let mut first = true;
+    let mut sep = |out: &mut Vec<u8>| {
+        if !first {
+            out.push(b',');
+        }
+        first = false;
+    };
+    let write_functions = |out: &mut Vec<u8>| {
+        out.extend_from_slice(br#"{"type":"namespace","name":"functions","description":"#);
+        write_string(out, &description);
+        out.extend_from_slice(br#","tools":["#);
+        for (index, tool) in functions.iter().enumerate() {
+            if index > 0 {
+                out.push(b',');
+            }
+            write_tool(out, tool);
+        }
+        out.extend_from_slice(b"]}");
+    };
+    for (index, tool) in others.iter().enumerate() {
+        if functions_index == Some(index) && !functions.is_empty() {
+            sep(&mut out);
+            write_functions(&mut out);
+        }
+        sep(&mut out);
+        write_tool(&mut out, tool);
+    }
+    if functions_index == Some(others.len()) && !functions.is_empty() {
+        sep(&mut out);
+        write_functions(&mut out);
+    }
+    out.push(b']');
+    out
+}
+
 fn write_tool(out: &mut Vec<u8>, tool: &Value) {
     let Some(object) = tool.as_object() else {
         write_json(out, tool);
@@ -1869,24 +2032,28 @@ impl super::app::App {
                 ));
             }
         }
+        // The entry a Codex reads for this model from the pool's catalog
+        // (catalog.rs, Codex's own entry where Codex knows the model), so the
+        // completed request is the one that Codex would build.
         let defaults = {
             let inner = self.read();
             let info = inner
-                .codex_model_catalog(&[model.to_string()])
+                .codex_model_catalog_json(&[model.to_string()])
                 .into_iter()
-                .next();
+                .next()
+                .unwrap_or(Value::Null);
+            let flag = |name: &str| info.get(name).and_then(Value::as_bool);
+            let text = |name: &str| info.get(name).and_then(Value::as_str).map(str::to_string);
             ModelDefaults {
-                effort: info.as_ref().map_or_else(
-                    || "medium".to_string(),
-                    |info| info.default_reasoning_level.clone(),
-                ),
-                verbosity: info
-                    .as_ref()
-                    .filter(|info| info.support_verbosity)
-                    .map(|info| info.default_verbosity.to_string()),
-                parallel_tool_calls: info
-                    .as_ref()
-                    .is_none_or(|info| info.supports_parallel_tool_calls),
+                effort: text("default_reasoning_level").unwrap_or_else(|| "medium".to_string()),
+                verbosity: if flag("support_verbosity") == Some(true) {
+                    text("default_verbosity")
+                } else {
+                    None
+                },
+                parallel_tool_calls: flag("supports_parallel_tool_calls").unwrap_or(true),
+                responses_lite: flag("use_responses_lite") == Some(true),
+                effort_updates: flag("supports_reasoning_effort_updates") == Some(true),
             }
         };
         let (agent, profile) = self.foreign_presentation(&candidate.id);

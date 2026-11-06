@@ -27,5 +27,11 @@ codex-rs/codex-api/src/sse/responses_error_parser_tests.rs
 codex-rs/codex-api/src/sse/responses_error_tests.rs
 codex-rs/codex-api/src/telemetry.rs
 
+# Codex's bundled model catalog: the pool advertises each model it lists on
+# /v1/models with Codex's own entry for it (catalog.rs), so a Codex using the
+# pool as a custom provider builds its requests as it would with upstream's
+# catalog (Responses Lite, tool mode, multi-agent version, effort updates).
+codex-rs/models-manager/models.json
+
 # Pool-owned files inside the vendor tree ("pool <path>"); each explains itself.
 pool codex-rs/codex-api/src/endpoint/connector.rs

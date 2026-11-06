@@ -3,7 +3,7 @@
 //! The device limit counts ChatGPT logins, so a client may sign its Codex in
 //! with an API key (`codex login --with-api-key`) and still use the pool's
 //! native endpoint. Such a Codex sends the request its built-in provider sends
-//! the Codex backend, less what only a ChatGPT login adds (Codex rust-v0.166.0,
+//! the Codex backend, less what only a ChatGPT login adds (Codex rust-v0.167.0,
 //! measured by scripts/conformance/wire-capture.sh):
 //!
 //! - the MCP resource helpers (list_mcp_resources, list_mcp_resource_templates,
@@ -86,6 +86,25 @@ pub fn is_key_login(headers: &HeaderMap) -> bool {
 #[derive(Deserialize)]
 struct ToolsFile {
     tools: HashMap<String, String>,
+}
+
+/// The sections a ChatGPT login's code-mode exec description has and a key
+/// login's lacks, by namespace (key_login_tools.json `liteExecSections`).
+fn lite_exec_section(namespace: &str) -> Option<&'static str> {
+    #[derive(Deserialize)]
+    struct LiteFile {
+        #[serde(default, rename = "liteExecSections")]
+        sections: HashMap<String, String>,
+    }
+    static SECTIONS: OnceLock<HashMap<String, String>> = OnceLock::new();
+    SECTIONS
+        .get_or_init(|| {
+            serde_json::from_str::<LiteFile>(TOOLS_JSON)
+                .map(|file| file.sections)
+                .unwrap_or_default()
+        })
+        .get(namespace)
+        .map(String::as_str)
 }
 
 fn tool(name: &str) -> Option<&'static str> {
@@ -425,6 +444,13 @@ pub fn complete<'a>(body: &'a str, completion: &Completion<'_>, seen: &KeyLogin)
         });
     }
     if let Some(input) = top.input {
+        // Only where a ChatGPT login offers image generation at all, as for
+        // the plain imagegen tool (completed_tools).
+        if completion.image_gen
+            && let Some(splice) = lite_exec_description(body, input.get())
+        {
+            splices.push(splice);
+        }
         splices.extend(answered_calls(body, input.get(), seen));
     }
     if splices.is_empty() {
@@ -436,6 +462,105 @@ pub fn complete<'a>(body: &'a str, completion: &Completion<'_>, seen: &KeyLogin)
         out.replace_range(splice.start..splice.end, &splice.text);
     }
     Cow::Owned(out)
+}
+
+#[derive(Deserialize)]
+struct LiteTools<'a> {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(borrow, default)]
+    tools: Vec<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct LiteTool<'a> {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    name: String,
+    #[serde(borrow, default)]
+    tools: Vec<&'a RawValue>,
+    #[serde(borrow, default)]
+    description: Option<&'a RawValue>,
+}
+
+/// For a Responses Lite request in code mode (gpt-6.x): a Codex signed in
+/// with ChatGPT lists image generation among the nested tools of its
+/// code-mode exec description, and one signed in with an API key does not
+/// (measured, key_login_tools.json liteExecSections). The section goes in
+/// among the namespace sections by name, as the measured description orders
+/// them (clock, image_gen, web), each joined with a blank line as Codex joins
+/// them (code-mode-protocol description.rs build_exec_tool_description).
+/// wire-capture.sh with CONFORMANCE_MODEL=gpt-6.1-sol holds the result equal
+/// to a native Codex's.
+fn lite_exec_description(body: &str, input: &str) -> Option<Splice> {
+    let items: Vec<&RawValue> = serde_json::from_str(input).ok()?;
+    let first: LiteTools<'_> = serde_json::from_str(items.first()?.get()).ok()?;
+    if first.kind != "additional_tools" {
+        return None;
+    }
+    let section = lite_exec_section(IMAGE_GEN_NAMESPACE)?;
+    for namespace in &first.tools {
+        let namespace: LiteTool<'_> = serde_json::from_str(namespace.get()).ok()?;
+        if namespace.kind != "namespace" || namespace.name != "functions" {
+            continue;
+        }
+        for member in &namespace.tools {
+            let member: LiteTool<'_> = serde_json::from_str(member.get()).ok()?;
+            if member.kind != "custom" || member.name != "exec" {
+                continue;
+            }
+            let raw = member.description?;
+            let text: String = serde_json::from_str(raw.get()).ok()?;
+            let heading = format!("## {IMAGE_GEN_NAMESPACE}\n");
+            if text.contains(&heading) {
+                return None;
+            }
+            let mut pieces = split_sections(&text);
+            let is_namespace = |piece: &str| {
+                piece.strip_prefix("## ").is_some_and(|rest| {
+                    let name = rest.split('\n').next().unwrap_or_default();
+                    rest.contains(&format!("\nTools in the {name} namespace."))
+                })
+            };
+            let position = pieces
+                .iter()
+                .position(|piece| {
+                    is_namespace(piece)
+                        && piece
+                            .strip_prefix("## ")
+                            .and_then(|rest| rest.split('\n').next())
+                            .is_some_and(|name| name > IMAGE_GEN_NAMESPACE)
+                })
+                .or_else(|| {
+                    pieces
+                        .iter()
+                        .rposition(|piece| is_namespace(piece))
+                        .map(|last| last + 1)
+                })?;
+            pieces.insert(position, section.to_string());
+            let written = serde_json::to_string(&pieces.join("\n")).ok()?;
+            return Some(Splice {
+                start: offset(body, raw.get()),
+                end: offset(body, raw.get()) + raw.get().len(),
+                text: written,
+            });
+        }
+    }
+    None
+}
+
+/// A description cut before each line that starts a "## " heading, the way
+/// the measured section was cut out of it; joining with a newline restores it.
+fn split_sections(text: &str) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    for (index, _) in text.match_indices("\n## ") {
+        pieces.push(text[start..index].to_string());
+        start = index + 1;
+    }
+    pieces.push(text[start..].to_string());
+    pieces
 }
 
 #[derive(Deserialize)]
@@ -800,6 +925,45 @@ mod tests {
             guardian: true,
             resource_messages: messages,
         }
+    }
+
+    #[test]
+    fn a_lite_exec_description_gets_the_image_gen_section() {
+        // A key-login Codex's code-mode exec description lacks the image_gen
+        // section a ChatGPT login lists (measured on gpt-6.1-sol); it goes in
+        // among the namespace sections by name.
+        let description = "Run JavaScript code\n\n## clock\nTools in the clock namespace.\n\n### `clock__curr_time`\nx\n\n## web\nTools in the web namespace.\n\n### `web__run`\ny";
+        let body = serde_json::json!({
+            "model": "gpt-6.1-sol",
+            "input": [
+                {"type": "additional_tools", "id": "at_1", "role": "developer", "tools": [
+                    {"type": "namespace", "name": "functions", "description": "", "tools": [
+                        {"type": "custom", "name": "exec", "description": description}
+                    ]}
+                ]},
+                {"type": "message", "role": "user", "content": []}
+            ]
+        })
+        .to_string();
+        let messages = no_messages();
+        let completed = complete(&body, &completion(&messages, true), &KeyLogin::default());
+        let value: Value = serde_json::from_str(&completed).unwrap();
+        let written = value["input"][0]["tools"][0]["tools"][0]["description"]
+            .as_str()
+            .unwrap();
+        let section = lite_exec_section("image_gen").unwrap();
+        assert!(section.starts_with("## image_gen\nTools in the image_gen namespace."));
+        let at_clock = written.find("## clock\n").unwrap();
+        let at_image = written.find("## image_gen\n").unwrap();
+        let at_web = written.find("## web\n").unwrap();
+        assert!(at_clock < at_image && at_image < at_web, "{written}");
+        assert!(
+            written.contains(&format!("x\n\n{section}\n## web")),
+            "{written}"
+        );
+        // Without image generation for the model, nothing is added.
+        let unchanged = complete(&body, &completion(&messages, false), &KeyLogin::default());
+        assert!(!unchanged.contains("## image_gen"));
     }
 
     // The tools of a key-login Codex 0.166 request, by name only; enough for

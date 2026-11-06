@@ -198,7 +198,78 @@ pub fn codex_catalog_priority(model: &str, default_model: &str) -> i64 {
         .map_or(1000, |index| i64::try_from(index).unwrap_or(999) + 1)
 }
 
+/// Codex's bundled model catalog at the pinned release
+/// (models-manager/models.json, vendored and checked equal by
+/// codex-vendor.sh), by slug.
+fn bundled_models() -> &'static std::collections::HashMap<String, Value> {
+    static MODELS: std::sync::OnceLock<std::collections::HashMap<String, Value>> =
+        std::sync::OnceLock::new();
+    MODELS.get_or_init(|| {
+        let text = include_str!("../../vendor/codex/codex-rs/models-manager/models.json");
+        serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|catalog| catalog.get("models").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| {
+                let slug = entry.get("slug")?.as_str()?.to_string();
+                Some((slug, entry))
+            })
+            .collect()
+    })
+}
+
+/// Codex's own entry for a model, when its bundled catalog has one.
+pub fn bundled_model(slug: &str) -> Option<&'static Value> {
+    bundled_models().get(slug)
+}
+
 impl Inner {
+    /// The catalog a Codex reads from /v1/models: for every model Codex's own
+    /// bundled catalog knows, Codex's entry itself, so a Codex using the pool
+    /// as a custom provider builds its requests as it does with upstream's
+    /// catalog. The pool's hand-written entries said every model was a plain
+    /// Responses model, and Codex then sent gpt-6.x requests shaped unlike a
+    /// native Codex's (no Responses Lite, no code-mode tools, no effort
+    /// updates, a smaller context window). The pool decides only the rank
+    /// (its default model first) and, for the default model, a reasoning tier
+    /// the operator configured; a model Codex does not know keeps the pool's
+    /// own entry.
+    pub fn codex_model_catalog_json(&self, models: &[String]) -> Vec<Value> {
+        let (default_model, default_tier) = parse_model(&self.config.default_model);
+        self.codex_model_catalog(models)
+            .into_iter()
+            .map(|info| {
+                let Some(entry) = bundled_model(&info.slug) else {
+                    return serde_json::to_value(&info).unwrap_or(Value::Null);
+                };
+                let mut entry = entry.clone();
+                if let Some(object) = entry.as_object_mut() {
+                    // Codex's /models serializer adds the deprecated top-level
+                    // base_instructions, mirroring the model's instruction
+                    // template, for older clients (protocol openai_models.rs
+                    // serialize_model_infos_with_legacy_base), so upstream's
+                    // catalog carries it and so does this one.
+                    let template = object
+                        .get("model_messages")
+                        .and_then(|messages| messages.get("instructions_template"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    object.insert("base_instructions".into(), Value::from(template));
+                    object.insert("priority".into(), Value::from(info.priority));
+                    if info.slug == default_model && !default_tier.is_empty() {
+                        object.insert(
+                            "default_reasoning_level".into(),
+                            Value::from(info.default_reasoning_level.clone()),
+                        );
+                    }
+                }
+                entry
+            })
+            .collect()
+    }
+
     /// The advertised model names: the compiled-in lineup, the configured
     /// default model with its reasoning tiers, per-account allowedModels and
     /// aliases, sorted.

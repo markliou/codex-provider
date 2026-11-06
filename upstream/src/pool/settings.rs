@@ -56,7 +56,7 @@ pub struct Settings {
     pub quota_prime: bool,
     /// CODEX_POOL_PI_CHANNEL: whether an app's non-Codex /v1 request goes on
     /// the Pi channel (pi_channel.rs) rather than being completed into a
-    /// Codex request. On by default; there is no Console switch.
+    /// Codex request. Off by default; there is no Console switch.
     pub pi_channel: bool,
     /// CODEX_POOL_QUOTA_PRIME_GRACE: a fixed grace for tests; None draws one
     /// at random (codex_prime.go, quota prime grace).
@@ -268,13 +268,17 @@ impl Settings {
             false,
         )?;
         let quota_prime_grace = quota_prime_grace(&get("CODEX_POOL_QUOTA_PRIME_GRACE"))?;
-        // The Pi channel is the pool's rule, not a Console switch, the
-        // owner's choice (2026-11-06): an app's request that is not a Codex
-        // request goes as Pi sends it. Off restores completing such requests
-        // into Codex requests, for an operator who needs that; the tests that
-        // are not about Pi run with it off (Settings::for_test).
-        let pi_channel =
-            bool_from_env(&get("CODEX_POOL_PI_CHANNEL"), "CODEX_POOL_PI_CHANNEL", true)?;
+        // Off by default, the owner's choice (2026-11-07): an app's request
+        // that is not a Codex request is completed into a Codex request and
+        // goes on the Codex channel, the least to maintain, and Business
+        // workspaces cannot use Pi's sign-in at all. The Pi channel's code
+        // stays; CODEX_POOL_PI_CHANNEL=true turns it on. There is no Console
+        // switch.
+        let pi_channel = bool_from_env(
+            &get("CODEX_POOL_PI_CHANNEL"),
+            "CODEX_POOL_PI_CHANNEL",
+            false,
+        )?;
         // The upstream switch defaults off, the owner's choice after accounts
         // were revoked: a pool started without it sends nothing upstream, not
         // a quota poll, a prime, a token refresh, a login or a client's

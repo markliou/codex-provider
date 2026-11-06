@@ -177,8 +177,8 @@ Every request the pool sends upstream is one a Codex would send
 The pool log shows each refusal (`request refused before upstream`) and each
 field it passed without knowing it.
 
-"Completed" applies only with `CODEX_POOL_PI_CHANNEL=false`: by default an
-app's request that is not a Codex request goes upstream as Pi sends it (below).
+With `CODEX_POOL_PI_CHANNEL=true` an app's request that is not a Codex request
+goes upstream as Pi sends it instead (SPEC.md 2.3.7); it is off by default.
 
 ### Pi
 
@@ -192,30 +192,35 @@ does not sign in to OpenAI; the accounts' sign-ins live in the pool.
   "providers": {
     "openai": {
       "baseUrl": "https://<pool-host>/v1",
-      "apiKey": "<pool-api-key>"
+      "apiKey": "<pool-api-key>",
+      "compat": { "supportsMaxOutputTokens": false }
     }
   }
 }
 ```
 
 `apiKey` may also name an environment variable (`$NAME`), as Pi's own docs
-allow. Then pick an `openai/...` model (for example `pi --model openai/gpt-5.5`).
+allow. Then pick an `openai/...` model (for example
+`pi --model openai/gpt-6.1-sol`).
+
+The pool completes Pi's request into the request Codex sends (Other clients,
+above) and sends it with an account's Codex sign-in, so any account in the
+pool, Business ones included, serves it.
+
+- **`compat.supportsMaxOutputTokens: false`** keeps Pi from sending
+  `max_output_tokens`, which no Codex sends and the pool refuses (Pi's own
+  `models.json` setting).
 
 - **Base URL ends at `/v1`.** Pi adds `/responses` itself. Do not use the
   native endpoint (`/k/...`) for Pi.
 - **Log Pi out of OpenAI** (`/logout`) on that machine if it was ever signed in
   there: Pi prefers a stored login over the key in `models.json`, would send
   that login to the pool, and the pool refuses it.
-- **At least one account must be signed in for Pi** (see
-  [Pi sign-in](#pi-sign-in)); otherwise the pool answers `503`
-  `pi_channel_unavailable`.
 
-On the Pi channel the pool sends what an unmodified Pi sends OpenAI through
-"Sign in with ChatGPT": the public Responses API with the account's own Pi
-sign-in, Pi's headers and field order, and only the fields Pi itself leaves out
-on that route removed. The client's own name (from its user agent) is kept in
-the pool log (`pi channel request: client=...`); upstream sees Pi's. Details:
-SPEC.md 2.3.7.
+With `CODEX_POOL_PI_CHANNEL=true` the pool instead sends what an unmodified Pi
+sends OpenAI through "Sign in with ChatGPT", with each account's own Pi sign-in
+([Pi sign-in](#pi-sign-in)); Business workspaces cannot sign in that way
+(SPEC.md 2.3.7).
 
 ## Accounts
 
@@ -429,7 +434,7 @@ refreshes the account's token five minutes before expiry, and once more on a
 `401` before treating the account as signed out.
 
 The pool is one Rust process ([upstream/](upstream/)) built from Codex's HTTP
-and WebSocket client crates at the pinned release (`rust-v0.166.0` in
+and WebSocket client crates at the pinned release (`rust-v0.167.0` in
 [upstream/Cargo.toml](upstream/Cargo.toml)). It opens one connection per
 request, as Codex does, and serves clients on port 8317 itself.
 
@@ -480,7 +485,7 @@ settings and SPEC.md 2.1 lists them all. The ones most often changed:
 | `CODEX_POOL_CLIENT_MAX_IN_FLIGHT` | `16` | Requests one client key may have running at once; over it the client gets a 429 to retry later (SPEC.md 2.3.6) |
 | `CODEX_POOL_CLIENT_MAX_PER_MINUTE` | `120` | Requests one client key may start in a minute (SPEC.md 2.3.6) |
 | `CODEX_POOL_QUOTA_PRIME` | `false` | Initial **Prime idle accounts** setting |
-| `CODEX_POOL_PI_CHANNEL` | `true` | Apps' non-Codex requests go as Pi sends them; `false` completes them into Codex requests (no Console switch) |
+| `CODEX_POOL_PI_CHANNEL` | `false` | `true` sends apps' non-Codex requests as Pi sends them instead of completing them into Codex requests (no Console switch) |
 | `CODEX_POOL_QUOTA_RESERVE` | `true` | Initial **Quota reserve** setting: stop using an account at 10% left in its 5-hour or weekly window (both set in the Console) |
 | `CODEX_POOL_SHUTDOWN_GRACE` | `120s` | Drain time on stop (keep `stop_grace_period` above it) |
 
@@ -548,7 +553,10 @@ sh scripts/conformance/codex-conformance.sh diff <tag>   # every change to the w
   header order and values, and bodies. It covers HTTP, the WebSocket, the native
   endpoint, a subagent, compaction and a failover between two accounts, plus the
   pool's own calls and a quota prime. It also reports the custom-provider client
-  gap separately. Output goes to `scripts/conformance/out/` (git-ignored).
+  gap separately. It then runs the request-shape phases again on gpt-6.1-sol, a
+  Responses Lite model (tools as an `additional_tools` item, code-mode tools);
+  the scripted scenarios stay on gpt-5.5, since a code-mode model calls nested
+  tools through `exec`. `CONFORMANCE_MODEL=<model>` runs one model only. Output goes to `scripts/conformance/out/` (git-ignored).
 
 Moving to a new Codex release is described in AGENTS.md.
 

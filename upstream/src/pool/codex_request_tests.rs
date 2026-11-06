@@ -310,7 +310,133 @@ fn defaults() -> ModelDefaults {
         effort: "medium".to_string(),
         verbosity: Some("low".to_string()),
         parallel_tool_calls: true,
+        responses_lite: false,
+        effort_updates: false,
     }
+}
+
+fn lite_defaults() -> ModelDefaults {
+    ModelDefaults {
+        responses_lite: true,
+        effort_updates: true,
+        ..defaults()
+    }
+}
+
+#[test]
+fn a_responses_lite_request_is_written_as_codex_writes_one() {
+    // What a native Codex 0.167 sends a custom provider for gpt-6.1-sol
+    // (wire-capture with CONFORMANCE_MODEL=gpt-6.1-sol): the tools as a
+    // leading additional_tools item, function tools in the `functions`
+    // namespace, no `tools` field, reasoning context all_turns, the Lite
+    // header. Pi declares its tools in additional_tools items and sends
+    // configuration_update items; both become Codex's.
+    let request = object(serde_json::json!({
+        "model": "gpt-6.1-sol",
+        "instructions": "be brief",
+        "input": [
+            {"type": "additional_tools", "role": "developer", "tools": [
+                {"type": "function", "name": "read", "description": "Read", "parameters": {"type": "object", "properties": {}}, "strict": true}
+            ]},
+            {"role": "developer", "content": "sys"},
+            {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "configuration_update", "reasoning": {"effort": "medium"}},
+            {"type": "configuration_update", "reasoning": {"effort": "high"}}
+        ],
+        "reasoning": {"effort": "medium", "summary": "auto"},
+    }));
+    let normalized = normalize(&request);
+    let conversations = Conversations::default();
+    let turn = conversations.turn("k", &normalized);
+    let (body, headers) = complete(
+        &normalized,
+        "gpt-6.1-sol",
+        &lite_defaults(),
+        &presented(),
+        &turn,
+    );
+    assert!(!keys_in_order(&body).contains(&"tools".to_string()));
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    let input = value["input"].as_array().unwrap();
+    assert_eq!(input[0]["type"], "additional_tools");
+    // Codex's prefix: the tools item, then the base instructions.
+    assert_eq!(input[1]["content"][0]["text"], "be brief");
+    assert_eq!(input[0]["role"], "developer");
+    assert!(input[0]["id"].as_str().unwrap().starts_with("at_"));
+    assert_eq!(input[0]["tools"][0]["type"], "namespace");
+    assert_eq!(input[0]["tools"][0]["name"], "functions");
+    assert_eq!(input[0]["tools"][0]["tools"][0]["name"], "read");
+    let text = String::from_utf8(body).unwrap();
+    assert!(
+        text.contains(r#"{"type":"additional_tools","id":"at_"#),
+        "{text}"
+    );
+    assert!(text.contains(r#""tools":[{"type":"namespace","name":"functions","description":"","tools":[{"type":"function","name":"read""#), "{text}");
+    // Only the latest of consecutive configuration updates stays.
+    let updates: Vec<&Value> = input
+        .iter()
+        .filter(|item| item["type"] == "configuration_update")
+        .collect();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0]["reasoning"]["effort"], "high");
+    assert_eq!(
+        input
+            .iter()
+            .filter(|item| item["type"] == "additional_tools")
+            .count(),
+        1
+    );
+    assert_eq!(
+        value["reasoning"],
+        serde_json::json!({"effort": "medium", "summary": "auto", "context": "all_turns"})
+    );
+    assert!(
+        text.contains(r#""reasoning":{"effort":"medium","summary":"auto","context":"all_turns"}"#)
+    );
+    assert_eq!(
+        headers
+            .get("x-openai-internal-codex-responses-lite")
+            .unwrap(),
+        "true"
+    );
+    // The id is stable for the same tools in the same thread.
+    let (again, _) = complete(
+        &normalized,
+        "gpt-6.1-sol",
+        &lite_defaults(),
+        &presented(),
+        &turn,
+    );
+    let again: Value = serde_json::from_slice(&again).unwrap();
+    assert_eq!(again["input"][0]["id"], input[0]["id"]);
+}
+
+#[test]
+fn a_model_without_effort_updates_drops_configuration_updates() {
+    let request = object(serde_json::json!({
+        "model": "gpt-5.5",
+        "input": [
+            {"role": "user", "content": "hi"},
+            {"type": "configuration_update", "reasoning": {"effort": "high"}}
+        ],
+    }));
+    let normalized = normalize(&request);
+    let conversations = Conversations::default();
+    let turn = conversations.turn("k", &normalized);
+    let (body, headers) = complete(&normalized, "gpt-5.5", &defaults(), &presented(), &turn);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        value["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["type"] != "configuration_update")
+    );
+    assert!(
+        headers
+            .get("x-openai-internal-codex-responses-lite")
+            .is_none()
+    );
 }
 
 fn keys_in_order(body: &[u8]) -> Vec<String> {

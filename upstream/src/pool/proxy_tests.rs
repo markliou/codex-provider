@@ -5529,7 +5529,7 @@ async fn codex_model_catalog_advertises_reasoning_capabilities() {
         );
     }
     assert!(
-        model["id"] == "gpt-5.5"
+        model["slug"] == "gpt-5.5"
             && model["context_window"] == 272000
             && model["default_reasoning_level"] == "xhigh",
         "{model}"

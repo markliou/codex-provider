@@ -1,6 +1,6 @@
 {
   "_comment": "Upstream event shapes as Codex itself parses them, at codexRelease. Every entry names the Codex file it comes from and a marker string that appears in that file verbatim; scripts/conformance/codex-conformance.sh check verifies the markers against the Codex source, and TestCodexUpstreamShapesClassifyAsCodexReadsThem verifies the pool's reading. Payloads are copied from Codex's own tests where one exists; entries with a note are built from Codex's parser where it has no test fixture. When codexRelease changes (it must equal the tag in upstream/Cargo.toml), re-run the check and add the shapes the new release parses.",
-  "codexRelease": "rust-v0.166.0",
+  "codexRelease": "rust-v0.167.0",
   "_ignoredComment": "Snake-case literals the conformance check finds in Codex's error parsers that are not error codes. Anything else it finds must appear as a failure code above.",
   "ignoredCodexLiterals": {
     "safety_buffering": "a response.metadata payload type, not an error; response.metadata is held before the commit point (see lifecycle)"
@@ -69,6 +69,108 @@
       },
       "class": "capacity",
       "code": "policy_capacity_unavailable"
+    },
+    {
+      "name": "stream audio input audio too large",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "\"audio_too_large\",",
+      "codex": "InvalidAudioInput (not retried, on every transport: audio_validation_codes_map_to_non_retryable_audio_input_errors_on_all_transports)",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "audio_too_large",
+            "message": "Invalid recording."
+          }
+        }
+      },
+      "class": "request",
+      "code": "audio_too_large"
+    },
+    {
+      "name": "stream audio input audio too short",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "\"audio_too_short\",",
+      "codex": "InvalidAudioInput (not retried, on every transport: audio_validation_codes_map_to_non_retryable_audio_input_errors_on_all_transports)",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "audio_too_short",
+            "message": "Invalid recording."
+          }
+        }
+      },
+      "class": "request",
+      "code": "audio_too_short"
+    },
+    {
+      "name": "stream audio input invalid audio",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "\"invalid_audio\",",
+      "codex": "InvalidAudioInput (not retried, on every transport: audio_validation_codes_map_to_non_retryable_audio_input_errors_on_all_transports)",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "invalid_audio",
+            "message": "Invalid recording."
+          }
+        }
+      },
+      "class": "request",
+      "code": "invalid_audio"
+    },
+    {
+      "name": "stream audio input invalid audio data",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "\"invalid_audio_data\",",
+      "codex": "InvalidAudioInput (not retried, on every transport: audio_validation_codes_map_to_non_retryable_audio_input_errors_on_all_transports)",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "invalid_audio_data",
+            "message": "Invalid recording."
+          }
+        }
+      },
+      "class": "request",
+      "code": "invalid_audio_data"
+    },
+    {
+      "name": "stream audio input invalid audio format",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "\"invalid_audio_format\",",
+      "codex": "InvalidAudioInput (not retried, on every transport: audio_validation_codes_map_to_non_retryable_audio_input_errors_on_all_transports)",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "invalid_audio_format",
+            "message": "Invalid recording."
+          }
+        }
+      },
+      "class": "request",
+      "code": "invalid_audio_format"
+    },
+    {
+      "name": "stream audio input missing audio sample rate",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "\"missing_audio_sample_rate\",",
+      "codex": "InvalidAudioInput (not retried, on every transport: audio_validation_codes_map_to_non_retryable_audio_input_errors_on_all_transports)",
+      "event": {
+        "type": "response.failed",
+        "response": {
+          "error": {
+            "code": "missing_audio_sample_rate",
+            "message": "Invalid recording."
+          }
+        }
+      },
+      "class": "request",
+      "code": "missing_audio_sample_rate"
     },
     {
       "name": "stream overload with a malformed error",
