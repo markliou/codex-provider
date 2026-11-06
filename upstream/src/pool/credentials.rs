@@ -449,7 +449,7 @@ impl RefreshSettle {
 pub struct SettlingRefresh(Arc<std::sync::atomic::AtomicI64>);
 
 impl SettlingRefresh {
-    fn start(count: Arc<std::sync::atomic::AtomicI64>) -> Self {
+    pub(super) fn start(count: Arc<std::sync::atomic::AtomicI64>) -> Self {
         count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self(count)
     }

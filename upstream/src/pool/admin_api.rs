@@ -370,6 +370,8 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
         #[serde(default)]
         quota_prime: Option<bool>,
         #[serde(default)]
+        pi_channel: Option<bool>,
+        #[serde(default)]
         upstream_enabled: Option<bool>,
         #[serde(default)]
         quota_reserve: Option<bool>,
@@ -392,6 +394,7 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
     if switches.preserve_pro_quota.is_none()
         && switches.lineage_affinity.is_none()
         && switches.quota_prime.is_none()
+        && switches.pi_channel.is_none()
         && switches.upstream_enabled.is_none()
         && switches.quota_reserve.is_none()
         && switches.quota_reserve_five_hour.is_none()
@@ -401,7 +404,7 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
             writer,
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "preserveProQuota, lineageAffinity, quotaPrime, upstreamEnabled, quotaReserve, quotaReserveFiveHour or quotaReserveWeekly is required",
+            "preserveProQuota, lineageAffinity, quotaPrime, piChannel, upstreamEnabled, quotaReserve, quotaReserveFiveHour or quotaReserveWeekly is required",
         );
         return;
     }
@@ -429,6 +432,17 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
     if let Some(value) = switches.lineage_affinity {
         inner.lineage_affinity = value;
         inner.config.lineage_affinity = Some(value);
+    }
+    if let Some(value) = switches.pi_channel
+        && value != inner.pi_channel
+    {
+        inner.pi_channel = value;
+        inner.config.pi_channel = Some(value);
+        app.logger.printf(if value {
+            "pi channel turned on by the owner: apps' non-Codex requests go as Pi sends them"
+        } else {
+            "pi channel turned off by the owner: apps' requests are completed into Codex requests"
+        });
     }
     if let Some(value) = switches.quota_prime {
         inner.quota_prime = value;
@@ -1008,6 +1022,20 @@ pub fn handle_reset_prompt_cache_window(app: &App, writer: &mut dyn ResponseWrit
     );
 }
 
+/// GET /admin/api/pi-channel: the switch and each ChatGPT account's state on
+/// the Pi channel (signed in, refused, resting, or waiting for a sign-in).
+pub fn handle_pi_channel(app: &App, writer: &mut dyn ResponseWriter) {
+    write_json(
+        writer,
+        StatusCode::OK,
+        &json!({
+            "enabled": app.pi_channel_enabled(),
+            "piRelease": super::pi_channel::PI_RELEASE,
+            "accounts": app.pi_account_states(),
+        }),
+    );
+}
+
 pub fn handle_sticky_sessions(app: &App, writer: &mut dyn ResponseWriter) {
     let mut inner = app.write();
     let pruned = inner.prune_expired_runtime_state(Timestamp::now());
@@ -1088,8 +1116,74 @@ pub async fn handle_account_action(
     };
     // These ask upstream; with the upstream switch off they are refused
     // here, before the transport would fail them (SPEC.md, upstream switch).
-    if matches!(action, "quota/reset-credit" | "quota/refresh") && !app.upstream_enabled() {
+    if matches!(
+        action,
+        "quota/reset-credit" | "quota/refresh" | "pi/login/complete"
+    ) && !app.upstream_enabled()
+    {
         return write_upstream_closed(writer, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    // The Pi channel's sign-in (pi_channel.rs, SPEC.md 2.3.7): start gives
+    // the address to open in a browser; complete takes the address the
+    // browser landed on, which only the owner's own machine receives.
+    if action.starts_with("pi/") {
+        let item = app.read().config.accounts()[index].clone();
+        if !App::uses_codex_backend_directly(&item) {
+            write_openai_error(
+                writer,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "the pi channel is only available for accounts signed in to ChatGPT",
+            );
+            return;
+        }
+        match action {
+            "pi/login/start" => match app.pi_login_start(id) {
+                Ok(url) => write_json(
+                    writer,
+                    StatusCode::OK,
+                    &json!({"ok": true, "authorizeUrl": url, "redirectUri": super::pi_channel::REDIRECT_URI}),
+                ),
+                Err(error) => write_storage_error(writer, &error),
+            },
+            "pi/login/complete" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Callback {
+                    #[serde(default)]
+                    callback_url: String,
+                }
+                let Some(callback) = decode::<Callback>(&request.body, SMALL_BODY) else {
+                    write_openai_error(
+                        writer,
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        "callbackUrl is required",
+                    );
+                    return;
+                };
+                match app.pi_login_complete(id, &callback.callback_url).await {
+                    Ok(()) => write_json(writer, StatusCode::OK, &json!({"ok": true})),
+                    Err(error) => write_openai_error(
+                        writer,
+                        StatusCode::BAD_REQUEST,
+                        "pi_login_failed",
+                        &error,
+                    ),
+                }
+            }
+            "pi/logout" => match app.pi_sign_out(id).await {
+                Ok(()) => write_json(writer, StatusCode::OK, &json!({"ok": true})),
+                Err(_) => write_storage_error(writer, "unable to remove the pi credential"),
+            },
+            _ => write_openai_error(
+                writer,
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "account action not found",
+            ),
+        }
+        return;
     }
     match action {
         "quota/reset-credit" => {
