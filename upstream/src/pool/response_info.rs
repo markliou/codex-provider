@@ -343,7 +343,19 @@ pub fn terminal_failure_class(event_type: &str, code: &str) -> &'static str {
         // answer, without retrying (codex-api error.rs
         // parse_terminal_provider_error, ApiError::ModelNotFound): the model
         // named in the request does not exist upstream.
-        | "model_not_found" => "request",
+        | "model_not_found"
+        // Codex 0.167: the request's audio input is invalid; Codex ends the
+        // turn without retrying on every transport (codex-api error.rs
+        // parse_terminal_provider_error, ApiError::InvalidAudioInput;
+        // responses_error_tests.rs
+        // audio_validation_codes_map_to_non_retryable_audio_input_errors_on_all_transports).
+        // The same audio fails on any account.
+        | "audio_too_large"
+        | "audio_too_short"
+        | "invalid_audio"
+        | "invalid_audio_data"
+        | "invalid_audio_format"
+        | "missing_audio_sample_rate" => "request",
         // Recognized, and Codex's to handle: it reconnects on the WebSocket
         // connection limit, resends in full when a previous response is gone,
         // and reports flex unavailability itself. Another account would not do

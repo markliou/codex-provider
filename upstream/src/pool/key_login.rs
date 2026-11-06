@@ -3,7 +3,7 @@
 //! The device limit counts ChatGPT logins, so a client may sign its Codex in
 //! with an API key (`codex login --with-api-key`) and still use the pool's
 //! native endpoint. Such a Codex sends the request its built-in provider sends
-//! the Codex backend, less what only a ChatGPT login adds (Codex rust-v0.166.0,
+//! the Codex backend, less what only a ChatGPT login adds (Codex rust-v0.167.0,
 //! measured by scripts/conformance/wire-capture.sh):
 //!
 //! - the MCP resource helpers (list_mcp_resources, list_mcp_resource_templates,

@@ -50,7 +50,7 @@ const SCOPE: &str = "openid profile email offline_access resource.invoke chatgpt
 const EXPIRY_MARGIN_MS: i64 = 3 * 60 * 1000;
 /// Not Pi's: Pi leaves its token call unbounded. The pool holds the
 /// account's lock across a refresh, so a refresh that never answers would
-/// stall every request of the account; the bound is Codex 0.168's own.
+/// stall every request of the account; the bound is Codex 0.167's own.
 const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 /// A sign-in the owner started and has not finished is kept this long.
 const PENDING_LOGIN_TTL_SECONDS: i64 = 15 * 60;

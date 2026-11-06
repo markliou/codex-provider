@@ -36,7 +36,7 @@ use std::sync::Mutex;
 /// The Codex release the pool is held to. It must equal the tag in
 /// upstream/Cargo.toml and the bundled CLI in the Dockerfile; a test
 /// (bundled_codex_matches_the_pinned_release) keeps the three together.
-pub const PINNED_CODEX_VERSION: &str = "0.166.0";
+pub const PINNED_CODEX_VERSION: &str = "0.167.0";
 /// Why a token refresh is made, as Codex names it upstream (login
 /// oauth/client.rs RefreshReason::as_str, 0.164.0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -331,9 +331,9 @@ async fn send_own_call_with(
 }
 
 /// How long a token refresh exchange may take before it fails as transient.
-/// Codex 0.166 sets none; 0.168 bounds its own at 45 seconds (login
+/// Codex 0.166 set none; 0.167 bounds its own at 45 seconds (login
 /// auth/manager.rs request_chatgpt_token_refresh, `timeout:
-/// Some(Duration::from_secs(45))`, rust-v0.168.0-alpha.3). The pool takes it
+/// Some(Duration::from_secs(45))`, rust-v0.167.0). The pool takes it
 /// ahead of the upgrade: a refresh now runs to the end detached from its
 /// caller and holds the account's refresh lock, so without a bound a stalled
 /// exchange would stall every request to the account and the shutdown drain.
@@ -410,7 +410,7 @@ impl RefreshSettle {
     /// Writes the refreshed tokens only over the tokens this refresh spent
     /// (login auth/manager.rs persist_tokens, which compares the stored
     /// refresh and access tokens with the ones it refreshed and saves with
-    /// compare_and_save, rust-v0.168.0-alpha.3). A sign-in finished from the
+    /// compare_and_save, rust-v0.167.0). A sign-in finished from the
     /// management page while the exchange was out wrote a new login; the
     /// rotated tokens of the old one must not overwrite it. Unlike Codex,
     /// which fails the refresh, the pool keeps going: the caller reads
@@ -648,10 +648,10 @@ impl App {
     /// rotate on use: when a client disconnected (or a caller's timeout fired)
     /// after upstream had issued new tokens but before they reached auth.json,
     /// the account was left holding a refresh token upstream had already
-    /// spent, and its next refresh presented it again. Codex 0.168 guards the
+    /// spent, and its next refresh presented it again. Codex 0.167 guards the
     /// same gap by remembering an exchange that was dropped mid-way
     /// (login auth/manager.rs unsettled_chatgpt_refresh,
-    /// rust-v0.168.0-alpha.3); the pool never drops one. Do not move the
+    /// rust-v0.167.0); the pool never drops one. Do not move the
     /// exchange back into the caller's future, and keep the permit inside the
     /// task, or a second request can spend the same token while the first is
     /// still settling.
@@ -927,7 +927,7 @@ mod tests {
     }
 
     // A sign-in finished while a refresh was out wins over the old login's
-    // rotated tokens (Codex 0.168 persist_tokens).
+    // rotated tokens (Codex 0.167 persist_tokens).
     #[tokio::test]
     async fn a_refresh_never_overwrites_a_new_login() {
         let new_login = fake_jwt(Timestamp::now().add(super::super::time::hours(2)));
