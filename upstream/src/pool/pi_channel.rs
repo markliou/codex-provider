@@ -1085,6 +1085,11 @@ impl App {
             slot.pending_pool_activation = false;
         }
         slot.updated_at = Timestamp::now();
+        // A quota error recorded while the slot had no sign-in at all is the
+        // Codex poll's, not this account's state (Inner::credential_error_blocks).
+        if let Some(snapshot) = inner.state.quotas_mut().get_mut(account_id) {
+            snapshot.quota_error = None;
+        }
         if inner.save().is_err() {
             drop(inner);
             self.logger.printf(&format!(

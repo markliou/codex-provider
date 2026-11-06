@@ -994,7 +994,7 @@ impl Inner {
         now: Timestamp,
     ) -> (i32, i64) {
         let snapshot = self.quota_snapshot(&item.id);
-        if quota_error_blocks_routing(snapshot.quota_error.as_ref()) {
+        if self.credential_error_blocks(item) {
             return (0, 0);
         }
         if let Some(quota) = &snapshot.quota {
@@ -1106,9 +1106,21 @@ impl Inner {
         !self.account_cooling_down(&item.id, model, now)
     }
 
+    /// Whether the account's quota error proves its credential unusable for
+    /// this selection. The error comes from the quota poll, which reads the
+    /// plan with the Codex credential: it says nothing about a Pi sign-in, so
+    /// it does not hold the account back from the Pi channel, nor mark an
+    /// account signed in for Pi alone (a slot added for Pi can be polled in
+    /// the minutes before its sign-in finishes).
+    pub fn credential_error_blocks(&self, item: &Account) -> bool {
+        quota_error_blocks_routing(self.quota_snapshot(&item.id).quota_error.as_ref())
+            && !super::pi_channel::pi_selection()
+            && !self.pi_only(item)
+    }
+
     pub fn quota_available(&self, item: &Account, model: &str, now: Timestamp) -> bool {
         let snapshot = self.quota_snapshot(&item.id);
-        if quota_error_blocks_routing(snapshot.quota_error.as_ref()) {
+        if self.credential_error_blocks(item) {
             return false;
         }
         if let Some(quota) = &snapshot.quota {
@@ -1136,7 +1148,7 @@ impl Inner {
         now: Timestamp,
     ) -> Option<bool> {
         let snapshot = self.quota_snapshot(&item.id);
-        if quota_error_blocks_routing(snapshot.quota_error.as_ref()) {
+        if self.credential_error_blocks(item) {
             return Some(false);
         }
         let quota = snapshot.quota.as_ref()?;
