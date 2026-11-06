@@ -1124,6 +1124,11 @@ pub fn complete(
         if let Some(object) = item.as_object_mut() {
             object.insert("id".into(), Value::from(id));
         }
+        // After the Lite tools item, when there is one (Codex's prefix order:
+        // tools, then base instructions).
+        if wrote_item {
+            out.push(b',');
+        }
         write_item(&mut out, &item);
         wrote_item = true;
     }

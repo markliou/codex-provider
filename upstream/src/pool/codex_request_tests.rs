@@ -333,6 +333,7 @@ fn a_responses_lite_request_is_written_as_codex_writes_one() {
     // configuration_update items; both become Codex's.
     let request = object(serde_json::json!({
         "model": "gpt-6.1-sol",
+        "instructions": "be brief",
         "input": [
             {"type": "additional_tools", "role": "developer", "tools": [
                 {"type": "function", "name": "read", "description": "Read", "parameters": {"type": "object", "properties": {}}, "strict": true}
@@ -358,6 +359,8 @@ fn a_responses_lite_request_is_written_as_codex_writes_one() {
     let value: Value = serde_json::from_slice(&body).unwrap();
     let input = value["input"].as_array().unwrap();
     assert_eq!(input[0]["type"], "additional_tools");
+    // Codex's prefix: the tools item, then the base instructions.
+    assert_eq!(input[1]["content"][0]["text"], "be brief");
     assert_eq!(input[0]["role"], "developer");
     assert!(input[0]["id"].as_str().unwrap().starts_with("at_"));
     assert_eq!(input[0]["tools"][0]["type"], "namespace");
