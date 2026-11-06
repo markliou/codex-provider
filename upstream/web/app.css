@@ -650,3 +650,5 @@ tr[data-pool-membership="out"] .quota-track::-moz-progress-bar { background: lin
 .pi-sign-in-step p { margin: 0; font-size: 14px; line-height: 1.5; }
 .pi-sign-in-step code { overflow-wrap: anywhere; }
 .pi-sign-in-step input { width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: 12px; font: inherit; background: var(--surface); color: var(--ink); }
+.sign-in-note { margin: 8px 0 0; color: var(--red); font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
+.sign-in-note[hidden] { display: none; }
