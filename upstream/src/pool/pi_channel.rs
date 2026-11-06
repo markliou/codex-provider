@@ -378,6 +378,31 @@ impl App {
         })
     }
 
+    /// One line per distinct answer shape on this channel: its terminal
+    /// event and whether it carried usage the pool read, never content.
+    pub fn note_pi_answer_shape(&self, info: &super::response_info::ProxyResponseInfo) {
+        let shape = format!(
+            "terminal={} usage={}",
+            if info.terminal_event.is_empty() {
+                "-"
+            } else {
+                info.terminal_event.as_str()
+            },
+            if info.usage.present { "read" } else { "absent" }
+        );
+        let first = {
+            let mut seen = self
+                .unrelayed_header_sets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            seen.len() < 256 && seen.insert(format!("pi-answer:{shape}"))
+        };
+        if first {
+            self.logger
+                .printf(&format!("pi channel answer shape: {shape}"));
+        }
+    }
+
     /// One line per distinct set of response header names on this channel,
     /// names only: what upstream sends back here is not documented, and a
     /// usage or limit header would show up in this list first.
