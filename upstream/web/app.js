@@ -761,6 +761,9 @@
     $("#sign-in-pi").disabled = closed;
     $("#sign-in-codex").textContent = codexBusy ? "Codex · Sign-in busy" : "Codex · device code";
     $("#sign-out-pi").hidden = !id || !piSignedIn(state.piByID?.get(id));
+    // Neither mode is shown chosen until one is: a filled Codex button read
+    // as "this is the Codex sign-in" while a Pi sign-in was under way.
+    markSignInChoice("");
     $("#pi-sign-in-step").hidden = true;
     $("#pi-callback-input").value = "";
     $("#pi-authorize-url").textContent = "";
@@ -777,8 +780,19 @@
     line.hidden = false;
   }
 
+  function markSignInChoice(mode) {
+    for (const [id, name] of [["#sign-in-codex", "codex"], ["#sign-in-pi", "pi"]]) {
+      const button = $(id);
+      const chosen = mode === name;
+      button.classList.toggle("primary", chosen);
+      button.classList.toggle("secondary", !chosen);
+      button.setAttribute("aria-pressed", chosen ? "true" : "false");
+    }
+  }
+
   async function piStartSignIn() {
     const dialog = $("#sign-in-dialog");
+    markSignInChoice("pi");
     try {
       if (!dialog.dataset.accountId) {
         const response = await api("/accounts", { method: "POST", body: JSON.stringify({ authType: "codex_device_auth", priority: 100, enabled: true, inPool: true }) });
