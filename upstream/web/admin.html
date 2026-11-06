@@ -288,6 +288,8 @@
   <dialog id="sign-in-dialog" class="device-dialog">
     <div class="device-auth-panel">
       <div class="dialog-heading"><div><div class="eyebrow">LOG IN</div><h2 id="sign-in-account"></h2></div><button id="close-sign-in-button" class="button quiet" type="button">Close</button></div>
+      <p id="sign-in-closed" class="sign-in-note" hidden>Upstream is closed. Open the upstream switch first: signing in talks to OpenAI.</p>
+      <p id="sign-in-error" class="sign-in-note" role="alert" hidden></p>
       <div class="sign-in-choices">
         <button id="sign-in-codex" class="button primary" type="button">Codex · device code</button>
         <button id="sign-in-pi" class="button secondary" type="button">Pi · browser sign-in</button>

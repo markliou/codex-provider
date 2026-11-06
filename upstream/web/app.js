@@ -749,12 +749,24 @@
     const codexBusy = [...healthByID.values()].some((item) => item.loginJob && item.accountId !== id);
     dialog.dataset.accountId = id;
     $("#sign-in-account").textContent = account.displayName || account.label || id;
-    $("#sign-in-codex").disabled = codexBusy;
+    const closed = !upstreamOpen();
+    $("#sign-in-closed").hidden = !closed;
+    $("#sign-in-error").hidden = true;
+    $("#sign-in-codex").disabled = codexBusy || closed;
+    $("#sign-in-pi").disabled = closed;
     $("#sign-in-codex").textContent = codexBusy ? "Codex · Sign-in busy" : "Codex · device code";
     $("#sign-out-pi").hidden = !piSignedIn(state.piByID?.get(id));
     $("#pi-sign-in-step").hidden = true;
     $("#pi-callback-input").value = "";
     dialog.showModal();
+  }
+
+  // Errors in the chooser are shown in it; the status line would be
+  // overwritten by the next refresh before anyone reads it.
+  function signInError(message) {
+    const line = $("#sign-in-error");
+    line.textContent = message;
+    line.hidden = false;
   }
 
   async function piStartSignIn() {
@@ -766,7 +778,7 @@
       $("#pi-sign-in-step").hidden = false;
       $("#pi-callback-input").focus();
     } catch (error) {
-      notify(error.message, true);
+      signInError(error.message);
     }
   }
 
@@ -778,11 +790,10 @@
     try {
       await api(`/accounts/${encodeURIComponent(id)}/pi/login/complete`, { method: "POST", body: JSON.stringify({ callbackUrl: landed }) });
       dialog.close();
-      notify(`Signed ${id} in for Pi`);
+      refresh(true);
     } catch (error) {
-      notify(error.message, true);
+      signInError(error.message);
     }
-    refresh(true);
   }
 
   async function piSignOut() {
@@ -792,11 +803,10 @@
     try {
       await api(`/accounts/${encodeURIComponent(id)}/pi/logout`, { method: "POST" });
       dialog.close();
-      notify(`Signed ${id} out of Pi`);
+      refresh(true);
     } catch (error) {
-      notify(error.message, true);
+      signInError(error.message);
     }
-    refresh(true);
   }
 
   function renderSettings(serviceState) {
@@ -1552,7 +1562,18 @@
     watchPublicLoginJob(ref);
   }
 
+  // Signing in talks to OpenAI, so with upstream closed it cannot start.
+  // Say so before anything is made: the status line that errors go to is
+  // overwritten by the next refresh, and a slot was once left behind empty
+  // with nothing on screen to say why.
+  const upstreamOpen = () => state.data?.serviceState?.upstreamEnabled === true;
+  const UPSTREAM_CLOSED_SIGN_IN = "Upstream is closed. Open the upstream switch first: signing in talks to OpenAI.";
+
   async function createAccountAndStartLogin() {
+    if (!upstreamOpen()) {
+      window.alert(UPSTREAM_CLOSED_SIGN_IN);
+      return;
+    }
     try {
       const response = await api("/accounts", { method: "POST", body: JSON.stringify({ authType: "codex_device_auth", priority: 100, enabled: true, inPool: true }) });
       await refresh(true);
@@ -1748,7 +1769,7 @@
     const id = dialog.dataset.accountId;
     dialog.close();
     if (!window.confirm("Repair the Codex sign-in for this slot? Sign in with the same upstream account to preserve its cache and affinity history.")) return;
-    try { await startDeviceAuth(id); } catch (error) { notify(error.message, true); }
+    try { await startDeviceAuth(id); } catch (error) { window.alert(error.message); }
     refresh(true);
   });
   $("#sign-in-pi").addEventListener("click", piStartSignIn);
