@@ -551,6 +551,34 @@ fn user_message(text: &str) -> Result<Box<RawValue>, String> {
     ))
 }
 
+/// Pi's `configuration_update` input item.
+#[derive(Deserialize)]
+struct ConfigurationUpdate {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    reasoning: Option<ConfiguredReasoning>,
+}
+
+#[derive(Deserialize)]
+struct ConfiguredReasoning {
+    #[serde(default)]
+    effort: Option<String>,
+}
+
+/// A `reasoning` object with its effort set, its other keys in place.
+fn with_effort(reasoning: &RawValue, effort: &str) -> Result<Box<RawValue>, String> {
+    let Ok(Ordered(mut fields)) = serde_json::from_str::<Ordered>(reasoning.get()) else {
+        return literal(format!(r#"{{"effort":{}}}"#, quoted(effort)?));
+    };
+    let value = literal(quoted(effort)?)?;
+    match fields.iter_mut().find(|(name, _)| name == "effort") {
+        Some((_, slot)) => *slot = value,
+        None => fields.insert(0, ("effort".to_string(), value)),
+    }
+    literal(object(&fields)?)
+}
+
 /// An input item with a system role written as a developer one, every other
 /// byte as the client wrote it.
 fn without_system_role(item: Box<RawValue>) -> Result<Box<RawValue>, String> {
@@ -629,6 +657,8 @@ pub fn pi_request_body(
     }
     let mut input_items: Vec<Box<RawValue>> = Vec::new();
     let mut had_input = false;
+    let mut configured_effort: Option<String> = None;
+    let mut removed_updates = false;
     if let Some(position) = kept.iter().position(|(name, _)| name == "input") {
         had_input = true;
         let (_, value) = kept.remove(position);
@@ -640,11 +670,43 @@ pub fn pi_request_body(
             // are rejected. Use instructions or developer messages
             // instead."); Pi writes a system prompt as a developer message.
             for item in items {
+                // "Sign in with ChatGPT rejects configuration_update items"
+                // (pi-ai api/openai-responses.js getConfigurationUpdateEffort):
+                // signed in, Pi sends none and puts the thinking level in
+                // reasoning.effort. A Pi pointed at the pool does not know it
+                // is signed in, so it sends the items with reasoning.effort
+                // fixed at "medium" (CONFIGURATION_UPDATE_REQUEST_EFFORT); the
+                // pool writes the request as Pi signed in writes it. The last
+                // item carries the current level (pushConfigurationUpdate).
+                if let Ok(update) = serde_json::from_str::<ConfigurationUpdate>(item.get())
+                    && update.kind == "configuration_update"
+                {
+                    if let Some(effort) = update.reasoning.and_then(|reasoning| reasoning.effort) {
+                        configured_effort = Some(effort);
+                    }
+                    removed_updates = true;
+                    continue;
+                }
                 input_items.push(without_system_role(item)?);
             }
         } else {
             return Err("input must be a string or a list".to_string());
         }
+    }
+    if removed_updates {
+        removed.push("configuration_update".to_string());
+    }
+    if tier.is_none()
+        && let Some(effort) = configured_effort
+    {
+        let reasoning = match kept.iter().position(|(name, _)| name == "reasoning") {
+            Some(position) => {
+                let (_, value) = kept.remove(position);
+                with_effort(&value, &effort)?
+            }
+            None => literal(format!(r#"{{"effort":{}}}"#, quoted(&effort)?))?,
+        };
+        kept.push(("reasoning".to_string(), reasoning));
     }
     if let Some(text) = instructions {
         input_items.insert(0, developer_message(&text)?);
@@ -1297,7 +1359,16 @@ impl App {
                     None if signed_in => ("ready", String::new()),
                     None => ("sign_in", "not signed in".to_string()),
                 };
-                serde_json::json!({"accountId": id, "state": state, "detail": detail, "usage": self.pi_usage(&id)})
+                serde_json::json!({
+                    "accountId": id,
+                    "state": state,
+                    "detail": detail,
+                    "usage": self.pi_usage(&id),
+                    // Whether the account holds a Codex sign-in at all, for
+                    // the Codex badge: an account signed in for Pi alone
+                    // shows none.
+                    "codexSignedIn": home.join("auth.json").is_file(),
+                })
             })
             .collect()
     }

@@ -670,3 +670,65 @@ async fn a_codex_quota_error_does_not_hold_back_a_pi_only_account() {
         "error"
     );
 }
+
+#[test]
+fn what_pi_sends_the_pool_becomes_what_pi_signed_in_sends() {
+    // The whole channel in one check, against the measured requests
+    // (pi-reference.json, a Pi of PI_RELEASE on a model that uses every
+    // request feature Pi switches on this route): the body Pi sends a custom
+    // base URL, written by the pool, must equal the body Pi sends OpenAI
+    // signed in, field order included.
+    #[derive(serde::Deserialize)]
+    struct Body<'a> {
+        #[serde(rename = "fieldOrder")]
+        field_order: Vec<String>,
+        #[serde(borrow)]
+        value: &'a serde_json::value::RawValue,
+    }
+    #[derive(serde::Deserialize)]
+    struct Request<'a> {
+        #[serde(borrow)]
+        body: Body<'a>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Reference<'a> {
+        #[serde(borrow)]
+        responses: Request<'a>,
+        #[serde(borrow, rename = "viaPool")]
+        via_pool: Request<'a>,
+    }
+    let text = include_str!("../../testdata/pi-reference.json");
+    let reference: Reference = serde_json::from_str(text).unwrap();
+    let signed_in: Value = serde_json::from_str(reference.responses.body.value.get()).unwrap();
+    let model = signed_in["model"].as_str().unwrap().to_string();
+    let (out, removed) = super::pi_channel::pi_request_body(
+        reference.via_pool.body.value.get().as_bytes(),
+        &model,
+        None,
+    )
+    .unwrap();
+    assert!(removed.contains(&"max_output_tokens".to_string()));
+    assert!(removed.contains(&"configuration_update".to_string()));
+    let written: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(written, signed_in);
+    let order: Vec<String> = {
+        // Top-level order as written (serde_json's map sorts, so read the
+        // keys off the bytes).
+        let text = String::from_utf8(out.to_vec()).unwrap();
+        reference
+            .responses
+            .body
+            .field_order
+            .iter()
+            .filter(|name| text.contains(&format!("\"{name}\":")))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(order, reference.responses.body.field_order);
+    let text = String::from_utf8(out.to_vec()).unwrap();
+    let positions: Vec<usize> = order
+        .iter()
+        .map(|name| text.find(&format!("\"{name}\":")).unwrap())
+        .collect();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+}

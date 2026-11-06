@@ -642,7 +642,7 @@ tr[data-pool-membership="out"] .quota-track::-moz-progress-bar { background: lin
 .mode-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .mode-badge { font-size: 11px; }
 .mode-badge.codex.off, .mode-badge.pi.sign_in, .mode-badge.pi.refused, .mode-badge.pi.limited { color: var(--red); background: var(--red-bg); }
-.mode-badge.pi.ready { color: var(--green); background: var(--green-bg); }
+.mode-badge.pi.ready, .mode-badge.codex.ready { color: var(--green); background: var(--green-bg); }
 .pi-usage { margin-top: 6px; color: var(--muted-strong); font-size: 12px; overflow-wrap: anywhere; }
 .sign-in-choices { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0 4px; }
 .pi-sign-in-step { display: grid; gap: 10px; margin-top: 12px; }

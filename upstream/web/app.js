@@ -720,9 +720,13 @@
 
   function modeBadgesMarkup(account, health, pi) {
     const badges = [];
-    if (account.authType === "codex_device_auth") {
+    // The Codex badge means the account holds a Codex sign-in: none for an
+    // account signed in for Pi alone (it once showed there as plain text and
+    // read as a Codex sign-in), red when the sign-in needs repair.
+    const codexSignedIn = pi ? pi.codexSignedIn === true : account.authType === "codex_device_auth";
+    if (account.authType === "codex_device_auth" && codexSignedIn) {
       const missing = health.status === "missing_auth";
-      badges.push(`<span class="badge mode-badge codex${missing ? " off" : ""}" title="${missing ? "Codex sign-in missing" : "Signed in for Codex"}">Codex</span>`);
+      badges.push(`<span class="badge mode-badge codex ${missing ? "off" : "ready"}" title="${missing ? "Codex sign-in needs repair" : "Signed in for Codex"}">${missing ? "Codex · sign in again" : "Codex"}</span>`);
     }
     if (piSignedIn(pi)) {
       badges.push(`<span class="badge mode-badge pi ${escapeHTML(pi.state)}"${pi.detail ? ` title="${escapeHTML(pi.detail)}"` : ""}>${escapeHTML(PI_STATE_TEXT[pi.state] || "Pi")}</span>`);
@@ -1264,7 +1268,7 @@
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${accountEntitlementMarkup(account)}${ownerNoteInput(account)}</div></td>
         <td><div class="status-stack">${statusBadgeMarkup(health.status, statusLabel(health.status), health.quota)}${activeBadge(health.active)}</div>${modeBadgesMarkup(account, health, pi)}</td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt, health.quotaFreshness, health.lastSuccessfulRefreshAt, health.quotaMetering, account.id)}${piUsageMarkup(pi)}${quotaProtectionMarkup(account, health)}</td>
-        <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)} · ${escapeHTML(routeCount)}</div></td>
+        <td><div class="route">${account.authType === "codex_device_auth" ? "" : `<strong>${escapeHTML(authLabel(account.authType))}</strong><br>`}${escapeHTML(route)} · ${escapeHTML(routeCount)}</div></td>
         <td class="cache-column">${cacheHitMarkup(health, "main", account.id)}</td>
         <td class="cache-column">${cacheHitMarkup(health, "subagent")}</td>
         <td class="routing-count-column" title="${affinityHits} parent-affinity hits, ${affinityFallbacks} fallbacks">${affinityHits}/${affinityFallbacks}</td>

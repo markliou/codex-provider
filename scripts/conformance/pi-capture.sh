@@ -22,6 +22,10 @@ OUT="$ROOT/scripts/conformance/out/pi-capture"
 RELEASE=$(sed -n 's/^pub const PI_RELEASE: &str = "\(.*\)";/\1/p' "$ROOT/upstream/src/pool/pi_channel.rs")
 NETWORK=codex-pool-pi-capture-net
 SERVER=codex-pool-pi-capture
+# A model that uses every request feature Pi switches on this route:
+# additional_tools items, the explicit prompt-cache mode and configuration_update
+# items (pi-ai providers/data/openai.json compat). gpt-5.5 uses none of them.
+PI_MODEL=${PI_MODEL:-openai/gpt-6.1-sol}
 [ -n "$RELEASE" ] || { echo "PI_RELEASE not found" >&2; exit 1; }
 
 rm -rf "$OUT"
@@ -55,14 +59,19 @@ docker run -d --name "$SERVER" --network "$NETWORK" \
   -v "$HARNESS/capture.mjs:/capture.mjs:ro" -v "$OUT/certs:/certs:ro" -v "$OUT/rec:/rec" \
   node:22-alpine node /capture.mjs >/dev/null
 sleep 2
+# run_pi HOME ARGS...: one Pi turn with that home; every other argument goes to
+# Pi, so both runs get the same settings (a dropped --thinking once made the
+# two runs differ in more than the route).
 run_pi() {
+  home=$1
+  shift
   docker run --rm --network "$NETWORK" -u "$(id -u):$(id -g)" -e HOME=/home/u \
     -e NODE_EXTRA_CA_CERTS=/certs/ca.crt \
-    -v "$1:/home/u" -v "$OUT/work:/work" -v "$OUT/pi:/pi:ro" -v "$OUT/certs:/certs:ro" -w /work \
-    node:22-alpine node /pi/node_modules/.bin/pi --offline --no-session --model openai/gpt-5.5 "$2" "$3" -p "say hi" >/dev/null
+    -v "$home:/home/u" -v "$OUT/work:/work" -v "$OUT/pi:/pi:ro" -v "$OUT/certs:/certs:ro" -w /work \
+    node:22-alpine node /pi/node_modules/.bin/pi --offline --no-session --model "$PI_MODEL" "$@" -p "say hi" >/dev/null
 }
-run_pi "$OUT/home1" --thinking medium
-run_pi "$OUT/home2" --api-key pool-key-placeholder
+run_pi "$OUT/home1" --thinking high
+run_pi "$OUT/home2" --api-key pool-key-placeholder --thinking high
 
 docker run --rm -v "$HARNESS:/h:ro" -v "$OUT/rec:/rec:ro" node:22-alpine \
   node /h/reference.mjs /rec/capture.jsonl "$RELEASE" > "$OUT/pi-reference.json"
