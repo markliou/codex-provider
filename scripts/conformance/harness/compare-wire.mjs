@@ -503,6 +503,9 @@ compareConnections("native-http.jsonl", "native-pool-http.jsonl");
 compareConnections("native-ws.jsonl", "native-pool-ws.jsonl");
 compareConnections("native-http.jsonl", "key-pool-http.jsonl");
 compareConnections("native-ws.jsonl", "key-pool-ws.jsonl");
+// The scripted scenarios run only with CONFORMANCE_SCENARIOS=all (wire-capture.sh:
+// a code-mode model calls nested tools through exec, which the fake does not script).
+if (process.env.CONFORMANCE_SCENARIOS !== "basic") {
 compareScenario("subagent-http", { requireChild: true });
 compareScenario("subagent-ws", { requireChild: true });
 compareScenario("compact", { requireCompaction: true });
@@ -515,6 +518,7 @@ compareScenario("keytools-http", { requireKeyTools: true, prefix: "key-pool" });
 compareScenario("keytools-ws", { requireKeyTools: true, prefix: "key-pool" });
 compareScenario("failover-http", { failover: true });
 compareScenario("failover-ws", { failover: true });
+}
 compareTLS("tls-http.txt");
 compareTLS("tls-ws.txt");
 for (const note of notes) console.log(`ok   ${note}`);

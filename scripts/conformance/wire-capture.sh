@@ -275,6 +275,11 @@ run_turn native-pool native-pool-ws
 run_turn key-pool key-pool-ws
 stop_fake ws
 
+# The scripted scenarios below have the fake model call tools directly. A
+# code-mode model (gpt-6.x, Responses Lite) calls nested tools through its exec
+# tool instead, so on such a model only the request-shape phases above run
+# (CONFORMANCE_SCENARIOS=basic, the Lite pass at the end).
+if [ "${CONFORMANCE_SCENARIOS:-all}" = all ]; then
 echo "Subagent: a parent spawns one child, over HTTP and over the WebSocket"
 subagent_config='[features.multi_agent_v2]
 enabled = true
@@ -311,6 +316,7 @@ for transport in http ws; do
   clear_pool_cooldowns
   FAIL_FROM=$(cat "$work/pool-ip.txt") scenario_phase "failover-$transport" failover "$reject"
 done
+fi
 
 docker logs "$pool" > "$work/pool.log" 2>&1 || true
 # The installation ids the pool's accounts present (upstream/src/pool/installation_id.rs); the
@@ -318,7 +324,16 @@ docker logs "$pool" > "$work/pool.log" 2>&1 || true
 docker run --rm -v "$volume:/data:ro" alpine:3.21 sh -c '
   for f in /data/accounts/*/.codex/installation_id; do [ -f "$f" ] && { cat "$f"; echo; }; done' > "$work/account-installation-ids.txt"
 status=0
-docker run --rm -v "$work:/w:ro" -v "$repo_root/scripts/conformance/harness:/h:ro" node:22-alpine \
+docker run --rm -e CONFORMANCE_SCENARIOS="${CONFORMANCE_SCENARIOS:-all}" -v "$work:/w:ro" -v "$repo_root/scripts/conformance/harness:/h:ro" node:22-alpine \
   node /h/compare-wire.mjs /w > "$work/report.txt" || status=$?
 cat "$work/report.txt"
+# Then the same request shapes on a Responses Lite model (gpt-6.x): Codex sends
+# those requests in another shape (tools as an additional_tools item, code-mode
+# tools, the Lite header), and the pool's completion and key login must match
+# it too. Skipped when a model was named explicitly.
+if [ -z "${CONFORMANCE_MODEL:-}" ] && [ -z "${CONFORMANCE_LITE_PASS:-}" ]; then
+  echo
+  echo "Responses Lite pass: gpt-6.1-sol, request shapes only"
+  CONFORMANCE_LITE_PASS=1 CONFORMANCE_MODEL=gpt-6.1-sol CONFORMANCE_SCENARIOS=basic sh "$0" || status=$?
+fi
 exit "$status"
