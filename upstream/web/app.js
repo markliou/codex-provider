@@ -705,80 +705,94 @@
         : "Accounts are used until their quota runs out, unless they have their own protection.";
   }
 
-  // The Pi channel's per-account sign-ins (SPEC.md 2.3.7). Each ChatGPT
-  // account signs in for it apart from its Codex sign-in; the state says
-  // whether the channel can use the account now.
+  // Each ChatGPT account may hold two sign-ins (SPEC.md 2.3.7): its Codex
+  // device-code sign-in, and a Pi sign-in for the Pi channel. The account row
+  // shows one badge per mode, and the Pi badge carries the channel's own
+  // usage count: OpenAI gives an app no plan-usage reading, and the plan's
+  // windows (the quota column) are shared by both modes.
   const PI_STATE_TEXT = {
-    ready: "Signed in",
-    sign_in: "Needs sign-in",
-    refused: "Not eligible",
-    limited: "Usage limit reached",
+    ready: "Pi",
+    sign_in: "Pi · sign in again",
+    refused: "Pi · not eligible",
+    limited: "Pi · resting",
   };
-  function renderPiChannel(response) {
-    const card = $("#pi-channel-card");
-    const list = $("#pi-channel-accounts");
-    if (!card || !list) return;
-    list.replaceChildren();
-    if (!response || !Array.isArray(response.accounts)) {
-      $("#pi-channel-summary").textContent = "This server has no Pi channel.";
-      return;
+  const piSignedIn = (pi) => Boolean(pi) && !(pi.state === "sign_in" && pi.detail === "not signed in");
+
+  function modeBadgesMarkup(account, health, pi) {
+    const badges = [];
+    if (account.authType === "codex_device_auth") {
+      const missing = health.status === "missing_auth";
+      badges.push(`<span class="badge mode-badge codex${missing ? " off" : ""}" title="${missing ? "Codex sign-in missing" : "Signed in for Codex"}">Codex</span>`);
     }
-    const ready = response.accounts.filter((item) => item.state === "ready").length;
-    $("#pi-channel-summary").textContent = `${response.enabled ? "On" : "Off"} · Pi ${response.piRelease} · ${ready} of ${response.accounts.length} accounts signed in`;
-    for (const item of response.accounts) {
-      const row = document.createElement("li");
-      const name = document.createElement("span");
-      name.className = "pi-channel-account";
-      name.textContent = item.accountId;
-      const status = document.createElement("span");
-      status.className = `pi-channel-state ${item.state}`;
-      status.textContent = PI_STATE_TEXT[item.state] || item.state;
-      if (item.detail) status.title = item.detail;
-      const signIn = document.createElement("button");
-      signIn.type = "button";
-      signIn.className = "button";
-      signIn.textContent = item.state === "ready" ? "Sign in again" : "Sign in";
-      signIn.dataset.piAction = "sign-in";
-      signIn.dataset.accountId = item.accountId;
-      row.append(name, status, signIn);
-      if (item.state !== "sign_in" || item.detail !== "not signed in") {
-        const signOut = document.createElement("button");
-        signOut.type = "button";
-        signOut.className = "button";
-        signOut.textContent = "Sign out";
-        signOut.dataset.piAction = "sign-out";
-        signOut.dataset.accountId = item.accountId;
-        row.append(signOut);
-      }
-      list.append(row);
+    if (piSignedIn(pi)) {
+      badges.push(`<span class="badge mode-badge pi ${escapeHTML(pi.state)}"${pi.detail ? ` title="${escapeHTML(pi.detail)}"` : ""}>${escapeHTML(PI_STATE_TEXT[pi.state] || "Pi")}</span>`);
+    }
+    return badges.length ? `<div class="mode-badges">${badges.join("")}</div>` : "";
+  }
+
+  function piUsageMarkup(pi) {
+    if (!piSignedIn(pi) || !pi.usage) return "";
+    const line = (label, total) => total && Number(total.requests) > 0
+      ? `${label}: ${Number(total.requests)} req · ${formatTokens(total.inputTokens)} in · ${formatTokens(total.outputTokens)} out`
+      : `${label}: none`;
+    return `<div class="pi-usage" title="Counted by the pool from each Pi-mode answer; the plan's own windows are above">Pi use · ${escapeHTML(line("5h", pi.usage.fiveHours))} · ${escapeHTML(line("7d", pi.usage.week))}</div>`;
+  }
+
+  // The sign-in chooser: Codex's device code, or Pi's browser sign-in. Pi's
+  // sign-in lands the browser on a 127.0.0.1 address only the owner's machine
+  // receives; the owner pastes it here and the pool finishes the sign-in.
+  function openSignIn(id) {
+    const dialog = $("#sign-in-dialog");
+    const account = (state.data?.accounts || []).find((item) => item.id === id) || {};
+    const healthByID = state.data?.healthByID || new Map();
+    // Codex's device sign-in is single-flight across slots; Pi's is not.
+    const codexBusy = [...healthByID.values()].some((item) => item.loginJob && item.accountId !== id);
+    dialog.dataset.accountId = id;
+    $("#sign-in-account").textContent = account.displayName || account.label || id;
+    $("#sign-in-codex").disabled = codexBusy;
+    $("#sign-in-codex").textContent = codexBusy ? "Codex · Sign-in busy" : "Codex · device code";
+    $("#sign-out-pi").hidden = !piSignedIn(state.piByID?.get(id));
+    $("#pi-sign-in-step").hidden = true;
+    $("#pi-callback-input").value = "";
+    dialog.showModal();
+  }
+
+  async function piStartSignIn() {
+    const id = $("#sign-in-dialog").dataset.accountId;
+    try {
+      const started = await api(`/accounts/${encodeURIComponent(id)}/pi/login/start`, { method: "POST" });
+      window.open(started.authorizeUrl, "_blank", "noopener");
+      $("#pi-redirect-uri").textContent = started.redirectUri;
+      $("#pi-sign-in-step").hidden = false;
+      $("#pi-callback-input").focus();
+    } catch (error) {
+      notify(error.message, true);
     }
   }
 
-  // Sign in for the Pi channel: open ChatGPT's page, then paste back the
-  // address the browser landed on (http://127.0.0.1:1455/...), which only
-  // this machine receives; the pool finishes the sign-in with it.
-  async function piSignIn(accountId) {
-    const path = `/accounts/${encodeURIComponent(accountId)}/pi`;
+  async function piFinishSignIn() {
+    const dialog = $("#sign-in-dialog");
+    const id = dialog.dataset.accountId;
+    const landed = $("#pi-callback-input").value.trim();
+    if (!landed) return;
     try {
-      const started = await api(`${path}/login/start`, { method: "POST" });
-      window.open(started.authorizeUrl, "_blank", "noopener");
-      const landed = window.prompt(
-        `Sign in with the ChatGPT account for ${accountId} in the new tab. When the browser shows an address starting with ${started.redirectUri} (the page itself may fail to load), copy the whole address and paste it here.`,
-      );
-      if (!landed) return;
-      await api(`${path}/login/complete`, { method: "POST", body: JSON.stringify({ callbackUrl: landed }) });
-      notify(`Signed ${accountId} in for the Pi channel`);
+      await api(`/accounts/${encodeURIComponent(id)}/pi/login/complete`, { method: "POST", body: JSON.stringify({ callbackUrl: landed }) });
+      dialog.close();
+      notify(`Signed ${id} in for Pi`);
     } catch (error) {
       notify(error.message, true);
     }
     refresh(true);
   }
 
-  async function piSignOut(accountId) {
-    if (!window.confirm(`Sign ${accountId} out of the Pi channel? Its Codex sign-in is not affected.`)) return;
+  async function piSignOut() {
+    const dialog = $("#sign-in-dialog");
+    const id = dialog.dataset.accountId;
+    if (!window.confirm(`Sign ${id} out of Pi? Its Codex sign-in is not affected.`)) return;
     try {
-      await api(`/accounts/${encodeURIComponent(accountId)}/pi/logout`, { method: "POST" });
-      notify(`Signed ${accountId} out of the Pi channel`);
+      await api(`/accounts/${encodeURIComponent(id)}/pi/logout`, { method: "POST" });
+      dialog.close();
+      notify(`Signed ${id} out of Pi`);
     } catch (error) {
       notify(error.message, true);
     }
@@ -1179,7 +1193,6 @@
     $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Routing</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity/Fallback")}</th><th class="throughput-column">Throughput (5m)</th><th>Last activity</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} configured`;
     const body = $("#accounts-body");
-    const activeLoginAccountId = accounts.find((account) => healthByID.get(account.id)?.loginJob)?.id || "";
     if (!accounts.length) {
       body.innerHTML = '<tr><td colspan="10"><div class="empty-state">No accounts configured</div></td></tr>';
       return;
@@ -1197,10 +1210,13 @@
       // the repair action stays beside Remove and calls the existing slot login
       // endpoint instead of recreating credentials under a new id.
       const signingIn = health.status === "authenticating";
-      const anotherAccountSigningIn = Boolean(activeLoginAccountId && activeLoginAccountId !== account.id);
       const repairTone = health.status === "missing_auth" || health.status === "error" ? "primary" : "secondary";
+      // One Repair sign-in button for both modes; the chooser it opens offers the
+      // Codex device code (busy while another slot's device sign-in runs)
+      // and Pi's browser sign-in.
+      const pi = state.piByID?.get(account.id);
       const repair = account.authType === "codex_device_auth"
-        ? actionButton("login", account.id, signingIn ? "Signing in…" : anotherAccountSigningIn ? "Sign-in busy" : "Repair sign-in", repairTone, signingIn || anotherAccountSigningIn)
+        ? actionButton("login", account.id, signingIn ? "Signing in…" : "Repair sign-in", repairTone, signingIn)
         : "";
       const actions = repair + actionButton("delete", account.id, "Remove", "danger");
       const cacheWindow = health.cacheWindow || {};
@@ -1208,8 +1224,8 @@
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
       return `<tr data-account-row="${escapeHTML(account.id)}"${poolMembershipAttribute(account.inPool === false)}>
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${accountEntitlementMarkup(account)}${ownerNoteInput(account)}</div></td>
-        <td><div class="status-stack">${statusBadgeMarkup(health.status, statusLabel(health.status), health.quota)}${activeBadge(health.active)}</div></td>
-        <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt, health.quotaFreshness, health.lastSuccessfulRefreshAt, health.quotaMetering, account.id)}${quotaProtectionMarkup(account, health)}</td>
+        <td><div class="status-stack">${statusBadgeMarkup(health.status, statusLabel(health.status), health.quota)}${activeBadge(health.active)}</div>${modeBadgesMarkup(account, health, pi)}</td>
+        <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt, health.quotaFreshness, health.lastSuccessfulRefreshAt, health.quotaMetering, account.id)}${piUsageMarkup(pi)}${quotaProtectionMarkup(account, health)}</td>
         <td><div class="route"><strong>${escapeHTML(authLabel(account.authType))}</strong><br>${escapeHTML(route)} · ${escapeHTML(routeCount)}</div></td>
         <td class="cache-column">${cacheHitMarkup(health, "main", account.id)}</td>
         <td class="cache-column">${cacheHitMarkup(health, "subagent")}</td>
@@ -1373,10 +1389,13 @@
 
   async function refresh(silent = false) {
     try {
-      const [stateResponse, accountsResponse, healthResponse, sessionsResponse] = await Promise.all([api("/state"), api("/accounts"), api("/accounts/health"), api("/sticky-sessions")]);
+      // The Pi channel may be missing on an older server; its absence must
+      // not fail the whole refresh.
+      const [stateResponse, accountsResponse, healthResponse, sessionsResponse, piResponse] = await Promise.all([api("/state"), api("/accounts"), api("/accounts/health"), api("/sticky-sessions"), api("/pi-channel").catch(() => null)]);
       const serviceState = stateResponse.state;
       state.quotaFloorPercent = finiteMetric(serviceState.quotaFloorPercent) ?? 0;
       const healthByID = new Map(healthResponse.accounts.map((item) => [item.accountId, item]));
+      state.piByID = new Map((piResponse?.accounts || []).map((item) => [item.accountId, item]));
       const activeLoginJob = healthResponse.accounts.find((item) => item.loginJob)?.loginJob || null;
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
       renderSettings(serviceState);
@@ -1388,9 +1407,6 @@
       renderRoutingCacheEvents(serviceState.routingCacheEvents);
       renderCapacityWatch(serviceState.capacityWatch);
       renderSticky(state.data.sessions, state.data.accounts);
-      // Apart from the others: an older server has no Pi channel, and its
-      // absence must not fail the whole refresh.
-      api("/pi-channel").then(renderPiChannel).catch(() => renderPiChannel(null));
       const addAccountButton = $("#add-account-button");
       if (addAccountButton) addAccountButton.disabled = Boolean(activeLoginJob);
       // Device-auth jobs are intentionally single-flight. Recover a live job
@@ -1441,9 +1457,9 @@
         if (!window.confirm(`Remove account ${id}?`)) return;
         await api(`/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
       } else if (action === "login") {
-        if (!window.confirm("Repair sign-in for this slot? Sign in with the same upstream account to preserve its cache and affinity history.")) return;
-        await startDeviceAuth(id);
-        await refresh(true);
+        // One Sign in button for both modes; the chooser offers the Codex
+        // device code, which repairs this same slot, and Pi's sign-in.
+        openSignIn(id);
         return;
       } else if (action === "quota/reset-credit") {
         if (!window.confirm("Spend one reset credit on this account? This is irreversible and consumes real entitlement.")) return;
@@ -1727,12 +1743,18 @@
   $("#lineage-affinity-switch").addEventListener("change", updateLineageAffinity);
   $("#quota-prime-switch").addEventListener("change", updateQuotaPrime);
   $("#pi-channel-switch").addEventListener("change", updatePiChannel);
-  $("#pi-channel-accounts").addEventListener("click", (event) => {
-    const button = event.target.closest("[data-pi-action]");
-    if (!button) return;
-    if (button.dataset.piAction === "sign-in") piSignIn(button.dataset.accountId);
-    if (button.dataset.piAction === "sign-out") piSignOut(button.dataset.accountId);
+  $("#sign-in-codex").addEventListener("click", async () => {
+    const dialog = $("#sign-in-dialog");
+    const id = dialog.dataset.accountId;
+    dialog.close();
+    if (!window.confirm("Repair the Codex sign-in for this slot? Sign in with the same upstream account to preserve its cache and affinity history.")) return;
+    try { await startDeviceAuth(id); } catch (error) { notify(error.message, true); }
+    refresh(true);
   });
+  $("#sign-in-pi").addEventListener("click", piStartSignIn);
+  $("#pi-sign-in-finish").addEventListener("click", piFinishSignIn);
+  $("#sign-out-pi").addEventListener("click", piSignOut);
+  $("#close-sign-in-button").addEventListener("click", () => $("#sign-in-dialog").close());
   $("#quota-reserve-switch").addEventListener("change", updateQuotaReserve);
   $("#quota-reserve-save").addEventListener("click", updateQuotaReserveThresholds);
   $("#upstream-switch").addEventListener("change", updateUpstreamSwitch);
