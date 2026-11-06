@@ -1190,7 +1190,7 @@ async fn proxy(
     } else {
         Bytes::from(gojson::marshal(&Value::Object(payload.clone())))
     };
-    attempts(
+    let loop_ = attempts(
         app,
         request,
         writer,
@@ -1208,8 +1208,14 @@ async fn proxy(
         &mut route,
         updated_body,
         &mut throughput,
-    )
-    .await;
+    );
+    // The Pi channel picks accounts by their Pi sign-in
+    // (pi_channel::pi_selection); every other request by its Codex one.
+    if pi {
+        super::pi_channel::as_pi_selection(loop_).await;
+    } else {
+        loop_.await;
+    }
     app.finish_throughput_measurement(&mut throughput);
 }
 

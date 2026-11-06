@@ -747,15 +747,20 @@
     const healthByID = state.data?.healthByID || new Map();
     // Codex's device sign-in is single-flight across slots; Pi's is not.
     const codexBusy = [...healthByID.values()].some((item) => item.loginJob && item.accountId !== id);
+    // An empty id is Add account: nothing exists yet, and a slot is made
+    // only once a mode is chosen (a Pi slot is removed again if its sign-in
+    // is not finished, so closing the chooser leaves nothing behind).
     dialog.dataset.accountId = id;
-    $("#sign-in-account").textContent = account.displayName || account.label || id;
+    dialog.dataset.created = "";
+    dialog.dataset.done = "";
+    $("#sign-in-account").textContent = id ? (account.displayName || account.label || id) : "New account";
     const closed = !upstreamOpen();
     $("#sign-in-closed").hidden = !closed;
     $("#sign-in-error").hidden = true;
     $("#sign-in-codex").disabled = codexBusy || closed;
     $("#sign-in-pi").disabled = closed;
     $("#sign-in-codex").textContent = codexBusy ? "Codex · Sign-in busy" : "Codex · device code";
-    $("#sign-out-pi").hidden = !piSignedIn(state.piByID?.get(id));
+    $("#sign-out-pi").hidden = !id || !piSignedIn(state.piByID?.get(id));
     $("#pi-sign-in-step").hidden = true;
     $("#pi-callback-input").value = "";
     dialog.showModal();
@@ -770,8 +775,14 @@
   }
 
   async function piStartSignIn() {
-    const id = $("#sign-in-dialog").dataset.accountId;
+    const dialog = $("#sign-in-dialog");
     try {
+      if (!dialog.dataset.accountId) {
+        const response = await api("/accounts", { method: "POST", body: JSON.stringify({ authType: "codex_device_auth", priority: 100, enabled: true, inPool: true }) });
+        dialog.dataset.accountId = response.account.id;
+        dialog.dataset.created = "1";
+      }
+      const id = dialog.dataset.accountId;
       const started = await api(`/accounts/${encodeURIComponent(id)}/pi/login/start`, { method: "POST" });
       window.open(started.authorizeUrl, "_blank", "noopener");
       $("#pi-redirect-uri").textContent = started.redirectUri;
@@ -789,6 +800,7 @@
     if (!landed) return;
     try {
       await api(`/accounts/${encodeURIComponent(id)}/pi/login/complete`, { method: "POST", body: JSON.stringify({ callbackUrl: landed }) });
+      dialog.dataset.done = "1";
       dialog.close();
       refresh(true);
     } catch (error) {
@@ -829,12 +841,6 @@
       // Missing means an older server; the product default is off.
       primeSwitch.checked = serviceState?.quotaPrime === true;
       primeSwitch.disabled = false;
-    }
-    const piSwitch = $("#pi-channel-switch");
-    if (piSwitch) {
-      // Missing means an older server without the channel; shown off.
-      piSwitch.checked = serviceState?.piChannel === true;
-      piSwitch.disabled = serviceState?.piChannel === undefined;
     }
     const routingPill = $("#routing-strategy-pill");
     if (routingPill) {
@@ -1569,6 +1575,14 @@
   const upstreamOpen = () => state.data?.serviceState?.upstreamEnabled === true;
   const UPSTREAM_CLOSED_SIGN_IN = "Upstream is closed. Open the upstream switch first: signing in talks to OpenAI.";
 
+  function addAccount() {
+    if (!upstreamOpen()) {
+      window.alert(UPSTREAM_CLOSED_SIGN_IN);
+      return;
+    }
+    openSignIn("");
+  }
+
   async function createAccountAndStartLogin() {
     if (!upstreamOpen()) {
       window.alert(UPSTREAM_CLOSED_SIGN_IN);
@@ -1604,7 +1618,6 @@
   const updatePreserveProQuota = updateSetting("preserveProQuota", false);
   const updateLineageAffinity = updateSetting("lineageAffinity", true);
   const updateQuotaPrime = updateSetting("quotaPrime", false);
-  const updatePiChannel = updateSetting("piChannel", false);
   // The reserve's switch saves at once; its two thresholds save together.
   const saveQuotaReserve = async (body) => {
     try {
@@ -1759,15 +1772,18 @@
   });
   $("#sign-in-button").addEventListener("click", () => showLogin());
   $("#logout-button").addEventListener("click", async () => { try { await api("/logout", { method: "POST" }); } catch (_) {} sessionStorage.removeItem("codexPoolCsrf"); state.csrfToken = ""; showPublicDashboard(); });
-  $("#add-account-button").addEventListener("click", createAccountAndStartLogin);
+  $("#add-account-button").addEventListener("click", addAccount);
   $("#preserve-pro-quota-switch").addEventListener("change", updatePreserveProQuota);
   $("#lineage-affinity-switch").addEventListener("change", updateLineageAffinity);
   $("#quota-prime-switch").addEventListener("change", updateQuotaPrime);
-  $("#pi-channel-switch").addEventListener("change", updatePiChannel);
   $("#sign-in-codex").addEventListener("click", async () => {
     const dialog = $("#sign-in-dialog");
     const id = dialog.dataset.accountId;
     dialog.close();
+    if (!id) {
+      await createAccountAndStartLogin();
+      return;
+    }
     if (!window.confirm("Repair the Codex sign-in for this slot? Sign in with the same upstream account to preserve its cache and affinity history.")) return;
     try { await startDeviceAuth(id); } catch (error) { window.alert(error.message); }
     refresh(true);
@@ -1776,6 +1792,16 @@
   $("#pi-sign-in-finish").addEventListener("click", piFinishSignIn);
   $("#sign-out-pi").addEventListener("click", piSignOut);
   $("#close-sign-in-button").addEventListener("click", () => $("#sign-in-dialog").close());
+  // A slot made for a Pi sign-in that was not finished is removed again, so
+  // Add account never leaves an empty slot behind.
+  $("#sign-in-dialog").addEventListener("close", async () => {
+    const dialog = $("#sign-in-dialog");
+    if (dialog.dataset.created !== "1" || dialog.dataset.done === "1") return;
+    const id = dialog.dataset.accountId;
+    dialog.dataset.created = "";
+    try { await api(`/accounts/${encodeURIComponent(id)}`, { method: "DELETE" }); } catch (_) {}
+    refresh(true);
+  });
   $("#quota-reserve-switch").addEventListener("change", updateQuotaReserve);
   $("#quota-reserve-save").addEventListener("click", updateQuotaReserveThresholds);
   $("#upstream-switch").addEventListener("change", updateUpstreamSwitch);
