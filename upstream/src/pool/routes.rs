@@ -22,7 +22,6 @@ use super::proxy::handle_proxy;
 use super::proxy::parse_model;
 use super::server::query_param;
 use super::server::request_api_key;
-use super::status::to_value;
 use super::time::Timestamp;
 use bytes::Bytes;
 use http::HeaderMap;
@@ -717,7 +716,7 @@ fn handle_models(app: &App, request: &Request, writer: &mut dyn ResponseWriter) 
         // capability fields makes the model manager retry during app-server
         // startup and can starve unrelated MCP app initialization until it
         // times out.
-        let catalog = to_value(&inner.codex_model_catalog(&models));
+        let catalog = inner.codex_model_catalog_json(&models);
         drop(inner);
         write_json(
             writer,
