@@ -1502,7 +1502,7 @@ async fn attempts(
                     candidate.id,
                     status.as_u16()
                 ));
-                app.pi_channel.mark(&candidate.id, reason);
+                app.pi_mark(&candidate.id, reason);
                 excluded.insert(candidate.id.clone(), true);
                 failover_from.clone_from(&candidate.id);
                 failover_outcome = "pi_failover".to_string();
@@ -1938,7 +1938,7 @@ async fn attempts(
                 use super::pi_channel::Verdict;
                 match super::pi_channel::stream_failure_verdict(&info.terminal_error_code) {
                     Some(Verdict::Limited(code)) => {
-                        app.pi_channel.mark(
+                        app.pi_mark(
                             &candidate.id,
                             Unavailable::Limited {
                                 code,
@@ -1949,7 +1949,7 @@ async fn attempts(
                     }
                     Some(_) => info.terminal_failure_class = "pi_channel".to_string(),
                     None if info.terminal_failure_class == "authentication" => {
-                        app.pi_channel.mark(
+                        app.pi_mark(
                             &candidate.id,
                             Unavailable::SignIn(info.terminal_error_code.clone()),
                         );

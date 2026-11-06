@@ -210,7 +210,7 @@ async fn a_usage_limit_rests_the_account_on_this_channel_only() {
     assert_eq!(result.code(), 200, "{}", result.body_string());
     assert_eq!(upstream.count(), 2);
     assert!(matches!(
-        app.pi_channel.unavailable("acct-a", Timestamp::now()),
+        app.pi_unavailable("acct-a", Timestamp::now()),
         Some(Unavailable::Limited { .. })
     ));
     assert!(codex_credential_untouched(&app, "acct-a"));
@@ -232,7 +232,7 @@ async fn an_unauthorized_token_asks_for_a_new_sign_in_without_touching_codex() {
     let result = serve(&app, pi_request(PI_BODY)).await;
     assert_eq!(result.code(), 200, "{}", result.body_string());
     assert!(matches!(
-        app.pi_channel.unavailable("acct-a", Timestamp::now()),
+        app.pi_unavailable("acct-a", Timestamp::now()),
         Some(Unavailable::SignIn(_))
     ));
     assert!(codex_credential_untouched(&app, "acct-a"));
@@ -262,11 +262,43 @@ async fn an_unsupported_capability_is_the_callers_to_fix() {
         1,
         "the same body must not go to another account"
     );
+    assert!(app.pi_unavailable("acct-a", Timestamp::now()).is_none());
+}
+
+#[tokio::test]
+async fn a_resting_account_stays_resting_after_a_restart() {
+    // A restart must not spend a request on an account upstream just
+    // refused: the mark is kept in the account's directory.
+    let upstream = FakeServer::start(|_| ok_stream()).await;
+    let (app, dir) = pi_app(&upstream, &["acct-a"]);
+    app.pi_mark(
+        "acct-a",
+        Unavailable::Limited {
+            code: "subscription_sharing_usage_limit_exceeded".to_string(),
+            until: Timestamp::now().add(super::time::minutes(30)),
+        },
+    );
+    let accounts = app.read().config.accounts().to_vec();
+    let restarted = App::for_test(dir.path(), accounts);
+    assert!(matches!(
+        restarted.pi_unavailable("acct-a", Timestamp::now()),
+        Some(Unavailable::Limited { .. })
+    ));
+    // An ended rest is forgotten, file included.
+    restarted.pi_mark(
+        "acct-a",
+        Unavailable::Limited {
+            code: "subscription_sharing_usage_limit_exceeded".to_string(),
+            until: Timestamp::now().add(-super::time::minutes(1)),
+        },
+    );
     assert!(
-        app.pi_channel
-            .unavailable("acct-a", Timestamp::now())
+        restarted
+            .pi_unavailable("acct-a", Timestamp::now())
             .is_none()
     );
+    let home = restarted.read().account_codex_home("acct-a");
+    assert!(!home.join(super::pi_channel::STATE_FILE).exists());
 }
 
 #[tokio::test]
@@ -288,7 +320,7 @@ async fn a_usage_limit_mid_stream_rests_the_account() {
     let result = serve(&app, pi_request(PI_BODY)).await;
     assert!(result.body_string().contains("response.failed"));
     assert!(matches!(
-        app.pi_channel.unavailable("acct-a", Timestamp::now()),
+        app.pi_unavailable("acct-a", Timestamp::now()),
         Some(Unavailable::Limited { .. })
     ));
     assert!(codex_credential_untouched(&app, "acct-a"));
@@ -349,7 +381,7 @@ async fn a_spent_refresh_token_asks_for_a_new_sign_in() {
     let result = serve(&app, pi_request(PI_BODY)).await;
     assert_ne!(result.code(), 200);
     assert!(matches!(
-        app.pi_channel.unavailable("acct-a", Timestamp::now()),
+        app.pi_unavailable("acct-a", Timestamp::now()),
         Some(Unavailable::SignIn(_))
     ));
     assert!(codex_credential_untouched(&app, "acct-a"));

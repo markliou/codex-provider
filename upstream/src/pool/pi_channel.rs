@@ -155,8 +155,12 @@ pub struct Credential {
     pub scopes: Vec<String>,
 }
 
-/// Why the channel cannot use an account right now.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why the channel cannot use an account right now. Kept in the account's
+/// directory as well (STATE_FILE), so a restart does not try a refused or
+/// resting account again only to be refused: each such try is a request
+/// upstream answers for nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "camelCase")]
 pub enum Unavailable {
     /// No credential, or upstream refused it for good: the owner signs in.
     SignIn(String),
@@ -176,12 +180,16 @@ struct Pending {
     started: Timestamp,
 }
 
-/// The channel's in-memory state.
+pub const STATE_FILE: &str = "pi-state.json";
+
+/// The channel's in-memory state; each account's `Unavailable` is read from
+/// its STATE_FILE the first time it is asked for (App::pi_unavailable).
 #[derive(Default)]
 pub struct PiChannel {
     endpoints: std::sync::RwLock<Endpoints>,
     pending: std::sync::Mutex<HashMap<String, Pending>>,
     unavailable: std::sync::Mutex<HashMap<String, Unavailable>>,
+    loaded: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl PiChannel {
@@ -199,7 +207,9 @@ impl PiChannel {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = endpoints;
     }
 
-    pub fn unavailable(&self, account_id: &str, now: Timestamp) -> Option<Unavailable> {
+    /// The account's state in memory; `None` for a rest that has ended
+    /// (`expired` then says so, for the caller to forget the file too).
+    fn unavailable(&self, account_id: &str, now: Timestamp) -> (Option<Unavailable>, bool) {
         let mut all = self
             .unavailable
             .lock()
@@ -207,24 +217,70 @@ impl PiChannel {
         match all.get(account_id) {
             Some(Unavailable::Limited { until, .. }) if !now.before(until) => {
                 all.remove(account_id);
-                None
+                (None, true)
             }
-            other => other.cloned(),
+            other => (other.cloned(), false),
         }
     }
 
-    pub fn mark(&self, account_id: &str, reason: Unavailable) {
-        self.unavailable
+    fn set(&self, account_id: &str, reason: Option<Unavailable>) {
+        let mut all = self
+            .unavailable
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(account_id.to_string(), reason);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match reason {
+            Some(reason) => all.insert(account_id.to_string(), reason),
+            None => all.remove(account_id),
+        };
     }
 
-    pub fn clear(&self, account_id: &str) {
-        self.unavailable
+    /// Whether the account's file still has to be read (once per process).
+    fn first_look(&self, account_id: &str) -> bool {
+        self.loaded
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(account_id);
+            .insert(account_id.to_string())
+    }
+}
+
+impl App {
+    /// The account's state on the channel, read from its file the first
+    /// time this process asks.
+    pub fn pi_unavailable(&self, account_id: &str, now: Timestamp) -> Option<Unavailable> {
+        let home = self.read().account_codex_home(account_id);
+        if self.pi_channel.first_look(account_id)
+            && let Ok(text) = std::fs::read_to_string(home.join(STATE_FILE))
+            && let Ok(reason) = serde_json::from_str::<Unavailable>(&text)
+        {
+            self.pi_channel.set(account_id, Some(reason));
+        }
+        let (reason, expired) = self.pi_channel.unavailable(account_id, now);
+        if expired {
+            let _ = std::fs::remove_file(home.join(STATE_FILE));
+        }
+        reason
+    }
+
+    /// Marks the account, in memory and in its file.
+    pub fn pi_mark(&self, account_id: &str, reason: Unavailable) {
+        self.pi_channel.first_look(account_id);
+        let home = self.read().account_codex_home(account_id);
+        if let Err(error) = std::fs::create_dir_all(&home)
+            .and_then(|()| super::app::write_json_atomic(&home.join(STATE_FILE), &reason))
+        {
+            self.logger.printf(&format!(
+                "pi channel state for {account_id} not saved: {error}"
+            ));
+        }
+        self.pi_channel.set(account_id, Some(reason));
+    }
+
+    /// Clears the account's mark, in memory and in its file.
+    pub fn pi_clear(&self, account_id: &str) {
+        self.pi_channel.first_look(account_id);
+        let home = self.read().account_codex_home(account_id);
+        let _ = std::fs::remove_file(home.join(STATE_FILE));
+        self.pi_channel.set(account_id, None);
     }
 }
 
@@ -814,7 +870,7 @@ impl App {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(account_id);
-        self.pi_channel.clear(account_id);
+        self.pi_clear(account_id);
         self.logger
             .printf(&format!("pi channel signed in for {account_id}"));
         Ok(())
@@ -829,7 +885,7 @@ impl App {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
             _ => {}
         }
-        self.pi_channel.mark(
+        self.pi_mark(
             account_id,
             Unavailable::SignIn("signed out by the owner".to_string()),
         );
@@ -942,8 +998,7 @@ impl App {
         let credential = match self.pi_credential(&candidate.id).await {
             Ok(credential) => credential,
             Err(error) if error.permanent => {
-                self.pi_channel
-                    .mark(&candidate.id, Unavailable::SignIn(error.message.clone()));
+                self.pi_mark(&candidate.id, Unavailable::SignIn(error.message.clone()));
                 return Err(ForwardError::Auth(error.message));
             }
             Err(error) => return Err(ForwardError::Transport(error.message)),
@@ -989,7 +1044,7 @@ impl App {
             .filter(|(id, home, chatgpt)| {
                 !chatgpt
                     || read_credential(home).is_none()
-                    || self.pi_channel.unavailable(id, now).is_some()
+                    || self.pi_unavailable(id, now).is_some()
             })
             .map(|(id, _, _)| id)
             .collect()
@@ -1011,7 +1066,7 @@ impl App {
         ids.into_iter()
             .map(|(id, home)| {
                 let signed_in = read_credential(&home).is_some();
-                let (state, detail) = match self.pi_channel.unavailable(&id, now) {
+                let (state, detail) = match self.pi_unavailable(&id, now) {
                     Some(Unavailable::SignIn(detail)) => ("sign_in", detail),
                     Some(Unavailable::Refused(code)) => ("refused", code),
                     Some(Unavailable::Limited { code, until }) => {
