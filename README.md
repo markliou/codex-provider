@@ -548,7 +548,10 @@ sh scripts/conformance/codex-conformance.sh diff <tag>   # every change to the w
   header order and values, and bodies. It covers HTTP, the WebSocket, the native
   endpoint, a subagent, compaction and a failover between two accounts, plus the
   pool's own calls and a quota prime. It also reports the custom-provider client
-  gap separately. Output goes to `scripts/conformance/out/` (git-ignored).
+  gap separately. It then runs the request-shape phases again on gpt-6.1-sol, a
+  Responses Lite model (tools as an `additional_tools` item, code-mode tools);
+  the scripted scenarios stay on gpt-5.5, since a code-mode model calls nested
+  tools through `exec`. `CONFORMANCE_MODEL=<model>` runs one model only. Output goes to `scripts/conformance/out/` (git-ignored).
 
 Moving to a new Codex release is described in AGENTS.md.
 
