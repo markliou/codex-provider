@@ -521,3 +521,29 @@ fn pis_headers_are_the_measured_ones() {
         .collect();
     assert_eq!(ours, measured);
 }
+
+#[tokio::test]
+async fn the_channel_counts_its_own_usage() {
+    // Upstream gives an app no plan-usage reading; the pool sums each
+    // answer's usage for the Console's Pi badge.
+    let upstream = FakeServer::start(|_| {
+        sse_response(&[
+            created("resp_pi"),
+            completed(
+                "resp_pi",
+                r#"{"input_tokens":10,"input_tokens_details":{"cached_tokens":4},"output_tokens":2,"total_tokens":12}"#,
+            ),
+        ])
+    })
+    .await;
+    let (app, _dir) = pi_app(&upstream, &["acct-a"]);
+    for _ in 0..2 {
+        let result = serve(&app, pi_request(PI_BODY)).await;
+        assert_eq!(result.code(), 200, "{}", result.body_string());
+    }
+    let usage = app.pi_usage("acct-a");
+    assert_eq!(usage["fiveHours"]["requests"], 2);
+    assert_eq!(usage["fiveHours"]["inputTokens"], 20);
+    assert_eq!(usage["fiveHours"]["cachedTokens"], 8);
+    assert_eq!(usage["week"]["outputTokens"], 4);
+}

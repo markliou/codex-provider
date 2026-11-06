@@ -190,6 +190,8 @@ pub struct PiChannel {
     pending: std::sync::Mutex<HashMap<String, Pending>>,
     unavailable: std::sync::Mutex<HashMap<String, Unavailable>>,
     loaded: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Serializes the usage files' read-modify-write.
+    usage_lock: std::sync::Mutex<()>,
 }
 
 impl PiChannel {
@@ -243,7 +245,120 @@ impl PiChannel {
     }
 }
 
+pub const USAGE_FILE: &str = "pi-usage.json";
+/// Kept a little past the week the Console shows.
+const USAGE_HOURS_KEPT: i64 = 8 * 24;
+
+/// One hour of the channel's use of an account, from each answer's own
+/// usage. OpenAI offers no way for an app to read its plan usage (the
+/// route's docs send the user to ChatGPT's Settings > Usage page), so this
+/// is the pool's own count; the plan's windows are the Codex channel's quota
+/// poll, which both channels share.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageHour {
+    pub hour: i64,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub output_tokens: u64,
+}
+
+fn read_usage(home: &Path) -> Vec<UsageHour> {
+    std::fs::read_to_string(home.join(USAGE_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Sums the hours from `since` (an hour number) on.
+fn usage_total(hours: &[UsageHour], since: i64) -> Value {
+    let mut total = UsageHour::default();
+    for hour in hours.iter().filter(|hour| hour.hour >= since) {
+        total.requests += hour.requests;
+        total.input_tokens += hour.input_tokens;
+        total.cached_tokens += hour.cached_tokens;
+        total.output_tokens += hour.output_tokens;
+    }
+    serde_json::json!({
+        "requests": total.requests,
+        "inputTokens": total.input_tokens,
+        "cachedTokens": total.cached_tokens,
+        "outputTokens": total.output_tokens,
+    })
+}
+
 impl App {
+    /// Adds one answer's usage to the account's current hour.
+    pub fn pi_record_usage(
+        &self,
+        account_id: &str,
+        usage: &super::response_info::PromptCacheUsage,
+    ) {
+        let home = self.read().account_codex_home(account_id);
+        let hour = Timestamp::now().unix() / 3600;
+        let _guard = self
+            .pi_channel
+            .usage_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut hours = read_usage(&home);
+        hours.retain(|kept| kept.hour > hour - USAGE_HOURS_KEPT);
+        if hours.last().is_none_or(|last| last.hour != hour) {
+            hours.push(UsageHour {
+                hour,
+                ..UsageHour::default()
+            });
+        }
+        if let Some(current) = hours.last_mut() {
+            current.requests += 1;
+            current.input_tokens += usage.input_tokens;
+            current.cached_tokens += usage.cached_tokens;
+            current.output_tokens += usage.output_tokens;
+        }
+        if let Err(error) = std::fs::create_dir_all(&home)
+            .and_then(|()| super::app::write_json_atomic(&home.join(USAGE_FILE), &hours))
+        {
+            self.logger.printf(&format!(
+                "pi channel usage for {account_id} not saved: {error}"
+            ));
+        }
+    }
+
+    /// The account's use of the channel over the last five hours and the
+    /// last seven days, in whole hours (the current hour included).
+    pub fn pi_usage(&self, account_id: &str) -> Value {
+        let home = self.read().account_codex_home(account_id);
+        let hours = read_usage(&home);
+        let now = Timestamp::now().unix() / 3600;
+        serde_json::json!({
+            "fiveHours": usage_total(&hours, now - 4),
+            "week": usage_total(&hours, now - 7 * 24 + 1),
+            "lastHour": hours.last().map(|last| last.hour * 3600),
+        })
+    }
+
+    /// One line per distinct set of response header names on this channel,
+    /// names only: what upstream sends back here is not documented, and a
+    /// usage or limit header would show up in this list first.
+    pub fn note_pi_response_headers(&self, headers: &HeaderMap) {
+        let mut names: Vec<&str> = headers.keys().map(http::HeaderName::as_str).collect();
+        names.sort_unstable();
+        names.dedup();
+        let list = names.join(",");
+        let first = {
+            let mut seen = self
+                .unrelayed_header_sets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            seen.len() < 256 && seen.insert(format!("pi-response:{list}"))
+        };
+        if first {
+            self.logger
+                .printf(&format!("pi channel response header names: {list}"));
+        }
+    }
+
     /// The account's state on the channel, read from its file the first
     /// time this process asks.
     pub fn pi_unavailable(&self, account_id: &str, now: Timestamp) -> Option<Unavailable> {
@@ -1075,7 +1190,7 @@ impl App {
                     None if signed_in => ("ready", String::new()),
                     None => ("sign_in", "not signed in".to_string()),
                 };
-                serde_json::json!({"accountId": id, "state": state, "detail": detail})
+                serde_json::json!({"accountId": id, "state": state, "detail": detail, "usage": self.pi_usage(&id)})
             })
             .collect()
     }

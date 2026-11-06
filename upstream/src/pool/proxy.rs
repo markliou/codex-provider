@@ -1764,6 +1764,9 @@ async fn attempts(
             continue;
         }
         let response_headers = response.headers.clone();
+        if pi.is_some() {
+            app.note_pi_response_headers(&response_headers);
+        }
         let info = if !convert_response && is_streaming(&response.headers) {
             let account_headers = app.current_account_response_headers(&candidate.id);
             let mut before_commit = |writer: &mut dyn ResponseWriter| {
@@ -1957,6 +1960,7 @@ async fn attempts(
                     }
                     None => {}
                 }
+                app.pi_record_usage(&candidate.id, &info.usage);
             }
             app.mark_terminal_response_failure(
                 route,
@@ -1972,6 +1976,12 @@ async fn attempts(
         // as a healthy connection, but client throughput success is stricter:
         // only a 2xx response belongs in the success numerator.
         throughput.success = status.is_success();
+        if pi.is_some() {
+            // The route reports no plan usage the pool can read, so the
+            // channel keeps its own count from each answer's usage
+            // (pi_channel.rs, the Console's Pi badge).
+            app.pi_record_usage(&candidate.id, &info.usage);
+        }
         app.mark_success_with_measurement(route, model, &candidate.id, &info, Some(throughput));
         return;
     }

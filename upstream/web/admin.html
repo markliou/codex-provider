@@ -118,16 +118,6 @@
             </label>
           </section>
 
-          <!-- The Pi channel's sign-ins (SPEC.md 2.3.7). Each ChatGPT account
-               signs in for it separately from its Codex sign-in; the browser
-               lands on a 127.0.0.1 address only the owner's machine receives,
-               so the owner pastes that address back here. -->
-          <section id="pi-channel-card" class="pi-channel-card management-only" aria-label="Pi channel" hidden>
-            <div class="eyebrow">PI CHANNEL</div>
-            <p id="pi-channel-summary" class="pi-channel-summary"></p>
-            <ul id="pi-channel-accounts" class="pi-channel-accounts"></ul>
-          </section>
-
           <!-- The global quota reserve (SPEC.md 9.7): on by default at 10% of
                each window, the owner's choice, because ChatGPT and Codex are
                to share one allowance and an account's owner keeps that much
@@ -287,6 +277,26 @@
           <div class="device-auth-row-heading"><span class="device-auth-label">Verification code</span><button class="copy-button" type="button" data-copy-target="device-auth-code" data-copy-label="Copy" aria-label="Copy verification code" disabled>Copy</button></div>
           <code id="device-auth-code" class="device-auth-code"></code>
         </div>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- One sign-in chooser per account (SPEC.md 2.3.7): Codex's device code,
+       or Pi's browser sign-in. Pi's sign-in lands the browser on a 127.0.0.1
+       address only the owner's machine receives, so the owner pastes it
+       here and the pool finishes the sign-in with it. -->
+  <dialog id="sign-in-dialog" class="device-dialog">
+    <div class="device-auth-panel">
+      <div class="dialog-heading"><div><div class="eyebrow">LOG IN</div><h2 id="sign-in-account"></h2></div><button id="close-sign-in-button" class="button quiet" type="button">Close</button></div>
+      <div class="sign-in-choices">
+        <button id="sign-in-codex" class="button primary" type="button">Codex · device code</button>
+        <button id="sign-in-pi" class="button secondary" type="button">Pi · browser sign-in</button>
+        <button id="sign-out-pi" class="button warn" type="button" hidden>Sign out of Pi</button>
+      </div>
+      <div id="pi-sign-in-step" class="pi-sign-in-step" hidden>
+        <p>In the new tab, log in with this account's ChatGPT login and allow it. The browser then goes to an address starting with <code id="pi-redirect-uri">http://127.0.0.1:1455/auth/callback</code>; that page does not load, which is expected. Copy the whole address from the address bar and paste it here.</p>
+        <input id="pi-callback-input" type="url" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:1455/auth/callback?code=…">
+        <button id="pi-sign-in-finish" class="button primary" type="button">Finish</button>
       </div>
     </div>
   </dialog>
