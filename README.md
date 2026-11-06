@@ -253,13 +253,15 @@ one device-auth job runs at a time.
 An account can hold a Codex sign-in, a Pi sign-in, or both. The account row
 shows a badge per sign-in it holds (**Codex**, **Pi**). **Add account** and each
 row's **Repair sign-in** open the same chooser: **Codex · device code** is the
-device flow above; **Pi · browser sign-in** opens OpenAI's sign-in page
-(`auth.openai.com`) in a new tab. An account signed in for Pi alone serves only
+device flow above; **Pi · browser sign-in** shows a link to OpenAI's sign-in
+page (`auth.openai.com`) with a **Copy** button, to open in whichever browser
+holds the account's ChatGPT login. An account signed in for Pi alone serves only
 Pi requests and is never given a Codex request.
 
 1. Upstream must be open: the last step talks to OpenAI.
-2. Log in with the account's ChatGPT login and allow it.
-3. The browser then goes to `http://127.0.0.1:1455/auth/callback?code=...`.
+2. Open the link in the browser with the account's ChatGPT login, log in and
+   allow it.
+3. That browser then goes to `http://127.0.0.1:1455/auth/callback?code=...`.
    That page does not load, which is expected: the pool is not on your machine.
    Copy the whole address from the address bar, paste it into the chooser, and
    choose **Finish**. Do it at once; the code is single-use and short-lived.

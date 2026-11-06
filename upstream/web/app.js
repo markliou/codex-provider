@@ -763,6 +763,9 @@
     $("#sign-out-pi").hidden = !id || !piSignedIn(state.piByID?.get(id));
     $("#pi-sign-in-step").hidden = true;
     $("#pi-callback-input").value = "";
+    $("#pi-authorize-url").textContent = "";
+    $("#pi-authorize-url").removeAttribute("href");
+    $("[data-copy-target='pi-authorize-url']").disabled = true;
     dialog.showModal();
   }
 
@@ -784,7 +787,12 @@
       }
       const id = dialog.dataset.accountId;
       const started = await api(`/accounts/${encodeURIComponent(id)}/pi/login/start`, { method: "POST" });
-      window.open(started.authorizeUrl, "_blank", "noopener");
+      // Shown with a Copy button, not opened here: the account's ChatGPT
+      // login is often in another browser, where the owner pastes the link.
+      const link = $("#pi-authorize-url");
+      link.textContent = started.authorizeUrl;
+      link.href = started.authorizeUrl;
+      $("[data-copy-target='pi-authorize-url']").disabled = false;
       $("#pi-redirect-uri").textContent = started.redirectUri;
       $("#pi-sign-in-step").hidden = false;
       $("#pi-callback-input").focus();
@@ -1807,6 +1815,10 @@
   $("#upstream-switch").addEventListener("change", updateUpstreamSwitch);
   $("#close-device-auth-button").addEventListener("click", () => closeDeviceAuth(true));
   $("#device-auth-dialog").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-copy-target]");
+    if (button) handleCopyButton(button);
+  });
+  $("#sign-in-dialog").addEventListener("click", (event) => {
     const button = event.target.closest("[data-copy-target]");
     if (button) handleCopyButton(button);
   });
