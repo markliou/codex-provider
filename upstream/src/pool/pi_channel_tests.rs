@@ -732,3 +732,25 @@ fn what_pi_sends_the_pool_becomes_what_pi_signed_in_sends() {
         .collect();
     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
 }
+
+#[tokio::test]
+async fn a_stream_without_a_content_type_is_still_read_as_one() {
+    // The route's answer carries no Content-Type (measured on the first
+    // live answer); its usage must still be read.
+    let upstream = FakeServer::start(|_| {
+        let mut reply = sse_response(&[
+            created("resp_pi"),
+            completed(
+                "resp_pi",
+                r#"{"input_tokens":7,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"total_tokens":8}"#,
+            ),
+        ]);
+        reply.headers.clear();
+        reply
+    })
+    .await;
+    let (app, _dir) = pi_app(&upstream, &["acct-a"]);
+    let result = serve(&app, pi_request(PI_BODY)).await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    assert_eq!(app.pi_usage("acct-a")["fiveHours"]["inputTokens"], 7);
+}

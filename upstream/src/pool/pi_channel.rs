@@ -1323,9 +1323,26 @@ impl App {
             Some(&order),
         )
         .map_err(ForwardError::Transport)?;
-        crate::transport::send_request(&self.transports, request, &after)
+        let mut response = crate::transport::send_request(&self.transports, request, &after)
             .await
-            .map_err(|failure| ForwardError::Transport(format!("pi upstream: {failure}")))
+            .map_err(|failure| ForwardError::Transport(format!("pi upstream: {failure}")))?;
+        // This route answers its stream with no Content-Type at all, as the
+        // Codex backend does (measured: the first live answer's header names
+        // had none). Every request here streams, so a success without one is
+        // that stream; read as a plain body, the pool saw no terminal event
+        // and no usage, and the pre-commit window never ran (App::forward
+        // does the same for the Codex channel).
+        if response.status.is_success()
+            && super::http_io::header_value(&response.headers, "content-type")
+                .trim()
+                .is_empty()
+        {
+            response.headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/event-stream"),
+            );
+        }
+        Ok(response)
     }
 
     /// The accounts this channel cannot use now, for the attempt loop's
