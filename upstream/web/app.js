@@ -728,14 +728,14 @@
       const missing = health.status === "missing_auth";
       badges.push(`<span class="badge mode-badge codex ${missing ? "off" : "ready"}" title="${missing ? "Codex sign-in needs repair" : "Signed in for Codex"}">${missing ? "Codex · sign in again" : "Codex"}</span>`);
     }
-    if (piSignedIn(pi)) {
+    if (state.piEnabled && piSignedIn(pi)) {
       badges.push(`<span class="badge mode-badge pi ${escapeHTML(pi.state)}"${pi.detail ? ` title="${escapeHTML(pi.detail)}"` : ""}>${escapeHTML(PI_STATE_TEXT[pi.state] || "Pi")}</span>`);
     }
     return badges.length ? `<div class="mode-badges">${badges.join("")}</div>` : "";
   }
 
   function piUsageMarkup(pi) {
-    if (!piSignedIn(pi) || !pi.usage) return "";
+    if (!state.piEnabled || !piSignedIn(pi) || !pi.usage) return "";
     const line = (label, total) => total && Number(total.requests) > 0
       ? `${label}: ${Number(total.requests)} req · ${formatTokens(total.inputTokens)} in · ${formatTokens(total.outputTokens)} out`
       : `${label}: none`;
@@ -763,6 +763,7 @@
     $("#sign-in-error").hidden = true;
     $("#sign-in-codex").disabled = codexBusy || closed;
     $("#sign-in-pi").disabled = closed;
+    $("#sign-in-pi").hidden = !state.piEnabled;
     $("#sign-in-codex").textContent = codexBusy ? "Codex · Sign-in busy" : "Codex · device code";
     $("#sign-out-pi").hidden = !id || !piSignedIn(state.piByID?.get(id));
     // Neither mode is shown chosen until one is: a filled Codex button read
@@ -1438,6 +1439,9 @@
       state.quotaFloorPercent = finiteMetric(serviceState.quotaFloorPercent) ?? 0;
       const healthByID = new Map(healthResponse.accounts.map((item) => [item.accountId, item]));
       state.piByID = new Map((piResponse?.accounts || []).map((item) => [item.accountId, item]));
+      // With the Pi channel off (the default), Pi's sign-in, badge and usage
+      // are not offered: no request would use them (SPEC.md 2.3.7).
+      state.piEnabled = piResponse?.enabled === true;
       const activeLoginJob = healthResponse.accounts.find((item) => item.loginJob)?.loginJob || null;
       state.data = { serviceState, accounts: accountsResponse.accounts, healthByID, sessions: sessionsResponse.sessions };
       renderSettings(serviceState);
@@ -1500,8 +1504,15 @@
         await api(`/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
       } else if (action === "login") {
         // One Sign in button for both modes; the chooser offers the Codex
-        // device code, which repairs this same slot, and Pi's sign-in.
-        openSignIn(id);
+        // device code, which repairs this same slot, and Pi's sign-in. With
+        // the Pi channel off, the chooser opens only for an account that
+        // still holds a Pi sign-in (to sign it out); else it is the Codex
+        // repair straight away.
+        if (state.piEnabled || piSignedIn(state.piByID?.get(id))) {
+          openSignIn(id);
+        } else {
+          await repairCodex(id);
+        }
         return;
       } else if (action === "quota/reset-credit") {
         if (!window.confirm("Spend one reset credit on this account? This is irreversible and consumes real entitlement.")) return;
@@ -1606,7 +1617,18 @@
       window.alert(UPSTREAM_CLOSED_SIGN_IN);
       return;
     }
-    openSignIn("");
+    // With the Pi channel off there is only the Codex sign-in to choose.
+    if (state.piEnabled) {
+      openSignIn("");
+    } else {
+      createAccountAndStartLogin();
+    }
+  }
+
+  async function repairCodex(id) {
+    if (!window.confirm("Repair the Codex sign-in for this slot? Sign in with the same upstream account to preserve its cache and affinity history.")) return;
+    try { await startDeviceAuth(id); } catch (error) { window.alert(error.message); }
+    refresh(true);
   }
 
   async function createAccountAndStartLogin() {
@@ -1810,9 +1832,7 @@
       await createAccountAndStartLogin();
       return;
     }
-    if (!window.confirm("Repair the Codex sign-in for this slot? Sign in with the same upstream account to preserve its cache and affinity history.")) return;
-    try { await startDeviceAuth(id); } catch (error) { window.alert(error.message); }
-    refresh(true);
+    await repairCodex(id);
   });
   $("#sign-in-pi").addEventListener("click", piStartSignIn);
   $("#pi-sign-in-finish").addEventListener("click", piFinishSignIn);
