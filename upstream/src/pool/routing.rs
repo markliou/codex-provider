@@ -299,32 +299,46 @@ pub fn client_fingerprint_from(
     facts: &RequestFacts<'_>,
     payload: &Map<String, Value>,
 ) -> ClientFingerprint {
+    // The product token runs to the "/" and the release to the next space,
+    // as credentials::codex_product reads it: the desktop app's originator
+    // "Codex Desktop" has a space, and cutting at the first space recorded it
+    // as "Codex".
     let user_agent = header(facts.headers, "user-agent").trim();
-    let user_agent = user_agent
-        .split_once(' ')
-        .map_or(user_agent, |(product, _)| product);
-    let mut request_kind = metadata_object(Some(&Value::String(
-        header(facts.headers, "x-codex-turn-metadata").to_string(),
-    )))
-    .map(|metadata| metadata_string(&metadata, &["request_kind"]))
-    .unwrap_or_default();
+    let product = match super::credentials::codex_product(user_agent) {
+        Some((name, version)) => format!("{name}/{version}"),
+        None => user_agent
+            .split_once(' ')
+            .map_or(user_agent, |(product, _)| product)
+            .to_string(),
+    };
+    // The request's own client_metadata comes first: Codex writes this
+    // request's turn metadata there (rust-v0.167.0 core/src/responses_metadata.rs
+    // client_metadata), while the x-codex-turn-metadata header is its
+    // "compatibility output", and on a WebSocket the header is the
+    // handshake's, sent while Codex prewarmed. Reading the header first
+    // recorded every turn on a socket as "prewarm".
+    let client_metadata = metadata_object(payload.get("client_metadata"));
+    let turn = client_metadata.as_ref().and_then(|metadata| {
+        first_metadata_value(
+            metadata,
+            &["x-codex-turn-metadata", "x_codex_turn_metadata"],
+        )
+    });
+    let mut request_kind = metadata_object(turn)
+        .map(|metadata| metadata_string(&metadata, &["request_kind"]))
+        .unwrap_or_default();
     if request_kind.is_empty() {
-        let client_metadata = metadata_object(payload.get("client_metadata"));
-        let turn = client_metadata.as_ref().and_then(|metadata| {
-            first_metadata_value(
-                metadata,
-                &["x-codex-turn-metadata", "x_codex_turn_metadata"],
-            )
-        });
-        request_kind = metadata_object(turn)
-            .map(|metadata| metadata_string(&metadata, &["request_kind"]))
-            .unwrap_or_default();
+        request_kind = metadata_object(Some(&Value::String(
+            header(facts.headers, "x-codex-turn-metadata").to_string(),
+        )))
+        .map(|metadata| metadata_string(&metadata, &["request_kind"]))
+        .unwrap_or_default();
     }
     let mut entry = if facts.native { "native" } else { "v1" }.to_string();
     entry.push_str(if facts.websocket { "/ws" } else { "/http" });
     ClientFingerprint {
         originator: telemetry_label(header(facts.headers, "originator")),
-        user_agent: telemetry_label(user_agent),
+        user_agent: telemetry_label(&product),
         request_kind: telemetry_label(&request_kind),
         turn_state: String::new(),
         entry,

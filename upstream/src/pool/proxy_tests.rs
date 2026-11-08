@@ -2713,6 +2713,48 @@ async fn client_fingerprint_is_recorded_locally_and_never_sent_upstream() {
     );
 }
 
+// The desktop app's product token has a space ("Codex Desktop"), and the
+// request's own client_metadata names its kind even when the header (on a
+// WebSocket, the handshake's) still says "prewarm".
+#[tokio::test]
+async fn client_fingerprint_reads_the_desktop_app_and_the_request_s_own_kind() {
+    const USER_AGENT: &str =
+        "Codex Desktop/0.167.0 (Mac OS 15.5.0; arm64) unknown (Codex Desktop; 26.1105.1)";
+    let upstream = FakeServer::start(|_| {
+        FakeResponse::json(
+            200,
+            r#"{"id":"resp_fingerprint","object":"response","output":[]}"#,
+        )
+    })
+    .await;
+    let (app, _dir) = arc_app(vec![provider(
+        "provider",
+        100,
+        &format!("{}/v1", upstream.url),
+        "upstream-key",
+    )]);
+    let body = r#"{"model":"gpt-test","input":"hello","client_metadata":{"x-codex-turn-metadata":"{\"thread_id\":\"thread-a\",\"request_kind\":\"turn\"}"}}"#;
+    let request = post("/v1/responses", body)
+        .with_header("originator", "Codex Desktop")
+        .with_header("user-agent", USER_AGENT)
+        .with_header(
+            "x-codex-turn-metadata",
+            r#"{"thread_id":"thread-a","request_kind":"prewarm"}"#,
+        );
+    let result = serve(&app, request).await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    let events = events(&app);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        (
+            events[0].client_originator.as_str(),
+            events[0].client_user_agent.as_str(),
+            events[0].client_request_kind.as_str()
+        ),
+        ("Codex_Desktop", "Codex_Desktop/0.167.0", "turn")
+    );
+}
+
 // Go TestTurnStateIsRelayedOnlyToTheAccountThatIssuedIt.
 #[tokio::test]
 async fn turn_state_is_relayed_only_to_the_account_that_issued_it() {

@@ -269,7 +269,7 @@ pub fn codex_client_version(headers: &HeaderMap) -> String {
 /// (app-server/src/request_processors/initialize_processor.rs). So the name
 /// runs to the first "/", never to the first space; cutting at the space read
 /// "Codex Desktop/0.167.0 (...)" as "Codex" and refused the desktop app.
-fn codex_product(user_agent: &str) -> Option<(&str, &str)> {
+pub fn codex_product(user_agent: &str) -> Option<(&str, &str)> {
     let (name, rest) = user_agent.split_once('/')?;
     let version = rest.split_once(' ').map_or(rest, |(version, _)| version);
     Some((name, version))
