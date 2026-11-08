@@ -51,7 +51,7 @@ pub struct Settings {
     pub shutdown_grace: Duration,
     /// The starting values of the Console switches; config.json overrides
     /// them at load (Go app.preserveProQuota and friends).
-    pub preserve_pro_quota: bool,
+    pub five_hour_first: bool,
     pub lineage_affinity: bool,
     pub quota_prime: bool,
     /// CODEX_POOL_PI_CHANNEL: whether an app's non-Codex /v1 request goes on
@@ -142,7 +142,7 @@ impl Settings {
             codex_base_url: "https://chatgpt.example.test/backend-api".to_string(),
             default_model_override: None,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
-            preserve_pro_quota: false,
+            five_hour_first: false,
             lineage_affinity: true,
             quota_prime: false,
             pi_channel: false,
@@ -244,10 +244,12 @@ impl Settings {
         let prompt_cache_buckets = prompt_cache_buckets(&get("CODEX_POOL_PROMPT_CACHE_BUCKETS"))?;
         let prompt_cache_retention =
             prompt_cache_retention(&get("CODEX_POOL_PROMPT_CACHE_RETENTION"))?;
-        let preserve_pro_quota = bool_from_env(
-            &get("CODEX_POOL_PRESERVE_PRO_QUOTA"),
-            "CODEX_POOL_PRESERVE_PRO_QUOTA",
-            false,
+        // 5h limit first defaults on, the owner's choice (2026-11-08): accounts
+        // with a five-hour window are spent before weekly-only ones.
+        let five_hour_first = bool_from_env(
+            &get("CODEX_POOL_FIVE_HOUR_FIRST"),
+            "CODEX_POOL_FIVE_HOUR_FIRST",
+            true,
         )?;
         // Lineage affinity defaults on: splitting a main agent and its
         // subagents across accounts was the reported bug, so only an explicit
@@ -342,7 +344,7 @@ impl Settings {
             codex_base_url,
             default_model_override,
             shutdown_grace,
-            preserve_pro_quota,
+            five_hour_first,
             lineage_affinity,
             quota_prime,
             pi_channel,
@@ -748,7 +750,7 @@ mod tests {
         ]));
         let settings = settings.unwrap_or_else(|error| panic!("{error}"));
         assert!(settings.lineage_affinity && settings.public_dashboard);
-        assert!(!settings.preserve_pro_quota);
+        assert!(settings.five_hour_first);
         // Priming and the upstream switch default off.
         assert!(!settings.quota_prime);
         assert!(!settings.upstream_enabled);

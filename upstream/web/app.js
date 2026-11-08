@@ -852,10 +852,10 @@
     renderUpstreamClosed(serviceState?.upstreamEnabled);
     renderUpstreamSwitch(serviceState?.upstreamEnabled);
     renderQuotaReserve(serviceState?.quotaReserve);
-    const preserveSwitch = $("#preserve-pro-quota-switch");
-    if (preserveSwitch) {
-      preserveSwitch.checked = Boolean(serviceState?.preserveProQuota);
-      preserveSwitch.disabled = false;
+    const fiveHourSwitch = $("#five-hour-first-switch");
+    if (fiveHourSwitch) {
+      fiveHourSwitch.checked = Boolean(serviceState?.fiveHourFirst);
+      fiveHourSwitch.disabled = false;
     }
     const lineageSwitch = $("#lineage-affinity-switch");
     if (lineageSwitch) {
@@ -1663,7 +1663,7 @@
       notify(error.message, true);
     }
   };
-  const updatePreserveProQuota = updateSetting("preserveProQuota", false);
+  const updateFiveHourFirst = updateSetting("fiveHourFirst", true);
   const updateLineageAffinity = updateSetting("lineageAffinity", true);
   const updateQuotaPrime = updateSetting("quotaPrime", false);
   // The reserve's switch saves at once; its two thresholds save together.
@@ -1821,7 +1821,7 @@
   $("#sign-in-button").addEventListener("click", () => showLogin());
   $("#logout-button").addEventListener("click", async () => { try { await api("/logout", { method: "POST" }); } catch (_) {} sessionStorage.removeItem("codexPoolCsrf"); state.csrfToken = ""; showPublicDashboard(); });
   $("#add-account-button").addEventListener("click", addAccount);
-  $("#preserve-pro-quota-switch").addEventListener("change", updatePreserveProQuota);
+  $("#five-hour-first-switch").addEventListener("change", updateFiveHourFirst);
   $("#lineage-affinity-switch").addEventListener("change", updateLineageAffinity);
   $("#quota-prime-switch").addEventListener("change", updateQuotaPrime);
   $("#sign-in-codex").addEventListener("click", async () => {

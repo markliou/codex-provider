@@ -67,9 +67,11 @@
             </div>
             <div class="page-actions management-only">
               <span id="routing-strategy-pill" class="strategy-pill">Balanced sticky</span>
-              <label class="switch-row" for="preserve-pro-quota-switch">
-                <span class="switch-label">Use Pro last</span>
-                <input id="preserve-pro-quota-switch" type="checkbox" role="switch">
+              <!-- On by default (the owner's choice): accounts whose plan has a
+                   five-hour window are spent before weekly-only ones. -->
+              <label class="switch-row" for="five-hour-first-switch" title="Spend accounts with a five-hour window before weekly-only ones">
+                <span class="switch-label">5h limit first</span>
+                <input id="five-hour-first-switch" type="checkbox" role="switch">
                 <span class="switch-ui" aria-hidden="true"></span>
               </label>
               <!-- On by default: a main agent and its subagents share one account.

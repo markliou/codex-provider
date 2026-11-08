@@ -1005,7 +1005,7 @@ impl Inner {
             "running": true,
             "routingStrategy": self.effective_routing_strategy(),
             "defaultModel": self.config.default_model,
-            "preserveProQuota": self.preserve_pro_quota,
+            "fiveHourFirst": self.five_hour_first,
             "lineageAffinity": self.lineage_affinity,
             "quotaPrime": self.quota_prime,
             "piChannel": self.pi_channel,

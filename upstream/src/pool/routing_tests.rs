@@ -114,6 +114,40 @@ fn week_snapshot(id: &str, remaining: f64, credit_expires_in: Option<TimeDelta>)
     }
 }
 
+/// A quota read with a five-hour window and a weekly one, as a plan with a
+/// five-hour limit reports it.
+fn five_hour_snapshot(id: &str) -> QuotaSnapshot {
+    QuotaSnapshot {
+        account_id: id.to_string(),
+        quota: Some(AccountQuota {
+            hourly: QuotaWindow {
+                percentage: 50,
+                present: true,
+                ..QuotaWindow::default()
+            },
+            weekly: QuotaWindow {
+                percentage: 50,
+                present: true,
+                ..QuotaWindow::default()
+            },
+            ..AccountQuota::default()
+        }),
+        ..QuotaSnapshot::default()
+    }
+}
+
+/// The same quota read with a five-hour window as well.
+fn with_five_hour(mut snapshot: QuotaSnapshot) -> QuotaSnapshot {
+    if let Some(quota) = snapshot.quota.as_mut() {
+        quota.hourly = QuotaWindow {
+            percentage: 50,
+            present: true,
+            ..QuotaWindow::default()
+        };
+    }
+    snapshot
+}
+
 fn set_quota(app: &App, id: &str, snapshot: QuotaSnapshot) {
     app.write()
         .state
@@ -351,7 +385,7 @@ fn bound_sessions_move_to_red_outlined_accounts() {
         plan(provider_account("red", 100), "business"),
         plan(provider_account("red-pro", 100), "pro"),
     ]);
-    app.write().preserve_pro_quota = true;
+    app.write().five_hour_first = true;
     set_quota(&app, "plain", week_snapshot("plain", 50.0, None));
     set_quota(&app, "red", week_snapshot("red", 50.0, None));
     // A transient failure once left the lineage on an ordinary account
@@ -375,7 +409,8 @@ fn bound_sessions_move_to_red_outlined_accounts() {
         "plain"
     );
 
-    // A red-outlined Pro account takes it despite Use Pro last.
+    // A red-outlined account takes it even without a five-hour window,
+    // despite 5h limit first.
     set_quota(
         &app,
         "red-pro",
@@ -391,9 +426,13 @@ fn bound_sessions_move_to_red_outlined_accounts() {
         &ProxyResponseInfo::default(),
     );
 
-    // Once an ordinary account is red-outlined too, Use Pro last moves the
-    // lineage down to it, from one red outline to another.
-    set_quota(&app, "red", week_snapshot("red", 50.0, Some(hours(24))));
+    // Once an account with a five-hour window is red-outlined too, 5h limit
+    // first moves the lineage to it, from one red outline to another.
+    set_quota(
+        &app,
+        "red",
+        with_five_hour(week_snapshot("red", 50.0, Some(hours(24)))),
+    );
     let mut main_route = request(&app, "gpt-test", STRICT_MAIN_METADATA);
     let selected = selected_id(app.select_account_for_route(&mut main_route, "gpt-test", &none()));
     assert_eq!(selected, "red");
@@ -634,52 +673,65 @@ fn sticky_balanced_counts_duplicate_upstream_identity_once() {
     );
 }
 
-// Go TestStickyBalancedPreserveProQuotaFormsPreferredTierBeforePriority.
+// 5h limit first forms its tier before priority: a weekly-only account is not
+// placed while accounts with a five-hour window can serve, whatever its
+// priority, and the five-hour tier stays balanced.
 #[test]
-fn sticky_balanced_preserve_pro_quota_forms_preferred_tier_before_priority() {
+fn sticky_balanced_five_hour_first_forms_preferred_tier_before_priority() {
     let (app, _dir) = balanced(vec![
-        plan(provider_account("plus-a", 10), "plus"),
-        plan(provider_account("plus-b", 10), "plus"),
-        plan(provider_account("pro-high-priority", 100), "pro"),
+        plan(provider_account("five-a", 10), "business"),
+        plan(provider_account("five-b", 10), "business"),
+        plan(provider_account("weekly-high-priority", 100), "business"),
     ]);
-    app.write().preserve_pro_quota = true;
+    app.write().five_hour_first = true;
+    set_quota(&app, "five-a", five_hour_snapshot("five-a"));
+    set_quota(&app, "five-b", five_hour_snapshot("five-b"));
+    set_quota(
+        &app,
+        "weekly-high-priority",
+        week_snapshot("weekly-high-priority", 50.0, None),
+    );
     let mut counts: HashMap<String, usize> = HashMap::new();
     for index in 0..1000 {
         let selected = selected_id(app.select_account(
-            &format!("gpt-test:preserve-pro-{index}"),
+            &format!("gpt-test:five-hour-{index}"),
             "gpt-test",
             &none(),
         ));
         *counts.entry(selected).or_default() += 1;
     }
-    assert_eq!(counts.get("pro-high-priority").copied().unwrap_or(0), 0);
-    for id in ["plus-a", "plus-b"] {
+    assert_eq!(counts.get("weekly-high-priority").copied().unwrap_or(0), 0);
+    for id in ["five-a", "five-b"] {
         let got = counts.get(id).copied().unwrap_or(0);
         assert!(
             (400..=600).contains(&got),
-            "non-Pro tier not balanced: {counts:?}"
+            "five-hour tier not balanced: {counts:?}"
         );
     }
 }
 
-// Go TestPreserveProQuotaModeMovesStickySessionBackToNonPro.
+// A session on a weekly-only account moves to an account with a five-hour
+// window once 5h limit first is on, and the binding records the move.
 #[test]
-fn preserve_pro_quota_mode_moves_sticky_session_back_to_non_pro() {
-    let mut pro = plan(provider_account("pro", 100), "pro");
-    pro.plan_limit = "20x".into();
-    let (app, _dir) = test_app(vec![plan(provider_account("plus", 10), "plus"), pro]);
+fn five_hour_first_moves_sticky_session_to_a_five_hour_account() {
+    let (app, _dir) = test_app(vec![
+        plan(provider_account("five", 10), "business"),
+        plan(provider_account("weekly", 100), "business"),
+    ]);
+    set_quota(&app, "five", five_hour_snapshot("five"));
+    set_quota(&app, "weekly", week_snapshot("weekly", 50.0, None));
     let now = Timestamp::now();
     app.write().state.sticky_sessions_mut().insert(
         "gpt-test:session".into(),
-        sticky("gpt-test:session", "pro", now),
+        sticky("gpt-test:session", "weekly", now),
     );
     assert_eq!(
         selected_id(app.select_account("gpt-test:session", "gpt-test", &none())),
-        "pro"
+        "weekly"
     );
-    app.write().preserve_pro_quota = true;
+    app.write().five_hour_first = true;
     let selected = selected_id(app.select_account("gpt-test:session", "gpt-test", &none()));
-    assert_eq!(selected, "plus");
+    assert_eq!(selected, "five");
     let route = RoutingDecision {
         sticky_key: "gpt-test:session".into(),
         ..RoutingDecision::default()
@@ -694,62 +746,45 @@ fn preserve_pro_quota_mode_moves_sticky_session_back_to_non_pro() {
         .unwrap_or_default();
     assert_eq!(
         (session.account_id.as_str(), session.failover_from.as_str()),
-        ("plus", "pro")
+        ("five", "weekly")
     );
 }
 
-// Go TestPreserveProQuotaSpendsProLiteBetweenOrdinaryAndPro.
+// An account whose quota has not been read yet ranks with the weekly-only
+// ones: only a read five-hour window earns the first tier.
 #[test]
-fn preserve_pro_quota_spends_pro_lite_between_ordinary_and_pro() {
+fn an_unread_account_is_not_in_the_five_hour_tier() {
     let (app, _dir) = balanced(vec![
-        plan(provider_account("business", 10), "business"),
-        plan(provider_account("pro-lite", 10), "pro_lite"),
-        plan(provider_account("pro", 10), "pro"),
+        plan(provider_account("five", 10), "business"),
+        plan(provider_account("unread", 10), "business"),
     ]);
-    app.write().preserve_pro_quota = true;
+    app.write().five_hour_first = true;
+    set_quota(&app, "five", five_hour_snapshot("five"));
     for index in 0..200 {
         let selected =
             selected_id(app.select_account(&format!("gpt-test:tier-{index}"), "gpt-test", &none()));
-        assert_eq!(selected, "business", "session {index}");
+        assert_eq!(selected, "five", "session {index}");
     }
     assert_eq!(
-        selected_id(app.select_account(
-            "gpt-test:tier-lite",
-            "gpt-test",
-            &excluding(&["business"])
-        )),
-        "pro-lite"
-    );
-    assert_eq!(
-        selected_id(app.select_account(
-            "gpt-test:tier-pro",
-            "gpt-test",
-            &excluding(&["business", "pro-lite"])
-        )),
-        "pro"
-    );
-    let now = Timestamp::now();
-    app.write().state.sticky_sessions_mut().insert(
-        "gpt-test:on-lite".into(),
-        sticky("gpt-test:on-lite", "pro-lite", now),
-    );
-    assert_eq!(
-        selected_id(app.select_account("gpt-test:on-lite", "gpt-test", &none())),
-        "business"
+        selected_id(app.select_account("gpt-test:tier-unread", "gpt-test", &excluding(&["five"]))),
+        "unread"
     );
 }
 
-// Go TestPreserveProQuotaModeUsesProWhenNonProCoolingDown.
+// A weekly-only account still serves when every five-hour account cools down.
 #[test]
-fn preserve_pro_quota_mode_uses_pro_when_non_pro_cooling_down() {
-    let mut pro = plan(provider_account("pro", 100), "pro");
-    pro.plan_limit = "20x".into();
-    let (app, _dir) = test_app(vec![plan(provider_account("plus", 10), "plus"), pro]);
+fn five_hour_first_uses_a_weekly_account_when_five_hour_ones_cool_down() {
+    let (app, _dir) = test_app(vec![
+        plan(provider_account("five", 10), "business"),
+        plan(provider_account("weekly", 100), "business"),
+    ]);
+    set_quota(&app, "five", five_hour_snapshot("five"));
+    set_quota(&app, "weekly", week_snapshot("weekly", 50.0, None));
     {
         let mut inner = app.write();
-        inner.preserve_pro_quota = true;
+        inner.five_hour_first = true;
         inner.state.cooldowns_mut().insert(
-            "plus".into(),
+            "five".into(),
             vec![Cooldown {
                 model_id: "gpt-test".into(),
                 next_retry_at: Timestamp::now().add(minutes(1)),
@@ -760,7 +795,7 @@ fn preserve_pro_quota_mode_uses_pro_when_non_pro_cooling_down() {
     }
     assert_eq!(
         selected_id(app.select_account("gpt-test:new", "gpt-test", &none())),
-        "pro"
+        "weekly"
     );
 }
 
@@ -933,12 +968,12 @@ fn expiring_reset_credit_accounts_are_their_own_tier() {
     );
     assert!((6.9..=7.0).contains(&boost), "boost at expiry = {boost:.2}");
 
-    // The red outline outranks Use Pro last.
+    // The red outline outranks 5h limit first.
     let (app, _dir3) = balanced(vec![
         plan(bare_account("pro"), "pro"),
         plan(bare_account("plain"), "business"),
     ]);
-    app.write().preserve_pro_quota = true;
+    app.write().five_hour_first = true;
     set_quota(&app, "pro", week_snapshot("pro", 50.0, Some(hours(24))));
     set_quota(&app, "plain", week_snapshot("plain", 50.0, None));
     let picked = |app: &App| {
@@ -948,8 +983,12 @@ fn expiring_reset_credit_accounts_are_their_own_tier() {
             .map(|item| item.id)
     };
     assert_eq!(picked(&app).as_deref(), Some("pro"));
-    // Among red-outlined accounts Use Pro last still orders the plan tiers.
-    set_quota(&app, "plain", week_snapshot("plain", 50.0, Some(hours(24))));
+    // Among red-outlined accounts 5h limit first still orders them.
+    set_quota(
+        &app,
+        "plain",
+        with_five_hour(week_snapshot("plain", 50.0, Some(hours(24)))),
+    );
     assert_eq!(picked(&app).as_deref(), Some("plain"));
 }
 
@@ -1658,12 +1697,15 @@ fn ineligible_parent_falls_back_without_bypassing_safeguards() {
             }),
         ),
         (
-            "pro preservation",
+            "five-hour preference",
             Box::new(|app: &App| {
-                let mut inner = app.write();
-                inner.preserve_pro_quota = true;
-                inner.config.accounts_mut()[0].plan_type = "pro".into();
-                inner.config.accounts_mut()[1].plan_type = "plus".into();
+                app.write().five_hour_first = true;
+                set_quota(
+                    app,
+                    "parent-account",
+                    week_snapshot("parent-account", 50.0, None),
+                );
+                set_quota(app, "fallback", five_hour_snapshot("fallback"));
             }),
         ),
     ];

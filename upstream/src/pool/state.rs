@@ -68,6 +68,10 @@ pub struct Config {
     #[serde(default)]
     pub accounts: Option<Vec<Account>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour_first: Option<bool>,
+    /// Use Pro last, retired 2026-11-08 for 5h limit first. Read and written
+    /// back so a saved config keeps it; nothing uses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preserve_pro_quota: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage_affinity: Option<bool>,

@@ -1,6 +1,6 @@
 //! Which account serves a request: the routing decision (sticky key,
 //! lineage, balance key) and account selection (sticky sessions, strict
-//! lineage binding, balanced placement, the red outline and Use Pro last).
+//! lineage binding, balanced placement, the red outline and 5h limit first).
 //!
 //! A port of routingDecision, selectAccount* and pickBalancedAccountLocked in
 //! the Go pool's main.go. The comments that say why a rule exists come with
@@ -8,8 +8,8 @@
 
 use super::app::App;
 use super::app::Inner;
-use super::app::PRO_TIER_ORDINARY;
-use super::app::PRO_TIER_PRO;
+use super::app::LIMIT_TIER_FIVE_HOUR;
+use super::app::LIMIT_TIER_OTHER;
 use super::gojson;
 use super::gosort::slice_stable;
 use super::hash;
@@ -1091,21 +1091,22 @@ impl Inner {
     ///   - Red outline: a session on an account without an expiring reset
     ///     credit moves to a red-outlined account, a Pro one included. A reset
     ///     credit not spent before it expires is lost, so the owner treats
-    ///     those accounts as a special case, ranked above Use Pro last because
-    ///     an unspent credit on a Pro account is lost just the same. Placing
+    ///     those accounts as a special case, ranked above 5h limit first
+    ///     because an unspent credit is lost whatever the account's windows. Placing
     ///     only new sessions there was not enough: a transient overload or a
     ///     one-minute 429 moved running sessions off them for good while the
     ///     red-outlined accounts sat idle.
-    ///   - Use Pro last: a session on a higher plan tier moves to an eligible
-    ///     lower-tier account, so Pro quota stays the last resort, but never
-    ///     off a red outline onto an account without one.
+    ///   - 5h limit first: a session on an account without a five-hour window
+    ///     moves to an eligible account with one, so the weekly-only
+    ///     allowance stays for later, but never off a red outline onto an
+    ///     account without one.
     ///
     /// Each move only goes towards a red outline or down a plan tier, so a
     /// session cannot oscillate, and spending the credit stays the owner's
     /// decision. This is the cheap pre-check that spares computing a
     /// replacement for a session no exception can move.
     pub fn bound_session_may_move(&self, current: &Account, now: Timestamp) -> bool {
-        if self.preserve_pro_quota && self.pro_tier(current) > PRO_TIER_ORDINARY {
+        if self.five_hour_first && self.limit_tier(current) > LIMIT_TIER_FIVE_HOUR {
             return true;
         }
         !self.expiring_reset_credit(current, now)
@@ -1130,10 +1131,10 @@ impl Inner {
             return true;
         }
         if current_red && !replacement_red {
-            // Use Pro last never pulls a session off a red outline.
+            // 5h limit first never pulls a session off a red outline.
             return false;
         }
-        self.preserve_pro_quota && self.pro_tier(replacement) < self.pro_tier(current)
+        self.five_hour_first && self.limit_tier(replacement) < self.limit_tier(current)
     }
 
     /// The soonest expiry when every active cooldown for this account/model is
@@ -1309,8 +1310,8 @@ impl Inner {
         // The owner asked for these to be spent first because the credit is
         // lost at expiry; as a weight alone they still lost about one new
         // session in six to ordinary accounts, which strict binding then kept
-        // there. It sits above Use Pro last because an unspent credit on a Pro
-        // account is lost just the same; Use Pro last still orders the
+        // there. It sits above 5h limit first because an unspent credit is lost
+        // whatever the account's windows; 5h limit first still orders the
         // red-outlined accounts among themselves. A bound session on an account
         // without a red outline also moves here (bound_session_moves_to),
         // because a transient failure once moved running sessions off these
@@ -1328,13 +1329,13 @@ impl Inner {
         // accounts all use the same priority, so normal pools distribute
         // evenly; operators who intentionally configured a lower priority still
         // retain a standby tier.
-        if self.preserve_pro_quota {
+        if self.five_hour_first {
             let lowest = eligible
                 .iter()
-                .map(|item| self.pro_tier(item))
+                .map(|item| self.limit_tier(item))
                 .min()
-                .unwrap_or(PRO_TIER_PRO);
-            eligible.retain(|item| self.pro_tier(item) == lowest);
+                .unwrap_or(LIMIT_TIER_OTHER);
+            eligible.retain(|item| self.limit_tier(item) == lowest);
         }
         let highest = eligible
             .iter()

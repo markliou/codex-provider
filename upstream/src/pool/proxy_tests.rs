@@ -405,9 +405,9 @@ async fn upstream_failure_after_selection_does_not_return_no_eligible_503() {
         ..device_account("pro-only", "upstream-pro", 90)
     };
     let (app, _dir) = arc_app(vec![team, pro_account]);
-    app.write().preserve_pro_quota = true;
+    app.write().five_hour_first = true;
     set_quota(&app, "team-empty", "team", windows(Some(0), Some(0)));
-    set_quota(&app, "pro-only", "pro", windows(Some(96), Some(98)));
+    set_quota(&app, "pro-only", "pro", windows(None, Some(98)));
     write_codex_device_auth(&app, "team-empty", "upstream-team", "team@example.test");
     write_codex_device_auth(&app, "pro-only", "upstream-pro", "pro@example.test");
     let result = serve(
@@ -3313,7 +3313,7 @@ async fn transient_quota_refresh_error_does_not_block_pro_failover() {
             ..provider("pro", 100, &pro.url, "pro")
         },
     ]);
-    app.write().preserve_pro_quota = true;
+    app.write().five_hour_first = true;
     set_quota(&app, "plus", "plus", windows(Some(0), Some(80)));
     app.write().state.quotas_mut().insert(
         "pro".into(),
@@ -3541,7 +3541,7 @@ async fn team_pair_and_pro(duplicate_id: &'static str) -> (Arc<App>, TempDir, [F
         ),
         planned_device("pro-backup", "upstream-pro", "pro", 100, &pro.url),
     ]);
-    app.write().preserve_pro_quota = true;
+    app.write().five_hour_first = true;
     write_device_auths(
         &app,
         &[
@@ -3563,10 +3563,10 @@ fn counts(servers: &[FakeServer; 3]) -> (usize, usize, usize) {
 #[tokio::test]
 async fn duplicate_upstream_positive_quota_credential_represents_identity_before_pro() {
     let (app, _dir, servers) = team_pair_and_pro("resp_team_duplicate").await;
-    app.write().config.preserve_pro_quota = Some(true);
+    app.write().config.five_hour_first = Some(true);
     set_quota(&app, "team-primary", "team", windows(Some(99), Some(0)));
     set_quota(&app, "team-duplicate", "team", windows(Some(99), Some(61)));
-    set_quota(&app, "pro-backup", "pro", windows(Some(97), Some(11)));
+    set_quota(&app, "pro-backup", "pro", windows(None, Some(11)));
     let result = serve(
         &app,
         responses(r#"{"model":"gpt-test","input":"hello"}"#, "team-before-pro"),
@@ -3600,7 +3600,7 @@ async fn duplicate_upstream_cooling_representative_uses_healthy_credential_befor
     );
     set_quota(&app, "team-primary", "team", windows(Some(80), Some(80)));
     set_quota(&app, "team-duplicate", "team", windows(Some(99), Some(61)));
-    set_quota(&app, "pro-backup", "pro", windows(Some(97), Some(11)));
+    set_quota(&app, "pro-backup", "pro", windows(None, Some(11)));
     let result = serve(
         &app,
         responses(
@@ -3635,7 +3635,7 @@ async fn duplicate_upstream_healthy_credential_can_represent_identity() {
         quota_error("token_invalidated"),
     );
     set_quota(&app, "team-duplicate", "team", windows(Some(99), Some(61)));
-    set_quota(&app, "pro-backup", "pro", windows(Some(97), Some(11)));
+    set_quota(&app, "pro-backup", "pro", windows(None, Some(11)));
     let result = serve(
         &app,
         responses(
@@ -3678,7 +3678,7 @@ async fn errored_duplicate_manual_quota_does_not_keep_zero_quota_representative_
         duplicate_slot,
         planned_device("pro-backup", "upstream-pro", "pro", 100, &pro.url),
     ]);
-    app.write().preserve_pro_quota = true;
+    app.write().five_hour_first = true;
     set_quota(&app, "team-primary", "team", windows(Some(0), Some(37)));
     set_snapshot(
         &app,
@@ -3686,7 +3686,7 @@ async fn errored_duplicate_manual_quota_does_not_keep_zero_quota_representative_
         "team",
         quota_error("token_invalidated"),
     );
-    set_quota(&app, "pro-backup", "pro", windows(Some(93), Some(99)));
+    set_quota(&app, "pro-backup", "pro", windows(None, Some(99)));
     write_device_auths(
         &app,
         &[
