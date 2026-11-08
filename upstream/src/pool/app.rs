@@ -108,7 +108,9 @@ pub struct Inner {
     pub tuning: Tuning,
     pub config: Config,
     pub state: RuntimeState,
-    pub preserve_pro_quota: bool,
+    /// 5h limit first (SPEC.md 6.4): accounts whose plan has a five-hour
+    /// window are spent before accounts with only a weekly one.
+    pub five_hour_first: bool,
     pub lineage_affinity: bool,
     pub quota_prime: bool,
     /// Whether apps' non-Codex requests go on the Pi channel (pi_channel.rs);
@@ -205,9 +207,7 @@ impl App {
             throughput_buckets: Vec::new(),
             active_proxy_requests: 0,
             logger: logger.clone(),
-            preserve_pro_quota: config
-                .preserve_pro_quota
-                .unwrap_or(settings.preserve_pro_quota),
+            five_hour_first: config.five_hour_first.unwrap_or(settings.five_hour_first),
             lineage_affinity: config.lineage_affinity.unwrap_or(settings.lineage_affinity),
             quota_prime: config.quota_prime.unwrap_or(settings.quota_prime),
             pi_channel: settings.pi_channel,
@@ -717,6 +717,14 @@ pub const PRO_TIER_ORDINARY: i32 = 0;
 pub const PRO_TIER_LITE: i32 = 1;
 pub const PRO_TIER_PRO: i32 = 2;
 
+/// 5h limit first spends accounts in two tiers, the owner's choice
+/// (2026-11-08), replacing Use Pro last: accounts whose plan has a five-hour
+/// window first, then the others (a weekly window only, or no quota read
+/// yet). A five-hour window comes back within hours, so spending it first
+/// keeps the accounts whose allowance resets only weekly for later.
+pub const LIMIT_TIER_FIVE_HOUR: i32 = 0;
+pub const LIMIT_TIER_OTHER: i32 = 1;
+
 pub fn quota_error_blocks_routing(info: Option<&super::state::QuotaErrorInfo>) -> bool {
     let Some(info) = info else {
         return false;
@@ -1016,8 +1024,8 @@ impl Inner {
         }
     }
 
-    /// Red outline first, then Use Pro last, then priority: the same order as
-    /// balanced placement.
+    /// Red outline first, then 5h limit first, then priority: the same order
+    /// as balanced placement.
     pub fn preferred_before(&self, left: &Account, right: &Account) -> bool {
         let now = Timestamp::now();
         let (left_red, right_red) = (
@@ -1027,8 +1035,8 @@ impl Inner {
         if left_red != right_red {
             return left_red;
         }
-        if self.preserve_pro_quota {
-            let (left_tier, right_tier) = (self.pro_tier(left), self.pro_tier(right));
+        if self.five_hour_first {
+            let (left_tier, right_tier) = (self.limit_tier(left), self.limit_tier(right));
             if left_tier != right_tier {
                 return left_tier < right_tier;
             }
@@ -1302,6 +1310,20 @@ impl Inner {
             "pro" | "pro_max" => PRO_TIER_PRO,
             "pro_lite" => PRO_TIER_LITE,
             _ => PRO_TIER_ORDINARY,
+        }
+    }
+
+    /// The account's 5h limit first tier, from its last quota read: a
+    /// five-hour window present puts it first.
+    pub fn limit_tier(&self, item: &Account) -> i32 {
+        match self
+            .state
+            .quotas()
+            .get(&item.id)
+            .and_then(|snapshot| snapshot.quota.as_ref())
+        {
+            Some(quota) if quota.hourly.present => LIMIT_TIER_FIVE_HOUR,
+            _ => LIMIT_TIER_OTHER,
         }
     }
 

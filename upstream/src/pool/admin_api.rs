@@ -364,7 +364,7 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
     #[serde(rename_all = "camelCase")]
     struct Switches {
         #[serde(default)]
-        preserve_pro_quota: Option<bool>,
+        five_hour_first: Option<bool>,
         #[serde(default)]
         lineage_affinity: Option<bool>,
         #[serde(default)]
@@ -389,7 +389,7 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
     };
     // Each Console switch posts only its own field, so an omitted field leaves
     // that setting untouched rather than resetting it.
-    if switches.preserve_pro_quota.is_none()
+    if switches.five_hour_first.is_none()
         && switches.lineage_affinity.is_none()
         && switches.quota_prime.is_none()
         && switches.upstream_enabled.is_none()
@@ -401,7 +401,7 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
             writer,
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "preserveProQuota, lineageAffinity, quotaPrime, upstreamEnabled, quotaReserve, quotaReserveFiveHour or quotaReserveWeekly is required",
+            "fiveHourFirst, lineageAffinity, quotaPrime, upstreamEnabled, quotaReserve, quotaReserveFiveHour or quotaReserveWeekly is required",
         );
         return;
     }
@@ -422,9 +422,9 @@ pub fn handle_admin_settings(app: &App, request: &Request, writer: &mut dyn Resp
         return;
     }
     let mut inner = app.write();
-    if let Some(value) = switches.preserve_pro_quota {
-        inner.preserve_pro_quota = value;
-        inner.config.preserve_pro_quota = Some(value);
+    if let Some(value) = switches.five_hour_first {
+        inner.five_hour_first = value;
+        inner.config.five_hour_first = Some(value);
     }
     if let Some(value) = switches.lineage_affinity {
         inner.lineage_affinity = value;

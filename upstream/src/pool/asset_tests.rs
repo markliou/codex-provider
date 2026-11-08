@@ -93,7 +93,7 @@ async fn admin_dashboard_assets() {
             "Continue",
             "Password",
             "Add account",
-            "Use Pro last",
+            "5h limit first",
             "Balanced sticky",
             "routing-strategy-pill",
             "SERVICE STATUS",
@@ -266,7 +266,7 @@ async fn admin_dashboard_assets() {
         path,
         &js,
         &[
-            "preserveProQuota",
+            "fiveHourFirst",
             "codexPoolAdminTheme",
             "themeMetaColors",
             "themeNames.has",

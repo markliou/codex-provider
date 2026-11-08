@@ -348,10 +348,10 @@ fn saved_config(app: &App) -> serde_json::Value {
 
 // Go TestAdminSettingsTogglePreserveProQuota.
 #[tokio::test]
-async fn admin_settings_toggle_preserve_pro_quota() {
+async fn admin_settings_toggle_five_hour_first() {
     let (app, _dir) = arc_app(Vec::new());
     let session = admin_session(&app);
-    let result = post_settings(&app, &session, r#"{"preserveProQuota":true}"#).await;
+    let result = post_settings(&app, &session, r#"{"fiveHourFirst":true}"#).await;
     assert_eq!(
         result.code(),
         200,
@@ -359,25 +359,25 @@ async fn admin_settings_toggle_preserve_pro_quota() {
         result.body_string()
     );
     assert!(
-        app.read().preserve_pro_quota,
-        "settings update did not enable preserveProQuota"
+        app.read().five_hour_first,
+        "settings update did not enable fiveHourFirst"
     );
-    assert!(result.body_string().contains(r#""preserveProQuota":true"#));
+    assert!(result.body_string().contains(r#""fiveHourFirst":true"#));
     assert_eq!(
-        saved_config(&app)["preserveProQuota"],
+        saved_config(&app)["fiveHourFirst"],
         true,
-        "settings update did not persist preserveProQuota"
+        "settings update did not persist fiveHourFirst"
     );
-    let result = post_settings(&app, &session, r#"{"preserveProQuota":false}"#).await;
+    let result = post_settings(&app, &session, r#"{"fiveHourFirst":false}"#).await;
     assert_eq!(result.code(), 200);
     assert!(
-        !app.read().preserve_pro_quota,
-        "settings update did not disable preserveProQuota"
+        !app.read().five_hour_first,
+        "settings update did not disable fiveHourFirst"
     );
     assert_eq!(
-        saved_config(&app)["preserveProQuota"],
+        saved_config(&app)["fiveHourFirst"],
         false,
-        "settings update did not persist disabled preserveProQuota"
+        "settings update did not persist disabled fiveHourFirst"
     );
 }
 
@@ -385,7 +385,7 @@ async fn admin_settings_toggle_preserve_pro_quota() {
 #[tokio::test]
 async fn admin_settings_toggle_lineage_affinity_keeps_other_settings() {
     let (app, _dir) = arc_app(Vec::new());
-    app.write().preserve_pro_quota = true;
+    app.write().five_hour_first = true;
     let session = admin_session(&app);
     let result = post_settings(&app, &session, r#"{"lineageAffinity":false}"#).await;
     assert_eq!(
@@ -399,8 +399,8 @@ async fn admin_settings_toggle_lineage_affinity_keeps_other_settings() {
         "settings update did not disable lineageAffinity"
     );
     assert!(
-        app.read().preserve_pro_quota,
-        "lineage-only settings update reset preserveProQuota"
+        app.read().five_hour_first,
+        "lineage-only settings update reset fiveHourFirst"
     );
     assert!(result.body_string().contains(r#""lineageAffinity":false"#));
     assert_eq!(saved_config(&app)["lineageAffinity"], false);

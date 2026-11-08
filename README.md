@@ -317,8 +317,9 @@ A new conversation is placed in steps:
    days come first, Pro accounts included, since an unspent credit is lost
    either way. While one of them can take the conversation it goes to one of
    them, even a busy one.
-2. **Plan tier** (with **Use Pro last** on): ordinary accounts, then Pro 100,
-   then Pro 200/500, applied within the red-outlined accounts or, when none can
+2. **Five-hour window** (with **5h limit first** on, the default): accounts whose
+   plan has a five-hour window, then the others (a weekly window only, or no
+   quota read yet), applied within the red-outlined accounts or, when none can
    serve, within the rest.
 3. **Idle first**: an account no conversation is using is preferred; only when
    all are busy is one shared, with the weight divided by (1 + sessions on it)².
@@ -329,9 +330,9 @@ A new conversation is placed in steps:
 
 A conversation already bound stays where it is, with two exceptions that move it
 (main agent and subagents together, at the cost of one prefill) on its next
-request: **Use Pro last** moves it down to a lower plan tier, and the **red
-outline** moves it from an account without one to a red-outlined account (a Pro
-one included), so a failover caused by a passing overload does not keep it away from
+request: **5h limit first** moves it from a weekly-only account to one with a
+five-hour window, and the **red outline** moves it from an account without one
+to a red-outlined account (a weekly-only one included), so a failover caused by a passing overload does not keep it away from
 an expiring credit. The pool never spends a reset credit; that stays the account
 owner's decision.
 
@@ -360,13 +361,16 @@ The pool reads thread, parent and lineage identity from Codex's
 `client_metadata` and headers. It never changes `spawn_agent` arguments or
 `fork_turns`; history inheritance belongs to Codex.
 
-### Use Pro last
+### 5h limit first
 
-With **Use Pro last** on, accounts are spent in three tiers: ordinary accounts
-first, then Pro 100 (Pro Lite), then Pro 200 and Pro 500. A conversation that had
-to use a higher tier moves down as soon as a lower tier can serve it.
-`CODEX_POOL_PRESERVE_PRO_QUOTA` sets only the initial default; the switch is
-saved in `/data/config.json`.
+With **5h limit first** on (the default), accounts whose plan has a five-hour
+window are spent first, and accounts with only a weekly window (or whose quota
+has not been read yet) after them. A five-hour window comes back within hours,
+so the allowance that resets only weekly is kept for later. A conversation on a
+weekly-only account moves to one with a five-hour window as soon as one can
+serve it. It replaces the earlier **Use Pro last** (2026-11-08).
+`CODEX_POOL_FIVE_HOUR_FIRST` sets only the initial default; the switch is saved
+in `/data/config.json`.
 
 ### When upstream refuses
 
@@ -480,7 +484,7 @@ settings and SPEC.md 2.1 lists them all. The ones most often changed:
 | `CODEX_POOL_ROUTING_STRATEGY` | `sticky_balanced` | `sticky_failover` restores strict priority order |
 | `CODEX_POOL_QUOTA_FLOOR_PERCENT` | `1` | Share of a window held back so overage is not billed to credits |
 | `CODEX_POOL_PREMIUM_SEAT_MULTIPLIER` | `5` | Assumed Business Premium seat size |
-| `CODEX_POOL_PRESERVE_PRO_QUOTA` | `false` | Initial **Use Pro last** setting |
+| `CODEX_POOL_FIVE_HOUR_FIRST` | `true` | Initial **5h limit first** setting |
 | `CODEX_POOL_LINEAGE_AFFINITY` | `true` | Initial **Keep subagents together** setting |
 | `CODEX_POOL_CLIENT_MAX_IN_FLIGHT` | `16` | Requests one client key may have running at once; over it the client gets a 429 to retry later (SPEC.md 2.3.6) |
 | `CODEX_POOL_CLIENT_MAX_PER_MINUTE` | `120` | Requests one client key may start in a minute (SPEC.md 2.3.6) |

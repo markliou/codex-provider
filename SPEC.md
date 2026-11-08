@@ -177,7 +177,7 @@ docker run -d \
 | `CODEX_POOL_PROMPT_CACHE_KEY_SCOPE` | no | `auto` | Coarseness of the injected `prompt_cache_key`. `auto` groups by `X-Codex-Pool-Project` header, else API key, else per-conversation. `project`/`user` force that grouping; `conversation` keeps the historical per-conversation key. Coarser keys let sibling conversations reuse the same static-prefix cache. |
 | `CODEX_POOL_PROMPT_CACHE_BUCKETS` | no | `4` | Number of buckets (1–256) a coarse cache key is split across, keyed by the stable per-conversation routing key, to stay under OpenAI's ~15 RPM-per-(prefix+key) cache-routing limit. Raise for hot pools; set `1` to maximize sharing. |
 | `CODEX_POOL_PROMPT_CACHE_RETENTION` | no | `24h` | Upstream prompt cache retention. Defaults to `24h` (extended retention) to maximize cache hit rate across conversation turns. Set `passthrough` to leave requests untouched, or `in_memory` for the shorter built-in retention. |
-| `CODEX_POOL_PRESERVE_PRO_QUOTA` | no | `false` | Initial default for the admin Console `Use Pro last` switch. Once saved in `/data/config.json`, the Console setting takes precedence. |
+| `CODEX_POOL_FIVE_HOUR_FIRST` | no | `true` | Initial default for the admin Console `5h limit first` switch. Once saved in `/data/config.json` as `fiveHourFirst`, the Console setting takes precedence. |
 | `CODEX_POOL_UPSTREAM_ENABLED` | no | `false` | Initial state of the upstream switch (section 2.3.5) until the owner flips it in the Console, whose saved choice then wins. Off, the pool sends nothing upstream: no client request, quota poll, token refresh, prime, reset-credit spend or sign-in. |
 | `CODEX_POOL_CLIENT_MAX_IN_FLIGHT` | no | `16` | Responses one client key may have running at once (section 2.3.6). A positive integer; there is no unlimited. |
 | `CODEX_POOL_CLIENT_MAX_PER_MINUTE` | no | `120` | Requests one client key may start in a minute (section 2.3.6). A positive integer; there is no unlimited. |
@@ -700,8 +700,8 @@ balancing, not mutable request round-robin:
    out rising to 7 at expiry, so the credit lost soonest draws the most. As a
    weight alone (the earlier rule) red-outlined accounts still lost about one
    new session in six, which strict binding then kept elsewhere. The tier comes
-   first, above the Use Pro last tiers and the priority comparison, because
-   an unspent credit on a Pro account is lost just the same; Use Pro last and
+   first, above the 5h limit first tiers and the priority comparison, because
+   an unspent credit is lost whatever the account's windows; 5h limit first and
    priority still order the red-outlined accounts among themselves. It also
    moves bound sessions: one on an account without a red outline moves to a
    red-outlined account (6.4), and spending the credit stays the owner's
@@ -710,13 +710,13 @@ balancing, not mutable request round-robin:
    upstream identity.
 3. Existing TTL-live sticky bindings remain authoritative and are never
    rebalanced merely because another account becomes available, apart from
-   the two exceptions in 6.4 (Use Pro last, red outline).
+   the two exceptions in 6.4 (5h limit first, red outline).
 4. Selection balances only within the highest-priority eligible tier, preserving
    explicitly configured lower-priority standby accounts.
-5. When `preserveProQuota` is enabled, the lowest eligible plan tier forms the
-   preferred tier before the priority comparison: ordinary accounts, then
-   Pro 100 (Pro Lite), then Pro 200 and Pro 500 (6.4). The red-outline tier
-   (item 2) is applied before it.
+5. When `fiveHourFirst` is enabled (the default), the accounts whose last quota
+   read has a five-hour window form the preferred tier before the priority
+   comparison, the others (a weekly window only, or no read yet) after them
+   (6.4). The red-outline tier (item 2) is applied before it.
 6. Duplicate local slots for one upstream identity remain one balancing target.
    The hash identity must use the upstream identity when known so changing its
    healthy local representative does not create artificial capacity.
@@ -894,9 +894,9 @@ failback = new_session_only
 
 A session that failed over from `acct-a` to `acct-b` should remain on `acct-b` until it ends, unless `acct-b` also fails.
 
-Optional exception: when `preserveProQuota` is enabled from the admin Console, accounts are spent in three tiers: ordinary accounts first, then Pro 100 (Pro Lite), then Pro 200 and Pro 500. A new session uses the lowest tier with an eligible account. If a sticky or lineage account sits in a higher tier than an eligible account, select the lower-tier account and rewrite the binding on success. This keeps Pro quota as the last-resort pool while preserving normal failover for deployments that leave the mode disabled. Pro Lite was once an ordinary account here; its 5x weight then drew sessions about as often as a Business seat whose reset credit was about to expire, so the owner placed it between the two.
+Optional exception: when `fiveHourFirst` is enabled from the admin Console (the default, the owner's choice of 2026-11-08, replacing Use Pro last), accounts are spent in two tiers: those whose last quota read has a five-hour window first, then the others (a weekly window only, or no read yet). A five-hour window comes back within hours, so the allowance that resets only weekly is kept for later. A new session uses the first tier with an eligible account. If a sticky or lineage account sits in the second tier while a first-tier account is eligible, select the first-tier account and rewrite the binding on success. The saved `preserveProQuota` of Use Pro last is kept in `config.json` and no longer read.
 
-Red-outline exception: a reset credit not spent before it expires is lost, so the owner treats accounts holding one that expires within seven days (the dashboard's red outline) as a special case. A sticky or lineage session on an account without a red outline moves, on its next request, to a red-outlined account when one is eligible, a Pro account included: the red outline ranks above Use Pro last, since an unspent credit on a Pro account is lost just the same. Use Pro last then orders the red-outlined accounts among themselves, and never moves a session off a red outline onto an account without one. The binding is rewritten on success; under strict lineage binding the whole lineage follows and the main agent re-prefills once. On a WebSocket the pool closes the client socket (1012) before sending anything, and Codex reconnects and resends in full. Every move goes towards a red outline or down a plan tier, so a session cannot oscillate. Placing only new sessions there was not enough: a transient overload and a one-minute `429` moved running sessions off red-outlined accounts for good while those accounts sat idle.
+Red-outline exception: a reset credit not spent before it expires is lost, so the owner treats accounts holding one that expires within seven days (the dashboard's red outline) as a special case. A sticky or lineage session on an account without a red outline moves, on its next request, to a red-outlined account when one is eligible, a weekly-only account included: the red outline ranks above 5h limit first, since an unspent credit is lost whatever the account's windows. 5h limit first then orders the red-outlined accounts among themselves, and never moves a session off a red outline onto an account without one. The binding is rewritten on success; under strict lineage binding the whole lineage follows and the main agent re-prefills once. On a WebSocket the pool closes the client socket (1012) before sending anything, and Codex reconnects and resends in full. Every move goes towards a red outline or down a plan tier, so a session cannot oscillate. Placing only new sessions there was not enough: a transient overload and a one-minute `429` moved running sessions off red-outlined accounts for good while those accounts sat idle.
 
 A request that cannot reach upstream at all (the connection fails or drops before any answer) is retried on the same account twice, after 0.5 s and 1 s, before it fails over with `transport_failover`. A WebSocket that cannot be opened gets the same retries, and a socket that drops mid-response records the failure but sets no cooldown, so Codex's reconnect returns to the same account. A failed connection is no evidence against the account, and under strict lineage binding a move is permanent and costs a full prefill: two connection failures right after a restart once moved a session off the expiring-credit accounts it had been placed on. A revoked credential still fails over at once.
 
@@ -2094,7 +2094,7 @@ Response:
       "gatewayMode": "direct",
       "upstreamProxyUrl": null,
       "routingStrategy": "sticky_balanced",
-      "preserveProQuota": false,
+      "fiveHourFirst": true,
       "customRoutingRules": [],
       "accountModelRules": [],
       "modelAliases": [],
@@ -2143,7 +2143,7 @@ Request:
 
 ```json
 {
-  "preserveProQuota": true,
+  "fiveHourFirst": true,
   "lineageAffinity": true,
   "quotaPrime": false,
   "upstreamEnabled": false,
@@ -2153,7 +2153,7 @@ Request:
 }
 ```
 
-At least one field is required; an omitted field leaves that setting unchanged, so each Console switch posts only its own field. `preserveProQuota` backs the `Use Pro last` switch, `lineageAffinity` backs the `Keep subagents together` switch (default on), `quotaPrime` backs the `Prime idle accounts` switch (default off), `upstreamEnabled` backs the large `Upstream` switch (section 2.3.5; default off, takes effect at once, logged), and `quotaReserve`, `quotaReserveFiveHour` and `quotaReserveWeekly` back the global quota reserve card (section 9.7; on, 10 and 10 by default; a threshold outside 0–100 is `400` and changes nothing). All are persisted in `/data/config.json` and returned in the admin state.
+At least one field is required; an omitted field leaves that setting unchanged, so each Console switch posts only its own field. `fiveHourFirst` backs the `5h limit first` switch, `lineageAffinity` backs the `Keep subagents together` switch (default on), `quotaPrime` backs the `Prime idle accounts` switch (default off), `upstreamEnabled` backs the large `Upstream` switch (section 2.3.5; default off, takes effect at once, logged), and `quotaReserve`, `quotaReserveFiveHour` and `quotaReserveWeekly` back the global quota reserve card (section 9.7; on, 10 and 10 by default; a threshold outside 0–100 is `400` and changes nothing). All are persisted in `/data/config.json` and returned in the admin state.
 
 ---
 
