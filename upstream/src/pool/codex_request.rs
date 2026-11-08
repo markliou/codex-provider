@@ -1188,10 +1188,16 @@ pub fn complete(
     field(&mut out, "tool_choice");
     write_string(&mut out, "auto");
     field(&mut out, "parallel_tool_calls");
-    let parallel = payload
-        .get("parallel_tool_calls")
-        .and_then(Value::as_bool)
-        .unwrap_or(defaults.parallel_tool_calls);
+    // Codex never sends parallel tool calls on Responses Lite
+    // (core/src/client.rs: `prompt.parallel_tool_calls &&
+    // !model_info.use_responses_lite`), and upstream refuses a Lite request
+    // that asks for them ("X-OpenAI-Internal-Codex-Responses-Lite requires
+    // `parallel_tool_calls` to be false", seen live on gpt-6.1-sol).
+    let parallel = !defaults.responses_lite
+        && payload
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+            .unwrap_or(defaults.parallel_tool_calls);
     out.extend_from_slice(if parallel { b"true" } else { b"false" });
     field(&mut out, "reasoning");
     let mut reasoning = match payload.get("reasoning") {
