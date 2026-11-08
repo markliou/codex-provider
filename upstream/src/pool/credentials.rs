@@ -245,10 +245,8 @@ pub fn codex_default_client_user_agent(user_agent: &str) -> String {
 /// (codex_exec/0.163.0, codex-tui/0.163.0, ...). Other clients get none.
 pub fn codex_client_version(headers: &HeaderMap) -> String {
     let user_agent = super::http_io::header_value(headers, "user-agent").trim();
-    let product = user_agent
-        .split_once(' ')
-        .map_or(user_agent, |(product, _)| product);
-    let Some((name, version)) = product.split_once('/') else {
+    // Read with codex_product, so "Codex Desktop/<release>" keeps its release.
+    let Some((name, version)) = codex_product(user_agent) else {
         return String::new();
     };
     if !name.to_lowercase().starts_with("codex") || version.is_empty() {
@@ -264,13 +262,22 @@ pub fn codex_client_version(headers: &HeaderMap) -> String {
     }
 }
 
+/// The product token of a Codex user agent: the originator and the release.
+/// Codex writes it as format!("{originator}/{build_version} (...") (rust-v0.167.0
+/// login/src/auth/default_client.rs get_codex_user_agent), and an originator
+/// may contain a space: the desktop app's is "Codex Desktop"
+/// (app-server/src/request_processors/initialize_processor.rs). So the name
+/// runs to the first "/", never to the first space; cutting at the space read
+/// "Codex Desktop/0.167.0 (...)" as "Codex" and refused the desktop app.
+fn codex_product(user_agent: &str) -> Option<(&str, &str)> {
+    let (name, rest) = user_agent.split_once('/')?;
+    let version = rest.split_once(' ').map_or(rest, |(version, _)| version);
+    Some((name, version))
+}
+
 pub fn codex_originator_from_user_agent(user_agent: &str) -> String {
-    let product = user_agent
-        .split_once(' ')
-        .map_or(user_agent, |(product, _)| product);
-    product
-        .split_once('/')
-        .map_or(product, |(name, _)| name)
+    codex_product(user_agent)
+        .map_or(user_agent, |(name, _)| name)
         .to_string()
 }
 

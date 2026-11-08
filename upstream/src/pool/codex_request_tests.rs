@@ -201,6 +201,27 @@ fn only_codex_s_identity_format_counts_as_codex() {
         ),
         ("originator", "codex-tui"),
     ])));
+    // The desktop app's originator has a space (app-server
+    // initialize_processor.rs "Codex Desktop"); the product runs to the "/".
+    let desktop = headers(&[
+        (
+            "user-agent",
+            "Codex Desktop/0.167.0 (Mac OS 15.5.0; arm64) unknown (Codex Desktop; 26.1105.1)",
+        ),
+        ("originator", "Codex Desktop"),
+    ]);
+    assert!(codex_identity(&desktop));
+    assert_eq!(
+        super::super::credentials::codex_client_version(&desktop),
+        "0.167.0"
+    );
+    assert!(!codex_identity(&headers(&[
+        (
+            "user-agent",
+            "Codex Desktop/0.167.0 (Mac OS 15.5.0; arm64) unknown",
+        ),
+        ("originator", "Codex"),
+    ])));
     // An app that calls itself Codex without Codex's format.
     for pairs in [
         &[("user-agent", "codex"), ("originator", "codex")][..],
