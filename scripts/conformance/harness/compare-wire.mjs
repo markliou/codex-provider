@@ -479,6 +479,12 @@ function compareApp() {
   for (const [name, value] of [["stream", true], ["store", false], ["tool_choice", "auto"]]) {
     if (body[name] !== value) fail(`app: ${name} is ${JSON.stringify(body[name])}, Codex sends ${JSON.stringify(value)}`);
   }
+  // Values Codex derives from the model, not from the app: on a Responses Lite
+  // model it sends parallel_tool_calls false and reasoning context all_turns
+  // (core/src/client.rs), and upstream refuses a Lite request with parallel
+  // tool calls on. Comparing keys alone once let a true through.
+  if (body.parallel_tool_calls !== codex.parallel_tool_calls) fail(`app: parallel_tool_calls is ${JSON.stringify(body.parallel_tool_calls)}, Codex sends ${JSON.stringify(codex.parallel_tool_calls)}`);
+  if (body.reasoning?.context !== codex.reasoning?.context) fail(`app: reasoning.context is ${JSON.stringify(body.reasoning?.context)}, Codex sends ${JSON.stringify(codex.reasoning?.context)}`);
   notes.push("app: its turn reached upstream as Codex's request through the pool, and its refused turn did not");
 }
 

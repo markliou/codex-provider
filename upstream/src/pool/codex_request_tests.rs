@@ -399,6 +399,8 @@ fn a_responses_lite_request_is_written_as_codex_writes_one() {
             .unwrap(),
         "true"
     );
+    // Codex sends no parallel tool calls on Lite, and upstream refuses them.
+    assert_eq!(value["parallel_tool_calls"], false);
     // The id is stable for the same tools in the same thread.
     let (again, _) = complete(
         &normalized,
