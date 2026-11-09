@@ -1299,7 +1299,7 @@ async fn attempts(
     let tuning = app.tuning;
     let mut attempt: i64 = 0;
     while attempt < attempt_limit {
-        let candidate = match app.select_account_for_route(route, model, &excluded) {
+        let candidate = match app.select_account_checked(route, model, &excluded).await {
             Ok(candidate) => candidate,
             Err(SelectError::AuthRepairPending) => {
                 write_openai_error(
@@ -1481,6 +1481,13 @@ async fn attempts(
             }
         };
         let status = response.status;
+        // What upstream says this account has left, read from the response
+        // as a native Codex reads it (quota_observed.rs). It includes what
+        // other clients of the account spent. The Pi channel's answers come
+        // from another route and say nothing about the Codex windows.
+        if pi.is_none() && App::uses_codex_backend_directly(&candidate) {
+            app.note_rate_limit_headers(&candidate.id, &response.headers);
+        }
         if pi.is_some() && !status.is_success() {
             // The Pi channel reads its answers by OpenAI's table for the
             // route (pi_channel::verdict), never by the Codex rules below:

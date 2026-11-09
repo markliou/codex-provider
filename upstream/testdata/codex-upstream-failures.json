@@ -684,6 +684,47 @@
       }
     }
   ],
+  "_rateLimitsComment": "What upstream reports with each response about the serving account's windows, read by Codex's own vendored parser (crate::rate_limits) and folded into the account's quota (quota_observed.rs). Field names come from the parser's structs and header names; the values are the test's.",
+  "rateLimits": [
+    {
+      "name": "rate limits event",
+      "source": "codex-rs/codex-api/src/rate_limits.rs",
+      "marker": "struct RateLimitEventDetails {",
+      "event": {
+        "type": "codex.rate_limits",
+        "plan_type": "team",
+        "rate_limits": {
+          "primary": {"used_percent": 42.0, "window_minutes": 300, "reset_at": 4102444800},
+          "secondary": {"used_percent": 71.0, "window_minutes": 10080, "reset_at": 4103049600}
+        },
+        "credits": {"has_credits": true, "unlimited": false, "balance": "12"}
+      }
+    },
+    {
+      "name": "rate limit headers",
+      "source": "codex-rs/codex-api/src/rate_limits.rs",
+      "marker": "&format!(\"{prefix}-primary-used-percent\"),",
+      "headers": {
+        "x-codex-primary-used-percent": "40.0",
+        "x-codex-primary-window-minutes": "300",
+        "x-codex-primary-reset-at": "4102444800",
+        "x-codex-secondary-used-percent": "70.0",
+        "x-codex-secondary-window-minutes": "10080",
+        "x-codex-secondary-reset-at": "4103049600"
+      }
+    },
+    {
+      "name": "rate limit headers of a metered model",
+      "source": "codex-rs/codex-api/src/rate_limits.rs",
+      "marker": "let limit_name_header = format!(\"{prefix}-limit-name\");",
+      "headers": {
+        "x-codex-bengalfox-primary-used-percent": "25.0",
+        "x-codex-bengalfox-primary-window-minutes": "300",
+        "x-codex-bengalfox-primary-reset-at": "4102444800",
+        "x-codex-bengalfox-limit-name": "GPT-5.3-Codex-Spark-Next"
+      }
+    }
+  ],
   "_assumptionsComment": "Codex behaviors the pool's own requests and the native endpoint are built on (SPEC.md 2.3.2, 2.3.3). codex-conformance.sh check fails when a marker disappears: re-read that Codex code and adjust the pool before moving the pin.",
   "assumptions": [
     {"name": "key login: detection", "source": "codex-rs/model-provider/src/bearer_auth_provider.rs", "marker": "            account_id: None,\n            is_fedramp_account,", "pool": "an API-key Codex sends a bearer key and no ChatGPT-Account-ID (key_login.rs is_key_login)"},

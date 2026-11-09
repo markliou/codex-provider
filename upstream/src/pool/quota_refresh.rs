@@ -572,8 +572,9 @@ impl App {
 
     /// When an idle account's quota next changes on its own: the reset of its
     /// longest reported window, the budget window priming also reads
-    /// (prime.rs `unanchored_budget_window`). Until then the background poll
-    /// leaves it alone (quota_schedule.rs).
+    /// (prime.rs `unanchored_budget_window`). The background poll asks it
+    /// just after, unless its sparse idle cadence comes first
+    /// (quota_schedule.rs).
     pub fn idle_quota_wake(&self, account_id: &str) -> Option<Timestamp> {
         let snapshot = self.read().quota_snapshot(account_id);
         let quota = snapshot
@@ -613,6 +614,16 @@ impl App {
                         return;
                     }
                     continue;
+                }
+                // A read made just before sending to an account
+                // (quota_observed.rs) is this account's poll.
+                for (id, at) in app.take_quota_reads_elsewhere() {
+                    schedule.polled(&id, at);
+                    if let Some(reset) = app.idle_quota_wake(&id)
+                        && let Ok(wait) = reset.sub(&Timestamp::now()).to_std()
+                    {
+                        schedule.wake_at(&id, std::time::Instant::now() + wait);
+                    }
                 }
                 let accounts = app.quota_poll_accounts();
                 let ids: Vec<String> = accounts.iter().map(|item| item.id.clone()).collect();

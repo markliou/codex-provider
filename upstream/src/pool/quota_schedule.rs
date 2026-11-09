@@ -11,20 +11,27 @@
 //! sweep: that brings the burst back.
 //!
 //! That cadence is for an account in use (a request went to it within
-//! `ACTIVE_WINDOW`). An idle account is not polled on a cadence at all: it is
-//! asked once a random `WAKE_DELAY_MIN` to `WAKE_DELAY_MAX` after its longest
-//! window resets (`wake_at`), and is due at the in-use cadence again as soon as
-//! a request lands on it. Meanwhile only its owner's own Codex changes its
-//! quota, and routing already treats quota figures as hints (fail-open).
-//! An idle account whose reset is unknown waits `IDLE_MIN_INTERVAL` to
-//! `IDLE_MAX_INTERVAL`. A native Codex reads usage only while it is open (every
-//! 60 seconds, more often near exhaustion, timed from the end of the last read:
-//! tui app/rate_limit_refresh.rs `poll_deadline`, chatwidget/rate_limits.rs
-//! `rate_limit_refresh_interval`) and not at all while nobody uses it. The pool
-//! once asked idle accounts every 20 to 30 minutes around the clock, so
-//! accounts nobody was using still read usage all night from one address,
-//! which no person's Codex does; do not bring an idle cadence back. Only when a
-//! poll is sent is the pool's own; what is sent stays the native Codex request.
+//! `ACTIVE_WINDOW`). An idle account is asked on a sparse cadence with no
+//! beat: each gap is drawn anew from a truncated exponential between
+//! `IDLE_MIN_INTERVAL` and `IDLE_MAX_INTERVAL` (`IDLE_MEAN_EXTRA` above the
+//! minimum on average, about an hour and a half between reads), the spacing of
+//! arrivals that happen at random, not a timer's. A gap is never a fixed or
+//! clipped value, so no interval repeats often enough to read as a timer. It is
+//! also asked a random `WAKE_DELAY_MIN` to `WAKE_DELAY_MAX` after its longest
+//! window resets (`wake_at`), if that comes first, and is due at the in-use
+//! cadence again as soon as a request lands on it.
+//!
+//! History, so neither extreme comes back: the pool once asked idle accounts
+//! every 20 to 30 minutes around the clock, then (2026-10-27, after account
+//! bans) not at all between resets, on the assumption that only the owner's
+//! own Codex changes an idle account's quota. That assumption is wrong: the
+//! owner's accounts serve more than one pool, and what another pool spends was
+//! invisible here until a request was refused (SPEC.md 9.9). The owner chose
+//! (2026-11-09) to read idle accounts again, sparsely and at random. A native
+//! Codex reads usage every 60 seconds while it is open (tui
+//! app/rate_limit_refresh.rs `poll_deadline`, chatwidget/rate_limits.rs
+//! `rate_limit_refresh_interval`). Only when a poll is sent is the pool's own;
+//! what is sent stays the native Codex request.
 //!
 //! The random source is the caller's (uniform in [0, 1)), so the schedule
 //! needs no dependency and tests can replay it.
@@ -39,10 +46,12 @@ use std::time::Instant;
 pub const INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const JITTER: Duration = Duration::from_secs(60);
 pub const MAX_INTERVAL: Duration = INTERVAL.saturating_add(JITTER);
-/// An idle account whose next reset is unknown (no quota read yet, or the
-/// last read failed).
-pub const IDLE_MIN_INTERVAL: Duration = Duration::from_secs(6 * 3600);
-pub const IDLE_MAX_INTERVAL: Duration = Duration::from_secs(8 * 3600);
+/// An idle account's gap between reads: never shorter than the minimum or
+/// longer than the maximum, `IDLE_MEAN_EXTRA` above the minimum on average
+/// before truncation (about 66 minutes after it).
+pub const IDLE_MIN_INTERVAL: Duration = Duration::from_secs(20 * 60);
+pub const IDLE_MAX_INTERVAL: Duration = Duration::from_secs(4 * 3600);
+pub const IDLE_MEAN_EXTRA: Duration = Duration::from_secs(70 * 60);
 /// How long after an idle account's reset it is asked again.
 pub const WAKE_DELAY_MIN: Duration = Duration::from_secs(60);
 pub const WAKE_DELAY_MAX: Duration = Duration::from_secs(10 * 60);
@@ -72,7 +81,10 @@ impl Plan {
         let next = match self.last {
             None => self.first,
             Some(last) if active => last + self.active_gap,
-            Some(last) => self.wake.unwrap_or(last + self.idle_gap),
+            Some(last) => {
+                let idle = last + self.idle_gap;
+                self.wake.map_or(idle, |wake| wake.min(idle))
+            }
         };
         match self.by {
             Some(by) if by < next => by,
@@ -96,6 +108,19 @@ impl<R: FnMut() -> f64> QuotaPollSchedule<R> {
 
     fn between(&mut self, low: Duration, high: Duration) -> Duration {
         low + (high - low).mul_f64((self.random)())
+    }
+
+    /// The idle gap: `IDLE_MIN_INTERVAL` plus an exponential with mean
+    /// `IDLE_MEAN_EXTRA`, truncated at `IDLE_MAX_INTERVAL` by inverting its
+    /// distribution rather than clipping, so no gap is ever the bound
+    /// itself.
+    fn idle_gap(&mut self) -> Duration {
+        let range = (IDLE_MAX_INTERVAL - IDLE_MIN_INTERVAL).as_secs_f64();
+        let mean = IDLE_MEAN_EXTRA.as_secs_f64();
+        let kept = 1.0 - (-range / mean).exp();
+        let u = (self.random)().clamp(0.0, 1.0 - f64::EPSILON);
+        let extra = -mean * (1.0 - u * kept).ln();
+        IDLE_MIN_INTERVAL + Duration::from_secs_f64(extra.clamp(0.0, range))
     }
 
     /// The account whose poll is most overdue at `now`; `active` reports
@@ -142,7 +167,7 @@ impl<R: FnMut() -> f64> QuotaPollSchedule<R> {
             first: finished,
             last: Some(finished),
             active_gap: self.between(INTERVAL - JITTER, MAX_INTERVAL),
-            idle_gap: self.between(IDLE_MIN_INTERVAL, IDLE_MAX_INTERVAL),
+            idle_gap: self.idle_gap(),
             wake: None,
             by: None,
         };
@@ -248,17 +273,18 @@ mod tests {
         );
     }
 
-    // Go TestQuotaPollScheduleAsksIdleAccountsLess, changed: an idle
-    // account is asked only after its reset, not on a cadence.
+    // Go TestQuotaPollScheduleAsksIdleAccountsLess, changed twice: an idle
+    // account is read sparsely, at random gaps, and also just after its
+    // reset when that comes first.
     #[test]
-    fn asks_an_idle_account_only_after_its_reset() {
+    fn reads_an_idle_account_sparsely_and_after_its_reset() {
         let mut schedule = QuotaPollSchedule::new(replayable(3));
         let ids = vec!["idle".to_string(), "busy".to_string()];
         let start = Instant::now();
         let reset = start + Duration::from_secs(3 * 3600);
         let mut polls: HashMap<String, Vec<Instant>> = HashMap::new();
         let mut now = start;
-        while now < start + Duration::from_secs(5 * 3600) {
+        while now < start + Duration::from_secs(48 * 3600) {
             if let Some(id) = schedule.due(now, &ids, |id| id == "busy") {
                 polls.entry(id.clone()).or_default().push(now);
                 now += Duration::from_secs(1);
@@ -270,15 +296,32 @@ mod tests {
             now += schedule.pause();
         }
         let idle = &polls["idle"];
-        assert_eq!(idle.len(), 2, "idle account polled at {idle:?}");
         assert!(idle[0] - start <= START_SPREAD + PAUSE_MAX * 2);
         let slack = (PAUSE_MAX + Duration::from_secs(1)) * 2;
         assert!(
-            idle[1] >= reset + WAKE_DELAY_MIN && idle[1] <= reset + WAKE_DELAY_MAX + slack,
-            "idle account asked {:?} after its reset",
-            idle[1].saturating_duration_since(reset)
+            idle.iter()
+                .any(|at| *at >= reset + WAKE_DELAY_MIN && *at <= reset + WAKE_DELAY_MAX + slack),
+            "idle account not asked after its reset"
         );
-        assert!(polls["busy"].len() >= 40);
+        // Between reads: never closer than the minimum, never further than
+        // the maximum, and no gap repeated.
+        let mut gaps = BTreeSet::new();
+        for pair in idle.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(gap <= IDLE_MAX_INTERVAL + slack, "idle gap {gap:?}");
+            if pair[0] > reset + WAKE_DELAY_MAX + slack || pair[1] < reset {
+                assert!(gap >= IDLE_MIN_INTERVAL, "idle gap {gap:?}");
+            }
+            gaps.insert(gap.as_secs());
+        }
+        assert_eq!(gaps.len(), idle.len() - 1, "idle reads on a beat");
+        // About an hour and a half apart over two days: sparse, not off.
+        assert!(
+            (18..=50).contains(&idle.len()),
+            "idle account read {} times in two days",
+            idle.len()
+        );
+        assert!(polls["busy"].len() >= 400);
         // Use resumes: the idle account, last asked over six minutes ago, is due.
         let last = *idle.last().unwrap();
         let resumed = last + MAX_INTERVAL + Duration::from_secs(2);
@@ -290,9 +333,33 @@ mod tests {
         );
     }
 
-    // An idle account with no known reset is asked hours apart, not minutes.
+    // The idle gap is drawn inside its bounds, reaches neither bound as a
+    // clipped value, and averages near the minimum plus its mean.
     #[test]
-    fn idle_account_without_a_reset_waits_hours() {
+    fn idle_gap_is_a_truncated_exponential() {
+        let mut low = QuotaPollSchedule::new(|| 0.0);
+        assert_eq!(low.idle_gap(), IDLE_MIN_INTERVAL);
+        let mut high = QuotaPollSchedule::new(|| 1.0);
+        assert!(high.idle_gap() <= IDLE_MAX_INTERVAL);
+        let mut schedule = QuotaPollSchedule::new(replayable(7));
+        let draws: Vec<Duration> = (0..5000).map(|_| schedule.idle_gap()).collect();
+        assert!(
+            draws
+                .iter()
+                .all(|gap| *gap >= IDLE_MIN_INTERVAL && *gap < IDLE_MAX_INTERVAL)
+        );
+        let mean = draws.iter().sum::<Duration>() / 5000;
+        assert!(
+            mean > Duration::from_secs(75 * 60) && mean < Duration::from_secs(100 * 60),
+            "mean idle gap {mean:?}"
+        );
+        let distinct: BTreeSet<u128> = draws.iter().map(Duration::as_millis).collect();
+        assert!(distinct.len() > 4900, "idle gaps repeat");
+    }
+
+    // An idle account with no known reset is asked on the idle cadence.
+    #[test]
+    fn idle_account_without_a_reset_waits_its_idle_gap() {
         let mut schedule = QuotaPollSchedule::new(|| 0.0);
         let now = Instant::now();
         let a = vec!["a".to_string()];

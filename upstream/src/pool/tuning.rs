@@ -59,6 +59,11 @@ pub struct Tuning {
     /// the keepalive task checks (see stream::EarlyStreamWriter).
     pub stream_keepalive_interval: Duration,
     pub stream_keepalive_tick: Duration,
+    /// How long a request waits for the usage read of a stale account before
+    /// it is sent (quota_observed.rs). Zero turns the read off: tests whose
+    /// fake upstream counts requests use that, and the read has tests of its
+    /// own. Not read from the environment.
+    pub placement_check_wait: Duration,
 }
 
 /// How many times an overload is retried on the same account (after 6s to 8s
@@ -92,6 +97,7 @@ impl Default for Tuning {
             unmanaged_precommit_commit_after: Duration::from_secs(5),
             stream_keepalive_interval: Duration::from_millis(1500),
             stream_keepalive_tick: Duration::from_millis(250),
+            placement_check_wait: super::quota_observed::PLACEMENT_CHECK_WAIT,
         }
     }
 }
