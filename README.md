@@ -409,9 +409,12 @@ The control page refreshes every five minutes (**Refresh** reads at once).
   `Standby`), every quota window with its own percentage and reset time, credits,
   spend control, and reset credits with the nearest expiry (red within seven
   days). Quota is read from `/wham/usage` one account at a time, at random:
-  every four to six minutes for an account used in the last 30 minutes, and
-  for an idle one only once after its quota resets; a value upstream
-  does not report shows as `Not reported`. **Use reset credit** spends one the
+  every four to six minutes for an account used in the last 30 minutes, about
+  every hour and a half (never on a beat) for an idle one, and once more just
+  before a request goes to an account whose reading is over 35 minutes old,
+  since another pool or the owner's own Codex may have spent it. Every
+  response also carries the serving account's windows, which update it at no
+  extra request. A value upstream does not report shows as `Not reported`. **Use reset credit** spends one the
   way Codex's own `/usage` reset does: the credit expiring soonest, and a press
   after a failed attempt resends that attempt, so it cannot spend twice.
 - **Cache**: main and subagent cache reads per account, token and request hit

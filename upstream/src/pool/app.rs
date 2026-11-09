@@ -149,6 +149,13 @@ pub struct App {
     /// When a request last went to each account; it sets the account's quota
     /// poll cadence (quota_schedule.rs).
     pub account_activity: std::sync::Mutex<HashMap<String, Timestamp>>,
+    /// When the pool last read each account's usage just before sending to
+    /// it, so one stale account costs one read, not one per request
+    /// (quota_observed.rs).
+    pub placement_checks: std::sync::Mutex<HashMap<String, Timestamp>>,
+    /// Usage reads made outside the background poll, for its schedule to
+    /// count as polls (quota_refresh.rs).
+    pub quota_reads_elsewhere: std::sync::Mutex<Vec<(String, std::time::Instant)>>,
     /// Provider requests (responses, compact, chat) whose handler has not
     /// returned, streams included. The shutdown drain and the deploy script's
     /// idle wait both read it.
@@ -245,6 +252,8 @@ impl App {
             refused: Arc::default(),
             refreshes_settling: Arc::default(),
             account_activity: std::sync::Mutex::new(HashMap::new()),
+            placement_checks: std::sync::Mutex::new(HashMap::new()),
+            quota_reads_elsewhere: std::sync::Mutex::new(Vec::new()),
             in_flight: std::sync::atomic::AtomicI64::new(0),
             client_limits,
             turn_state_issuers: std::sync::Mutex::new(HashMap::new()),
@@ -288,6 +297,9 @@ impl App {
             // Capacity retries wait seconds in production; tests pace them down.
             capacity_retry_backoff: Duration::from_millis(1),
             capacity_retry_max_wait: Duration::from_millis(4),
+            // The usage read before sending to a stale account would add a
+            // request to every fake upstream; its own tests turn it on.
+            placement_check_wait: Duration::ZERO,
             ..Tuning::default()
         };
         let _ = std::fs::create_dir_all(data_dir.join("state"));
@@ -1183,12 +1195,9 @@ impl Inner {
             state: "disabled".to_string(),
             message: "Protection disabled".to_string(),
             freshness: quota::quota_telemetry_state(snapshot, now).to_string(),
-            last_successful_update: snapshot.last_successful_refresh_at,
+            last_successful_update: quota::quota_observed_at(snapshot),
             ..QuotaProtectionStatus::default()
         };
-        if status.last_successful_update.is_zero() {
-            status.last_successful_update = snapshot.usage_updated_at;
-        }
         if !status.supported {
             status.message =
                 "Protection unavailable: API-key accounts do not use ChatGPT quota windows"

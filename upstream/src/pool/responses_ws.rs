@@ -625,7 +625,9 @@ async fn start_response(
         let state = session.state();
         (state.account.clone(), state.sent)
     };
-    let candidate = app.select_account_for_route(&mut route, &model, &HashMap::new());
+    let candidate = app
+        .select_account_checked(&mut route, &model, &HashMap::new())
+        .await;
     if candidate
         .as_ref()
         .map_or(true, |candidate| candidate.id != bound.id)
@@ -731,7 +733,7 @@ async fn dial(
         detail: "no eligible upstream account".to_string(),
     };
     for _ in 0..app.proxy_attempt_limit() {
-        let Ok(candidate) = app.select_account_for_route(route, model, &excluded) else {
+        let Ok(candidate) = app.select_account_checked(route, model, &excluded).await else {
             break;
         };
         excluded.insert(candidate.id.clone(), true);
@@ -1069,6 +1071,9 @@ async fn relay_upstream<S>(
         let response = session.state().active.clone();
         if let Frame::Text(text) = &frame {
             app.note_event_turn_state(text, &account_id);
+            // codex.rate_limits: what upstream says this account has left,
+            // other clients' use included (quota_observed.rs).
+            app.note_rate_limit_event(&account_id, text);
             // A later message answers a resource or image call without
             // repeating it; key_login.rs needs its arguments.
             if session.key_login {

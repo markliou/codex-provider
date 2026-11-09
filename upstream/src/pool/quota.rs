@@ -38,9 +38,11 @@ pub const FIVE_HOUR_WINDOW_MINUTES: i64 = 300;
 /// multipliers describe.
 pub const WEEKLY_WINDOW_MINUTES: i64 = 10080;
 
-/// Quota telemetry is refreshed every four to six minutes for an account in
-/// use; an idle one is asked only after its reset (quota_schedule.rs), so its
-/// figures read as stale until it is used again, which is what they are.
+/// Quota telemetry is refreshed with every response and every four to six
+/// minutes for an account in use; an idle one is asked about every hour and a
+/// half at random (quota_schedule.rs), so its figures usually read as stale,
+/// which is what they are, and it is read again just before it is sent to
+/// (quota_observed.rs).
 /// Freshness itself is never a routing gate: SPEC section 6.4 deliberately
 /// keeps telemetry failures fail-open.
 pub const QUOTA_TELEMETRY_FRESHNESS_MINUTES: i64 = 35;
@@ -316,6 +318,191 @@ pub fn merge_sparse_quota(
         current.additional_limits = drop_retired_model_meters(prior.additional_limits.clone());
     }
     current
+}
+
+// ---- What upstream reports with each response ----
+
+/// Folds the rate limits upstream reported with a response into the
+/// account's last snapshot, as a native Codex keeps them: on the HTTP stream
+/// from the `x-codex-*` headers (codex-api sse/responses.rs
+/// `parse_all_rate_limits` on every response), on a WebSocket from the
+/// `codex.rate_limits` event (endpoint/responses_websocket.rs
+/// `parse_rate_limit_event`). Both are parsed by Codex's own vendored code
+/// (`crate::rate_limits`); this only maps the result.
+///
+/// It exists because an account can serve more than one pool, or its owner's
+/// own Codex, at once: what another client spent reaches this pool only
+/// through upstream's figures, and each response carries them for free.
+///
+/// A response reports less than the usage endpoint (no plan, no reset
+/// credits, no allowed/limit-reached flags), so it is merged, never a
+/// replacement: a window is matched by its length (else its role) and
+/// replaced, a window or meter the response does not mention keeps its last
+/// reading, and exhaustion flags stay the usage endpoint's. None when the
+/// response reported nothing the snapshot holds.
+pub fn apply_rate_limit_snapshots(
+    prior: Option<&AccountQuota>,
+    snapshots: &[codex_protocol::protocol::RateLimitSnapshot],
+    now: Timestamp,
+) -> Option<AccountQuota> {
+    let mut quota = prior.cloned().unwrap_or_else(|| AccountQuota {
+        limit_id: "codex".to_string(),
+        provenance: "codex_response".to_string(),
+        ..AccountQuota::default()
+    });
+    let mut applied = false;
+    for snapshot in snapshots {
+        let windows: Vec<QuotaWindow> = [
+            ("primary", snapshot.primary.as_ref()),
+            ("secondary", snapshot.secondary.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(role, window)| window.map(|window| observed_window(role, window, now)))
+        .collect();
+        let limit_id = clean_metadata_token(snapshot.limit_id.as_deref().unwrap_or("codex"));
+        if limit_id.is_empty() || limit_id == "codex" {
+            for window in windows {
+                merge_observed_window(
+                    &mut quota.primary,
+                    &mut quota.secondary,
+                    &mut quota.windows,
+                    window,
+                );
+                applied = true;
+            }
+            if let Some(credits) = &snapshot.credits {
+                let prior = quota.credits.take().unwrap_or_default();
+                quota.credits = Some(QuotaCredits {
+                    has_credits: credits.has_credits,
+                    unlimited: credits.unlimited,
+                    balance: credits
+                        .balance
+                        .as_deref()
+                        .map(|balance| clean_metadata_text(balance, 80))
+                        .filter(|balance| !balance.is_empty()),
+                    ..prior
+                });
+                applied = true;
+            }
+            continue;
+        }
+        if windows.is_empty() {
+            continue;
+        }
+        let index = match quota
+            .additional_limits
+            .iter()
+            .position(|limit| clean_metadata_token(&limit.limit_id) == limit_id)
+        {
+            Some(index) => index,
+            None => {
+                quota.additional_limits.push(QuotaLimit {
+                    limit_id: limit_id.clone(),
+                    limit_name: clean_metadata_text(
+                        snapshot.limit_name.as_deref().unwrap_or_default(),
+                        120,
+                    ),
+                    ..QuotaLimit::default()
+                });
+                quota.additional_limits.len() - 1
+            }
+        };
+        let limit = &mut quota.additional_limits[index];
+        for window in windows {
+            merge_observed_window(
+                &mut limit.primary,
+                &mut limit.secondary,
+                &mut limit.windows,
+                window,
+            );
+        }
+        applied = true;
+    }
+    if !applied {
+        return None;
+    }
+    quota.additional_limits =
+        drop_retired_model_meters(std::mem::take(&mut quota.additional_limits));
+    quota.hourly = quota_window_by_duration(&quota, FIVE_HOUR_WINDOW_MINUTES);
+    quota.weekly = quota_window_by_duration(&quota, WEEKLY_WINDOW_MINUTES);
+    Some(quota)
+}
+
+fn observed_window(
+    role: &str,
+    window: &codex_protocol::protocol::RateLimitWindow,
+    now: Timestamp,
+) -> QuotaWindow {
+    // The same reading the usage endpoint's window gets, so both sources mean
+    // the same thing to routing and the dashboard.
+    normalize_quota_window(
+        role,
+        Some(&WindowInfo {
+            used_percent: Some(window.used_percent),
+            limit_window_seconds: window.window_minutes.map(|minutes| minutes * 60),
+            reset_after_seconds: None,
+            reset_at: window.resets_at,
+        }),
+        now,
+    )
+}
+
+fn merge_observed_window(
+    primary: &mut QuotaWindow,
+    secondary: &mut QuotaWindow,
+    windows: &mut Vec<QuotaWindow>,
+    observed: QuotaWindow,
+) {
+    if windows.is_empty() {
+        // An older snapshot may hold only the role fields.
+        windows.extend(
+            [&*primary, &*secondary]
+                .into_iter()
+                .filter(|window| window.observed || window.present)
+                .cloned(),
+        );
+    }
+    // By length when both say it: a five-hour reading must never land on the
+    // week because both arrived as "primary". By role only when a length is
+    // missing. A replaced window keeps its own role name.
+    let matches = |window: &QuotaWindow| match (observed.window_minutes, window.window_minutes) {
+        (Some(observed), Some(window)) => observed == window,
+        _ => window.role == observed.role,
+    };
+    let replace = |window: &mut QuotaWindow| {
+        let role = std::mem::take(&mut window.role);
+        *window = QuotaWindow {
+            role,
+            ..observed.clone()
+        };
+    };
+    match windows.iter().position(matches) {
+        Some(index) => replace(&mut windows[index]),
+        None => windows.push(observed.clone()),
+    }
+    for (field, slot) in [(primary, "primary"), (secondary, "secondary")] {
+        if field.observed || field.present {
+            if matches(field) {
+                replace(field);
+            }
+        } else if slot == observed.role {
+            *field = observed.clone();
+        }
+    }
+}
+
+/// When the snapshot's figures were last read from upstream, by the usage
+/// endpoint or from a response, whichever is later. Freshness, the dashboard
+/// and protection all read this one instant.
+pub fn quota_observed_at(snapshot: &QuotaSnapshot) -> Timestamp {
+    if snapshot
+        .usage_updated_at
+        .after(&snapshot.last_successful_refresh_at)
+    {
+        snapshot.usage_updated_at
+    } else {
+        snapshot.last_successful_refresh_at
+    }
 }
 
 pub fn quota_limit_from_rate_limit(
@@ -620,10 +807,7 @@ pub fn quota_telemetry_state(snapshot: &QuotaSnapshot, now: Timestamp) -> &'stat
     if snapshot.quota_error.is_some() {
         return "refresh_unavailable";
     }
-    let mut observed_at = snapshot.last_successful_refresh_at;
-    if observed_at.is_zero() {
-        observed_at = snapshot.usage_updated_at;
-    }
+    let observed_at = quota_observed_at(snapshot);
     if observed_at.is_zero() {
         return "not_reported";
     }
