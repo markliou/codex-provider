@@ -8,9 +8,9 @@
 //! - from every response, as a native Codex does, at no extra request
 //!   (`note_rate_limit_headers`, `note_rate_limit_event`; quota.rs
 //!   `apply_rate_limit_snapshots`);
-//! - once just before sending to an account whose figures are stale
-//!   (`select_account_checked`), so routing does not pick an account
-//!   another pool drained on figures from hours ago;
+//! - once just before sending to an account whose figures are older than
+//!   five minutes (`select_account_checked`), so routing does not pick an
+//!   account another pool drained since this pool last looked;
 //! - by the background poll, which also asks idle accounts now
 //!   (quota_schedule.rs).
 //!
@@ -39,6 +39,15 @@ pub const PLACEMENT_CHECK_WAIT: Duration = Duration::from_secs(5);
 /// Reads per request: a request whose candidates are all stale reads at most
 /// this many before it is sent on the figures it has.
 pub const PLACEMENT_CHECKS_PER_REQUEST: usize = 2;
+/// Figures older than this many minutes are read again before a request is sent on them.
+/// Not the 35-minute freshness window (QUOTA_TELEMETRY_FRESHNESS_MINUTES):
+/// two pools on one account each saw the other's spending only after that
+/// window, and their readings of one account drifted 10 points apart, enough
+/// to send turns into the reserve (owner, 2026-11-09). An account this pool
+/// is serving is refreshed by every response and never gets this old, so the
+/// extra reads land only on an account picked again after a pause. Raising
+/// it back toward 35 minutes reopens that blind spot.
+pub const PLACEMENT_CHECK_AGE_MINUTES: i64 = 5;
 
 impl App {
     /// The `x-codex-*` rate-limit headers of a Codex backend response
@@ -145,24 +154,26 @@ impl App {
 
     /// Whether to read this account's usage before sending to it now, and
     /// if so, records that it is being read. Only a Codex sign-in the poll
-    /// would read, whose figures are older than the freshness window, and
-    /// that was not read this way within that window, so an account whose
-    /// read fails is not asked again on every request.
+    /// would read, whose figures are older than `PLACEMENT_CHECK_AGE_MINUTES` (or
+    /// were never read), and that was not read this way within that age, so
+    /// an account whose read fails is asked at most once per that age rather
+    /// than on every request.
     pub fn claim_placement_check(&self, item: &Account) -> bool {
         if !self.upstream_enabled() || self.credential_refused(item) {
             return false;
         }
         let now = Timestamp::now();
+        let window = minutes(PLACEMENT_CHECK_AGE_MINUTES);
         {
             let inner = self.read();
             if !plan::is_codex_device_auth(item) || inner.pi_only(item) {
                 return false;
             }
-            let snapshot = inner.quota_snapshot(&item.id);
-            if !matches!(
-                quota::quota_telemetry_state(&snapshot, now),
-                "stale" | "not_reported"
-            ) {
+            let observed_at = quota::quota_observed_at(&inner.quota_snapshot(&item.id));
+            // A failed last read (quota_error) does not exempt the account:
+            // its figures are just as old, and the per-account claim below
+            // keeps a failing endpoint from being asked on every request.
+            if !observed_at.is_zero() && now.sub(&observed_at) <= window {
                 return false;
             }
         }
@@ -170,7 +181,6 @@ impl App {
             .placement_checks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let window = minutes(quota::QUOTA_TELEMETRY_FRESHNESS_MINUTES);
         if checks
             .get(&item.id)
             .is_some_and(|last| now.sub(last) < window)

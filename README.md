@@ -411,7 +411,7 @@ The control page refreshes every five minutes (**Refresh** reads at once).
   days). Quota is read from `/wham/usage` one account at a time, at random:
   every four to six minutes for an account used in the last 30 minutes, about
   every hour and a half (never on a beat) for an idle one, and once more just
-  before a request goes to an account whose reading is over 35 minutes old,
+  before a request goes to an account whose reading is over five minutes old,
   since another pool or the owner's own Codex may have spent it. Every
   response also carries the serving account's windows, which update it at no
   extra request. A value upstream does not report shows as `Not reported`. **Use reset credit** spends one the

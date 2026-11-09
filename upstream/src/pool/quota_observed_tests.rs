@@ -18,6 +18,7 @@ use super::testing::device_account;
 use super::testing::write_codex_device_auth;
 use super::time::Timestamp;
 use super::time::hours;
+use super::time::minutes;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -105,7 +106,7 @@ fn remaining(snapshot: &QuotaSnapshot, minutes: i64) -> Option<f64> {
 }
 
 /// Device slots on a fake Codex backend, with the usage read before use on
-/// (the test app turns it off).
+/// (the test app turns it off) and the global reserve on, as it is live.
 fn checking_app(server_url: &str, slots: &[(&str, &str, i64)]) -> (Arc<App>, TempDir) {
     let accounts = slots
         .iter()
@@ -118,6 +119,7 @@ fn checking_app(server_url: &str, slots: &[(&str, &str, i64)]) -> (Arc<App>, Tem
         write_codex_device_auth(&app, id, upstream, &format!("{id}@example.test"));
     }
     app.tuning.placement_check_wait = super::quota_observed::PLACEMENT_CHECK_WAIT;
+    app.write().quota_reserve.enabled = true;
     (Arc::new(app), dir)
 }
 
@@ -307,6 +309,56 @@ async fn a_stale_account_is_read_before_it_is_sent_to() {
         .collect();
     elsewhere.sort();
     assert_eq!(elsewhere, ["a", "b"]);
+}
+
+// Two pools on one account: a reading ten minutes old still counts as fresh
+// for the dashboard, but the other pool may have spent the account into its
+// reserve since, so it is read before a request goes to it. A reading a
+// minute old is not read again.
+#[tokio::test]
+async fn a_reading_minutes_old_is_read_again_before_use() {
+    let upstream = FakeServer::start(|request| match request.path.as_str() {
+        "/backend-api/wham/usage" => {
+            let used = if request.header("chatgpt-account-id") == "acct-a" {
+                95
+            } else {
+                20
+            };
+            FakeResponse::json(200, &usage(used))
+        }
+        "/backend-api/codex/responses" => ok_stream(),
+        _ => FakeResponse::json(404, "{}"),
+    })
+    .await;
+    let (app, _dir) = checking_app(&upstream.url, &[("a", "acct-a", 100), ("b", "acct-b", 10)]);
+    let now = Timestamp::now();
+    read_long_ago(&app, "a", 10, now.add(-minutes(10)));
+    read_long_ago(&app, "b", 20, now.add(-minutes(1)));
+    assert_eq!(
+        quota::quota_telemetry_state(&snapshot(&app, "a"), now),
+        "fresh"
+    );
+
+    let result = serve(&app, codex_request("session-one")).await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+
+    let requests = upstream.requests();
+    let reads: Vec<&str> = requests
+        .iter()
+        .filter(|request| request.path == "/backend-api/wham/usage")
+        .map(|request| request.header("chatgpt-account-id"))
+        .collect();
+    assert_eq!(reads, ["acct-a"], "only the ten-minute reading is read");
+    let served: Vec<&str> = requests
+        .iter()
+        .filter(|request| request.path == "/backend-api/codex/responses")
+        .map(|request| request.header("chatgpt-account-id"))
+        .collect();
+    assert_eq!(
+        served,
+        ["acct-b"],
+        "the account in its reserve is passed over"
+    );
 }
 
 // A read that fails does not hold the request, and the account is not read
