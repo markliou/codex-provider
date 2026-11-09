@@ -86,11 +86,6 @@ impl App {
         else {
             return;
         };
-        let changed = snapshot.quota.as_ref().is_none_or(|prior| {
-            prior.windows != current.windows
-                || prior.additional_limits != current.additional_limits
-                || prior.credits != current.credits
-        });
         let has_window = quota::quota_reported_windows(&current)
             .iter()
             .any(|window| window.present);
@@ -106,11 +101,11 @@ impl App {
             .state
             .quotas_mut()
             .insert(account_id.to_string(), snapshot);
-        // The figures repeat on every response; the file is written only when
-        // they moved. A restart then loses at most the freshness instant.
-        if changed {
-            let _ = inner.save();
-        }
+        // Memory only, never the state file: the figures arrive with every
+        // response, and the response's own outcome (mark_success, a failure
+        // record) already writes runtime.json, about 1.4 MB, once per request.
+        // Writing here too doubled that. Routing reads memory; a restart
+        // between this and the next write loses only the last reading.
     }
 
     /// Selects the account for a route, first reading the usage of a

@@ -179,7 +179,8 @@ async fn response_headers_update_the_serving_account_s_windows() {
             .iter()
             .all(|request| request.path == "/backend-api/codex/responses")
     );
-    // Persisted, so a restart does not lose what moved.
+    // Persisted by the response's own success write, not a write of its own
+    // (quota_observed.rs), so a restart does not lose what moved.
     let saved = std::fs::read_to_string(app.settings.data_dir.join("state").join("runtime.json"))
         .unwrap_or_default();
     let saved: Value = serde_json::from_str(&saved).unwrap_or_default();
@@ -197,7 +198,15 @@ fn rate_limit_event_and_metered_headers_update_the_snapshot() {
     let (app, _dir) =
         super::testing::test_app_with(vec![device_account("device", "acct-up", 100)], |_| {});
     let event = shape("rate limits event")["event"].to_string();
+    let state_file = app.settings.data_dir.join("state").join("runtime.json");
+    let written = || std::fs::read(&state_file).ok();
+    let before_event = written();
     app.note_rate_limit_event("device", event.as_bytes());
+    assert_eq!(
+        written(),
+        before_event,
+        "a reading from a response must not write the state file of its own"
+    );
     let after = snapshot(&app, "device");
     assert_eq!(
         remaining(&after, quota::FIVE_HOUR_WINDOW_MINUTES),
