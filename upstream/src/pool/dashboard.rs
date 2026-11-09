@@ -1058,6 +1058,15 @@ impl Inner {
             "promptCacheWindow": self.prompt_cache_window(),
             "throughput": self.throughput_snapshot("", now),
             "upstreamEnabled": self.upstream_enabled,
+            // The weekly threshold of the global reserve (SPEC.md 9.7), shown
+            // read-only on the public page so users know the pool stops an
+            // account before its week runs out (the owner's request,
+            // 2026-11-09). Only the switch and that one threshold: the
+            // five-hour one is not shown there, and nothing here changes it.
+            "quotaReserve": {
+                "enabled": self.quota_reserve.enabled,
+                "weekly": self.quota_reserve.weekly,
+            },
         })
     }
 }

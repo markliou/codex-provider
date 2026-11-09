@@ -96,6 +96,7 @@ async fn admin_dashboard_assets() {
             "5h limit first",
             "Balanced sticky",
             "routing-strategy-pill",
+            "public-weekly-reserve",
             "SERVICE STATUS",
             "Active routes",
             "device-auth-url",
@@ -267,6 +268,7 @@ async fn admin_dashboard_assets() {
         &js,
         &[
             "fiveHourFirst",
+            "renderPublicWeeklyReserve(body.dashboard.quotaReserve)",
             "codexPoolAdminTheme",
             "themeMetaColors",
             "themeNames.has",
