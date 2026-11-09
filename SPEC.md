@@ -1805,6 +1805,10 @@ on by default (`CODEX_POOL_QUOTA_RESERVE`, the owner's choice, 2026-11-02).
   account is held back, the client gets the pool's usual no-account answer.
 - The Console shows it as a card with its switch and both thresholds, and
   each account's protection panel shows `Global` while it applies.
+- The public page shows the weekly threshold read-only while the reserve is
+  on (`quotaReserve.enabled` and `quotaReserve.weekly` in the public payload,
+  never the five-hour one), so users know an account's week ends for them at
+  the reserve, not at 0% (the owner's request, 2026-11-09).
 
 ```http
 POST /admin/api/settings

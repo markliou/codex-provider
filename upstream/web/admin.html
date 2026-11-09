@@ -133,6 +133,16 @@
             </div>
           </section>
 
+          <!-- The public page's read-only note of the weekly reserve (SPEC.md
+               9.7), so users know the pool stops an account before its week
+               runs out. It only shows the threshold; it is set in the
+               management view's reserve card. Hidden while the reserve is off. -->
+          <section id="public-weekly-reserve" class="public-weekly-reserve public-only off" role="note" aria-label="Weekly limit" hidden>
+            <div class="eyebrow">WEEKLY LIMIT</div>
+            <strong id="public-weekly-reserve-title">Accounts stop before their week runs out</strong>
+            <span id="public-weekly-reserve-detail">The pool keeps part of every account's weekly allowance for its owner.</span>
+          </section>
+
           <!-- Shown while the upstream switch is off (SPEC.md, upstream
                switch): the pool then sends nothing upstream, so every figure
                below is the last one it had. -->

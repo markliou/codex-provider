@@ -705,6 +705,21 @@
         : "Accounts are used until their quota runs out, unless they have their own protection.";
   }
 
+  // The public page's weekly limit note (SPEC.md 9.7): read-only, so users
+  // know an account is stopped at the reserve, not at 0%. The "off" class
+  // hides it (CSS), because entering public mode unhides every .public-only.
+  function renderPublicWeeklyReserve(reserve) {
+    const note = $("#public-weekly-reserve");
+    if (!note) return;
+    const weekly = finiteMetric(reserve?.weekly);
+    const on = reserve?.enabled === true && weekly !== null;
+    note.classList.toggle("off", !on);
+    if (!on) return;
+    $("#public-weekly-reserve-title").textContent = `Each account is stopped at ${weekly}% of its week left`;
+    $("#public-weekly-reserve-detail").textContent =
+      `The pool stops using an account once its weekly window is down to ${weekly}% remaining, and that part is kept for the account's owner. Plan for the weekly allowance to end there, not at 0%.`;
+  }
+
   // Each ChatGPT account may hold two sign-ins (SPEC.md 2.3.7): its Codex
   // device-code sign-in, and a Pi sign-in for the Pi channel. The account row
   // shows one badge per mode, and the Pi badge carries the channel's own
@@ -1479,6 +1494,7 @@
       const accounts = body.dashboard.accounts || [];
       state.quotaFloorPercent = finiteMetric(body.dashboard.quotaFloorPercent) ?? 0;
       renderUpstreamClosed(body.dashboard.upstreamEnabled);
+      renderPublicWeeklyReserve(body.dashboard.quotaReserve);
       renderSummary(body.dashboard.summary || {}, true);
       renderPoolCapacity(body.dashboard.poolCapacity);
       renderThroughput(body.dashboard.throughput);

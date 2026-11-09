@@ -565,6 +565,20 @@ async fn public_dashboard_redacts_account_secrets() {
         throughput["current"]["requestCount"], 1,
         "public current throughput"
     );
+    // The weekly reserve is shown read-only, and only its weekly threshold.
+    let reserve = body_json(&result)["dashboard"]["quotaReserve"].clone();
+    assert_eq!(
+        (reserve["enabled"].clone(), reserve["weekly"].clone()),
+        (
+            serde_json::Value::from(app.read().quota_reserve.enabled),
+            serde_json::Value::from(app.read().quota_reserve.weekly)
+        ),
+        "public weekly reserve"
+    );
+    assert!(
+        reserve.get("fiveHour").is_none(),
+        "public reserve: {reserve}"
+    );
     let series = throughput["series"].as_array().cloned().unwrap_or_default();
     assert_eq!(series.len(), 48 * 6 + 1, "public 48-hour throughput series");
     let latest = series.last().cloned().unwrap_or_default();
