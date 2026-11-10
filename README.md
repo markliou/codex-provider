@@ -299,7 +299,7 @@ healthy copy can stand in when the current one has failed.
   Missing or failed quota readings never block a slot.
 - **Quota reserve** (on by default, one switch for the whole pool): every slot
   without its own protection stops taking new routing once its 5-hour window
-  is down to 10% or its weekly window to 10% (each set in the Console), so the
+  is down to 10% or its weekly window to 3% (each set in the Console), so the
   rest stays for its owner's own ChatGPT use.
 - **Owner note**: an 80-character plain-text label, visible and editable on the
   public page so shared users can mark whose account it is. Never put secrets
@@ -493,7 +493,7 @@ settings and SPEC.md 2.1 lists them all. The ones most often changed:
 | `CODEX_POOL_CLIENT_MAX_PER_MINUTE` | `120` | Requests one client key may start in a minute (SPEC.md 2.3.6) |
 | `CODEX_POOL_QUOTA_PRIME` | `false` | Initial **Prime idle accounts** setting |
 | `CODEX_POOL_PI_CHANNEL` | `false` | `true` sends apps' non-Codex requests as Pi sends them instead of completing them into Codex requests (no Console switch) |
-| `CODEX_POOL_QUOTA_RESERVE` | `true` | Initial **Quota reserve** setting: stop using an account at 10% left in its 5-hour or weekly window (both set in the Console) |
+| `CODEX_POOL_QUOTA_RESERVE` | `true` | Initial **Quota reserve** setting: stop using an account at 10% left in its 5-hour window or 3% in its weekly window (both set in the Console) |
 | `CODEX_POOL_SHUTDOWN_GRACE` | `120s` | Drain time on stop (keep `stop_grace_period` above it) |
 
 ### Data and logs

@@ -1791,7 +1791,9 @@ spends is what the account's owner can no longer use in ChatGPT. The global
 reserve keeps part of every account's allowance for its owner: the pool stops
 selecting an account once its five-hour window has at most `fiveHour` percent
 left, or its weekly window at most `weekly` percent. The two thresholds are
-set apart (each an integer 0–100, both 10 by default) and share one switch,
+set apart (each an integer 0–100; 10 for the five-hour window and 3 for the
+week by default, the week lowered from 10 by the owner on 2026-11-10, since
+10% of a week held back far more than the owner's own use needs) and share one switch,
 on by default (`CODEX_POOL_QUOTA_RESERVE`, the owner's choice, 2026-11-02).
 
 - It applies to every Codex device-auth slot whose own protection (9.6) is
