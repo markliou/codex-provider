@@ -223,11 +223,11 @@ impl App {
                 enabled: config.quota_reserve.unwrap_or(settings.quota_reserve),
                 five_hour: config
                     .quota_reserve_five_hour
-                    .unwrap_or(QUOTA_RESERVE_DEFAULT_PERCENT)
+                    .unwrap_or(QUOTA_RESERVE_FIVE_HOUR_DEFAULT_PERCENT)
                     .clamp(0, 100),
                 weekly: config
                     .quota_reserve_weekly
-                    .unwrap_or(QUOTA_RESERVE_DEFAULT_PERCENT)
+                    .unwrap_or(QUOTA_RESERVE_WEEKLY_DEFAULT_PERCENT)
                     .clamp(0, 100),
             },
             settings: settings.clone(),
@@ -596,7 +596,11 @@ pub struct QuotaReserve {
     pub weekly: i64,
 }
 
-pub const QUOTA_RESERVE_DEFAULT_PERCENT: i64 = 10;
+pub const QUOTA_RESERVE_FIVE_HOUR_DEFAULT_PERCENT: i64 = 10;
+/// Lower than the five-hour default: 10% of a week held back far more than
+/// the owner's own use needs (the owner, 2026-11-10). A Console value saved
+/// in config.json still wins over either default.
+pub const QUOTA_RESERVE_WEEKLY_DEFAULT_PERCENT: i64 = 3;
 
 /// The week's threshold of an account's own protection. An account saved
 /// before the week had a threshold of its own keeps its one threshold for

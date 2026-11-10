@@ -1181,7 +1181,7 @@ async fn admin_settings_set_the_global_quota_reserve() {
     assert!(
         result
             .body_string()
-            .contains(r#""quotaReserve":{"enabled":true,"fiveHour":10,"weekly":10}"#)
+            .contains(r#""quotaReserve":{"enabled":true,"fiveHour":10,"weekly":3}"#)
     );
     let result = post_settings(
         &app,

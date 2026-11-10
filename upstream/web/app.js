@@ -695,7 +695,7 @@
     const fiveHour = $("#quota-reserve-five-hour");
     const weekly = $("#quota-reserve-weekly");
     if (known && document.activeElement !== fiveHour) fiveHour.value = String(reserve.fiveHour ?? 10);
-    if (known && document.activeElement !== weekly) weekly.value = String(reserve.weekly ?? 10);
+    if (known && document.activeElement !== weekly) weekly.value = String(reserve.weekly ?? 3);
     $("#quota-reserve-card").classList.toggle("off", !on);
     $("#quota-reserve-state").textContent = !known ? "Unavailable" : on ? "On" : "Off";
     $("#quota-reserve-detail").textContent = !known
