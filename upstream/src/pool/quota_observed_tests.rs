@@ -410,3 +410,33 @@ fn observed_windows_match_by_length() {
         "the five-hour window keeps its own reading"
     );
 }
+
+// The background poll reads each account on a native Codex's cadence for its
+// most used window, except that an account the reserve already holds out of
+// routing is read once a minute, not every 15 or 5 seconds until its reset.
+#[test]
+fn the_poll_interval_follows_codex_except_for_a_held_account() {
+    use super::quota_schedule::INTERVAL;
+    use std::time::Duration;
+    let (app, _dir) = checking_app("http://127.0.0.1:9", &[("a", "acct-a", 100)]);
+    assert_eq!(app.quota_poll_interval("a"), INTERVAL, "never read");
+    assert_eq!(app.quota_poll_interval("gone"), INTERVAL, "no such account");
+    let now = Timestamp::now();
+    read_long_ago(&app, "a", 50, now);
+    assert_eq!(app.quota_poll_interval("a"), Duration::from_secs(60));
+    read_long_ago(&app, "a", 80, now);
+    assert_eq!(app.quota_poll_interval("a"), Duration::from_secs(30));
+    read_long_ago(&app, "a", 89, now);
+    assert_eq!(app.quota_poll_interval("a"), Duration::from_secs(30));
+    // 5% of the five-hour window left: the 10% reserve holds it.
+    read_long_ago(&app, "a", 95, now);
+    assert_eq!(
+        app.quota_poll_interval("a"),
+        INTERVAL,
+        "held by the reserve"
+    );
+    app.write().quota_reserve.enabled = false;
+    assert_eq!(app.quota_poll_interval("a"), Duration::from_secs(15));
+    read_long_ago(&app, "a", 99, now);
+    assert_eq!(app.quota_poll_interval("a"), Duration::from_secs(5));
+}

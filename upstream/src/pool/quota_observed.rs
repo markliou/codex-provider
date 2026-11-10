@@ -11,8 +11,8 @@
 //! - once just before sending to an account whose figures are older than
 //!   five minutes (`select_account_checked`), so routing does not pick an
 //!   account another pool drained since this pool last looked;
-//! - by the background poll, which also asks idle accounts now
-//!   (quota_schedule.rs).
+//! - by the background poll, which reads every account, in use or not, on a
+//!   native Codex's cadence (quota_schedule.rs).
 //!
 //! The second and third are the pool's own usage calls (own_call.rs). Without
 //! the second, a drained account was found out only by upstream refusing a

@@ -1312,7 +1312,6 @@ impl App {
             }
             Err(error) => return Err(ForwardError::Transport(error.message)),
         };
-        self.note_account_activity(&candidate.id);
         let (headers, order) = pi_request_headers(&credential.access, inbound);
         let (request, after) = crate::transport::build_request(
             Method::POST,

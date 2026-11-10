@@ -207,7 +207,6 @@ impl App {
         let inbound = &request.headers;
         let mut body = request.body.clone();
         self.note_client_agent(&item.id, inbound);
-        self.note_account_activity(&item.id);
         // Whatever Codex request this is, the account presents its own
         // installation id.
         let installation = self.presented_installation_id(item);

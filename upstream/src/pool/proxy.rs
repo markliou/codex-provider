@@ -777,7 +777,6 @@ impl App {
         if record_agent {
             self.note_client_agent(&candidate.id, inbound);
         }
-        self.note_account_activity(&candidate.id);
         let direct = Self::uses_codex_backend_directly(candidate);
         // The account presents its own installation id, not the client's
         // (installation_id.rs, SPEC.md 2.3.2).
@@ -885,28 +884,6 @@ impl App {
                 None
             }
         }
-    }
-
-    /// When a request last went to each account sets its quota poll cadence
-    /// (quota_schedule.rs).
-    pub fn note_account_activity(&self, account_id: &str) {
-        let mut activity = self
-            .account_activity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        activity.insert(account_id.to_string(), Timestamp::now());
-    }
-
-    pub fn account_in_use(&self, account_id: &str, now: Timestamp) -> bool {
-        let activity = self
-            .account_activity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        activity.get(account_id).is_some_and(|last| {
-            now.sub(last)
-                < TimeDelta::from_std(super::quota_schedule::ACTIVE_WINDOW)
-                    .unwrap_or_else(|_| TimeDelta::minutes(30))
-        })
     }
 
     /// The account that served this route's last successful response, the
