@@ -154,6 +154,12 @@ pub struct Account {
     /// threshold for both windows (SPEC.md 9.6, `account_weekly_threshold`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_protection_weekly_threshold: Option<i64>,
+    /// The account's user chose on the public page to let the pool use it to
+    /// the end: neither the global reserve nor its own protection holds it
+    /// out (SPEC.md 9.7, `quota_protection_status`). What upstream itself
+    /// refuses as spent still stops it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_all_quota: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

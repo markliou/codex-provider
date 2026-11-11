@@ -337,6 +337,19 @@ pub fn public_pool_action(item: &Account, repair_available: bool) -> &'static st
     }
 }
 
+/// The public row's reserve switch: "use-all" lets the pool use the account
+/// to the end, "keep-reserve" puts the reserve back; none for an account
+/// without ChatGPT windows or with a sign-in pending.
+pub fn public_reserve_action(item: &Account) -> &'static str {
+    if !plan::is_codex_device_auth(item) || item.pending_auth_verification {
+        ""
+    } else if item.use_all_quota {
+        "keep-reserve"
+    } else {
+        "use-all"
+    }
+}
+
 pub fn public_pool_action_label(
     item: &Account,
     repair_available: bool,
@@ -978,6 +991,10 @@ impl Inner {
             "poolRef": self.public_account_ref(&item.id),
             "poolAction": public_pool_action(item, repair_available),
             "poolActionLabel": public_pool_action_label(item, repair_available, self.public_repair_job_active(&item.id)),
+            // The user's own switch past the reserve (SPEC.md 9.7); a Codex
+            // sign-in only, as the reserve reads only its windows.
+            "useAllQuota": item.use_all_quota,
+            "reserveAction": public_reserve_action(item),
             "remainingQuota": remaining,
             "quota": to_value(&snapshot.quota),
             "quotaUnavailable": snapshot.quota_error.is_some(),

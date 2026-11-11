@@ -107,7 +107,8 @@ Admin API prefix:
 ```
 
 Public mode is visible without admin login and may show pool status, join/leave
-controls, editable public owner notes, and strict same-identity repair for an
+controls, a Use to the end / Keep reserve switch per Codex account (9.7),
+editable public owner notes, and strict same-identity repair for an
 invalid in-pool Codex credential. Management APIs under `/admin/api/*`, except
 login and public-dashboard endpoints, require strong password authentication.
 Because this surface shares the provider listener, a non-loopback bind exposes
@@ -1798,6 +1799,21 @@ on by default (`CODEX_POOL_QUOTA_RESERVE`, the owner's choice, 2026-11-02).
 
 - It applies to every Codex device-auth slot whose own protection (9.6) is
   off; a slot with its own protection on is judged by that alone.
+- **Use to the end** (the owner's choice, 2026-11-11). The public page offers
+  each Codex device-auth row a switch beside Leave pool, and as open as it:
+  **Use to the end** (`POST /admin/api/public-dashboard/accounts/<ref>/use-all`)
+  saves `useAllQuota` on the slot, and **Keep reserve** (`.../keep-reserve`)
+  clears it. While it is set, neither the global reserve nor the slot's own
+  protection holds the slot out, since both keep a part for that same user,
+  who has given it up; the pool may then use the account until upstream
+  itself refuses it as spent (the 1% quota floor and `usage_limit_reached`
+  still apply). The decision is made in one place, the protection status
+  (`source` `user`, state `waived`), which routing, the quota poll's cadence
+  (9.5) and the dashboard all read. The public row carries `useAllQuota` and
+  `reserveAction` (`use-all`, `keep-reserve`, or empty for an API-key account
+  or a pending sign-in), and shows "Used to the end, no reserve" under its
+  pool state; the Console's protection panel shows `Waived`. An API-key slot
+  is refused with `409 reserve_unsupported`.
 - Both windows are read, each against its own threshold, as a slot's own
   protection reads them. Only a reported window counts, missing, stale or failed telemetry never blocks,
   and a window seen at or below its threshold stays evidence until its

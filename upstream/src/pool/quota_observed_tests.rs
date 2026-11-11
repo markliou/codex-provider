@@ -410,3 +410,36 @@ fn observed_windows_match_by_length() {
         "the five-hour window keeps its own reading"
     );
 }
+
+// An account whose user chose Use to the end on the public page takes turns
+// below the reserve, until upstream itself refuses it as spent; one that did
+// not stays held.
+#[tokio::test]
+async fn an_account_used_to_the_end_is_routed_below_the_reserve() {
+    let upstream = FakeServer::start(|request| match request.path.as_str() {
+        "/backend-api/codex/responses" => ok_stream(),
+        _ => FakeResponse::json(404, "{}"),
+    })
+    .await;
+    let (app, _dir) = checking_app(&upstream.url, &[("a", "acct-a", 100), ("b", "acct-b", 10)]);
+    let now = Timestamp::now();
+    // Both below the 10% reserve: nothing is routed until one is waived.
+    read_long_ago(&app, "a", 95, now);
+    read_long_ago(&app, "b", 96, now);
+    let served = |upstream: &FakeServer| -> Vec<String> {
+        upstream
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/backend-api/codex/responses")
+            .map(|request| request.header("chatgpt-account-id").to_string())
+            .collect()
+    };
+    let result = serve(&app, codex_request("session-one")).await;
+    assert_ne!(result.code(), 200, "the reserve holds both");
+    assert!(served(&upstream).is_empty());
+
+    app.write().config.accounts_mut()[0].use_all_quota = true;
+    let result = serve(&app, codex_request("session-two")).await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    assert_eq!(served(&upstream), ["acct-a"], "waived, acct-a is used");
+}
