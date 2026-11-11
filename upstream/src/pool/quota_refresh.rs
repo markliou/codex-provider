@@ -570,30 +570,43 @@ impl App {
         }
     }
 
-    /// When an idle account's quota next changes on its own: the reset of its
-    /// longest reported window, the budget window priming also reads
-    /// (prime.rs `unanchored_budget_window`). The background poll asks it
-    /// just after, unless its sparse idle cadence comes first
-    /// (quota_schedule.rs).
-    pub fn idle_quota_wake(&self, account_id: &str) -> Option<Timestamp> {
-        let snapshot = self.read().quota_snapshot(account_id);
-        let quota = snapshot
-            .quota
-            .as_ref()
-            .filter(|_| snapshot.quota_error.is_none())?;
-        quota::quota_reported_windows(quota)
-            .into_iter()
-            .filter(|window| {
-                window.present && window.window_minutes.is_some_and(|length| length > 0)
-            })
-            .max_by_key(|window| window.window_minutes.unwrap_or_default())
-            .and_then(|window| window.reset_at)
-            .map(Timestamp::from_unix)
+    /// How long after its last read was sent this account is read again:
+    /// a native Codex's interval for its most used `codex` window
+    /// (quota_schedule.rs `codex_interval`), except that an account the
+    /// quota reserve or its own protection holds out of routing is read
+    /// every minute, not every 15 or 5 seconds until its reset (the owner's
+    /// choice, 2026-11-11). Codex also watches the selected model's own
+    /// meter; the pool serves many models at once, so only the ordinary
+    /// windows set the pace. Unknown figures read as Codex's 60 seconds.
+    pub fn quota_poll_interval(&self, account_id: &str) -> std::time::Duration {
+        let now = Timestamp::now();
+        let inner = self.read();
+        let Some(index) = inner.account_index(account_id) else {
+            return super::quota_schedule::INTERVAL;
+        };
+        let snapshot = inner.quota_snapshot(account_id);
+        let Some(quota) = snapshot.quota.as_ref() else {
+            return super::quota_schedule::INTERVAL;
+        };
+        if inner
+            .quota_protection_status(&inner.config.accounts()[index], &snapshot, now)
+            .blocked
+        {
+            return super::quota_schedule::INTERVAL;
+        }
+        let used = quota::quota_reported_windows(quota)
+            .iter()
+            .filter(|window| window.present)
+            .map(|window| 100.0 - quota::quota_window_remaining(window))
+            .filter(|used| used.is_finite())
+            .fold(0.0, f64::max);
+        super::quota_schedule::codex_interval(used)
     }
 
     /// The background poll (Go startQuotaRefresher): one account at a time,
-    /// each on its own randomized cadence (quota_schedule.rs), never a fixed
-    /// beat a backend could recognize. It stops when `stop` is cancelled.
+    /// each on a native Codex's cadence (quota_schedule.rs), with a random
+    /// pause after each read so accounts are never swept together. It stops
+    /// when `stop` is cancelled.
     pub fn start_quota_refresher(
         self: &std::sync::Arc<Self>,
         stop: super::http_io::Cancel,
@@ -619,33 +632,29 @@ impl App {
                 // (quota_observed.rs) is this account's poll.
                 for (id, at) in app.take_quota_reads_elsewhere() {
                     schedule.polled(&id, at);
-                    if let Some(reset) = app.idle_quota_wake(&id)
-                        && let Ok(wait) = reset.sub(&Timestamp::now()).to_std()
-                    {
-                        schedule.wake_at(&id, std::time::Instant::now() + wait);
-                    }
                 }
                 let accounts = app.quota_poll_accounts();
                 let ids: Vec<String> = accounts.iter().map(|item| item.id.clone()).collect();
-                let (instant, now) = (std::time::Instant::now(), Timestamp::now());
-                if let Some(id) = schedule.due(instant, &ids, |id| app.account_in_use(id, now)) {
+                let instant = std::time::Instant::now();
+                let wait = if let Some(id) =
+                    schedule.due(instant, &ids, |id| app.quota_poll_interval(id))
+                {
+                    // Timed from when the read is sent, as Codex's
+                    // last_requested_at; the loop waits for it to finish,
+                    // so no second read of the account is ever pending.
+                    schedule.polled(&id, std::time::Instant::now());
                     if let Some(item) = accounts.iter().find(|item| item.id == id) {
                         app.poll_account_quota(item).await;
-                    }
-                    schedule.polled(&id, std::time::Instant::now());
-                    // A reset already past would wake it again every few
-                    // minutes; such an account waits the idle fallback.
-                    if let Some(reset) = app.idle_quota_wake(&id)
-                        && let Ok(wait) = reset.sub(&Timestamp::now()).to_std()
-                    {
-                        schedule.wake_at(&id, std::time::Instant::now() + wait);
                     }
                     if let Some(at) = app.prime_grace_due(&id) {
                         let wait = at.sub(&Timestamp::now()).to_std().unwrap_or_default();
                         schedule.poll_by(&id, std::time::Instant::now() + wait);
                     }
-                }
-                if !stop.sleep(schedule.pause()).await {
+                    schedule.pause()
+                } else {
+                    super::quota_schedule::IDLE_TICK
+                };
+                if !stop.sleep(wait).await {
                     return;
                 }
             }

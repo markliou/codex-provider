@@ -146,9 +146,6 @@ pub struct App {
     /// Token refreshes that started and have not settled; the shutdown drain
     /// waits for them (credentials.rs SettlingRefresh).
     pub refreshes_settling: Arc<std::sync::atomic::AtomicI64>,
-    /// When a request last went to each account; it sets the account's quota
-    /// poll cadence (quota_schedule.rs).
-    pub account_activity: std::sync::Mutex<HashMap<String, Timestamp>>,
     /// When the pool last read each account's usage just before sending to
     /// it, so one stale account costs one read, not one per request
     /// (quota_observed.rs).
@@ -251,7 +248,6 @@ impl App {
             auth_locks: std::sync::Mutex::new(HashMap::new()),
             refused: Arc::default(),
             refreshes_settling: Arc::default(),
-            account_activity: std::sync::Mutex::new(HashMap::new()),
             placement_checks: std::sync::Mutex::new(HashMap::new()),
             quota_reads_elsewhere: std::sync::Mutex::new(Vec::new()),
             in_flight: std::sync::atomic::AtomicI64::new(0),

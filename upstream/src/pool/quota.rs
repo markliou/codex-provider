@@ -38,11 +38,10 @@ pub const FIVE_HOUR_WINDOW_MINUTES: i64 = 300;
 /// multipliers describe.
 pub const WEEKLY_WINDOW_MINUTES: i64 = 10080;
 
-/// Quota telemetry is refreshed with every response and every four to six
-/// minutes for an account in use; an idle one is asked about every hour and a
-/// half at random (quota_schedule.rs), so its figures usually read as stale,
-/// which is what they are, and it is read again just before it is sent to
-/// (quota_observed.rs).
+/// Quota telemetry is refreshed with every response and, for every account,
+/// on a native Codex's cadence of a minute or less (quota_schedule.rs), so
+/// figures read as stale only when reads fail; such an account is read again
+/// just before it is sent to (quota_observed.rs).
 /// Freshness itself is never a routing gate: SPEC section 6.4 deliberately
 /// keeps telemetry failures fail-open.
 pub const QUOTA_TELEMETRY_FRESHNESS_MINUTES: i64 = 35;

@@ -671,7 +671,6 @@ async fn start_response(
     }
     let bound = session.state().account.clone();
     app.note_session_placement(&route.balance_key, &bound.id);
-    app.note_account_activity(&bound.id);
     message = gate_turn_state(session, message, &payload, &route, &bound.id);
     if let Some(id) = app.presented_installation_id(&bound) {
         let text = String::from_utf8_lossy(&message).into_owned();
@@ -924,7 +923,6 @@ async fn dial_codex_websocket_once(
     auth: &super::metadata::CodexAuthInfo,
 ) -> Result<DialedSocket, WsDialError> {
     app.note_client_agent(&candidate.id, client_headers);
-    app.note_account_activity(&candidate.id);
     let mut headers = GoHeader::default();
     for (name, value) in client_headers {
         if relayed_codex_request_header(name.as_str())
