@@ -301,6 +301,10 @@ healthy copy can stand in when the current one has failed.
   without its own protection stops taking new routing once its 5-hour window
   is down to 10% or its weekly window to 3% (each set in the Console), so the
   rest stays for its owner's own ChatGPT use.
+- **Use to the end** (public page, per account, beside Leave pool): the
+  account's user lets the pool use it until upstream refuses it as spent,
+  past both the reserve and the account's own protection. **Keep reserve**
+  puts them back.
 - **Owner note**: an 80-character plain-text label, visible and editable on the
   public page so shared users can mark whose account it is. Never put secrets
   in it.

@@ -717,7 +717,7 @@
     if (!on) return;
     $("#public-weekly-reserve-title").textContent = `Each account is stopped at ${weekly}% of its week left`;
     $("#public-weekly-reserve-detail").textContent =
-      `The pool stops using an account once its weekly window is down to ${weekly}% remaining, and that part is kept for the account's owner. Plan for the weekly allowance to end there, not at 0%.`;
+      `The pool stops using an account once its weekly window is down to ${weekly}% remaining, and that part is kept for the account's owner. Plan for the weekly allowance to end there, not at 0%, unless the account's row says it is used to the end.`;
   }
 
   // Each ChatGPT account may hold two sign-ins (SPEC.md 2.3.7): its Codex
@@ -1226,7 +1226,10 @@
     // Without its own protection an account is held to the global reserve
     // (SPEC.md 9.7), shown as "Global"; turning its own on replaces it.
     const global = !protection.enabled && protection.source === "global";
-    const state = protection.blocked ? "Blocked" : protection.enabled ? "On" : global ? "Global" : "Off";
+    // The account's user waived the reserve and its own protection on the
+    // public page; the owner's thresholds stay saved underneath.
+    const waived = protection.source === "user";
+    const state = waived ? "Waived" : protection.blocked ? "Blocked" : protection.enabled ? "On" : global ? "Global" : "Off";
     return `<details class="quota-protection"><summary><span>Protection</span><strong>${escapeHTML(state)}</strong></summary>
       <div class="quota-protection-body">
         <div class="quota-detail"><strong>${escapeHTML(protectionMessage)}</strong>${escapeHTML(windowDetail)}</div>
@@ -1236,7 +1239,7 @@
           <label>Week <input class="quota-threshold-input" type="number" min="0" max="100" step="1" value="${quotaPercent(account.quotaProtectionWeeklyThreshold ?? protection.threshold)}" data-quota-protection-weekly="${escapeHTML(account.id)}">%</label>
           <button class="button quiet" type="button" data-quota-protection-save="${escapeHTML(account.id)}">Save</button>
         </div>
-        <div class="quota-detail">${global ? `Global reserve: 5h ${escapeHTML(protection.fiveHourThreshold)}%, week ${escapeHTML(protection.weeklyThreshold)}%. Turning on this account's own protection replaces it.` : "Either window at or below its threshold stops this account. Duplicate slots share upstream capacity; these thresholds apply only to this local slot."}</div>
+        <div class="quota-detail">${waived ? "The account's user chose Use to the end on the public page, so neither the global reserve nor these thresholds apply until they choose Keep reserve." : global ? `Global reserve: 5h ${escapeHTML(protection.fiveHourThreshold)}%, week ${escapeHTML(protection.weeklyThreshold)}%. Turning on this account's own protection replaces it.` : "Either window at or below its threshold stops this account. Duplicate slots share upstream capacity; these thresholds apply only to this local slot."}</div>
       </div>
     </details>`;
   }
@@ -1321,9 +1324,15 @@
       const tone = account.statusTone || account.status || "standby";
       const label = account.statusLabel || statusLabel(account.status);
       const quota = account.quotaUnavailable ? '<span class="quota-unknown">Quota unavailable</span>' : quotaMarkup(account.remainingQuota, account.quota, null, null, account.quotaFreshness, account.lastSuccessfulRefreshAt, account.quotaMetering);
-      const action = account.poolRef && account.poolAction
+      const poolButton = account.poolRef && account.poolAction
         ? `<button class="button ${account.poolAction === "repair" ? "primary" : account.poolAction === "pool-remove" ? "warn" : "secondary"}" type="button" data-public-pool-action="${escapeHTML(account.poolAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${escapeHTML(account.poolActionLabel || "Update")}</button>`
         : "";
+      // The user's own switch past the reserve (SPEC.md 9.7), beside Leave
+      // pool and as open as it.
+      const reserveButton = account.poolRef && account.reserveAction
+        ? `<button class="button ${account.reserveAction === "use-all" ? "warn" : "secondary"}" type="button" data-public-pool-action="${escapeHTML(account.reserveAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${account.reserveAction === "use-all" ? "Use to the end" : "Keep reserve"}</button>`
+        : "";
+      const action = poolButton + reserveButton;
       const cacheWindow = account.cacheWindow || {};
       const affinityHits = Number(cacheWindow.parentAffinityHitCount) || 0;
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
@@ -1331,7 +1340,7 @@
       <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${publicSeatMarkup(account)}${ownerNoteInput(account, true)}</div></td>
       <td><div class="status-stack">${statusBadgeMarkup(tone, label, account.quota)}${activeBadge(account.active)}</div></td>
       <td>${quota}</td>
-      <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong></div></td>
+      <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong>${account.useAllQuota ? '<span class="account-id">Used to the end, no reserve</span>' : ""}</div></td>
       <td class="cache-column">${cacheHitMarkup(account, "main")}</td>
       <td class="cache-column">${cacheHitMarkup(account, "subagent")}</td>
       <td class="routing-count-column" title="${affinityHits} parent-affinity hits, ${affinityFallbacks} fallbacks">${affinityHits}/${affinityFallbacks}</td>
@@ -1596,6 +1605,7 @@
       }
       return;
     }
+    if (action === "use-all" && !window.confirm("Use this account to the end? The pool will stop keeping the reserve for it and may spend its 5-hour and weekly allowance until upstream refuses it as used up. Keep reserve puts the reserve back.")) return;
     button.disabled = true;
     try {
       await publicApi(`/accounts/${encodeURIComponent(ref)}/${action}`, { method: "POST" });

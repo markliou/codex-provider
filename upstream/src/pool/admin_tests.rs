@@ -1204,3 +1204,57 @@ async fn admin_settings_set_the_global_quota_reserve() {
     assert!(!app.read().quota_reserve.enabled);
     assert_eq!(app.read().quota_reserve.five_hour, 25, "thresholds kept");
 }
+
+async fn public_row(app: &Arc<App>) -> serde_json::Value {
+    let result = get(app, "/admin/api/public-dashboard").await;
+    body_json(&result)["dashboard"]["accounts"][0].clone()
+}
+
+// The public page's Use to the end switch: as open as Leave pool, saved on
+// the slot, shown on the row, and refused for an account with no ChatGPT
+// windows (SPEC.md 9.7).
+#[tokio::test]
+async fn public_use_to_the_end_waives_the_reserve() {
+    let (app, _dir) = arc_app(vec![device_account("device", "acct-device", 100)]);
+    let first = public_row(&app).await;
+    assert_eq!(first["reserveAction"], "use-all", "{first}");
+    assert_eq!(first["useAllQuota"], false);
+    let reference = first["poolRef"].as_str().unwrap_or_default().to_string();
+    let result = post(
+        &app,
+        &format!("/admin/api/public-dashboard/accounts/{reference}/use-all"),
+        "",
+    )
+    .await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    assert!(super::proxy_tests::account(&app, 0).use_all_quota);
+    assert_eq!(
+        saved_config(&app)["accounts"][0]["useAllQuota"],
+        true,
+        "the choice is saved"
+    );
+    let waived = public_row(&app).await;
+    assert_eq!(waived["useAllQuota"], true);
+    assert_eq!(waived["reserveAction"], "keep-reserve");
+    let result = post(
+        &app,
+        &format!("/admin/api/public-dashboard/accounts/{reference}/keep-reserve"),
+        "",
+    )
+    .await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    assert!(!super::proxy_tests::account(&app, 0).use_all_quota);
+
+    let provider = super::proxy_tests::provider("key", 0, "https://upstream.example.test/v1", "k");
+    let (app, _dir) = arc_app(vec![provider]);
+    let key_row = public_row(&app).await;
+    assert_eq!(key_row["reserveAction"], "", "{key_row}");
+    let reference = key_row["poolRef"].as_str().unwrap_or_default().to_string();
+    let result = post(
+        &app,
+        &format!("/admin/api/public-dashboard/accounts/{reference}/use-all"),
+        "",
+    )
+    .await;
+    assert_eq!(result.code(), 409, "{}", result.body_string());
+}

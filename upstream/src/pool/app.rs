@@ -563,7 +563,8 @@ pub struct QuotaProtectionStatus {
     pub enabled: bool,
     pub threshold: i64,
     /// Which policy decided: "account" (the account's own protection),
-    /// "global" (the global reserve), or empty when neither applies.
+    /// "global" (the global reserve), "user" (the account's user waived
+    /// both, `use_all_quota`), or empty when none applies.
     pub source: String,
     /// The deciding policy's thresholds of the five-hour and weekly windows.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1204,6 +1205,18 @@ impl Inner {
                     .to_string();
             return status;
         }
+        // The account's user lets the pool use it to the end (public page,
+        // SPEC.md 9.7). It replaces the reserve and the account's own
+        // protection alike: both keep a part for that same user, who has
+        // given it up. Routing, the poll's cadence and the dashboard all read
+        // this one status, so none of them may test the flag apart.
+        if item.use_all_quota {
+            status.source = "user".to_string();
+            status.state = "waived".to_string();
+            status.message =
+                "Reserve waived: the account's user lets the pool use it to the end".to_string();
+            return status;
+        }
         if !status.enabled {
             // An account without its own protection is held to the global
             // reserve; one with it is judged by its own alone (SPEC.md 9.7).
@@ -1418,6 +1431,48 @@ mod tests {
             reset_at,
             ..QuotaWindow::default()
         }
+    }
+
+    // The user's Use to the end replaces both the global reserve and the
+    // account's own protection: a drained account is not held.
+    #[test]
+    fn use_all_quota_waives_reserve_and_protection() {
+        let now = Timestamp::from_unix(1_800_000_000);
+        let future = now.add(hours(1)).unix();
+        let item = Account {
+            id: "device".into(),
+            auth_type: "codex_device_auth".into(),
+            quota_protection_enabled: true,
+            quota_protection_threshold: 20,
+            use_all_quota: true,
+            ..Account::default()
+        };
+        let (app, _dir) = test_app(vec![item.clone()]);
+        app.write().quota_reserve.enabled = true;
+        let inner = app.read();
+        let snapshot = QuotaSnapshot {
+            last_successful_refresh_at: now,
+            quota: Some(AccountQuota {
+                windows: vec![
+                    window("secondary", "Week", 1.0, 10080, Some(future)),
+                    window("primary", "5h", 1.0, 300, Some(future)),
+                ],
+                ..AccountQuota::default()
+            }),
+            ..QuotaSnapshot::default()
+        };
+        let status = inner.quota_protection_status(&item, &snapshot, now);
+        assert!(!status.blocked);
+        assert_eq!(
+            (status.source.as_str(), status.state.as_str()),
+            ("user", "waived")
+        );
+        let held = Account {
+            use_all_quota: false,
+            quota_protection_enabled: false,
+            ..item
+        };
+        assert!(inner.quota_protection_status(&held, &snapshot, now).blocked);
     }
 
     // Go TestQuotaProtectionUsesFiveHourThenWeekAndFailsOpen.

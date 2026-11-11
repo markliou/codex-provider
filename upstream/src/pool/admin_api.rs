@@ -517,7 +517,10 @@ pub fn handle_public_account_action(
         return not_found(writer);
     }
     let (reference, action) = (parts[0], parts[1]);
-    if !matches!(action, "pool-add" | "pool-remove" | "repair" | "note") {
+    if !matches!(
+        action,
+        "pool-add" | "pool-remove" | "repair" | "note" | "use-all" | "keep-reserve"
+    ) {
         return not_found(writer);
     }
     let get = request.method == Method::GET;
@@ -669,6 +672,22 @@ pub fn handle_public_account_action(
                         inner.config.accounts_mut()[index].in_pool = false;
                         inner.clear_sticky_for_account(&item.id);
                     }
+                }
+                // As open as Leave pool, by design: whoever may take the
+                // account out of the pool may as well let it be used to the
+                // end (SPEC.md 9.7). Only a Codex sign-in has the windows the
+                // reserve reads.
+                "use-all" | "keep-reserve" => {
+                    if !plan::is_codex_device_auth(&item) {
+                        write_openai_error(
+                            writer,
+                            StatusCode::CONFLICT,
+                            "reserve_unsupported",
+                            "API-key accounts have no ChatGPT quota reserve",
+                        );
+                        return;
+                    }
+                    inner.config.accounts_mut()[index].use_all_quota = action == "use-all";
                 }
                 _ => {}
             }
