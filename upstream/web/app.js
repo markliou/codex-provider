@@ -1393,6 +1393,17 @@
     return `<span class="account-seat">Seat: ${escapeHTML(name + suffix)}</span>`;
   }
 
+  // What each public row button does, shown when the pointer rests on it.
+  function publicActionHint(action) {
+    return {
+      "pool-remove": "Leave pool: the pool stops sending requests to this account. Its sign-in is kept, and Join pool brings it back.",
+      "pool-add": "Join pool: the pool may send requests to this account again.",
+      repair: "Repair: sign in again with the same account to fix an invalid sign-in, keeping its cache and affinity history.",
+      "use-all": "Use to the end: the pool may use this account until its quota runs out, without keeping the reserve (5h and weekly) for you. Keep reserve undoes it.",
+      "keep-reserve": "Keep reserve: the pool stops using this account again once it reaches the reserve, so the rest stays for your own use.",
+    }[action] || "";
+  }
+
   function renderPublicAccounts(accounts) {
     $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity/Fallback")}</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} visible`;
@@ -1408,12 +1419,12 @@
       const label = account.statusLabel || statusLabel(account.status);
       const quota = account.quotaUnavailable ? '<span class="quota-unknown">Quota unavailable</span>' : quotaMarkup(account.remainingQuota, account.quota, null, null, account.quotaFreshness, account.lastSuccessfulRefreshAt, account.quotaMetering);
       const poolButton = account.poolRef && account.poolAction
-        ? `<button class="button ${account.poolAction === "repair" ? "primary" : account.poolAction === "pool-remove" ? "warn" : "secondary"}" type="button" data-public-pool-action="${escapeHTML(account.poolAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${escapeHTML(account.poolActionLabel || "Update")}</button>`
+        ? `<button class="button ${account.poolAction === "repair" ? "primary" : account.poolAction === "pool-remove" ? "warn" : "secondary"}" type="button" title="${escapeHTML(publicActionHint(account.poolAction))}" data-public-pool-action="${escapeHTML(account.poolAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${escapeHTML(account.poolActionLabel || "Update")}</button>`
         : "";
       // The user's own switch past the reserve (SPEC.md 9.7), beside Leave
       // pool and as open as it.
       const reserveButton = account.poolRef && account.reserveAction
-        ? `<button class="button ${account.reserveAction === "use-all" ? "warn" : "secondary"}" type="button" data-public-pool-action="${escapeHTML(account.reserveAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${account.reserveAction === "use-all" ? "Use to the end" : "Keep reserve"}</button>`
+        ? `<button class="button ${account.reserveAction === "use-all" ? "warn" : "secondary"}" type="button" title="${escapeHTML(publicActionHint(account.reserveAction))}" data-public-pool-action="${escapeHTML(account.reserveAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${account.reserveAction === "use-all" ? "Use to the end" : "Keep reserve"}</button>`
         : "";
       const action = poolButton + reserveButton;
       const cacheWindow = account.cacheWindow || {};
