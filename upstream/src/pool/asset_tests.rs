@@ -61,6 +61,20 @@ async fn admin_dashboard_assets() {
             && html.contains(&super::admin::admin_display_version()),
         "admin page did not inject the build version"
     );
+    // The Console's update notice reads the build's commit from the page and
+    // asks GitHub from the browser; the policy allows that one origin only.
+    assert!(
+        !html.contains(super::admin::COMMIT_PLACEHOLDER)
+            && html.contains(&format!(
+                r#"<meta name="codex-pool-commit" content="{}">"#,
+                super::admin::build_commit()
+            )),
+        "admin page did not inject the build commit"
+    );
+    assert_eq!(
+        page.header("content-security-policy"),
+        "default-src 'self'; connect-src 'self' https://api.github.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    );
     has_all(
         "/admin",
         &html,

@@ -13,6 +13,8 @@ use http::StatusCode;
 
 /// The placeholder the HTML carries for the version.
 pub const VERSION_PLACEHOLDER: &str = "{{CODEX_POOL_VERSION}}";
+/// The build's full commit, for the Console's update notice (SPEC.md 1.2).
+pub const COMMIT_PLACEHOLDER: &str = "{{CODEX_POOL_COMMIT}}";
 const ADMIN_PAGE_HTML: &str = include_str!("../../web/admin.html");
 const ADMIN_CSS: &str = include_str!("../../web/app.css");
 const ADMIN_JS: &str = include_str!("../../web/app.js");
@@ -44,8 +46,15 @@ pub fn format_display_version(version: &str, commit: &str) -> String {
     version
 }
 
+/// The full commit the build was made from, or "unknown".
+pub fn build_commit() -> &'static str {
+    option_env!("CODEX_POOL_BUILD_COMMIT").unwrap_or("unknown")
+}
+
 pub fn admin_page() -> String {
-    ADMIN_PAGE_HTML.replace(VERSION_PLACEHOLDER, &admin_display_version())
+    ADMIN_PAGE_HTML
+        .replace(VERSION_PLACEHOLDER, &admin_display_version())
+        .replace(COMMIT_PLACEHOLDER, build_commit())
 }
 
 fn serve(writer: &mut dyn ResponseWriter, content_type: &str, body: &str) {
@@ -60,7 +69,10 @@ pub fn handle_admin_page(writer: &mut dyn ResponseWriter) {
     set_header(
         writer,
         "content-security-policy",
-        "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        // connect-src adds only GitHub's API: the Console's update notice
+        // asks it from the browser, so the pool itself makes no such call
+        // (SPEC.md 1.2). Nothing else may be added here for it.
+        "default-src 'self'; connect-src 'self' https://api.github.com; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
     );
     set_header(writer, "x-codex-pool-version", &admin_display_version());
     serve(writer, "text/html; charset=utf-8", &admin_page());

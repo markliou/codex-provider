@@ -8,7 +8,7 @@
     citrus: "#f59f00",
   });
   const themeNames = new Set(Object.keys(themeMetaColors));
-  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public", resetCreditNotice: null, openQuotaDetails: new Set(), quotaFloorPercent: 0 };
+  const state = { csrfToken: sessionStorage.getItem("codexPoolCsrf") || "", data: null, refreshTimer: null, updateTimer: null, deviceAuthTimer: null, deviceAuthPollTimer: null, currentLoginJobId: "", currentPublicRepairRef: "", mode: "public", resetCreditNotice: null, openQuotaDetails: new Set(), quotaFloorPercent: 0 };
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => document.querySelectorAll(selector);
   const loginView = $("#login-view");
@@ -476,7 +476,88 @@
     return body;
   }
 
+  // The Console's update notice (SPEC.md 1.2): is this build behind the
+  // repository's main? This browser asks GitHub's public compare API, never
+  // the pool, so the pool gains no outbound call; the owner chose that
+  // (2026-11-11). Management mode only: the public page never shows it. An
+  // answer is reused for an hour per build (GitHub allows 60 unauthenticated
+  // calls an hour per address), and a failed or refused one (a build whose
+  // commit is not on GitHub yet answers 404) shows nothing.
+  const updateRepo = "markliou/codex-provider";
+  const updateCheckEveryMs = 60 * 60 * 1000;
+  const updateCacheKey = "codex-pool-update-check";
+
+  function hideUpdateNotice() {
+    const notice = $("#update-notice");
+    if (notice) notice.hidden = true;
+    window.clearTimeout(state.updateTimer);
+    state.updateTimer = null;
+  }
+
+  async function updateComparison(commit) {
+    try {
+      const cached = JSON.parse(window.localStorage.getItem(updateCacheKey) || "null");
+      if (cached && cached.commit === commit && Date.now() - cached.at < updateCheckEveryMs) return cached.result;
+    } catch (_) { /* storage unavailable: ask again */ }
+    const response = await fetch(`https://api.github.com/repos/${updateRepo}/compare/${commit}...main`, {
+      headers: { Accept: "application/vnd.github+json" },
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      cache: "no-store",
+    });
+    if (!response.ok) return null;
+    const body = await response.json();
+    const latest = Array.isArray(body.commits) && body.commits.length ? body.commits[body.commits.length - 1] : null;
+    const result = {
+      status: String(body.status || ""),
+      // GitHub states the comparison from main's side (base...head):
+      // ahead_by counts the commits main has that this build lacks.
+      newer: Number(body.ahead_by) || 0,
+      url: String(body.html_url || ""),
+      message: String(latest?.commit?.message || "").split("\n")[0],
+      date: String(latest?.commit?.committer?.date || ""),
+    };
+    try { window.localStorage.setItem(updateCacheKey, JSON.stringify({ commit, at: Date.now(), result })); } catch (_) { /* best effort */ }
+    return result;
+  }
+
+  async function checkForUpdate() {
+    const notice = $("#update-notice");
+    const commit = document.querySelector('meta[name="codex-pool-commit"]')?.content || "";
+    if (!notice || state.mode !== "management" || !/^[0-9a-f]{40}$/.test(commit)) return;
+    window.clearTimeout(state.updateTimer);
+    state.updateTimer = window.setTimeout(checkForUpdate, updateCheckEveryMs);
+    let result = null;
+    try { result = await updateComparison(commit); } catch (_) { result = null; }
+    if (state.mode !== "management") return;
+    // From main's side: "ahead" is main past this build, "diverged" both
+    // apart; "behind" (a build not pushed yet) and "identical" need nothing.
+    if (!result || !(result.newer > 0) || !["ahead", "diverged"].includes(result.status)) {
+      notice.hidden = true;
+      return;
+    }
+    const plural = result.newer === 1 ? "" : "s";
+    const lead = result.status === "diverged"
+      ? `This build is not on main, and main has ${result.newer} commit${plural} it lacks.`
+      : `Update available: main is ${result.newer} commit${plural} ahead of this build.`;
+    const when = result.date ? ` (${new Date(result.date).toLocaleString()})` : "";
+    const latest = result.message ? ` Latest: ${result.message}${when}.` : "";
+    const version = document.querySelector('meta[name="codex-pool-version"]')?.content || "";
+    const dirty = version.includes("-dirty") ? " This build also had uncommitted changes." : "";
+    notice.textContent = lead + latest + dirty;
+    if (/^https:\/\/github\.com\//.test(result.url)) {
+      const link = document.createElement("a");
+      link.href = result.url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = "View changes";
+      notice.append(link);
+    }
+    notice.hidden = false;
+  }
+
   function showLogin(message = "") {
+    hideUpdateNotice();
     dashboardView.hidden = true;
     loginView.hidden = false;
     $$(".management-only, .public-only").forEach((element) => { element.hidden = true; });
@@ -512,6 +593,7 @@
     window.clearTimeout(state.refreshTimer);
     state.refreshTimer = null;
     refresh().finally(() => scheduleDashboardRefresh("management"));
+    checkForUpdate();
   }
 
   async function showPublicDashboard() {
@@ -519,6 +601,7 @@
     // this with an immediate login screen; password auth unlocks management mode
     // on the same page, while public status stays visible by default.
     state.mode = "public";
+    hideUpdateNotice();
     $("#dashboard-eyebrow").textContent = "SERVICE STATUS";
     $("#dashboard-title").textContent = "Pool status";
     window.clearTimeout(state.refreshTimer);
@@ -1310,6 +1393,17 @@
     return `<span class="account-seat">Seat: ${escapeHTML(name + suffix)}</span>`;
   }
 
+  // What each public row button does, shown when the pointer rests on it.
+  function publicActionHint(action) {
+    return {
+      "pool-remove": "Leave pool: the pool stops sending requests to this account. Its sign-in is kept, and Join pool brings it back.",
+      "pool-add": "Join pool: the pool may send requests to this account again.",
+      repair: "Repair: sign in again with the same account to fix an invalid sign-in, keeping its cache and affinity history.",
+      "use-all": "Use to the end: the pool may use this account until its quota runs out, without keeping the reserve (5h and weekly) for you. Keep reserve undoes it.",
+      "keep-reserve": "Keep reserve: the pool stops using this account again once it reaches the reserve, so the rest stays for your own use.",
+    }[action] || "";
+  }
+
   function renderPublicAccounts(accounts) {
     $("#accounts-head").innerHTML = `<tr><th>Account</th><th>Status</th><th>Quota</th><th>Pool</th><th class="cache-column">${cacheColumnHeader("Main cache")}</th><th class="cache-column">${cacheColumnHeader("Subagent cache")}</th><th class="routing-count-column">${poolColumnHeader("Affinity/Fallback")}</th><th>Action</th></tr>`;
     $("#account-count").textContent = `${accounts.length} visible`;
@@ -1325,12 +1419,12 @@
       const label = account.statusLabel || statusLabel(account.status);
       const quota = account.quotaUnavailable ? '<span class="quota-unknown">Quota unavailable</span>' : quotaMarkup(account.remainingQuota, account.quota, null, null, account.quotaFreshness, account.lastSuccessfulRefreshAt, account.quotaMetering);
       const poolButton = account.poolRef && account.poolAction
-        ? `<button class="button ${account.poolAction === "repair" ? "primary" : account.poolAction === "pool-remove" ? "warn" : "secondary"}" type="button" data-public-pool-action="${escapeHTML(account.poolAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${escapeHTML(account.poolActionLabel || "Update")}</button>`
+        ? `<button class="button ${account.poolAction === "repair" ? "primary" : account.poolAction === "pool-remove" ? "warn" : "secondary"}" type="button" title="${escapeHTML(publicActionHint(account.poolAction))}" data-public-pool-action="${escapeHTML(account.poolAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${escapeHTML(account.poolActionLabel || "Update")}</button>`
         : "";
       // The user's own switch past the reserve (SPEC.md 9.7), beside Leave
       // pool and as open as it.
       const reserveButton = account.poolRef && account.reserveAction
-        ? `<button class="button ${account.reserveAction === "use-all" ? "warn" : "secondary"}" type="button" data-public-pool-action="${escapeHTML(account.reserveAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${account.reserveAction === "use-all" ? "Use to the end" : "Keep reserve"}</button>`
+        ? `<button class="button ${account.reserveAction === "use-all" ? "warn" : "secondary"}" type="button" title="${escapeHTML(publicActionHint(account.reserveAction))}" data-public-pool-action="${escapeHTML(account.reserveAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${account.reserveAction === "use-all" ? "Use to the end" : "Keep reserve"}</button>`
         : "";
       const action = poolButton + reserveButton;
       const cacheWindow = account.cacheWindow || {};

@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#ff7a59">
+  <meta name="codex-pool-version" content="{{CODEX_POOL_VERSION}}">
+  <meta name="codex-pool-commit" content="{{CODEX_POOL_COMMIT}}">
   <title>Codex Pool</title>
   <link rel="icon" href="/admin/assets/logo.svg" type="image/svg+xml">
   <link rel="manifest" href="/admin/manifest.webmanifest">
@@ -147,6 +149,13 @@
                switch): the pool then sends nothing upstream, so every figure
                below is the last one it had. -->
           <p id="upstream-closed-notice" class="upstream-closed-notice" role="status" hidden>Upstream is closed: this pool sends nothing to OpenAI, and clients get an error.</p>
+
+          <!-- Management mode only, never the public page (SPEC.md 1.2):
+               this build compared with the repository's main, asked by this
+               browser.
+               Not .management-only, which showDashboard unhides wholesale;
+               app.js shows it only when main is ahead. -->
+          <p id="update-notice" class="update-notice" role="status" hidden></p>
 
           <section id="summary-grid" class="summary-grid" aria-label="Pool summary"></section>
 
