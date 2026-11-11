@@ -1828,8 +1828,9 @@ on by default (`CODEX_POOL_QUOTA_RESERVE`, the owner's choice, 2026-11-02).
   (`source` `user`, state `waived`), which routing, the quota poll's cadence
   (9.5) and the dashboard all read. The public row carries `useAllQuota` and
   `reserveAction` (`use-all`, `keep-reserve`, or empty for an API-key account
-  or a pending sign-in), and shows "Used to the end, no reserve" under its
-  pool state; the Console's protection panel shows `Waived`. An API-key slot
+  or a pending sign-in), and shows a short "No reserve" line under its pool
+  state (its own line, the explanation in its tooltip); the Console's
+  protection panel shows `Waived`. An API-key slot
   is refused with `409 reserve_unsupported`.
 - Both windows are read, each against its own threshold, as a slot's own
   protection reads them. Only a reported window counts, missing, stale or failed telemetry never blocks,

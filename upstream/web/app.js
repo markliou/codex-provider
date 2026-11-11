@@ -1422,7 +1422,10 @@
         ? `<button class="button ${account.poolAction === "repair" ? "primary" : account.poolAction === "pool-remove" ? "warn" : "secondary"}" type="button" title="${escapeHTML(publicActionHint(account.poolAction))}" data-public-pool-action="${escapeHTML(account.poolAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${escapeHTML(account.poolActionLabel || "Update")}</button>`
         : "";
       // The user's own switch past the reserve (SPEC.md 9.7), beside Leave
-      // pool and as open as it.
+      // pool and as open as it. While it is on, the Pool cell carries a short
+      // "No reserve" line under the pool state, its own block so it never
+      // runs on beside the label in the narrow column; the long explanation
+      // stays in its tooltip, not in the cell.
       const reserveButton = account.poolRef && account.reserveAction
         ? `<button class="button ${account.reserveAction === "use-all" ? "warn" : "secondary"}" type="button" title="${escapeHTML(publicActionHint(account.reserveAction))}" data-public-pool-action="${escapeHTML(account.reserveAction)}" data-pool-ref="${escapeHTML(account.poolRef)}">${account.reserveAction === "use-all" ? "Use to the end" : "Keep reserve"}</button>`
         : "";
@@ -1434,7 +1437,7 @@
       <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${publicSeatMarkup(account)}${ownerNoteInput(account, true)}</div></td>
       <td><div class="status-stack">${statusBadgeMarkup(tone, label, account.quota)}${activeBadge(account.active)}</div></td>
       <td>${quota}</td>
-      <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong>${account.useAllQuota ? '<span class="account-id">Used to the end, no reserve</span>' : ""}</div></td>
+      <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong>${account.useAllQuota ? `<span class="route-note" title="${escapeHTML(publicActionHint("use-all"))}">No reserve</span>` : ""}</div></td>
       <td class="cache-column">${cacheHitMarkup(account, "main")}</td>
       <td class="cache-column">${cacheHitMarkup(account, "subagent")}</td>
       <td class="routing-count-column" title="${affinityHits} parent-affinity hits, ${affinityFallbacks} fallbacks">${affinityHits}/${affinityFallbacks}</td>
