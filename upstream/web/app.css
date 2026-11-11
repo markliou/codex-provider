@@ -360,6 +360,8 @@ input:focus, select:focus { border-color: var(--accent-hot); box-shadow: 0 0 0 4
 .full { width: 100%; margin-top: 22px; }
 
 /* Hero: the page heading becomes a bright banner with the operator controls. */
+.update-notice { margin: 0 0 20px; padding: 12px 18px; color: var(--amber); background: var(--amber-bg); border: 1px solid var(--amber); border-radius: 18px; font-weight: 600; overflow-wrap: anywhere; }
+.update-notice a { color: inherit; margin-left: 6px; }
 .upstream-closed-notice { margin: 0 0 20px; padding: 14px 18px; color: var(--red); background: var(--red-bg); border: 1px solid var(--red); border-radius: 18px; font-weight: 600; }
 /* The upstream switch: large and colored so its state is never missed (red closed, green open). */
 /* The public page's weekly limit note: read-only, hidden while the reserve is off. */

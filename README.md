@@ -90,6 +90,10 @@ relies on the shutdown drain, which lets in-flight requests finish for up to
 `CODEX_POOL_SHUTDOWN_GRACE` (default `120s`). Codex reconnects on its own after a
 restart. `--force` restarts a pool that predates in-flight tracking.
 
+The Console (management mode only) shows a notice when this repository's
+`main` has commits the running build lacks, with the latest one and a link to
+the changes. Your browser asks GitHub for it; the pool itself does not.
+
 ## Connecting Codex and Pi
 
 ### Native endpoint (recommended)

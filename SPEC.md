@@ -116,6 +116,23 @@ both `/v1` and `/admin`. Require explicit opt-in with
 `CODEX_POOL_ALLOW_REMOTE_ADMIN=true`; merging the ports must not weaken the
 route-level API-key, session, and CSRF boundaries.
 
+**Update notice** (the owner's choice, 2026-11-11). In management mode only,
+never on the public page, the Console tells the owner when the repository's
+`main` has commits the running build lacks. The page carries the build's full
+commit (`<meta name="codex-pool-commit">`, from `CODEX_POOL_BUILD_COMMIT`) and
+the browser itself asks GitHub's public compare API
+(`api.github.com/repos/markliou/codex-provider/compare/<commit>...main`); the
+pool makes no such call, and the page's `connect-src` allows that one origin
+for it. The notice shows how many commits main is ahead, its latest commit's
+first line and time, and a link to the comparison; it also says when the build
+is not on main at all (`diverged`) or was built with uncommitted changes.
+GitHub states the comparison from main's side: `ahead` with `ahead_by` is
+main past the build. A build equal to main (`identical`), one main is behind
+(`behind`, a build not pushed yet), a 404 for a commit GitHub does not know,
+and any failed answer show nothing. An
+answer is reused for an hour per build in the browser's storage, and asked
+again hourly while the Console stays open.
+
 Unauthenticated and login chrome must use deliberately neutral copy, such as `Service`, `Access`, and `Continue`, instead of obvious Codex, pool, provider, or admin labels. This is passive exposure reduction for casual browsing and keyword probes, not a security boundary; management APIs remain protected server-side.
 
 ---
