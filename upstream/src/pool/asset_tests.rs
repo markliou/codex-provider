@@ -585,15 +585,18 @@ async fn expiring_reset_credit_outlines_the_status_badge() {
         &js,
         &[
             "function resetCreditExpiryFlag(quota)",
-            "function statusBadgeMarkup(tone, label, quota)",
+            "function statusBadgeMarkup(tone, label, quota, reason = \"\")",
             "expiring-reset",
             // It reuses the one seven-day rule rather than restating the window.
             "resetCreditExpiresSoon(credits.expiresAt)",
             // Nothing to lose when no credit is available, so nothing is marked.
             "Number(credits.availableCount) > 0",
             // Both tables carry it: the same fact is public.
-            "statusBadgeMarkup(health.status, statusLabel(health.status), health.quota)",
-            "statusBadgeMarkup(tone, label, account.quota)",
+            "statusBadgeMarkup(health.status, statusLabel(health.status), health.quota, health.statusReason)",
+            "statusBadgeMarkup(tone, label, account.quota, account.statusHint)",
+            // The status reason is the badge's tooltip; the public row's is
+            // its redacted hint.
+            "[reason, flag.title].filter(Boolean)",
         ],
     );
     // The outline must not replace the tone: a Ready account holding an

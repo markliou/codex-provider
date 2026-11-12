@@ -1258,3 +1258,29 @@ async fn public_use_to_the_end_waives_the_reserve() {
     .await;
     assert_eq!(result.code(), 409, "{}", result.body_string());
 }
+
+// The public row carries a redacted status hint for its badge's tooltip:
+// never another slot's name nor an upstream error code.
+#[tokio::test]
+async fn public_row_carries_a_redacted_status_hint() {
+    let (app, _dir) = arc_app(vec![device_account("device", "acct-device", 100)]);
+    let row = public_row(&app).await;
+    assert!(row.get("statusHint").is_some(), "{row}");
+    let hint = super::dashboard::public_status_hint;
+    assert_eq!(
+        hint(
+            "duplicate",
+            "Duplicate upstream account; routing uses acct-other"
+        ),
+        "Duplicate upstream account"
+    );
+    assert!(!hint("error", "Quota refresh failed: invalid_token").contains("invalid_token"));
+    assert!(!hint("cooldown", "usage_limit_reached").contains("usage_limit_reached"));
+    assert_eq!(
+        hint(
+            "exhausted",
+            "Quota exhausted: workspace_member_credits_depleted"
+        ),
+        "Quota exhausted: workspace_member_credits_depleted"
+    );
+}

@@ -1578,8 +1578,17 @@ minutes is `Week`, and all other durations use a truthful generic label.
 
 `limit_reached`, `allowed=false`, reached type, and reached spend control are
 separate exhaustion state. They must never fabricate a zero-percent 5h window.
-The reached type is an upstream enum that drives exhaustion and reaches the
-operator through the account status reason. The quota cell must not render it as
+The reached type is an upstream enum that names why a limit was last reached;
+upstream keeps reporting it after the windows reset, so it drives exhaustion
+only when the usage reports no window, and otherwise the windows decide (a
+workspace member whose credits are spent can use its windows again once they
+reset; the owner's report, 2026-11-12). Codex never holds a request back on it.
+It reaches the operator through the account status reason, shown as the status
+badge's tooltip. The public page never carries the raw reason; its row carries
+`statusHint`, the reason for exhausted, protected, low and out-of-pool (the
+pool's own sentences and the exhaustion token the quota already shows) and a
+fixed sentence otherwise, so no upstream error code or other slot's name
+reaches it. The quota cell must not render it as
 its own row: repeating the identifier there names a condition without saying
 what to do about it, and costs a row in the cell operators scan.
 Credits-scoped `unlimited=true` means only flexible credits are unlimited; it
