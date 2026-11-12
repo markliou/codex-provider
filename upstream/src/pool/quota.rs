@@ -255,9 +255,25 @@ pub fn quota_from_usage(usage: &UsageResponse, now: Timestamp) -> AccountQuota {
         quota.individual_limit = Some(limit);
     }
     quota.rate_limit_reached_type = clean_metadata_token(&usage.rate_limit_reached_type);
+    // The reached type names why a limit was last reached (for a workspace
+    // member, `workspace_member_credits_depleted`: the windows ran out and
+    // the workspace credits that would carry past them are spent). Upstream
+    // keeps reporting it after the windows reset, so it blocks only when no
+    // window is reported to say otherwise; with windows, they decide
+    // (quota_explicitly_blocks_routing). Codex itself never holds a request
+    // back on it (tui app/app_server_events.rs AccountRateLimitsUpdated: a
+    // banner and a usage re-read). The owner's report, 2026-11-12: a member
+    // account whose workspace credits were spent stayed Exhausted with its 5h
+    // window back, and as nothing was sent to it, nothing could clear it. `limit_reached`, `allowed=false`
+    // and a reached spend control still block on their own.
     if !quota.rate_limit_reached_type.is_empty() {
-        quota.exhausted = true;
-        quota.exhaustion_reason = quota.rate_limit_reached_type.clone();
+        let windows_reported = quota_reported_windows(&quota)
+            .iter()
+            .any(|window| window.present);
+        if !windows_reported {
+            quota.exhausted = true;
+            quota.exhaustion_reason = quota.rate_limit_reached_type.clone();
+        }
     }
     if let Some(additional) = &usage.additional_rate_limits {
         for limit in additional {
@@ -1340,6 +1356,49 @@ mod tests {
         ]);
         let ids: Vec<&str> = kept.iter().map(|limit| limit.limit_id.as_str()).collect();
         assert_eq!(ids, ["code_review", "codex_live"]);
+    }
+
+    // A reached type with windows reported is history, not a block: a
+    // workspace member whose credits are spent can use its windows again once
+    // they reset. Without any window it still blocks.
+    #[test]
+    fn reached_type_follows_the_windows() {
+        let back = decode(
+            r#"{
+            "rate_limit":{"allowed":true,"limit_reached":false,
+              "primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":1800018000},
+              "secondary_window":{"used_percent":40,"limit_window_seconds":604800,"reset_at":1800300000}},
+            "rate_limit_reached_type":{"type":"workspace_member_credits_depleted"}
+        }"#,
+        );
+        assert_eq!(
+            back.rate_limit_reached_type,
+            "workspace_member_credits_depleted"
+        );
+        assert!(!back.exhausted);
+        assert!(!quota_explicitly_blocks_routing(
+            &back,
+            "",
+            at(1_800_000_000),
+            1.0
+        ));
+        let spent = decode(
+            r#"{
+            "rate_limit":{"allowed":true,"limit_reached":false,
+              "primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_at":1800018000}},
+            "rate_limit_reached_type":{"type":"workspace_member_credits_depleted"}
+        }"#,
+        );
+        assert!(quota_explicitly_blocks_routing(
+            &spent,
+            "",
+            at(1_800_000_000),
+            1.0
+        ));
+        let bare =
+            decode(r#"{"rate_limit_reached_type":{"type":"workspace_member_credits_depleted"}}"#);
+        assert!(bare.exhausted);
+        assert_eq!(bare.exhaustion_reason, "workspace_member_credits_depleted");
     }
 
     // Go TestQuotaFromUsageTreatsReachedLimitWithoutWindowsAsExhausted.

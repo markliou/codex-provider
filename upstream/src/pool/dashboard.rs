@@ -313,6 +313,24 @@ pub fn public_dashboard_status(status: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// The public page's tooltip for a row's status badge. The full status
+/// reason stays in management mode: the public page never shows upstream
+/// error codes or another slot's name (public_dashboard_redacts_account_secrets,
+/// codex_quota_error_does_not_persist_upstream_body). Exhausted, protected,
+/// low and out-of-pool keep their reason, as it holds only the pool's own
+/// sentences and the exhaustion token the row's quota already carries; the
+/// others get a fixed sentence.
+pub fn public_status_hint(status: &str, reason: &str) -> String {
+    match status {
+        "exhausted" | "protected" | "low" | "standby" => reason.to_string(),
+        "cooldown" => "Resting after an upstream failure; it comes back on its own".to_string(),
+        "error" => "Quota refresh failed; the account may need Repair".to_string(),
+        "duplicate" => "Duplicate upstream account".to_string(),
+        "missing_auth" => "Sign-in needed".to_string(),
+        _ => String::new(),
+    }
+}
+
 pub fn public_pool_label(item: &Account) -> &'static str {
     if item.pending_auth_verification {
         "Verification pending"
@@ -963,7 +981,7 @@ impl Inner {
 
     /// The public dashboard row of one slot.
     pub fn public_dashboard_account(&self, item: &Account, index: usize, now: Timestamp) -> Value {
-        let (status, _) = self.account_status(item, now);
+        let (status, reason) = self.account_status(item, now);
         let snapshot = quota::quota_snapshot_for_display(&self.quota_snapshot(&item.id), now);
         let display = super::status::account_for_display(item, &snapshot);
         let (tone, label) = public_dashboard_status(status);
@@ -984,6 +1002,7 @@ impl Inner {
             "ownerNote": item.owner_note,
             "statusTone": tone,
             "statusLabel": label,
+            "statusHint": public_status_hint(status, &reason),
             // Membership is separate from the tone: duplicates use the neutral
             // standby presentation while their slot stays in the pool.
             "outOfPool": !item.in_pool,

@@ -1016,9 +1016,15 @@
     return { cls: " expiring-reset", title: when ? `Reset credit expires ${when} — spend it or lose it` : "Reset credit expires within seven days" };
   }
 
-  function statusBadgeMarkup(tone, label, quota) {
+  // The status reason rides on the badge as its tooltip (SPEC.md quota
+  // windows: the reached type "reaches the operator through the account
+  // status reason"); the public row passes its redacted statusHint instead. Without it an Exhausted badge gave no way to tell a
+  // spent window from an upstream flag such as workspace credits depleted.
+  // It stays a tooltip, never a row: the status column is scanned, not read.
+  function statusBadgeMarkup(tone, label, quota, reason = "") {
     const flag = resetCreditExpiryFlag(quota);
-    const title = flag.title ? ` title="${escapeHTML(flag.title)}"` : "";
+    const tip = [reason, flag.title].filter(Boolean).join("\n");
+    const title = tip ? ` title="${escapeHTML(tip)}"` : "";
     return `<span class="badge ${escapeHTML(tone)}${flag.cls}"${title}>${escapeHTML(label)}</span>`;
   }
 
@@ -1368,7 +1374,7 @@
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
       return `<tr data-account-row="${escapeHTML(account.id)}"${poolMembershipAttribute(account.inPool === false)}>
         <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${accountEntitlementMarkup(account)}${ownerNoteInput(account)}</div></td>
-        <td><div class="status-stack">${statusBadgeMarkup(health.status, statusLabel(health.status), health.quota)}${activeBadge(health.active)}</div>${modeBadgesMarkup(account, health, pi)}</td>
+        <td><div class="status-stack">${statusBadgeMarkup(health.status, statusLabel(health.status), health.quota, health.statusReason)}${activeBadge(health.active)}</div>${modeBadgesMarkup(account, health, pi)}</td>
         <td>${quotaMarkup(health.remainingQuota ?? account.remainingQuota, health.quota, health.quotaError, health.usageUpdatedAt, health.quotaFreshness, health.lastSuccessfulRefreshAt, health.quotaMetering, account.id)}${piUsageMarkup(pi)}${quotaProtectionMarkup(account, health)}</td>
         <td><div class="route">${account.authType === "codex_device_auth" ? "" : `<strong>${escapeHTML(authLabel(account.authType))}</strong><br>`}${escapeHTML(route)} · ${escapeHTML(routeCount)}</div></td>
         <td class="cache-column">${cacheHitMarkup(health, "main", account.id)}</td>
@@ -1435,7 +1441,7 @@
       const affinityFallbacks = Number(cacheWindow.parentAffinityFallbackCount) || 0;
       return `<tr${poolMembershipAttribute(account.outOfPool === true)}>
       <td><div class="account-name">${escapeHTML(displayName)}${metadata ? `<span class="account-id">${escapeHTML(metadata)}</span>` : ""}${publicSeatMarkup(account)}${ownerNoteInput(account, true)}</div></td>
-      <td><div class="status-stack">${statusBadgeMarkup(tone, label, account.quota)}${activeBadge(account.active)}</div></td>
+      <td><div class="status-stack">${statusBadgeMarkup(tone, label, account.quota, account.statusHint)}${activeBadge(account.active)}</div></td>
       <td>${quota}</td>
       <td><div class="route"><strong>${escapeHTML(account.poolLabel || "Unavailable")}</strong>${account.useAllQuota ? `<span class="route-note" title="${escapeHTML(publicActionHint("use-all"))}">No reserve</span>` : ""}</div></td>
       <td class="cache-column">${cacheHitMarkup(account, "main")}</td>
