@@ -1578,12 +1578,23 @@ minutes is `Week`, and all other durations use a truthful generic label.
 
 `limit_reached`, `allowed=false`, reached type, and reached spend control are
 separate exhaustion state. They must never fabricate a zero-percent 5h window.
-The reached type is an upstream enum that names why a limit was last reached;
-upstream keeps reporting it after the windows reset, so it drives exhaustion
-only when the usage reports no window, and otherwise the windows decide (a
-workspace member whose credits are spent can use its windows again once they
-reset; the owner's report, 2026-11-12). Codex never holds a request back on it.
-It reaches the operator through the account status reason, shown as the status
+The reached type (an upstream enum that names why a limit was last reached)
+and a reached spend control (the workspace's credit limit) are workspace
+stops: they say the credits that carry an account past its included allowance
+are spent, not that the allowance itself is gone (Standard and Premium seats
+use their included allowance first; OpenAI Help, "Managing credits and spend
+controls in ChatGPT Business"). Upstream keeps reporting both after the windows
+reset, so they drive exhaustion only without evidence that the included
+allowance is open: that evidence is `allowed=true` together with at least one
+reported window. With it the windows decide, through the same check that
+routing and the dashboard share; `limit_reached`, `allowed=false`, a spent
+window, a model meter, the reserve floor and an upstream refusal still block
+(the owner's reports, 2026-11-12 and 2026-11-13: member accounts with spent
+workspace credits or a reached spend control stayed Exhausted with their
+windows back). Codex never holds a request back on either; it shows a
+workspace banner and re-reads usage. The spend control stays visible in the
+Console's quota details. The exhaustion reason
+reaches the operator through the account status reason, shown as the status
 badge's tooltip. The public page never carries the raw reason; its row carries
 `statusHint`, the reason for exhausted, protected, low and out-of-pool (the
 pool's own sentences and the exhaustion token the quota already shows) and a
