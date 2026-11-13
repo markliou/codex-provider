@@ -248,32 +248,51 @@ pub fn quota_from_usage(usage: &UsageResponse, now: Timestamp) -> AccountQuota {
             limit.reset_at =
                 normalized_reset_at(details.reset_at, details.reset_after_seconds, now);
         }
-        if limit.reached {
-            quota.exhausted = true;
-            quota.exhaustion_reason = "spend_control_reached".to_string();
-        }
         quota.individual_limit = Some(limit);
     }
     quota.rate_limit_reached_type = clean_metadata_token(&usage.rate_limit_reached_type);
-    // The reached type names why a limit was last reached (for a workspace
-    // member, `workspace_member_credits_depleted`: the windows ran out and
-    // the workspace credits that would carry past them are spent). Upstream
-    // keeps reporting it after the windows reset, so it blocks only when no
-    // window is reported to say otherwise; with windows, they decide
-    // (quota_explicitly_blocks_routing). Codex itself never holds a request
-    // back on it (tui app/app_server_events.rs AccountRateLimitsUpdated: a
-    // banner and a usage re-read). The owner's report, 2026-11-12: a member
-    // account whose workspace credits were spent stayed Exhausted with its 5h
-    // window back, and as nothing was sent to it, nothing could clear it. `limit_reached`, `allowed=false`
-    // and a reached spend control still block on their own.
-    if !quota.rate_limit_reached_type.is_empty() {
-        let windows_reported = quota_reported_windows(&quota)
-            .iter()
-            .any(|window| window.present);
-        if !windows_reported {
-            quota.exhausted = true;
-            quota.exhaustion_reason = quota.rate_limit_reached_type.clone();
-        }
+    // A reached spend control and the reached type are workspace stops: the
+    // workspace credits that carry an account past its included allowance
+    // are spent, or its monthly credit limit is reached (for a workspace
+    // member, `workspace_member_credits_depleted`). Neither says the included
+    // allowance itself is gone: Standard and Premium seats use their included
+    // allowance first, and the credit limit governs only the usage beyond it
+    // (OpenAI Help, "Managing credits and spend controls in ChatGPT
+    // Business"). Upstream keeps reporting both after the windows reset.
+    // Codex itself never holds a request back on either (tui
+    // app/app_server_events.rs AccountRateLimitsUpdated: `workspace_hard_stop`
+    // on these reached types or `spend_control_reached == Some(true)` shows
+    // a banner and re-reads usage; chatwidget/rate_limits.rs only stops
+    // offering workspace credits).
+    //
+    // So they block only without evidence that the included allowance is
+    // open; with it, the windows decide (quota_explicitly_blocks_routing,
+    // shared by routing and the dashboard). `limit_reached`, `allowed=false`,
+    // a spent window, a model meter and the reserve floor still block as
+    // before, and an upstream refusal of a request is still read as one.
+    // The spend control stays on the snapshot for the Console's quota
+    // details. The owner's reports, 2026-11-12 and 2026-11-13: member
+    // accounts with spent workspace credits, or a reached spend control,
+    // stayed Exhausted with their windows back at 90%, and as nothing was
+    // sent to them, nothing could clear it. Do not drop either signal
+    // outright: with no window, or without `allowed: true`, it is all the
+    // pool knows.
+    let spend_control_reached = quota
+        .individual_limit
+        .as_ref()
+        .is_some_and(|limit| limit.reached);
+    let workspace_stop = if !quota.rate_limit_reached_type.is_empty() {
+        Some(quota.rate_limit_reached_type.clone())
+    } else if spend_control_reached {
+        Some("spend_control_reached".to_string())
+    } else {
+        None
+    };
+    if let Some(reason) = workspace_stop
+        && !included_allowance_reported_open(&quota)
+    {
+        quota.exhausted = true;
+        quota.exhaustion_reason = reason;
     }
     if let Some(additional) = &usage.additional_rate_limits {
         for limit in additional {
@@ -304,6 +323,18 @@ pub fn quota_from_usage(usage: &UsageResponse, now: Timestamp) -> AccountQuota {
     quota.hourly = quota_window_by_duration(&quota, FIVE_HOUR_WINDOW_MINUTES);
     quota.weekly = quota_window_by_duration(&quota, WEEKLY_WINDOW_MINUTES);
     quota
+}
+
+/// Evidence that an account's included allowance is open, which is what lets
+/// a workspace stop (a reached spend control or reached type) give way to the
+/// windows: upstream answered `allowed: true` and reported at least one
+/// window with a percentage. A missing or null `allowed`, or no window, is not
+/// evidence (see quota_from_usage).
+fn included_allowance_reported_open(quota: &AccountQuota) -> bool {
+    quota.allowed == Some(true)
+        && quota_reported_windows(quota)
+            .iter()
+            .any(|window| window.present)
 }
 
 /// Codex rolling snapshots may omit optional metadata while still providing
@@ -1399,6 +1430,102 @@ mod tests {
             decode(r#"{"rate_limit_reached_type":{"type":"workspace_member_credits_depleted"}}"#);
         assert!(bare.exhausted);
         assert_eq!(bare.exhaustion_reason, "workspace_member_credits_depleted");
+        // Windows without `allowed: true` are not evidence the allowance is
+        // open, so the reached type still holds the account.
+        let unconfirmed = decode(
+            r#"{
+            "rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":1800018000}},
+            "rate_limit_reached_type":{"type":"workspace_member_credits_depleted"}
+        }"#,
+        );
+        assert!(unconfirmed.exhausted);
+    }
+
+    // The owner's report, 2026-11-13, as observed on the other pool: a
+    // reached spend control (the workspace's monthly credit limit) with the
+    // included windows back and upstream allowing usage is not exhaustion;
+    // the windows decide, and the spend control stays on the snapshot.
+    const SPEND_REACHED: &str = r#""spend_control":{"reached":true,"individual_limit":{"source":"workspace_spend_controls","limit":"100","used":"100","remaining":"0","remaining_percent":0,"reset_at":1801000000}}"#;
+
+    fn spend_reached(rate_limit: &str) -> AccountQuota {
+        let rate_limit = if rate_limit.is_empty() {
+            String::new()
+        } else {
+            format!(r#""rate_limit":{rate_limit},"#)
+        };
+        decode(&format!("{{{rate_limit}{SPEND_REACHED}}}"))
+    }
+
+    const WINDOWS_BACK: &str = r#""primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_at":1800018000},
+        "secondary_window":{"used_percent":1,"limit_window_seconds":604800,"reset_at":1800300000}"#;
+
+    #[test]
+    fn reached_spend_control_follows_the_windows() {
+        let now = at(1_800_000_000);
+        let back = spend_reached(&format!(
+            r#"{{"allowed":true,"limit_reached":false,{WINDOWS_BACK}}}"#
+        ));
+        assert!(!back.exhausted, "{}", back.exhaustion_reason);
+        assert!(!quota_explicitly_blocks_routing(&back, "", now, 1.0));
+        assert!(back.individual_limit.as_ref().is_some_and(|l| l.reached));
+
+        // No window, or no affirmative allowance: the spend control is all
+        // the pool knows, so it still blocks.
+        for rate_limit in [
+            String::new(),
+            r#"{"allowed":true}"#.to_string(),
+            format!(r#"{{{WINDOWS_BACK}}}"#),
+            format!(r#"{{"allowed":null,{WINDOWS_BACK}}}"#),
+        ] {
+            let quota = spend_reached(&rate_limit);
+            assert!(quota.exhausted, "{rate_limit}");
+            assert_eq!(quota.exhaustion_reason, "spend_control_reached");
+            assert!(quota_explicitly_blocks_routing(&quota, "", now, 1.0));
+        }
+
+        // Explicit denials still block.
+        for rate_limit in [
+            format!(r#"{{"allowed":false,{WINDOWS_BACK}}}"#),
+            format!(r#"{{"allowed":true,"limit_reached":true,{WINDOWS_BACK}}}"#),
+        ] {
+            let quota = spend_reached(&rate_limit);
+            assert!(quota.exhausted, "{rate_limit}");
+            assert!(quota_explicitly_blocks_routing(&quota, "", now, 1.0));
+        }
+
+        // A spent window, or one at the reserve floor, still blocks.
+        let spent = spend_reached(
+            r#"{"allowed":true,"limit_reached":false,
+              "primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_at":1800018000}}"#,
+        );
+        assert!(!spent.exhausted);
+        assert!(quota_explicitly_blocks_routing(&spent, "", now, 1.0));
+        let at_floor = spend_reached(
+            r#"{"allowed":true,"limit_reached":false,
+              "primary_window":{"used_percent":97,"limit_window_seconds":18000,"reset_at":1800018000}}"#,
+        );
+        assert!(quota_explicitly_blocks_routing(&at_floor, "", now, 3.0));
+        assert!(!quota_explicitly_blocks_routing(&at_floor, "", now, 1.0));
+
+        // A spent model meter still blocks that model, and only that model.
+        let with_meter = decode(&format!(
+            r#"{{"rate_limit":{{"allowed":true,"limit_reached":false,{WINDOWS_BACK}}},{SPEND_REACHED},
+            "additional_rate_limits":[{{"limit_name":"gpt-test","metered_feature":"gpt-test",
+              "rate_limit":{{"limit_reached":true,"primary_window":{{"used_percent":100,"limit_window_seconds":18000,"reset_at":1800018000}}}}}}]}}"#
+        ));
+        assert!(!with_meter.exhausted);
+        assert!(quota_explicitly_blocks_routing(
+            &with_meter,
+            "gpt-test",
+            now,
+            1.0
+        ));
+        assert!(!quota_explicitly_blocks_routing(
+            &with_meter,
+            "gpt-other",
+            now,
+            1.0
+        ));
     }
 
     // Go TestQuotaFromUsageTreatsReachedLimitWithoutWindowsAsExhausted.

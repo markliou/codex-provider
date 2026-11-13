@@ -590,6 +590,72 @@ async fn sticky_session_with_exhausted_quota_snapshot_reselects() {
     );
 }
 
+// The owner's report, 2026-11-13: a reached spend control with the included
+// windows back and upstream allowing usage. Routing sends to the account and
+// the dashboard shows it routable, from the same decision; with no window
+// reported, both hold it as Exhausted.
+#[tokio::test]
+async fn reached_spend_control_routes_and_shows_by_the_windows() {
+    use super::quota::UsageResponse;
+    use super::quota::quota_from_usage;
+    let member = FakeServer::start(|_| FakeResponse::json(200, OK_RESPONSE)).await;
+    let other = FakeServer::start(|_| FakeResponse::json(200, OK_RESPONSE)).await;
+    let (app, _dir) = arc_app(vec![
+        provider("member", 100, &member.url, "one"),
+        provider("other", 10, &other.url, "two"),
+    ]);
+    let now = Timestamp::now();
+    let reset = now.unix() + 3_600;
+    let spend = r#""spend_control":{"reached":true,"individual_limit":{"source":"workspace_spend_controls","remaining_percent":0}}"#;
+    let quota_of = |payload: String| {
+        let usage: UsageResponse = serde_json::from_str(&payload).unwrap_or_default();
+        quota_from_usage(&usage, now)
+    };
+    let status_of = |app: &App| {
+        let inner = app.read();
+        let item = inner
+            .config
+            .accounts()
+            .iter()
+            .find(|account| account.id == "member")
+            .cloned()
+            .unwrap_or_default();
+        inner.account_status(&item, Timestamp::now())
+    };
+
+    set_quota(
+        &app,
+        "member",
+        "team",
+        quota_of(format!(
+            r#"{{"rate_limit":{{"allowed":true,"limit_reached":false,
+              "primary_window":{{"used_percent":10,"limit_window_seconds":18000,"reset_at":{reset}}},
+              "secondary_window":{{"used_percent":1,"limit_window_seconds":604800,"reset_at":{reset}}}}},{spend}}}"#
+        )),
+    );
+    let (status, reason) = status_of(&app);
+    assert_ne!(status, "exhausted", "{reason}");
+    let result = serve(
+        &app,
+        responses(r#"{"model":"gpt-test","input":"hello"}"#, "spend-back"),
+    )
+    .await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    assert_eq!((member.count(), other.count()), (1, 0));
+
+    set_quota(&app, "member", "team", quota_of(format!("{{{spend}}}")));
+    let (status, reason) = status_of(&app);
+    assert_eq!(status, "exhausted");
+    assert!(reason.contains("spend_control_reached"), "{reason}");
+    let result = serve(
+        &app,
+        responses(r#"{"model":"gpt-test","input":"hello"}"#, "spend-unknown"),
+    )
+    .await;
+    assert_eq!(result.code(), 200, "{}", result.body_string());
+    assert_eq!((member.count(), other.count()), (1, 1));
+}
+
 // Go TestFailoverTriesAllConfiguredAccounts.
 #[tokio::test]
 async fn failover_tries_all_configured_accounts() {
