@@ -37,6 +37,8 @@ struct Log {
 struct Behavior {
     /// identity -> handshake status
     refuse: HashMap<String, u16>,
+    /// The refusal's body, as the Codex backend sends one (default: none).
+    refuse_body: Option<&'static str>,
     /// identity -> handshakes still to drop as unreachable
     unreachable: Mutex<HashMap<String, usize>>,
     /// The 101's extra headers (default: a turn state).
@@ -48,6 +50,7 @@ impl Behavior {
     fn scripted(script: impl Fn(&str) -> Vec<String> + Send + Sync + 'static) -> Self {
         Self {
             refuse: HashMap::new(),
+            refuse_body: None,
             unreachable: Mutex::new(HashMap::new()),
             handshake: None,
             script: Box::new(script),
@@ -125,7 +128,7 @@ fn identity(headers: &HeaderMap) -> String {
     account.strip_prefix("acct-").unwrap_or(account).to_string()
 }
 
-type FakeBody = http_body_util::Empty<Bytes>;
+type FakeBody = http_body_util::Full<Bytes>;
 
 async fn answer(
     mut request: hyper::Request<hyper::body::Incoming>,
@@ -152,9 +155,12 @@ async fn answer(
         // hyper drops the connection without an answer.
         return Err(std::io::Error::other("unreachable"));
     }
-    let mut response = hyper::Response::new(FakeBody::new());
+    let mut response = hyper::Response::new(FakeBody::default());
     if let Some(status) = behavior.refuse.get(&who) {
         *response.status_mut() = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+        if let Some(body) = behavior.refuse_body {
+            *response.body_mut() = FakeBody::new(Bytes::from_static(body.as_bytes()));
+        }
         return Ok(response);
     }
     let key = super::http_io::header_value(request.headers(), "sec-websocket-key").to_string();
@@ -477,6 +483,103 @@ async fn responses_websocket_relays_codex_messages_unchanged() {
     assert!(
         events.len() == 1 && events[0].cached_tokens == 80,
         "only the real response is recorded, with its usage: {events:?}"
+    );
+}
+
+// A turn over 1 MiB goes upstream in Codex 0.169's fragments
+// (responses_ws.rs Framing::Codex) and arrives as the one message Codex sent.
+#[tokio::test]
+async fn responses_websocket_relays_a_large_turn_whole() {
+    let pool = ws_test_pool(Behavior::scripted(|_| completed_events("resp_big")), |_| {}).await;
+    let mut socket = dial_pool(&pool.url).await;
+    let text = "z".repeat(2 * 1024 * 1024 + 7);
+    let turn = format!(
+        r#"{{"type":"response.create","model":"gpt-test","input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{text}"}}]}}],"store":false,"stream":true}}"#
+    );
+    send(&mut socket, &turn).await;
+    let events = read_until_terminal(&mut socket).await;
+    assert!(
+        events
+            .last()
+            .is_some_and(|event| event.contains("response.completed")),
+        "events not relayed: {} events",
+        events.len()
+    );
+    let messages = pool.upstream.messages();
+    assert!(
+        messages.len() == 1 && messages[0] == turn,
+        "the large turn must reach upstream byte for byte"
+    );
+}
+
+// Codex 0.169: a 403 naming the request's access program is the request's,
+// not the account's (response_info.rs forbidden_request_refusal). The handshake
+// refusal goes to Codex at once, as the answer to its own handshake, the way
+// it hears it from upstream; no other account is tried and none is marked.
+#[tokio::test]
+async fn responses_websocket_passes_an_access_program_refusal_on() {
+    let mut behavior = Behavior::scripted(|_| completed_events("resp_ws"));
+    behavior.refuse.insert("first".to_string(), 403);
+    behavior.refuse_body = Some(r#"{"detail":{"code":"access_program_not_enabled"}}"#);
+    let pool = ws_test_pool(behavior, |_| {}).await;
+    match dial(
+        &pool.url,
+        &[
+            ("authorization", "Bearer client-key"),
+            ("user-agent", CODEX_EXEC_AGENT),
+            ("originator", "codex_exec"),
+        ],
+    )
+    .await
+    {
+        Err(Some(response)) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+        _ => panic!("handshake answer must be 403"),
+    }
+    assert_eq!(pool.upstream.identities(), ["first"]);
+    assert_eq!(
+        super::proxy_tests::health(&pool.app, "first").last_failure_reason,
+        "",
+        "the account is not marked"
+    );
+    let inner = pool.app.read();
+    let held = |id: &str| {
+        super::app::quota_error_blocks_routing(inner.quota_snapshot(id).quota_error.as_ref())
+    };
+    assert!(!held("first") && !held("second"));
+}
+
+// Codex 0.169 WorkspaceAccessDenied: the account cannot use Codex in its
+// workspace. The handshake moves to another account, and the denied one is
+// held out of routing until its next good usage read.
+#[tokio::test]
+async fn responses_websocket_holds_an_account_denied_its_workspace() {
+    let mut behavior = Behavior::scripted(|_| completed_events("resp_ws"));
+    behavior.refuse.insert("first".to_string(), 403);
+    behavior.refuse_body = Some(r#"{"detail":{"code":"codex_workspace_access_denied"}}"#);
+    let pool = ws_test_pool(behavior, |_| {}).await;
+    let mut socket = dial_pool(&pool.url).await;
+    send(
+        &mut socket,
+        r#"{"type":"response.create","model":"gpt-test","input":[],"store":false,"stream":true}"#,
+    )
+    .await;
+    let events = read_until_terminal(&mut socket).await;
+    assert!(
+        events
+            .last()
+            .is_some_and(|event| event.contains("response.completed")),
+        "served by another account: {events:?}"
+    );
+    assert_eq!(pool.upstream.identities(), ["first", "second"]);
+    let inner = pool.app.read();
+    let item = inner.config.accounts()[0].clone();
+    assert_eq!(item.id, "first");
+    assert!(super::app::quota_error_blocks_routing(
+        inner.quota_snapshot("first").quota_error.as_ref()
+    ));
+    assert_eq!(
+        inner.account_status(&item, super::time::Timestamp::now()).0,
+        "error"
     );
 }
 

@@ -16,6 +16,10 @@ pub(crate) use auth::AuthError;
 pub(crate) use codex_client::TransportError;
 pub(crate) use error::ApiError;
 pub(crate) use telemetry::WebsocketTelemetry;
+// Named at the root only by responses_websocket.rs's tests (codex-api lib.rs
+// re-exports it), so only test builds carry it.
+#[cfg(test)]
+pub(crate) use common::PromptCacheOptions;
 // codex-api lib.rs defines it at the root; the WebSocket files name it there.
 pub(crate) const RESPONSES_PATH: &str = "/responses";
 pub mod pool;
@@ -77,6 +81,18 @@ pub(crate) mod endpoint {
         pub(crate) fn pool_wrapped_error(text: &str) -> Option<ApiError> {
             let wrapped = parse_wrapped_websocket_error_event(text)?;
             map_wrapped_websocket_error_event(wrapped, text.to_string())
+        }
+
+        /// Codex's own send of one message on its Responses WebSocket. From
+        /// 0.169 a text message over 1 MiB goes out as 1 MiB fragments of
+        /// one message, waiting on each (`send_message`); a smaller one, or
+        /// any other message, goes out whole. The pool sends upstream
+        /// through this so its frames are a native Codex's.
+        pub(crate) async fn pool_send_message(
+            socket: &mut (impl futures::Sink<Message, Error = WsError> + Unpin),
+            message: Message,
+        ) -> Result<(), WsError> {
+            send_message(socket, message).await
         }
 
         include!("../vendor/codex/codex-rs/codex-api/src/endpoint/responses_websocket.rs");

@@ -157,7 +157,12 @@ mod tests {
         for failure in fixture["failures"].as_array().expect("failures") {
             let source = failure["source"].as_str().unwrap_or_default();
             let event = &failure["event"];
-            let verdict = if source.ends_with("responses_websocket.rs") {
+            let verdict = if source.ends_with("responses_websocket.rs")
+                || (source.ends_with("api_bridge.rs") && event.get("status").is_some())
+            {
+                // A wrapped WebSocket refusal: Codex hands its payload to
+                // api_bridge as the HTTP body of that status
+                // (responses_websocket.rs map_wrapped_websocket_error_event).
                 ws_message(&event.to_string())
             } else if source.ends_with("api_bridge.rs") {
                 // Codex reads this one from an HTTP 429 body; the fixture holds

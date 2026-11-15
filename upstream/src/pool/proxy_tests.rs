@@ -3273,6 +3273,86 @@ async fn device_auth_failover_after_rate_limit() {
     );
 }
 
+/// Two device-auth accounts; the first answers 403 with `body`.
+async fn forbidden_first(body: &'static str) -> (Arc<App>, TempDir, FakeServer, FakeServer) {
+    let first = FakeServer::start(move |_| FakeResponse::json(403, body)).await;
+    let second = FakeServer::start(|_| FakeResponse::json(200, OK_RESPONSE)).await;
+    let (app, dir) = arc_app(vec![
+        device_at("device-first", "acct-first", 100, &first.url),
+        device_at("device-second", "acct-second", 10, &second.url),
+    ]);
+    for id in ["device-first", "device-second"] {
+        write_auth(
+            &app,
+            id,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"<access-token>"}}"#,
+        );
+    }
+    (app, dir, first, second)
+}
+
+fn credential_held(app: &App, id: &str) -> bool {
+    super::app::quota_error_blocks_routing(app.read().quota_snapshot(id).quota_error.as_ref())
+}
+
+// Codex 0.169 AccessProgramNotEnabled (api_bridge.rs): a 403 naming the
+// request's access program goes to the caller as upstream answered; no other
+// account is tried and the account is not marked
+// (response_info.rs forbidden_request_refusal). The workspace's inference
+// hook refusing a request on a 403 is the request's too.
+#[tokio::test]
+async fn forbidden_request_refusals_go_to_the_caller() {
+    let body = r#"{"error":{"message":"program entitlement denied","type":"invalid_request_error","code":"access_program_not_enabled"}}"#;
+    let (app, _dir, first, second) = forbidden_first(body).await;
+    let result = serve(
+        &app,
+        responses(r#"{"model":"gpt-test","input":"hello"}"#, "access-program"),
+    )
+    .await;
+    assert_eq!(result.code(), 403, "{}", result.body_string());
+    assert!(result.body_string().contains("access_program_not_enabled"));
+    assert_eq!((first.count(), second.count()), (1, 0));
+    assert!(!credential_held(&app, "device-first"));
+    assert_eq!(health(&app, "device-first").last_failure_reason, "");
+
+    let body = r#"{"error":{"code":"inference_hook_denied","message":"Your workspace inference hook blocked this request."}}"#;
+    let (app, _dir, first, second) = forbidden_first(body).await;
+    let result = serve(
+        &app,
+        responses(r#"{"model":"gpt-test","input":"hello"}"#, "inference-hook"),
+    )
+    .await;
+    assert_eq!(result.code(), 403, "{}", result.body_string());
+    assert_eq!((first.count(), second.count()), (1, 0));
+    assert!(!credential_held(&app, "device-first"));
+    assert_eq!(health(&app, "device-first").last_failure_reason, "");
+}
+
+// Codex 0.169 WorkspaceAccessDenied (api_bridge.rs
+// only_an_explicit_workspace_403_stops_retries shapes): the account cannot
+// use Codex in its workspace. The request moves to another account and the
+// denied one is held out of routing, so the next request does not meet the
+// same 403 first.
+#[tokio::test]
+async fn workspace_denial_moves_on_and_holds_the_account() {
+    for body in [
+        r#"{"detail":{"code":"codex_workspace_access_denied"}}"#,
+        r#"{"detail":{"code":"invalid_workspace_selected"}}"#,
+    ] {
+        let (app, _dir, first, second) = forbidden_first(body).await;
+        for session in ["workspace-a", "workspace-b"] {
+            let result = serve(
+                &app,
+                responses(r#"{"model":"gpt-test","input":"hello"}"#, session),
+            )
+            .await;
+            assert_eq!(result.code(), 200, "{body}: {}", result.body_string());
+        }
+        assert_eq!((first.count(), second.count()), (1, 2), "{body}");
+        assert!(credential_held(&app, "device-first"), "{body}");
+    }
+}
+
 // Go TestDeviceAuthFailoverAfterRefreshTokenRevoked.
 #[tokio::test]
 async fn device_auth_failover_after_refresh_token_revoked() {
