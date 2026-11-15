@@ -430,19 +430,40 @@ pub async fn handle_responses_websocket(
     )
     .await;
     let (client_sink, client_stream) = client.split();
-    tokio::spawn(write_loop(client_sink, client_rx));
+    tokio::spawn(write_loop(client_sink, client_rx, Framing::Whole));
     start_relay(&session, socket);
     run(&session, client_stream).await;
 }
 
-async fn write_loop<S>(mut sink: S, mut rx: mpsc::UnboundedReceiver<Outgoing>)
+/// How a write loop puts a message on its socket.
+#[derive(Clone, Copy)]
+enum Framing {
+    /// Whole, one frame per message: the leg to Codex, where the pool stands
+    /// in for upstream, which does not fragment what it sends.
+    Whole,
+    /// As a native Codex sends on its Responses WebSocket: from 0.169 a text
+    /// message over 1 MiB goes out as 1 MiB fragments (codex-api
+    /// endpoint/responses_websocket.rs `send_message`, called through
+    /// lib.rs `pool_send_message`). The leg to upstream; sent whole there, a
+    /// large turn would reach upstream framed as no native Codex frames it.
+    Codex,
+}
+
+async fn write_loop<S>(mut sink: S, mut rx: mpsc::UnboundedReceiver<Outgoing>, framing: Framing)
 where
-    S: futures::Sink<Message> + Unpin,
+    S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     while let Some(outgoing) = rx.recv().await {
         match outgoing {
             Outgoing::Message(message) => {
-                if sink.send(message).await.is_err() {
+                let sent = match framing {
+                    Framing::Whole => sink.send(message).await,
+                    Framing::Codex => {
+                        crate::endpoint::responses_websocket::pool_send_message(&mut sink, message)
+                            .await
+                    }
+                };
+                if sent.is_err() {
                     return;
                 }
             }
@@ -802,7 +823,12 @@ async fn dial(
                     code: code.clone(),
                     detail: "upstream refused the websocket".to_string(),
                 };
-                if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                if super::response_info::forbidden_request_refusal(status.as_u16(), &code) {
+                    // The request, not the account: tell
+                    // the client at once and touch no account
+                    // (response_info.rs forbidden_request_refusal).
+                    return Err(refusal);
+                } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                     app.mark_account_auth_failure(&candidate.id, model, &code);
                 } else if status == StatusCode::TOO_MANY_REQUESTS {
                     let wait = super::proxy::retry_after_or_default(
@@ -1022,7 +1048,7 @@ fn start_relay(session: &Arc<Session>, socket: crate::transport::UpstreamSocket)
         state.upstream = Some(upstream.clone());
         state.account.id.clone()
     };
-    tokio::spawn(write_loop(sink, rx));
+    tokio::spawn(write_loop(sink, rx, Framing::Codex));
     let session = session.clone();
     tokio::spawn(async move { relay_upstream(session, upstream, account_id, stream).await });
 }
@@ -1497,6 +1523,75 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::Data;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::OpCode;
+
+    /// What one write loop puts on its socket for one message.
+    async fn written(framing: Framing, message: Message) -> Vec<Message> {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink =
+            futures::sink::unfold(captured.clone(), |captured, message: Message| async move {
+                if let Ok(mut sent) = captured.lock() {
+                    sent.push(message);
+                }
+                Ok::<_, tokio_tungstenite::tungstenite::Error>(captured)
+            });
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _ = tx.send(Outgoing::Message(message));
+        drop(tx);
+        write_loop(Box::pin(sink), rx, framing).await;
+        captured.lock().map(|sent| sent.clone()).unwrap_or_default()
+    }
+
+    // Codex 0.169 sends a text message over 1 MiB as 1 MiB fragments of one
+    // message (codex-api endpoint/responses_websocket.rs send_message); the
+    // leg to upstream frames it the same way, and the leg to Codex, where the
+    // pool stands in for upstream, keeps one frame per message.
+    #[tokio::test]
+    async fn upstream_leg_fragments_a_large_turn_as_codex_does() {
+        const MIB: usize = 1024 * 1024;
+        let text = "x".repeat(2 * MIB + MIB / 2);
+        let sent = written(Framing::Codex, Message::Text(text.clone().into())).await;
+        let frames: Vec<(OpCode, bool, usize)> = sent
+            .iter()
+            .map(|message| match message {
+                Message::Frame(frame) => (
+                    frame.header().opcode,
+                    frame.header().is_final,
+                    frame.payload().len(),
+                ),
+                other => panic!("expected fragments, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                (OpCode::Data(Data::Text), false, MIB),
+                (OpCode::Data(Data::Continue), false, MIB),
+                (OpCode::Data(Data::Continue), true, MIB / 2),
+            ]
+        );
+        let joined: Vec<u8> = sent
+            .iter()
+            .flat_map(|message| match message {
+                Message::Frame(frame) => frame.payload().to_vec(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(joined == text.as_bytes(), "fragments must rejoin the turn");
+
+        let small = "y".repeat(MIB);
+        let sent = written(Framing::Codex, Message::Text(small.clone().into())).await;
+        assert!(
+            matches!(sent.as_slice(), [Message::Text(whole)] if whole.as_str() == small),
+            "a message of 1 MiB or less goes out whole"
+        );
+        let sent = written(Framing::Whole, Message::Text(text.clone().into())).await;
+        assert!(
+            matches!(sent.as_slice(), [Message::Text(whole)] if whole.as_str() == text),
+            "the leg to Codex keeps one frame per message"
+        );
+    }
 
     #[test]
     fn removes_one_metadata_field_in_place() {

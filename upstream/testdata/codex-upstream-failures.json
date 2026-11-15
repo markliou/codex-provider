@@ -1,6 +1,6 @@
 {
   "_comment": "Upstream event shapes as Codex itself parses them, at codexRelease. Every entry names the Codex file it comes from and a marker string that appears in that file verbatim; scripts/conformance/codex-conformance.sh check verifies the markers against the Codex source, and TestCodexUpstreamShapesClassifyAsCodexReadsThem verifies the pool's reading. Payloads are copied from Codex's own tests where one exists; entries with a note are built from Codex's parser where it has no test fixture. When codexRelease changes (it must equal the tag in upstream/Cargo.toml), re-run the check and add the shapes the new release parses.",
-  "codexRelease": "rust-v0.167.2",
+  "codexRelease": "rust-v0.169.0",
   "_ignoredComment": "Snake-case literals the conformance check finds in Codex's error parsers that are not error codes. Anything else it finds must appear as a failure code above.",
   "ignoredCodexLiterals": {
     "safety_buffering": "a response.metadata payload type, not an error; response.metadata is held before the commit point (see lifecycle)"
@@ -447,7 +447,7 @@
     {
       "name": "flex unavailable error event",
       "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
-      "marker": "\"code\": \"flex_unavailable\"",
+      "marker": "(\"flex_unavailable\", CodexErrorInfo::FlexUnavailable),",
       "codex": "FlexUnavailable",
       "event": {
         "type": "error",
@@ -461,6 +461,146 @@
       },
       "class": "passthrough",
       "code": "flex_unavailable"
+    },
+    {
+      "name": "session budget reached error event",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "(\"budget_reached\", CodexErrorInfo::SessionBudgetExceeded),",
+      "codex": "SessionBudgetExceeded",
+      "event": {
+        "type": "error",
+        "error": {
+          "code": "budget_reached",
+          "plan_type": 42,
+          "headers": {
+            "retry-after": "300"
+          }
+        }
+      },
+      "class": "request",
+      "code": "budget_reached"
+    },
+    {
+      "name": "inference hook denied error event",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "(\"inference_hook_denied\", CodexErrorInfo::InferenceHookDenied),",
+      "codex": "InferenceHookDenied",
+      "event": {
+        "type": "error",
+        "error": {
+          "code": "inference_hook_denied",
+          "plan_type": 42,
+          "headers": {
+            "retry-after": "300"
+          }
+        }
+      },
+      "class": "request",
+      "code": "inference_hook_denied"
+    },
+    {
+      "name": "invalid access program error event",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "(\"invalid_access_program\", CodexErrorInfo::Other),",
+      "codex": "InvalidRequest",
+      "event": {
+        "type": "error",
+        "error": {
+          "code": "invalid_access_program",
+          "plan_type": 42,
+          "headers": {
+            "retry-after": "300"
+          }
+        }
+      },
+      "class": "request",
+      "code": "invalid_access_program"
+    },
+    {
+      "name": "unsupported access program error event",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "(\"unsupported_access_program\", CodexErrorInfo::Other),",
+      "codex": "InvalidRequest",
+      "event": {
+        "type": "error",
+        "error": {
+          "code": "unsupported_access_program",
+          "plan_type": 42,
+          "headers": {
+            "retry-after": "300"
+          }
+        }
+      },
+      "class": "request",
+      "code": "unsupported_access_program"
+    },
+    {
+      "name": "content policy violation error event",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "(\"content_policy_violation\", CodexErrorInfo::InvalidPrompt),",
+      "codex": "ContentPolicyViolation",
+      "event": {
+        "type": "error",
+        "error": {
+          "code": "content_policy_violation",
+          "plan_type": 42,
+          "headers": {
+            "retry-after": "300"
+          }
+        }
+      },
+      "class": "request",
+      "code": "content_policy_violation"
+    },
+    {
+      "name": "access program not enabled error event",
+      "source": "codex-rs/codex-api/src/sse/responses_error_tests.rs",
+      "marker": "\"access_program_not_enabled\",",
+      "codex": "AccessProgramNotEnabled",
+      "event": {
+        "type": "error",
+        "error": {
+          "code": "access_program_not_enabled",
+          "plan_type": 42,
+          "headers": {
+            "retry-after": "300"
+          }
+        }
+      },
+      "class": "request",
+      "code": "access_program_not_enabled"
+    },
+    {
+      "name": "websocket workspace not selected",
+      "source": "codex-rs/codex-api/src/api_bridge.rs",
+      "marker": "Some(\"invalid_workspace_selected\" | \"codex_workspace_access_denied\"),",
+      "codex": "WorkspaceAccessDenied",
+      "note": "built from the parser: a Responses WebSocket wraps the 403 that api_bridge_tests.rs only_an_explicit_workspace_403_stops_retries answers over HTTP, and Codex reads the wrapped payload as that HTTP body (responses_websocket.rs map_wrapped_websocket_error_event)",
+      "event": {
+        "type": "error",
+        "status": 403,
+        "error": {
+          "code": "invalid_workspace_selected"
+        }
+      },
+      "class": "authentication",
+      "code": "invalid_workspace_selected"
+    },
+    {
+      "name": "websocket workspace access denied",
+      "source": "codex-rs/codex-api/src/api_bridge.rs",
+      "marker": "Some(\"invalid_workspace_selected\" | \"codex_workspace_access_denied\"),",
+      "codex": "WorkspaceAccessDenied",
+      "note": "built from the parser: a Responses WebSocket wraps the 403 that api_bridge_tests.rs only_an_explicit_workspace_403_stops_retries answers over HTTP, and Codex reads the wrapped payload as that HTTP body (responses_websocket.rs map_wrapped_websocket_error_event)",
+      "event": {
+        "type": "error",
+        "status": 403,
+        "error": {
+          "code": "codex_workspace_access_denied"
+        }
+      },
+      "class": "authentication",
+      "code": "codex_workspace_access_denied"
     },
     {
       "name": "model not found error event",
@@ -818,7 +958,7 @@
     {
       "name": "client per request",
       "source": "codex-rs/core/src/client.rs",
-      "marker": "let transport = client_setup.build_api_transport(\"/responses\")?;",
+      "marker": "let transport = client_setup.http_transport(\"/responses\")?;",
       "pool": "codex-upstream builds a fresh client per request"
     },
     {

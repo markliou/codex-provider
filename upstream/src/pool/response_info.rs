@@ -330,7 +330,15 @@ pub fn terminal_failure_class(event_type: &str, code: &str) -> &'static str {
         | "token_invalidated"
         | "token_revoked"
         | "unauthorized"
-        | "forbidden" => "authentication",
+        | "forbidden"
+        // Codex 0.169: the account cannot use Codex in its selected workspace
+        // (a 403 naming one of these, over HTTP or wrapped on a WebSocket;
+        // codex-api api_bridge.rs, CodexErrorDetails::WorkspaceAccessDenied,
+        // terminal). The account's state, not the request's: another account
+        // can serve it, and this one stays out of routing until its next
+        // successful usage read (app.rs quota_error_blocks_routing).
+        | "invalid_workspace_selected"
+        | "codex_workspace_access_denied" => "authentication",
         "context_length_exceeded"
         | "invalid_prompt"
         | "cyber_policy"
@@ -355,7 +363,22 @@ pub fn terminal_failure_class(event_type: &str, code: &str) -> &'static str {
         | "invalid_audio"
         | "invalid_audio_data"
         | "invalid_audio_format"
-        | "missing_audio_sample_rate" => "request",
+        | "missing_audio_sample_rate"
+        // Codex 0.169 ends the turn on each without retrying (codex-api
+        // error.rs parse_terminal_provider_error; responses_error_tests.rs
+        // terminal_failure_with_retry_header_ends_stream_immediately). The
+        // session's budget is spent, the workspace's own inference hook
+        // refused the request, or the request names an access program the
+        // model or the account does not have. None says anything about the
+        // account's health, and none is for another account to retry: the
+        // hook and the access program are the workspace's and upstream's
+        // decisions about this request, and sending it to another account
+        // would step around them.
+        | "budget_reached"
+        | "inference_hook_denied"
+        | "invalid_access_program"
+        | "unsupported_access_program"
+        | "access_program_not_enabled" => "request",
         // Recognized, and Codex's to handle: it reconnects on the WebSocket
         // connection limit, resends in full when a previous response is gone,
         // and reports flex unavailability itself. Another account would not do
@@ -366,6 +389,27 @@ pub fn terminal_failure_class(event_type: &str, code: &str) -> &'static str {
         | "flex_unavailable" => "passthrough",
         _ => "unknown",
     }
+}
+
+/// A 403 that refuses the request, not the account's credential. Codex 0.169
+/// ends the turn without retrying on both, over HTTP or at the WebSocket
+/// handshake: `access_program_not_enabled` (AccessProgramNotEnabled,
+/// codex-api api_bridge.rs; core tests/suite/websocket_fallback.rs
+/// forbidden_responses_retry_only_without_an_explicit_access_denial) and
+/// `inference_hook_denied` (InferenceHookDenied, codex-api error.rs
+/// parse_terminal_provider_error, a stream error or a 403). The access program
+/// (for instance a cyber access program) is granted per workspace or project,
+/// and the inference hook is the workspace's own rule; sending the request on
+/// to another account would step around either, and marking this account
+/// would hold a working credential out of every other request. So the caller
+/// gets upstream's answer and no account is touched. Any other 401/403 stays
+/// the credential's.
+pub fn forbidden_request_refusal(status: u16, code: &str) -> bool {
+    status == 403
+        && matches!(
+            sanitized_error_code(code).as_str(),
+            "access_program_not_enabled" | "inference_hook_denied"
+        )
 }
 
 /// Classifies a wrapped refusal by its HTTP status, the way the pool

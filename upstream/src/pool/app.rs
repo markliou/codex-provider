@@ -756,6 +756,14 @@ pub fn quota_error_blocks_routing(info: Option<&super::state::QuotaErrorInfo>) -
             | "token_revoked"
             | "unauthorized"
             | "forbidden"
+            // Codex 0.169 WorkspaceAccessDenied (api_bridge.rs): the account
+            // cannot use Codex in its workspace, for instance a member removed
+            // from it. Held like a refused credential, so later requests do
+            // not each meet the same 403 first; the next successful usage read
+            // (quota_refresh.rs, a fresh snapshot) clears it, and a request
+            // that meets the 403 again holds it again.
+            | "invalid_workspace_selected"
+            | "codex_workspace_access_denied"
     )
 }
 

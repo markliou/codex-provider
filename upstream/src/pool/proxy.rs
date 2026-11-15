@@ -1592,6 +1592,31 @@ async fn attempts(
             // or transient capacity. Keep the error body out of persisted state
             // and route to a different upstream account if one exists.
             let mut reason = quota::extract_upstream_error_code(&body);
+            if super::response_info::forbidden_request_refusal(status.as_u16(), &reason) {
+                app.log_codex_verdict_for_http(
+                    &candidate.id,
+                    model,
+                    status,
+                    &headers,
+                    &body,
+                    "caller",
+                );
+                for (name, value) in app.current_account_response_headers(&candidate.id) {
+                    set_header(writer, &name, &value);
+                }
+                throughput.success = false;
+                let _ = copy_proxy_response(
+                    writer,
+                    UpstreamResponse {
+                        status,
+                        headers,
+                        body: super::stream::byte_stream_from(body),
+                    },
+                    &tuning,
+                )
+                .await;
+                return;
+            }
             if reason.is_empty() {
                 reason = "account_auth_failed".to_string();
             }
