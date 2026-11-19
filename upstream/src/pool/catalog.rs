@@ -30,11 +30,16 @@ use serde_json::Value;
 /// ranks just under gpt-6-astra; there is no gpt-6.1-astra. gpt-6.1-terra
 /// came with Codex 0.165, whose bundled list (models-manager/models.json)
 /// ranks it between gpt-5.6-sol and gpt-5.6-terra; it is listed from that
-/// file, not yet from upstream's own catalog. Listing a retired
+/// file, not yet from upstream's own catalog. gpt-6.2-sol and gpt-6.2-astra
+/// came with Codex 0.169.1/0.170.0, whose bundled list ranks them first and
+/// second, and OpenAI's Codex models page lists both for ChatGPT sign-in
+/// (2026-11-19); they lead the lineup. Listing a retired
 /// model is worse than omitting it: a client picks it out of this catalog and
 /// every request dies at the gateway, which answers a model it cannot route
 /// with a 5xx that reads as an account failure.
 pub const DEFAULT_CODEX_MODEL_SLUGS: &[&str] = &[
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
     "gpt-6-astra",
     "gpt-6.1-sol",
     "gpt-6-sol",
@@ -138,12 +143,13 @@ pub fn codex_model_in_family(model: &str, family: &str) -> bool {
 }
 
 /// Whether a model family documents the extended `max` tier: the gpt-6,
-/// gpt-6.1 and gpt-5.6 families; older families stop at xhigh. gpt-6.1 is its
+/// gpt-6.1, gpt-6.2 and gpt-5.6 families; older families stop at xhigh. gpt-6.1 is its
 /// own family on purpose: a point release is not a hyphenated member of gpt-6,
 /// so gpt-6.1-sol would otherwise silently fall back to the low-xhigh range.
 pub fn codex_extended_reasoning_model(model: &str) -> bool {
     codex_model_in_family(model, "gpt-6")
         || codex_model_in_family(model, "gpt-6.1")
+        || codex_model_in_family(model, "gpt-6.2")
         || codex_model_in_family(model, "gpt-5.6")
 }
 
@@ -151,7 +157,9 @@ pub fn codex_extended_reasoning_model(model: &str) -> bool {
 /// where it is not documented would let the client submit an effort upstream
 /// rejects, so two cases stop at `max`: gpt-6-luna (exact slug on purpose; the
 /// rest of gpt-6, and gpt-5.6-luna, keep ultra), and the gpt-6.1 family, whose
-/// ultra support OpenAI lists as "coming later" (2026-09-29).
+/// ultra support OpenAI lists as "coming later" (2026-09-29). gpt-6.2 keeps
+/// ultra: Codex 0.170's bundled catalog lists it for gpt-6.2-sol and
+/// gpt-6.2-astra.
 /// TODO(upstream): drop the gpt-6.1 exclusion once the Codex models page
 /// documents ultra for gpt-6.1-sol.
 pub fn codex_ultra_reasoning_model(model: &str) -> bool {
@@ -443,7 +451,13 @@ mod tests {
         for model in ["gpt-6-luna", "gpt-6.1-sol"] {
             assert_eq!(efforts(model), "low,medium,high,xhigh,max", "{model}");
         }
-        for model in ["gpt-6-sol", "gpt-6-astra", "gpt-5.6-luna"] {
+        for model in [
+            "gpt-6-sol",
+            "gpt-6-astra",
+            "gpt-5.6-luna",
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+        ] {
             assert_eq!(efforts(model), "low,medium,high,xhigh,max,ultra", "{model}");
         }
         for model in [
@@ -453,6 +467,9 @@ mod tests {
             "gpt-6-luna",
             "gpt-6.1",
             "gpt-6.1-sol",
+            "gpt-6.2",
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
             "gpt-5.6",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
@@ -469,6 +486,7 @@ mod tests {
             "gpt-61",
             "gpt-6.10-sol",
             "gpt-6.1x",
+            "gpt-6.20-sol",
         ] {
             assert!(!codex_extended_reasoning_model(model), "{model}");
         }
@@ -479,6 +497,8 @@ mod tests {
     #[test]
     fn default_lineup_matches_what_upstream_still_serves() {
         let want = [
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
             "gpt-6-astra",
             "gpt-6.1-sol",
             "gpt-6-sol",
