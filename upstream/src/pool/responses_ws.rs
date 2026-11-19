@@ -102,10 +102,31 @@ const TURN_STATE_ISSUER_TTL_HOURS: i64 = 24;
 const TURN_STATE_ISSUER_MAX: usize = 4096;
 /// The upstream handshake response headers a native Codex reads
 /// (codex-api endpoint/responses_websocket.rs): turn state, whether reasoning
-/// is included, and the serving model. X-Models-Etag joins them only on the
-/// native endpoint, where the catalog is upstream's.
-const WS_HANDSHAKE_HEADERS: &[&str] =
-    &["x-codex-turn-state", "x-reasoning-included", "openai-model"];
+/// is included, the serving model, and from 0.170 the largest message the
+/// backend takes (X_CODEX_WEBSOCKET_MAX_MESSAGE_BYTES_HEADER), which Codex
+/// checks before sending and answers by moving the turn to HTTP instead of
+/// uploading it. X-Models-Etag joins them only on the native endpoint, where
+/// the catalog is upstream's.
+const WS_HANDSHAKE_HEADERS: &[&str] = &[
+    "x-codex-turn-state",
+    "x-reasoning-included",
+    "openai-model",
+    X_CODEX_WEBSOCKET_MAX_MESSAGE_BYTES_HEADER,
+];
+const X_CODEX_WEBSOCKET_MAX_MESSAGE_BYTES_HEADER: &str = "x-codex-websocket-max-message-bytes";
+/// The close code upstream refuses an oversized message with (RFC 6455
+/// 1009, tungstenite CloseCode::Size).
+const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
+
+/// The largest message the upstream handshake says the backend takes, read as
+/// Codex 0.170 reads it (connect_websocket: a header that does not parse as a
+/// size is no limit).
+fn advertised_max_message_bytes(handshake: &HeaderMap) -> Option<usize> {
+    handshake
+        .get(X_CODEX_WEBSOCKET_MAX_MESSAGE_BYTES_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+}
 
 enum Outgoing {
     Message(Message),
@@ -160,6 +181,11 @@ struct WsResponse {
     account_id: String,
     warmup: bool,
     finished: AtomicBool,
+    /// Upstream has sent a text message since this request went out. Codex
+    /// 0.170 reads a 1009 close as "message too large" only before any text
+    /// (run_websocket_response_stream, received_text); after one it is an
+    /// ordinary closed stream.
+    upstream_spoke: AtomicBool,
     /// The key's slot while this response runs (client_limit.rs).
     permit: Mutex<Option<super::client_limit::Permit>>,
     /// The fields below belong to the upstream relay. buffered holds the
@@ -713,6 +739,7 @@ async fn start_response(
         account_id: bound.id,
         warmup,
         finished: AtomicBool::new(false),
+        upstream_spoke: AtomicBool::new(false),
         permit: Mutex::new(Some(permit)),
         state: Mutex::new(ResponseState {
             info: ProxyResponseInfo::default(),
@@ -721,6 +748,27 @@ async fn start_response(
             committed: false,
         }),
     });
+    // Codex 0.170 does not upload a message larger than the handshake's
+    // advertised limit (send_websocket_request: WebsocketMessageTooLarge
+    // before anything is sent) and moves the turn to HTTP. The client checked
+    // the message it wrote against the same header; this catches the one the
+    // pool made larger (key-login completion, installation id). Nothing goes
+    // upstream, and the 1009 close is what makes the client fall back, as no
+    // text has reached it for this request.
+    let limit = advertised_max_message_bytes(&session.state().upstream_headers);
+    if limit.is_some_and(|limit| message.len() > limit) {
+        // Counted in flight first: finish releases it.
+        app.in_flight.fetch_add(1, Ordering::SeqCst);
+        finish(
+            session,
+            &response,
+            false,
+            false,
+            "websocket_message_too_large",
+        );
+        session.close_client(CLOSE_MESSAGE_TOO_BIG, "message too big");
+        return false;
+    }
     let upstream = {
         let mut state = session.state();
         state.active = Some(response.clone());
@@ -1083,6 +1131,12 @@ async fn relay_upstream<S>(
     let app = session.app.clone();
     loop {
         let message = match stream.next().await {
+            Some(Ok(Message::Close(Some(frame))))
+                if u16::from(frame.code) == CLOSE_MESSAGE_TOO_BIG
+                    && upstream_refused_size(&session, &upstream) =>
+            {
+                return;
+            }
             Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
                 upstream_gone(&session, &upstream);
                 return;
@@ -1093,6 +1147,9 @@ async fn relay_upstream<S>(
             continue;
         };
         let response = session.state().active.clone();
+        if let (Frame::Text(_), Some(response)) = (&frame, &response) {
+            response.upstream_spoke.store(true, Ordering::SeqCst);
+        }
         if let Frame::Text(text) = &frame {
             app.note_event_turn_state(text, &account_id);
             // codex.rate_limits: what upstream says this account has left,
@@ -1333,6 +1390,45 @@ fn upstream_gone(session: &Arc<Session>, upstream: &Upstream) {
     }
     upstream.close(1000, "");
     session.close_client(1011, "upstream closed");
+}
+
+/// Upstream closed the socket with 1009 before saying anything about the
+/// request: the message was too large for the backend. Codex 0.170 reads
+/// exactly that as WebsocketMessageTooLarge and sends the turn over HTTP
+/// at once, without retrying the socket (responses_websocket.rs
+/// run_websocket_response_stream; core responses_retry.rs
+/// requires_http_fallback). The pool passes the same close on, so Codex
+/// makes that move itself. The size is the request's, not the account's:
+/// nothing is marked, and moving to another account would only upload it
+/// again. False when this is not that case (another socket, no request, or
+/// text already arrived); the caller then handles an ordinary close.
+fn upstream_refused_size(session: &Arc<Session>, upstream: &Upstream) -> bool {
+    let response = {
+        let mut state = session.state();
+        if state
+            .upstream
+            .as_ref()
+            .is_none_or(|current| current.id != upstream.id)
+        {
+            return false;
+        }
+        match &state.active {
+            Some(active) if !active.upstream_spoke.load(Ordering::SeqCst) => state.active.take(),
+            _ => return false,
+        }
+    };
+    if let Some(response) = response {
+        finish(
+            session,
+            &response,
+            false,
+            false,
+            "websocket_message_too_large",
+        );
+    }
+    upstream.close(1000, "");
+    session.close_client(CLOSE_MESSAGE_TOO_BIG, "message too big");
+    true
 }
 
 fn shutdown(session: &Arc<Session>) {

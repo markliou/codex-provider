@@ -211,6 +211,19 @@ async fn answer(
                 log.messages.push(text);
             }
             for event in (behavior.script)(&who) {
+                // A scripted close, as Codex's websocket_fallback_close.rs
+                // test server refuses an oversized message: CloseCode::Size
+                // with an empty reason.
+                if let Some(code) = event.strip_prefix(CLOSE_EVENT) {
+                    let code = code.parse::<u16>().unwrap_or(1000);
+                    let _ = socket
+                        .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                            code: code.into(),
+                            reason: "".into(),
+                        }))
+                        .await;
+                    return;
+                }
                 if socket.send(Message::Text(event.into())).await.is_err() {
                     return;
                 }
@@ -219,6 +232,9 @@ async fn answer(
     });
     Ok(response)
 }
+
+/// A script entry that closes the upstream socket with the code after it.
+const CLOSE_EVENT: &str = "close:";
 
 /// What the real Codex backend sends on a socket before response.created,
 /// captured from a live session.
@@ -394,6 +410,19 @@ async fn read_until_terminal(socket: &mut ClientSocket) -> Vec<String> {
             "response.completed" | "response.failed" | "error"
         ) {
             return events;
+        }
+    }
+}
+
+/// The close code the pool ends the client socket with, skipping any
+/// messages before it; None when the socket ends without a close frame.
+async fn read_close_code(socket: &mut ClientSocket) -> Option<u16> {
+    loop {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next()).await;
+        match next {
+            Ok(Some(Ok(Message::Close(frame)))) => return frame.map(|frame| frame.code.into()),
+            Ok(Some(Ok(_))) => continue,
+            _ => return None,
         }
     }
 }
@@ -780,6 +809,7 @@ async fn responses_websocket_relays_the_upstream_handshake() {
         ("x-reasoning-included", "true"),
         ("openai-model", "gpt-test"),
         ("x-models-etag", "catalog"),
+        ("x-codex-websocket-max-message-bytes", "1048576"),
     ]);
     let pool = ws_test_pool(behavior, |_| {}).await;
     let (_socket, headers) = dial(
@@ -797,6 +827,8 @@ async fn responses_websocket_relays_the_upstream_handshake() {
         ("x-codex-turn-state", "ts-native"),
         ("x-reasoning-included", "true"),
         ("openai-model", "gpt-test"),
+        // Codex 0.170 checks each message against it before sending.
+        ("x-codex-websocket-max-message-bytes", "1048576"),
     ] {
         assert_eq!(
             super::http_io::header_value(&headers, name),
@@ -811,6 +843,80 @@ async fn responses_websocket_relays_the_upstream_handshake() {
         1,
         "the upstream socket must be open before the client's is accepted"
     );
+}
+
+// Upstream refusing a message as too large (1009 before any text) reaches
+// Codex as that same close, which Codex 0.170 answers by sending the turn over
+// HTTP (responses_websocket.rs run_websocket_response_stream,
+// WebsocketMessageTooLarge). The size is the request's: no other account is
+// tried and the account is not marked.
+#[tokio::test]
+async fn responses_websocket_passes_a_size_refusal_on() {
+    let pool = ws_test_pool(
+        Behavior::scripted(|_| vec![format!("{CLOSE_EVENT}1009")]),
+        |_| {},
+    )
+    .await;
+    let mut socket = dial_pool(&pool.url).await;
+    send(
+        &mut socket,
+        r#"{"type":"response.create","model":"gpt-test","input":[]}"#,
+    )
+    .await;
+    assert_eq!(read_close_code(&mut socket).await, Some(1009));
+    wait_in_flight_zero(&pool.app).await;
+    assert_eq!(pool.upstream.identities(), ["first"]);
+    assert!(!cooled(&pool.app, "first"));
+    let inner = pool.app.read();
+    let item = inner.config.accounts()[0].clone();
+    assert_eq!(item.id, "first");
+    assert_ne!(
+        inner.account_status(&item, super::time::Timestamp::now()).0,
+        "error"
+    );
+}
+
+// After any text, Codex 0.170 reads a 1009 close as an ordinary closed
+// stream and retries the socket (websocket_fallback_close.rs
+// size_close_after_rate_limits), so the pool's ordinary close stands.
+#[tokio::test]
+async fn responses_websocket_reads_a_size_close_after_text_as_closed() {
+    let pool = ws_test_pool(
+        Behavior::scripted(|_| vec![NATIVE_PREAMBLE[0].to_string(), format!("{CLOSE_EVENT}1009")]),
+        |_| {},
+    )
+    .await;
+    let mut socket = dial_pool(&pool.url).await;
+    send(
+        &mut socket,
+        r#"{"type":"response.create","model":"gpt-test","input":[]}"#,
+    )
+    .await;
+    assert_eq!(read_close_code(&mut socket).await, Some(1011));
+    wait_in_flight_zero(&pool.app).await;
+}
+
+// A message over the handshake's advertised limit is not uploaded, as Codex
+// 0.170 does not upload one (send_websocket_request); the client socket
+// closes with 1009 so the client moves the turn to HTTP.
+#[tokio::test]
+async fn responses_websocket_keeps_a_message_over_the_advertised_limit() {
+    let mut behavior = Behavior::scripted(|_| completed_events("resp_big"));
+    behavior.handshake = Some(vec![
+        ("x-codex-turn-state", "ts-limit"),
+        ("x-codex-websocket-max-message-bytes", "16"),
+    ]);
+    let pool = ws_test_pool(behavior, |_| {}).await;
+    let mut socket = dial_pool(&pool.url).await;
+    send(
+        &mut socket,
+        r#"{"type":"response.create","model":"gpt-test","input":[]}"#,
+    )
+    .await;
+    assert_eq!(read_close_code(&mut socket).await, Some(1009));
+    wait_in_flight_zero(&pool.app).await;
+    assert!(pool.upstream.messages().is_empty());
+    assert!(!cooled(&pool.app, "first"));
 }
 
 // Go TestResponsesWebSocketRefusesTheHandshakeWhenNoAccountCan.

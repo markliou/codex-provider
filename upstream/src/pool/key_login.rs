@@ -818,7 +818,10 @@ fn list_answer(tool: Tool, arguments: &str) -> String {
         Some(server) if server == CODEX_APPS_MCP_SERVER => {
             format!("{{\"server\":\"{CODEX_APPS_MCP_SERVER}\",\"{field}\":[]}}")
         }
-        Some(server) => format!("unknown MCP server '{server}'"),
+        // From 0.170 a named server is resolved by resolve_resource_server,
+        // whose refusal names the selected environment; a ChatGPT login's
+        // Codex answers a server it does not have with exactly this.
+        Some(server) => format!("unknown MCP server '{server}' for the selected environment"),
         None if normalize_optional(args.cursor).is_some() => {
             "cursor can only be used when a server is specified".to_string()
         }
@@ -848,7 +851,10 @@ fn read_answer(arguments: &str) -> Option<String> {
     if server == CODEX_APPS_MCP_SERVER {
         return None;
     }
-    Some(format!("unknown MCP server '{server}'"))
+    // resolve_resource_server's refusal, as for a list (0.170).
+    Some(format!(
+        "unknown MCP server '{server}' for the selected environment"
+    ))
 }
 
 /// image_gen.imagegen (ext/image-generation/src/tool.rs): the arguments are
@@ -1118,7 +1124,7 @@ mod tests {
         );
         assert_eq!(
             list_answer(Tool::ListTemplates, r#"{"server":"docs"}"#),
-            "unknown MCP server 'docs'"
+            "unknown MCP server 'docs' for the selected environment"
         );
         assert_eq!(
             list_answer(Tool::ListResources, r#"{"cursor":"c"}"#),
@@ -1130,7 +1136,7 @@ mod tests {
         );
         assert_eq!(
             read_answer(r#"{"server":"docs","uri":"docs://readme"}"#).unwrap(),
-            "unknown MCP server 'docs'"
+            "unknown MCP server 'docs' for the selected environment"
         );
         assert_eq!(read_answer(r#"{"server":"codex_apps","uri":"u"}"#), None);
         assert_eq!(

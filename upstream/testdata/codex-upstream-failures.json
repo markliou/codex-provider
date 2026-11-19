@@ -1,9 +1,14 @@
 {
   "_comment": "Upstream event shapes as Codex itself parses them, at codexRelease. Every entry names the Codex file it comes from and a marker string that appears in that file verbatim; scripts/conformance/codex-conformance.sh check verifies the markers against the Codex source, and TestCodexUpstreamShapesClassifyAsCodexReadsThem verifies the pool's reading. Payloads are copied from Codex's own tests where one exists; entries with a note are built from Codex's parser where it has no test fixture. When codexRelease changes (it must equal the tag in upstream/Cargo.toml), re-run the check and add the shapes the new release parses.",
-  "codexRelease": "rust-v0.169.0",
+  "codexRelease": "rust-v0.170.0",
   "_ignoredComment": "Snake-case literals the conformance check finds in Codex's error parsers that are not error codes. Anything else it finds must appear as a failure code above.",
   "ignoredCodexLiterals": {
-    "safety_buffering": "a response.metadata payload type, not an error; response.metadata is held before the commit point (see lifecycle)"
+    "safety_buffering": "a response.metadata payload type, not an error; response.metadata is held before the commit point (see lifecycle)",
+    "organization_mismatch": "a reason in response.input_transformations (sse/responses.rs reasoning_removals, 0.170): Codex counts removed replayed reasoning for its metrics; not an error, and the pool relays it untouched",
+    "end_user_mismatch": "a reason in response.input_transformations, as organization_mismatch",
+    "model_mismatch": "a reason in response.input_transformations, as organization_mismatch",
+    "prefix_mismatch": "a reason in response.input_transformations, as organization_mismatch",
+    "turn_boundary": "a reason in response.input_transformations, as organization_mismatch"
   },
   "failures": [
     {
@@ -873,7 +878,7 @@
     {"name": "key login: guardian credits", "source": "codex-rs/core/src/client.rs", "marker": ".insert(\"guardian_credits_requested\".to_owned(), \"true\".to_owned());", "pool": "guardian_credits_requested on a ChatGPT login's Responses request, not a reviewer's"},
     {"name": "key login: unsupported call answer", "source": "codex-rs/core/src/tools/registry.rs", "marker": "_ => format!(\"unsupported call: {tool_name}\"),", "pool": "the answer of a Codex that did not offer the tool, which the pool replaces"},
     {"name": "key login: namespaced tool name", "source": "codex-rs/protocol/src/tool_name.rs", "marker": "Some(namespace) => write!(f, \"{namespace}{}\", self.name),", "pool": "unsupported call: image_genimagegen"},
-    {"name": "key login: unknown server answer", "source": "codex-rs/core/src/tools/handlers/mcp_resource.rs", "marker": "FunctionCallError::RespondToModel(format!(\"unknown MCP server '{server}'\"))", "pool": "read or list of a server the Codex does not have"},
+    {"name": "key login: unknown server answer", "source": "codex-rs/core/src/tools/handlers/mcp_resource.rs", "marker": "\"unknown MCP server '{server}' for the selected environment\"", "pool": "read or list of a server the Codex does not have (resolve_resource_server, from 0.170)"},
     {"name": "key login: cursor answer", "source": "codex-rs/core/src/tools/handlers/mcp_resource.rs", "marker": "\"cursor can only be used when a server is specified\".to_string(),", "pool": "a cursor without a server"},
     {"name": "key login: empty image answer", "source": "codex-rs/ext/image-generation/src/tool.rs", "marker": "\"image generation returned no image data\".to_string(),", "pool": "the answer the pool gives for image_gen"},
     {"name": "key login: apps server name", "source": "codex-rs/core/src/tools/handlers/mcp_resource.rs", "marker": "turn.config.orchestrator_mcp_enabled || server != CODEX_APPS_MCP_SERVER_NAME", "pool": "the apps server is reachable while orchestrator.mcp.enabled is on (the default)"},
@@ -996,6 +1001,18 @@
       "source": "codex-rs/login/src/auth/manager.rs",
       "marker": "later refresh attempts for the same credentials fail fast without network.",
       "pool": "refusedCredentials records a permanent refusal against the account's current tokens; the token refresh fails fast and background quota work skips the account until auth.json holds other tokens (refused_credential.go)"
+    },
+    {
+      "name": "websocket advertised message limit",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "const X_CODEX_WEBSOCKET_MAX_MESSAGE_BYTES_HEADER: &str = \"x-codex-websocket-max-message-bytes\";",
+      "pool": "relayed on the client's handshake; a message the pool made larger than it is not uploaded and the client socket closes with 1009 (responses_ws.rs)"
+    },
+    {
+      "name": "websocket size close",
+      "source": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+      "marker": "Message::Close(Some(frame)) if frame.code == CloseCode::Size && !received_text => {",
+      "pool": "upstream's 1009 close before any text for the request is passed to the client as 1009, with no account marked and no other account tried (responses_ws.rs upstream_refused_size); after text it is an ordinary close"
     },
     {
       "name": "permanent refresh failure",
