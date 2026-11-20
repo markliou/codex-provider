@@ -280,6 +280,11 @@ pub fn copy_all(from: &HeaderMap, name: &str, to: &mut HeaderMap) {
     }
 }
 
+/// Upstream's answer headers as relayed to the client. Content-Encoding is
+/// copied only because Codex's client (0.171+, reqwest "gzip" and "zstd")
+/// removes it from an answer it has decoded: what is left describes the body
+/// the pool relays. Do not strip it here: an answer in an encoding the client
+/// does not decode keeps both the header and its still-compressed body.
 pub fn response_headers(upstream: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for (name, value) in upstream {
