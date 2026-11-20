@@ -2308,6 +2308,46 @@ async fn direct_codex_gateway_sends_compaction_to_the_compact_endpoint() {
     );
 }
 
+// Codex 0.171's HTTP client (http-client/Cargo.toml: reqwest features "gzip"
+// and "zstd") asks upstream for a compressed answer and decodes it, dropping
+// content-encoding and content-length as it does. The pool relays upstream's
+// headers (transport::response_headers), so the client must get the decoded
+// body without a content-encoding claiming it is still compressed.
+#[tokio::test]
+async fn a_compressed_upstream_answer_reaches_the_client_decoded() {
+    const ANSWER: &str = r#"{"id":"resp_compressed","object":"response.compaction","output":[]}"#;
+    let upstream = FakeServer::start(|_| FakeResponse {
+        status: 200,
+        headers: vec![
+            ("content-type".into(), "application/json".into()),
+            ("content-encoding".into(), "zstd".into()),
+        ],
+        chunks: vec![(
+            std::time::Duration::ZERO,
+            bytes::Bytes::from(zstd::encode_all(ANSWER.as_bytes(), 3).unwrap_or_default()),
+        )],
+    })
+    .await;
+    let (app, _dir) = codex_app(&upstream.url, &[("device", "acct-up", 100)]);
+    let result = serve(
+        &app,
+        post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-test","input":[],"instructions":""}"#,
+        )
+        .with_header("user-agent", super::ws_tests::CODEX_EXEC_AGENT)
+        .with_header("originator", "codex_exec"),
+    )
+    .await;
+    assert_eq!(result.code(), 200, "proxy: {}", result.body_string());
+    assert_eq!(result.body_string(), ANSWER);
+    assert_eq!(result.header("content-encoding"), "");
+    let sent = upstream.requests().pop().unwrap_or_default();
+    // reqwest 0.12.28 decodes through tower-http 0.6.8, whose
+    // compression_utils.rs offers gzip and zstd as "zstd,gzip".
+    assert_eq!(sent.header("accept-encoding"), "zstd,gzip");
+}
+
 // Go TestDirectCodexGatewaySendsThroughCodexUpstream. The transport is
 // in-process now, so the hop is the request upstream receives: the first
 // account's endpoint refuses connections, is retried on that account
